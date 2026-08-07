@@ -1,0 +1,184 @@
+name: CI
+
+# Four lanes, ordered by how fast they fail. `static` needs no container and
+# finishes in seconds, so a broken manifest never costs an eight-minute image
+# pull. The three Odoo lanes run in parallel behind it.
+#
+# GitHub Actions is the assumption here, not a requirement: every lane is a
+# handful of `odoo` invocations against a Postgres service, so the translation
+# to GitLab CI or Forgejo is mechanical.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bumping this is a deliberate act: the addons declare 19.0.x versions and use
+  # Odoo 19 extension points. Pin the digest too once one is chosen.
+  ODOO_IMAGE: odoo:19
+  MODULES: >-
+    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise
+  # The same list with each name as a `/module` test spec. This is not
+  # decoration: `--test-enable` on its own also runs the tests of every
+  # dependency Odoo installs — the whole of mail, stock, account and
+  # point_of_sale — which is thousands of upstream tests, takes well past ten
+  # minutes, and tells us nothing about this repository. Restricting to
+  # `/module` specs runs only tests defined in these addons.
+  TEST_TAGS: >-
+    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise
+
+jobs:
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pipx install ruff
+
+      - name: Ruff
+        run: ruff check --output-format=github .
+
+      - name: Manifests, data paths, assets, XML, access rules, dependency graph
+        run: python3 tools/check_addons.py
+
+  install:
+    name: Clean install
+    runs-on: ubuntu-latest
+    needs: static
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          # Odoo requires UTF-8 with a deterministic collation, and an index
+          # built under a locale-aware one sorts differently from how Odoo
+          # compares. Must match docker-compose.yml.
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U odoo -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install every addon on an empty database
+        # `oca` is created empty and left that way on purpose: no addon here may
+        # depend on an AGPL-3 module, and a green run with an empty OCA path is
+        # what proves it. See SPEC.md, "Licence boundary".
+        run: |
+          mkdir -p oca
+          docker run --rm --network host \
+            -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
+            -v "$PWD/oca:/mnt/oca-addons:ro" \
+            "$ODOO_IMAGE" \
+            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo \
+                 -d ci_install -i "$MODULES" \
+                 --stop-after-init --log-level=warn
+
+  upgrade:
+    name: Upgrade in place
+    runs-on: ubuntu-latest
+    needs: static
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U odoo -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install then upgrade in one container so the filestore and data-dir are
+      # the same on both passes. This does not yet prove a migration from the
+      # *previous released* version — nine of eleven addons have no migration
+      # scripts at all (SPEC.md, "Known gaps" 3). It proves that `-u` is a no-op
+      # rather than a crash, which is the cheaper half and still catches a
+      # broken data file or a field that cannot be recomputed.
+      - name: Install, then upgrade
+        run: |
+          mkdir -p oca
+          run_odoo() {
+            docker run --rm --network host \
+              -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
+              -v odoo-ci-data:/var/lib/odoo \
+              "$ODOO_IMAGE" \
+              odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                   --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                   "$@"
+          }
+          run_odoo -d ci_upgrade -i "$MODULES" --stop-after-init --log-level=warn
+          run_odoo -d ci_upgrade -u "$MODULES" --stop-after-init --log-level=warn
+
+  test:
+    name: Server and browser tests
+    runs-on: ubuntu-latest
+    needs: static
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U odoo -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The 192 server test methods. `--test-tags` implies `--test-enable`,
+      # which implies `--stop-after-init`. Odoo exits non-zero when a test
+      # fails, so the result needs no log scraping.
+      #
+      # The 17 Hoot tests are NOT in this lane. They run inside a browser,
+      # driven by `web`'s own WebSuite.test_unit_desktop, and the odoo:19 image
+      # ships no browser — so the tag needed is `/web:WebSuite.test_unit_desktop
+      # [@mb_label,@mb_label_pos]` against an image that has Chromium. Building
+      # that image is a real task and is deliberately not faked here with a lane
+      # that would pass by running nothing. Until then the Hoot suite is run by
+      # hand; see README.md.
+      #
+      # The database must be new for this to mean anything: `-i` on a database
+      # where the modules are already installed is a no-op, and at_install tests
+      # then silently do not run — a green lane that tested nothing. Here the
+      # Postgres service is created fresh per job, so `ci_test` cannot exist.
+      # `make test` cannot rely on that and force-drops instead.
+      #
+      # Not covered, and not pretended otherwise: physical printer and scanner
+      # qualification. The Phomemo M110 and NIIMBOT D110 packet builders are
+      # tested against fixtures, and no device is attached to any runner.
+      - name: Run the suite
+        run: |
+          mkdir -p oca
+          docker run --rm --network host \
+            -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
+            "$ODOO_IMAGE" \
+            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo \
+                 -d ci_test -i "$MODULES" \
+                 --test-tags "$TEST_TAGS" --stop-after-init --log-level=test
