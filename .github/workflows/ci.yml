@@ -111,11 +111,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # Install then upgrade in one container so the filestore and data-dir are
-      # the same on both passes. This does not yet prove a migration from the
-      # *previous released* version — nine of eleven addons have no migration
-      # scripts at all (SPEC.md, "Known gaps" 3). It proves that `-u` is a no-op
-      # rather than a crash, which is the cheaper half and still catches a
-      # broken data file or a field that cannot be recomputed.
+      # the same on both passes.
+      #
+      # This proves `-u` is a no-op rather than a crash, which catches a broken
+      # data file or a field that cannot be recomputed. It does not prove
+      # migration from a previously released version, and is not meant to:
+      # nothing is released, so there is no prior version to migrate from, and
+      # development databases are rebuilt rather than migrated. See SPEC.md,
+      # "Migration scripts start at first release" — that is when this lane
+      # needs a second database restored from the last tag.
       - name: Install, then upgrade
         run: |
           mkdir -p oca
