@@ -62,7 +62,12 @@ pub struct AppliedCommand {
 }
 
 impl OdooClient {
-    pub fn new(base_url: &str, token: &str, timeout: Duration) -> anyhow::Result<Self> {
+    pub fn new(
+        base_url: &str,
+        token: &str,
+        database_ref: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
         if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
             anyhow::bail!("Odoo URL must be absolute HTTP(S)");
@@ -74,6 +79,20 @@ impl OdooClient {
         authorization.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        if let Some(database_ref) = database_ref {
+            if database_ref.len() != 35
+                || !database_ref.starts_with("mb_")
+                || !database_ref[3..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                anyhow::bail!("Odoo database reference is not opaque");
+            }
+            headers.insert(
+                "x-odoo-dbfilter",
+                reqwest::header::HeaderValue::from_str(&format!(r"^{database_ref}\Z"))?,
+            );
+        }
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(timeout)
@@ -154,14 +173,23 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/mb_control/v1/memberships/reconcile"))
             .and(header("authorization", "Bearer fixture-token"))
+            .and(header(
+                "x-odoo-dbfilter",
+                r"^mb_00000000000000000000000000000001\Z",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "applied": true, "epoch": 3
             })))
             .expect(1)
             .mount(&server)
             .await;
-        let client =
-            OdooClient::new(&server.uri(), "fixture-token", Duration::from_secs(2)).unwrap();
+        let client = OdooClient::new(
+            &server.uri(),
+            "fixture-token",
+            Some("mb_00000000000000000000000000000001"),
+            Duration::from_secs(2),
+        )
+        .unwrap();
         let result = client
             .reconcile_membership(&MembershipCommand {
                 operation_key: "member:fixture:3".into(),

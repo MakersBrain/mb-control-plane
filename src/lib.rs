@@ -2,6 +2,7 @@ pub mod api;
 pub mod api_error;
 pub mod auth;
 pub mod config;
+pub mod docker_driver;
 pub mod domain;
 pub mod integrations;
 pub mod invoice;

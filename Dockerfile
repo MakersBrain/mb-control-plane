@@ -12,6 +12,7 @@ COPY --from=builder /source/target/release/control-api /usr/local/bin/control-ap
 COPY --from=builder /source/target/release/control-migrate /usr/local/bin/control-migrate
 COPY --from=builder /source/target/release/control-worker /usr/local/bin/control-worker
 COPY --from=builder /source/target/release/control-fixture /usr/local/bin/control-fixture
+COPY --from=builder /source/target/release/control-docker-driver /usr/local/bin/control-docker-driver
 USER 10001:10001
 EXPOSE 8080
 CMD ["/usr/local/bin/control-api"]

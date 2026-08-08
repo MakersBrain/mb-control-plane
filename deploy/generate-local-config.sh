@@ -61,7 +61,7 @@ jq --arg secret "$PAPERLESS_OIDC_CLIENT_SECRET" --arg paperless "$paperless_orig
 }]' > deploy/secrets/rauthy/clients.json.tmp
 mv deploy/secrets/rauthy/clients.json.tmp deploy/secrets/rauthy/clients.json
 chmod 600 deploy/secrets/rauthy/clients.json
-jq -n --arg secret "$rauthy_key_secret" '[{"name":"makersbrain-runtime","secret":{"Plain":$secret},"access":[{"group":"Users","access_rights":["read","create","update"]},{"group":"Sessions","access_rights":["read","delete"]},{"group":"Events","access_rights":["read"]}]}]' > deploy/secrets/rauthy/api_keys.json.tmp
+jq -n --arg secret "$rauthy_key_secret" '[{"name":"makersbrain-runtime","secret":{"Plain":$secret},"access":[{"group":"Users","access_rights":["read","create","update"]},{"group":"Sessions","access_rights":["read","delete"]},{"group":"Clients","access_rights":["read","create","update","delete"]},{"group":"Secrets","access_rights":["read"]},{"group":"Events","access_rights":["read"]}]}]' > deploy/secrets/rauthy/api_keys.json.tmp
 mv deploy/secrets/rauthy/api_keys.json.tmp deploy/secrets/rauthy/api_keys.json
 chmod 600 deploy/secrets/rauthy/api_keys.json
 echo "generated Rauthy bootstrap manifests for $members_origin"

@@ -288,6 +288,7 @@ async fn create_workshop(
     let database_id = Uuid::new_v4();
     let database_ref = opaque_database_ref(database_id);
     let public_hostname = format!("{}.{}", body.slug, state.config.tenant_domain);
+    let paperless_hostname = format!("docs-{}.{}", body.slug, state.config.tenant_domain);
     let operation_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
@@ -314,7 +315,7 @@ async fn create_workshop(
         .bind(database_id).bind(workshop_id).bind(&database_ref).bind(&public_hostname).execute(&mut *tx).await?;
     sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key)
                  values($1,'tenant.provision','tenant-provisioning',$2,$3,1,$4,$3,$5,$6)")
-        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname})).bind(correlation_id).bind(&key).execute(&mut *tx).await?;
+        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname})).bind(correlation_id).bind(&key).execute(&mut *tx).await?;
     audit(
         &mut tx,
         Some(who.user_id),

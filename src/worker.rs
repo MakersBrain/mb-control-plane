@@ -94,6 +94,33 @@ fn secret(reference: &str) -> Result<String, IntegrationError> {
     if reference.is_empty() || reference.len() > 180 {
         return Err(IntegrationError::ContractDrift);
     }
+    let valid_reference = reference.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment.len() <= 64
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    });
+    if !valid_reference {
+        return Err(IntegrationError::ContractDrift);
+    }
+    if let Ok(root) = std::env::var("CONTROL_SECRET_ROOT") {
+        let root = std::fs::canonicalize(root).map_err(|_| IntegrationError::Unauthorized)?;
+        let candidate = root.join(reference);
+        let resolved =
+            std::fs::canonicalize(&candidate).map_err(|_| IntegrationError::Unauthorized)?;
+        if !resolved.starts_with(&root) {
+            return Err(IntegrationError::ContractDrift);
+        }
+        let value = std::fs::read_to_string(resolved)
+            .map_err(|_| IntegrationError::Unauthorized)?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if value.is_empty() {
+            return Err(IntegrationError::Unauthorized);
+        }
+        return Ok(value);
+    }
     let name = format!(
         "CONTROL_SECRET__{}",
         reference
@@ -112,9 +139,20 @@ async fn service(
     store: &Store,
     workshop: Uuid,
     name: &str,
-) -> Result<(String, String), IntegrationError> {
-    sqlx::query_as::<_,(String,String)>("select base_url,secret_ref from control.service_instances where workshop_id=$1 and service=$2")
-        .bind(workshop).bind(name).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)
+) -> Result<(String, String, Option<String>), IntegrationError> {
+    sqlx::query_as::<_, (String, String, Option<String>)>(
+        "select si.base_url,si.secret_ref,od.database_ref
+        from control.service_instances si
+        left join control.odoo_databases od on od.workshop_id=si.workshop_id
+            and od.kind='primary' and od.deleted_at is null and si.service='odoo'
+        where si.workshop_id=$1 and si.service=$2",
+    )
+    .bind(workshop)
+    .bind(name)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::NotFound)
 }
 
 async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
@@ -158,9 +196,14 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
     )
     .await?;
     let odoo_result = async {
-        let (url, reference) = service(store, workshop, "odoo").await?;
-        let client = OdooClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
-            .map_err(|_| IntegrationError::ContractDrift)?;
+        let (url, reference, database_ref) = service(store, workshop, "odoo").await?;
+        let client = OdooClient::new(
+            &url,
+            &secret(&reference)?,
+            database_ref.as_deref(),
+            Duration::from_secs(20),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
         client
             .reconcile_membership(&MembershipCommand {
                 operation_key: format!("membership:{workshop}:{user}:{epoch}"),
@@ -188,7 +231,7 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
     )
     .await?;
     let paperless_result = async {
-        let (url, reference) = service(store, workshop, "paperless").await?;
+        let (url, reference, _) = service(store, workshop, "paperless").await?;
         let client = PaperlessClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
             .map_err(|_| IntegrationError::ContractDrift)?;
         let groups = client.ensure_groups(paperless_group_names(&row.3)?).await?;
@@ -244,9 +287,14 @@ async fn entitlement(store: &Store, operation: &LeasedOperation) -> Result<(), I
         .workshop_id
         .ok_or(IntegrationError::ContractDrift)?;
     let row=sqlx::query_as::<_,(i64,String,String,Value,Option<time::OffsetDateTime>,String)>("select version,plan,status,limits,expires_at,signature from control.entitlements where workshop_id=$1").bind(workshop).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
-    let (url, reference) = service(store, workshop, "odoo").await?;
-    let client = OdooClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
-        .map_err(|_| IntegrationError::ContractDrift)?;
+    let (url, reference, database_ref) = service(store, workshop, "odoo").await?;
+    let client = OdooClient::new(
+        &url,
+        &secret(&reference)?,
+        database_ref.as_deref(),
+        Duration::from_secs(20),
+    )
+    .map_err(|_| IntegrationError::ContractDrift)?;
     client
         .apply_entitlement(&EntitlementCommand {
             operation_key: format!("entitlement:{workshop}:{}", row.0),
@@ -271,7 +319,7 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
         .get("document_id")
         .and_then(Value::as_i64)
         .ok_or(IntegrationError::ContractDrift)?;
-    let (paperless_url, paperless_ref) = service(store, workshop, "paperless").await?;
+    let (paperless_url, paperless_ref, _) = service(store, workshop, "paperless").await?;
     let paperless = PaperlessClient::new(
         &paperless_url,
         &secret(&paperless_ref)?,
@@ -312,9 +360,14 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
             ("azure", invoice, confidence, pages)
         };
     let requires_review = crate::invoice::requires_review(&invoice, &confidence);
-    let (odoo_url, odoo_ref) = service(store, workshop, "odoo").await?;
-    let odoo = OdooClient::new(&odoo_url, &secret(&odoo_ref)?, Duration::from_secs(45))
-        .map_err(|_| IntegrationError::ContractDrift)?;
+    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
+    let odoo = OdooClient::new(
+        &odoo_url,
+        &secret(&odoo_ref)?,
+        database_ref.as_deref(),
+        Duration::from_secs(45),
+    )
+    .map_err(|_| IntegrationError::ContractDrift)?;
     odoo.capture_invoice(&json!({"operation_key":format!("invoice:{workshop}:{document_id}:{digest}"),"workshop_id":workshop,"external_document_id":format!("paperless:{document_id}"),"content_digest":digest,"source_filename":metadata.filename,"source_mimetype":mimetype,"source_base64":base64::engine::general_purpose::STANDARD.encode(&source),"provider":provider,"model":if provider=="azure"{"prebuilt-invoice"}else{"structured"},"page_count":pages,"requires_review":requires_review,"field_confidence":confidence,"invoice":invoice})).await?;
     if let Ok(tags) = std::env::var("CONTROL_PAPERLESS_CAPTURED_TAG_IDS") {
         let mut ids = tags
@@ -510,9 +563,14 @@ async fn driver(
             .get("issuer")
             .and_then(Value::as_str)
             .ok_or(IntegrationError::ContractDrift)?;
-        let (odoo_url, odoo_ref) = service(store, workshop, "odoo").await?;
-        let odoo = OdooClient::new(&odoo_url, &secret(&odoo_ref)?, Duration::from_secs(30))
-            .map_err(|_| IntegrationError::ContractDrift)?;
+        let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
+        let odoo = OdooClient::new(
+            &odoo_url,
+            &secret(&odoo_ref)?,
+            database_ref.as_deref(),
+            Duration::from_secs(30),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
         odoo.bootstrap_tenant(&TenantBootstrapCommand {
             operation_key: format!("tenant-bootstrap:{workshop}"),
             workshop_id: workshop,
