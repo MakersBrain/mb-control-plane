@@ -18,12 +18,18 @@ references and byte counts. It must quiesce the tenant and handle the Odoo
 PostgreSQL database and filestore together; the development fixture is a
 contract simulator and is not a backup engine.
 
-Backups are one encrypted recovery set per workshop: the Odoo PostgreSQL
-database and filestore, the Paperless PostgreSQL database and media/data, plus
-the control rows for the workshop, memberships, external identities, service
-instances, entitlements, operations, usage, and audit. Secret values are never
-part of the set; infrastructure restores their references from its secret
-manager.
+The Docker driver's owner-facing database actions create an Odoo recovery set:
+the selected Odoo PostgreSQL database and its matching filestore namespace.
+This is the implemented replacement for Odoo's native database manager; it is
+not presented as an encrypted whole-tenant disaster-recovery export.
+
+The production disaster-recovery contract is a separate paired, encrypted
+recovery set per workshop: the Odoo PostgreSQL database and filestore, the
+Paperless PostgreSQL database and media/data, plus the control rows for the
+workshop, memberships, external identities, service instances, entitlements,
+operations, usage, and audit. `makersbrain-infra` owns that Phase-4 orchestration
+and encryption. Secret values are never part of either set; infrastructure
+restores their references from its secret manager.
 
 Before an Odoo or Paperless upgrade, stop admission for that tenant, let active
 operations finish, record the image digests, and take all members of the set

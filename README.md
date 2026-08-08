@@ -77,7 +77,9 @@ Paperless is process-isolated per workshop: the driver creates one container,
 one PostgreSQL role/database, and dedicated data, media, and consume volumes.
 All Paperless containers share the Redis process, but each receives a distinct
 ACL user, password, key prefix, and channel prefix. Redis uses AOF persistence
-and `noeviction`; tenant containers cannot access another tenant's keys.
+and `noeviction`; tenant containers cannot access another tenant's keys or
+channels and cannot run Redis ACL, configuration, persistence, replication, or
+other shared-service administration commands.
 
 The owner-only **Database & backups** page exposes snapshots, portable backups,
 restore, and non-routable duplicate requests. These are durable

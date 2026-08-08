@@ -859,17 +859,7 @@ async fn ensure_redis_acl(
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .map_err(DriverError::internal)?;
-    let arguments = [
-        "ACL".to_owned(),
-        "SETUSER".to_owned(),
-        username.to_owned(),
-        "reset".to_owned(),
-        "on".to_owned(),
-        format!(">{password}"),
-        format!("~{prefix}*"),
-        format!("&{prefix}*"),
-        "+@all".to_owned(),
-    ];
+    let arguments = redis_acl_arguments(username, password, prefix);
     let mut command = format!("*{}\r\n", arguments.len());
     for argument in arguments {
         command.push_str(&format!("${}\r\n{}\r\n", argument.len(), argument));
@@ -887,6 +877,32 @@ async fn ensure_redis_acl(
         return Err(DriverError::internal("Redis rejected tenant ACL"));
     }
     Ok(())
+}
+
+fn redis_acl_arguments(username: &str, password: &str, prefix: &str) -> Vec<String> {
+    vec![
+        "ACL".into(),
+        "SETUSER".into(),
+        username.into(),
+        "reset".into(),
+        "on".into(),
+        format!(">{password}"),
+        format!("~{prefix}*"),
+        format!("&{prefix}*"),
+        "+@all".into(),
+        // Paperless/Celery needs ordinary data, transaction, Pub/Sub and Lua
+        // commands. It must never be able to alter shared Redis configuration,
+        // ACL users, persistence, replication, or another tenant's database.
+        "-@admin".into(),
+        "-@dangerous".into(),
+        "+eval".into(),
+        "+eval_ro".into(),
+        "+evalsha".into(),
+        "+evalsha_ro".into(),
+        "+script|exists".into(),
+        "+script|load".into(),
+        "+script|kill".into(),
+    ]
 }
 
 async fn ensure_oidc_clients(
@@ -1449,5 +1465,21 @@ mod tests {
             0o640
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paperless_redis_acl_excludes_shared_service_administration() {
+        let rules = redis_acl_arguments("tenant", "password", "mb:tenant:");
+        let position = |rule: &str| {
+            rules
+                .iter()
+                .position(|candidate| candidate == rule)
+                .unwrap()
+        };
+        assert!(rules.iter().any(|rule| rule == "~mb:tenant:*"));
+        assert!(rules.iter().any(|rule| rule == "&mb:tenant:*"));
+        assert!(position("-@admin") > position("+@all"));
+        assert!(position("-@dangerous") > position("+@all"));
+        assert!(position("+evalsha") > position("-@dangerous"));
     }
 }

@@ -1264,6 +1264,24 @@ async fn reconcile_tenant(
     Path(workshop_id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     internal(&state, &headers)?;
+    let tenant = sqlx::query_as::<_, (Uuid, String, String, String)>(
+        "select d.id,w.slug,d.database_ref,d.public_hostname
+         from control.workshops w
+         join control.odoo_databases d on d.workshop_id=w.id
+         where w.id=$1 and w.status<>'deleted' and d.kind='primary'
+           and d.deleted_at is null and d.public_hostname is not null",
+    )
+    .bind(workshop_id)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let paperless_hostname = format!("docs-{}.{}", tenant.1, state.config.tenant_domain);
+    let payload = json!({
+        "database_id": tenant.0,
+        "database_ref": tenant.2,
+        "public_hostname": tenant.3,
+        "paperless_hostname": paperless_hostname,
+    });
     let mut tx = state.store.begin().await?;
     let correlation = Uuid::new_v4();
     let op = Store::enqueue(
@@ -1273,7 +1291,7 @@ async fn reconcile_tenant(
             workshop_id: Some(workshop_id),
             target_user_id: None,
             desired_epoch: None,
-            payload: &json!({}),
+            payload: &payload,
             requested_by: None,
             correlation_id: correlation,
             idempotency_key: &format!("manual:{correlation}"),
