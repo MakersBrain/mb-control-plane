@@ -2,35 +2,40 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 1,
   "release": "0.1.0",
-  "schema_release": "0003_odoo_database_lifecycle",
-  "schema_compatibility": ">=0003_odoo_database_lifecycle,<0004",
+  "schema_release": "0004_docker_deployment_driver",
+  "schema_compatibility": ">=0004_docker_deployment_driver,<0005",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "web": {"build_context": "control-plane/web", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
-    "odoo": {"build_context": ".", "dockerfile": "control-plane/deploy/Odoo.Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]}
+    "odoo": {"build_context": ".", "dockerfile": "control-plane/deploy/Odoo.Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
+    "paperless": {"build_context": "control-plane/deploy", "dockerfile": "Paperless.Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]}
   },
   "processes": {
     "migration": {"command": ["/usr/local/bin/control-migrate"], "run_before": ["api", "workers"]},
     "api": {"command": ["/usr/local/bin/control-api"], "port": 8080, "live": "/health/live", "ready": "/health/ready", "openapi": "/openapi.json"},
     "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["identity-operations", "tenant-provisioning", "membership-provisioning", "invoice-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle"]},
-    "web": {"port": 8080, "live": "/health/live"}
+    "web": {"port": 8080, "live": "/health/live"},
+    "docker_driver": {"command": ["/usr/local/bin/control-docker-driver"], "port": 8080, "live": "/health/live", "private": true}
   },
   "required_environment": {
     "migration": ["CONTROL_DATABASE_URL"],
     "api": ["CONTROL_LISTEN", "CONTROL_DATABASE_URL", "CONTROL_PUBLIC_ORIGIN", "CONTROL_CORS_ORIGIN", "CONTROL_OIDC_ISSUER", "CONTROL_OIDC_AUDIENCE", "CONTROL_OIDC_DISCOVERY_URL", "CONTROL_TENANT_DOMAIN", "CONTROL_INTERNAL_TOKEN"],
-    "membership_worker": ["CONTROL_DATABASE_URL", "CONTROL_RAUTHY_ADMIN_URL", "CONTROL_RAUTHY_ADMIN_KEY", "CONTROL_SECRET__<TENANT_ODOO_REF>", "CONTROL_SECRET__<TENANT_PAPERLESS_REF>"],
-    "invoice_worker": ["CONTROL_DATABASE_URL", "CONTROL_AZURE_ENDPOINT", "CONTROL_AZURE_KEY", "CONTROL_AZURE_API_VERSION", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS", "CONTROL_AZURE_POLL_INTERVAL_MS", "CONTROL_SECRET__<TENANT_ODOO_REF>", "CONTROL_SECRET__<TENANT_PAPERLESS_REF>"],
-    "provisioning_worker": ["CONTROL_DATABASE_URL", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN"],
+    "membership_worker": ["CONTROL_DATABASE_URL", "CONTROL_RAUTHY_ADMIN_URL", "CONTROL_RAUTHY_ADMIN_KEY", "CONTROL_SECRET_ROOT"],
+    "invoice_worker": ["CONTROL_DATABASE_URL", "CONTROL_AZURE_ENDPOINT", "CONTROL_AZURE_KEY", "CONTROL_AZURE_API_VERSION", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS", "CONTROL_AZURE_POLL_INTERVAL_MS", "CONTROL_SECRET_ROOT"],
+    "provisioning_worker": ["CONTROL_DATABASE_URL", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_SECRET_ROOT"],
+    "docker_driver": ["DRIVER_LISTEN", "DRIVER_TOKEN", "DRIVER_DOCKER_SOCKET", "DRIVER_DATABASE_URL", "DRIVER_POSTGRES_ADMIN_URL", "DRIVER_POSTGRES_HOST", "DRIVER_POSTGRES_PORT", "DRIVER_ODOO_POSTGRES_PASSWORD", "DRIVER_ODOO_BRIDGE_TOKEN", "DRIVER_ODOO_IMAGE", "DRIVER_POSTGRES_IMAGE", "DRIVER_PAPERLESS_IMAGE", "DRIVER_DOCKER_NETWORK", "DRIVER_ODOO_CONTAINER", "DRIVER_ODOO_VOLUME", "DRIVER_BACKUP_VOLUME", "DRIVER_ODOO_DATA_ROOT", "DRIVER_BACKUP_ROOT", "DRIVER_REDIS_ADDRESS", "DRIVER_SECRET_ROOT", "DRIVER_ROUTE_ROOT", "DRIVER_GATEWAY_CONTAINER", "DRIVER_ODOO_BASE_URL", "DRIVER_CONTROL_INTERNAL_URL", "DRIVER_CONTROL_INTERNAL_TOKEN", "DRIVER_RAUTHY_ADMIN_URL", "DRIVER_RAUTHY_ADMIN_KEY", "DRIVER_OIDC_ISSUER", "DRIVER_PUBLIC_SCHEME"],
     "email_worker": ["CONTROL_DATABASE_URL", "CONTROL_MAIL_WEBHOOK_URL", "CONTROL_MAIL_WEBHOOK_TOKEN"]
   },
   "volumes": {
     "control": ["postgresql_database"],
-    "odoo_tenant": ["postgresql_database", "filestore"],
-    "paperless_tenant": ["postgresql_database", "data", "media", "consume", "redis"]
+    "odoo_shared": ["postgresql_cluster", "filestore"],
+    "paperless_tenant": ["postgresql_database", "data", "media", "consume"],
+    "redis_shared": ["append_only_data"]
   },
   "identity": {"provider": "rauthy", "tested_version": "0.36.1", "client_manifest": "rauthy-client.schema.json", "required_flow": "authorization_code+PKCE(S256)", "human_local_passwords": false},
   "development_tunnel": {"connector": "cloudflared:2026.7.2", "domain_pattern": "*.dev[1-4].makersbrain.net", "infrastructure_root": "../makersbrain-infra/environments/development/developer-tunnels", "synthetic_data_only": true},
-  "paperless": {"tested_version": "2.20.15", "api_prefix": "/api", "oidc_provider": "openid_connect", "document_event": "/internal/v1/paperless/{workshop_id}/events"},
-  "odoo": {"version": "19", "modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_control_bridge", "mb_invoice_capture"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "deployment gateway resolves an exact registered hostname to an isolated tenant process; hostname and database identifier are never derived from one another"},
+  "paperless": {"tested_version": "2.20.15", "deployment": "one container and PostgreSQL database per workshop", "redis": "one shared Redis with a unique ACL user and key/channel prefix per workshop", "api_prefix": "/api", "oidc_provider": "openid_connect", "document_event": "/internal/v1/paperless/{workshop_id}/events"},
+  "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge", "mb_invoice_capture"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another"},
+  "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes"]},
   "rollback": {"application": "previous image is compatible while schema remains 0001_control_plane", "database": "forward repair only after migration adoption; restore the paired backup for destructive recovery"}
 }

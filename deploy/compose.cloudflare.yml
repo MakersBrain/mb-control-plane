@@ -7,7 +7,7 @@ services:
       PROXY_MODE: "true"
       TRUSTED_PROXIES: |-
         172.16.0.0/12
-        192.168.80.1/32
+        192.168.0.0/16
       PEER_IP_HEADER_NAME: CF-Connecting-IP
       TLS_GENERATE_SELF_SIGNED: "true"
       RP_ID: auth.${PUBLIC_DOMAIN}
@@ -34,6 +34,13 @@ services:
     environment:
       FIXTURE_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1
 
+  docker-driver:
+    environment:
+      DRIVER_RAUTHY_ADMIN_URL: https://auth.${PUBLIC_DOMAIN}/auth/v1
+      DRIVER_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1
+      DRIVER_PUBLIC_SCHEME: https
+      DRIVER_PUBLIC_PORT: ""
+
   worker-membership:
     environment: &public-rauthy-worker
       CONTROL_RAUTHY_ADMIN_URL: https://auth.${PUBLIC_DOMAIN}/auth/v1/
@@ -47,12 +54,6 @@ services:
     environment: *public-rauthy-worker
   worker-lifecycle:
     environment: *public-rauthy-worker
-
-  paperless:
-    environment:
-      PAPERLESS_URL: https://paperless.${PUBLIC_DOMAIN}
-      PAPERLESS_SOCIALACCOUNT_PROVIDERS: >-
-        {"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":"makersbrain-paperless-local","secret":"${PAPERLESS_OIDC_CLIENT_SECRET}","settings":{"server_url":"https://auth.${PUBLIC_DOMAIN}/auth/v1/.well-known/openid-configuration"}}]}}
 
   cloudflared:
     image: cloudflare/cloudflared:2026.7.2

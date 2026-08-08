@@ -30,9 +30,14 @@ pub struct DockerDriverConfig {
     odoo_postgres_password: String,
     odoo_bridge_token: String,
     odoo_image: String,
+    postgres_image: String,
     paperless_image: String,
     docker_network: String,
+    odoo_container: String,
     odoo_volume: String,
+    backup_volume: String,
+    odoo_data_root: PathBuf,
+    backup_root: PathBuf,
     redis_address: String,
     secret_root: PathBuf,
     route_root: PathBuf,
@@ -43,10 +48,21 @@ pub struct DockerDriverConfig {
     rauthy_admin_url: String,
     rauthy_admin_key: String,
     oidc_issuer: String,
+    public_scheme: String,
+    public_port: Option<u16>,
 }
 
 impl DockerDriverConfig {
     pub fn from_env() -> anyhow::Result<Self> {
+        let public_scheme = required("DRIVER_PUBLIC_SCHEME")?;
+        if !matches!(public_scheme.as_str(), "http" | "https") {
+            anyhow::bail!("DRIVER_PUBLIC_SCHEME must be http or https");
+        }
+        let public_port = std::env::var("DRIVER_PUBLIC_PORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.parse())
+            .transpose()?;
         Ok(Self {
             listen: required("DRIVER_LISTEN")?.parse()?,
             token: required("DRIVER_TOKEN")?,
@@ -58,9 +74,14 @@ impl DockerDriverConfig {
             odoo_postgres_password: required("DRIVER_ODOO_POSTGRES_PASSWORD")?,
             odoo_bridge_token: required("DRIVER_ODOO_BRIDGE_TOKEN")?,
             odoo_image: required("DRIVER_ODOO_IMAGE")?,
+            postgres_image: required("DRIVER_POSTGRES_IMAGE")?,
             paperless_image: required("DRIVER_PAPERLESS_IMAGE")?,
             docker_network: required("DRIVER_DOCKER_NETWORK")?,
+            odoo_container: required("DRIVER_ODOO_CONTAINER")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
+            backup_volume: required("DRIVER_BACKUP_VOLUME")?,
+            odoo_data_root: required("DRIVER_ODOO_DATA_ROOT")?.into(),
+            backup_root: required("DRIVER_BACKUP_ROOT")?.into(),
             redis_address: required("DRIVER_REDIS_ADDRESS")?,
             secret_root: required("DRIVER_SECRET_ROOT")?.into(),
             route_root: required("DRIVER_ROUTE_ROOT")?.into(),
@@ -71,7 +92,16 @@ impl DockerDriverConfig {
             rauthy_admin_url: absolute_http("DRIVER_RAUTHY_ADMIN_URL")?,
             rauthy_admin_key: required("DRIVER_RAUTHY_ADMIN_KEY")?,
             oidc_issuer: absolute_http("DRIVER_OIDC_ISSUER")?,
+            public_scheme,
+            public_port,
         })
+    }
+
+    fn public_origin(&self, hostname: &str) -> String {
+        match self.public_port {
+            Some(port) => format!("{}://{hostname}:{port}", self.public_scheme),
+            None => format!("{}://{hostname}", self.public_scheme),
+        }
     }
 }
 
@@ -104,6 +134,7 @@ struct DriverState {
 pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.secret_root)?;
     std::fs::create_dir_all(&config.route_root)?;
+    std::fs::create_dir_all(&config.backup_root)?;
     let ledger = PgPoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)
@@ -335,14 +366,239 @@ async fn provision(
 }
 
 async fn lifecycle(
-    _state: &DriverState,
-    _workshop: Uuid,
-    _payload: &Value,
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
 ) -> Result<Value, DriverError> {
-    Err(DriverError(
-        StatusCode::NOT_IMPLEMENTED,
-        "Docker lifecycle backend is not implemented yet".into(),
-    ))
+    let running = docker_inspect_container(state, &state.config.odoo_container)
+        .await?
+        .pointer("/State/Running")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if running {
+        docker_stop_container(state, &state.config.odoo_container).await?;
+    }
+    let result = lifecycle_quiesced(state, workshop, payload).await;
+    let restart = if running {
+        docker_start_container(state, &state.config.odoo_container).await
+    } else {
+        Ok(())
+    };
+    match (result, restart) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
+async fn lifecycle_quiesced(
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
+) -> Result<Value, DriverError> {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::bad("lifecycle action is required"))?;
+    let database_id = payload_uuid(payload, "database_id")?;
+    let database_ref = database_ref(state, workshop, database_id).await?;
+    match action {
+        "snapshot" | "backup" => {
+            let recovery = payload_uuid(payload, "recovery_point_id")?;
+            let recovery_point =
+                create_recovery_set(state, workshop, recovery, &database_ref, action).await?;
+            Ok(json!({"action":action,"recovery_point":recovery_point}))
+        }
+        "restore" => {
+            let safety = payload_uuid(payload, "safety_recovery_point_id")?;
+            let safety_recovery_point =
+                create_recovery_set(state, workshop, safety, &database_ref, "snapshot").await?;
+            let storage_ref = payload
+                .get("storage_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DriverError::bad("storage_ref is required"))?;
+            restore_recovery_set(state, workshop, &database_ref, storage_ref).await?;
+            Ok(json!({"action":"restore","safety_recovery_point":safety_recovery_point}))
+        }
+        "duplicate" => {
+            if payload.get("routable").and_then(Value::as_bool) != Some(false) {
+                return Err(DriverError::bad("database duplicates must be non-routable"));
+            }
+            let target_id = payload_uuid(payload, "target_database_id")?;
+            let target_ref = opaque_database(payload, "target_database_ref")?;
+            let temporary = create_recovery_set(
+                state,
+                workshop,
+                target_id,
+                &database_ref,
+                "duplicate-source",
+            )
+            .await?;
+            restore_recovery_set(
+                state,
+                workshop,
+                target_ref,
+                temporary
+                    .get("storage_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DriverError::internal("duplicate storage reference missing"))?,
+            )
+            .await?;
+            Ok(
+                json!({"action":"duplicate","database":{"database_ref":target_ref,"routable":false}}),
+            )
+        }
+        _ => Err(DriverError::bad("unsupported lifecycle action")),
+    }
+}
+
+fn payload_uuid(payload: &Value, key: &str) -> Result<Uuid, DriverError> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::bad(format!("{key} is required")))?
+        .parse()
+        .map_err(|_| DriverError::bad(format!("{key} is invalid")))
+}
+
+async fn database_ref(
+    state: &DriverState,
+    workshop: Uuid,
+    database_id: Uuid,
+) -> Result<String, DriverError> {
+    sqlx::query_scalar(
+        "select database_ref from control.odoo_databases where id=$1 and workshop_id=$2 and deleted_at is null",
+    )
+    .bind(database_id)
+    .bind(workshop)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "database not found".into()))
+}
+
+async fn create_recovery_set(
+    state: &DriverState,
+    workshop: Uuid,
+    recovery: Uuid,
+    database_ref: &str,
+    kind: &str,
+) -> Result<Value, DriverError> {
+    if !safe_pg_identifier(database_ref) {
+        return Err(DriverError::bad("unsafe database reference"));
+    }
+    let relative = PathBuf::from("docker-backup")
+        .join(workshop.to_string())
+        .join(recovery.to_string());
+    let directory = state.config.backup_root.join(&relative);
+    let complete = directory.join("complete.json");
+    if complete.is_file() {
+        let size = directory_size(&directory).map_err(DriverError::internal)?;
+        return Ok(json!({"storage_ref":relative.to_string_lossy(),"size_bytes":size}));
+    }
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).map_err(DriverError::internal)?;
+    }
+    secure_directory(&directory).map_err(DriverError::internal)?;
+    let dump_relative = relative.join("database.dump");
+    run_postgres_job(
+        state,
+        &format!("mb-pg-dump-{}", &recovery.simple().to_string()[..12]),
+        vec![
+            "pg_dump".into(),
+            "--format=custom".into(),
+            "--no-owner".into(),
+            "--no-acl".into(),
+            format!("--host={}", state.config.postgres_host),
+            format!("--port={}", state.config.postgres_port),
+            "--username=odoo".into(),
+            format!("--file=/backups/{}", dump_relative.to_string_lossy()),
+            database_ref.into(),
+        ],
+    )
+    .await?;
+    let source_filestore = state
+        .config
+        .odoo_data_root
+        .join("filestore")
+        .join(database_ref);
+    let target_filestore = directory.join("filestore");
+    copy_directory(&source_filestore, &target_filestore).map_err(DriverError::internal)?;
+    let manifest = json!({
+        "format":"makersbrain-odoo-recovery-v1",
+        "workshop_id":workshop,
+        "database_ref":database_ref,
+        "kind":kind
+    });
+    std::fs::write(
+        &complete,
+        serde_json::to_vec_pretty(&manifest).map_err(DriverError::internal)?,
+    )
+    .map_err(DriverError::internal)?;
+    let size = directory_size(&directory).map_err(DriverError::internal)?;
+    Ok(json!({"storage_ref":relative.to_string_lossy(),"size_bytes":size}))
+}
+
+async fn restore_recovery_set(
+    state: &DriverState,
+    workshop: Uuid,
+    target_database: &str,
+    storage_ref: &str,
+) -> Result<(), DriverError> {
+    if !safe_pg_identifier(target_database) {
+        return Err(DriverError::bad("unsafe target database reference"));
+    }
+    let relative = safe_storage_ref(storage_ref, workshop)?;
+    let directory = state.config.backup_root.join(&relative);
+    let resolved = std::fs::canonicalize(&directory).map_err(DriverError::internal)?;
+    let root = std::fs::canonicalize(&state.config.backup_root).map_err(DriverError::internal)?;
+    if !resolved.starts_with(&root)
+        || !resolved.join("complete.json").is_file()
+        || !resolved.join("database.dump").is_file()
+    {
+        return Err(DriverError::bad("recovery set is incomplete"));
+    }
+    replace_database(state, target_database).await?;
+    run_postgres_job(
+        state,
+        &format!(
+            "mb-pg-restore-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        vec![
+            "pg_restore".into(),
+            "--exit-on-error".into(),
+            "--no-owner".into(),
+            "--no-acl".into(),
+            format!("--host={}", state.config.postgres_host),
+            format!("--port={}", state.config.postgres_port),
+            "--username=odoo".into(),
+            format!("--dbname={target_database}"),
+            format!("/backups/{}/database.dump", relative.to_string_lossy()),
+        ],
+    )
+    .await?;
+    let target_filestore = state
+        .config
+        .odoo_data_root
+        .join("filestore")
+        .join(target_database);
+    if target_filestore.exists() {
+        std::fs::remove_dir_all(&target_filestore).map_err(DriverError::internal)?;
+    }
+    copy_directory(&resolved.join("filestore"), &target_filestore).map_err(DriverError::internal)
+}
+
+fn safe_storage_ref(storage_ref: &str, workshop: Uuid) -> Result<PathBuf, DriverError> {
+    let components = storage_ref.split('/').collect::<Vec<_>>();
+    if components.len() != 3
+        || components[0] != "docker-backup"
+        || components[1] != workshop.to_string()
+        || components[2].parse::<Uuid>().is_err()
+    {
+        return Err(DriverError::bad("storage_ref is invalid"));
+    }
+    Ok(components.iter().collect())
 }
 
 fn opaque_database<'a>(payload: &'a Value, key: &str) -> Result<&'a str, DriverError> {
@@ -407,7 +663,7 @@ async fn ensure_database(
     database: &str,
     role: &str,
     password: Option<&str>,
-) -> Result<(), DriverError> {
+) -> Result<bool, DriverError> {
     if !safe_pg_identifier(database) || !safe_pg_identifier(role) {
         return Err(DriverError::bad("unsafe PostgreSQL identifier"));
     }
@@ -416,7 +672,8 @@ async fn ensure_database(
         .fetch_one(pool)
         .await
         .map_err(DriverError::internal)?;
-    if !exists {
+    let created = !exists;
+    if created {
         let password = password.ok_or_else(|| DriverError::bad("database role is missing"))?;
         if !password.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(DriverError::bad("unsafe generated database password"));
@@ -442,7 +699,7 @@ async fn ensure_database(
         .await
         .map_err(DriverError::internal)?;
     }
-    Ok(())
+    Ok(created)
 }
 
 fn safe_pg_identifier(value: &str) -> bool {
@@ -451,6 +708,108 @@ fn safe_pg_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+async fn replace_database(state: &DriverState, database: &str) -> Result<(), DriverError> {
+    if !safe_pg_identifier(database) {
+        return Err(DriverError::bad("unsafe PostgreSQL identifier"));
+    }
+    sqlx::query(
+        "select pg_terminate_backend(pid) from pg_stat_activity where datname=$1 and pid<>pg_backend_pid()",
+    )
+    .bind(database)
+    .execute(&state.postgres)
+    .await
+    .map_err(DriverError::internal)?;
+    let exists: bool =
+        sqlx::query_scalar("select exists(select 1 from pg_database where datname=$1)")
+            .bind(database)
+            .fetch_one(&state.postgres)
+            .await
+            .map_err(DriverError::internal)?;
+    if exists {
+        sqlx::query(AssertSqlSafe(format!("drop database \"{database}\"")))
+            .execute(&state.postgres)
+            .await
+            .map_err(DriverError::internal)?;
+    }
+    sqlx::query(AssertSqlSafe(format!(
+        "create database \"{database}\" owner \"odoo\""
+    )))
+    .execute(&state.postgres)
+    .await
+    .map_err(DriverError::internal)?;
+    Ok(())
+}
+
+async fn run_postgres_job(
+    state: &DriverState,
+    container: &str,
+    command: Vec<String>,
+) -> Result<(), DriverError> {
+    if docker_container_exists(state, container).await? {
+        docker_delete_container(state, container).await?;
+    }
+    docker_create_container(
+        state,
+        container,
+        json!({
+            "Image":state.config.postgres_image,
+            "Cmd":command,
+            "Env":[format!("PGPASSWORD={}",state.config.odoo_postgres_password)],
+            "Labels":{"makersbrain.kind":"postgres-lifecycle-job"},
+            "HostConfig":{
+                "NetworkMode":state.config.docker_network,
+                "Binds":[format!("{}:/backups",state.config.backup_volume)]
+            }
+        }),
+    )
+    .await?;
+    docker_start_container(state, container).await?;
+    let code = docker_wait_container(state, container).await?;
+    let _ = docker_delete_container(state, container).await;
+    if code != 0 {
+        return Err(DriverError::internal(format!(
+            "PostgreSQL lifecycle job exited with {code}"
+        )));
+    }
+    Ok(())
+}
+
+fn copy_directory(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    if !source.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let destination = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory(&entry.path(), &destination)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), destination)?;
+        } else {
+            return Err(std::io::Error::other(
+                "recovery sets do not support symbolic links",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn directory_size(path: &Path) -> std::io::Result<i64> {
+    let mut size = 0_i64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            size = size.saturating_add(directory_size(&entry.path())?);
+        } else if metadata.is_file() {
+            size = size.saturating_add(i64::try_from(metadata.len()).unwrap_or(i64::MAX));
+        }
+    }
+    Ok(size)
 }
 
 async fn ensure_redis_acl(
@@ -500,20 +859,22 @@ async fn ensure_oidc_clients(
 ) -> Result<(String, String, String), DriverError> {
     let odoo_id = format!("makersbrain-odoo-{short}");
     let paperless_id = format!("makersbrain-paperless-{short}");
+    let odoo_origin = state.config.public_origin(odoo_hostname);
+    let paperless_origin = state.config.public_origin(paperless_hostname);
     ensure_rauthy_client(
         state,
         &odoo_id,
         false,
-        &format!("https://{odoo_hostname}/auth_oauth/signin"),
-        &format!("https://{odoo_hostname}/web/login"),
+        &format!("{odoo_origin}/auth_oauth/signin"),
+        &format!("{odoo_origin}/web/login"),
     )
     .await?;
     ensure_rauthy_client(
         state,
         &paperless_id,
         true,
-        &format!("https://{paperless_hostname}/accounts/oidc/rauthy/login/callback/"),
-        &format!("https://{paperless_hostname}/"),
+        &format!("{paperless_origin}/accounts/oidc/rauthy/login/callback/"),
+        &format!("{paperless_origin}/"),
     )
     .await?;
     let response = state
@@ -647,28 +1008,85 @@ async fn ensure_paperless(
     oidc_secret: &str,
     public_hostname: &str,
 ) -> Result<(), DriverError> {
-    if docker_container_exists(state, container).await? {
-        return Ok(());
-    }
     for suffix in ["data", "media", "consume"] {
         docker_create_volume(state, &format!("mb-paperless-{workshop}-{suffix}")).await?;
     }
     let providers = json!({"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":oidc_client_id,"secret":oidc_secret,"settings":{"server_url":format!("{}/.well-known/openid-configuration",state.config.oidc_issuer)}}]}}).to_string();
+    let public_origin = state.config.public_origin(public_hostname);
+    let environment = vec![
+        format!(
+            "PAPERLESS_REDIS=redis://{redis_user}:{redis_password}@{}",
+            state.config.redis_address
+        ),
+        format!("PAPERLESS_REDIS_PREFIX={redis_prefix}"),
+        format!("PAPERLESS_DBHOST={}", state.config.postgres_host),
+        format!("PAPERLESS_DBPORT={}", state.config.postgres_port),
+        format!("PAPERLESS_DBNAME={database}"),
+        format!("PAPERLESS_DBUSER={role}"),
+        format!("PAPERLESS_DBPASS={database_password}"),
+        format!("PAPERLESS_SECRET_KEY={secret_key}"),
+        format!("PAPERLESS_URL={public_origin}"),
+        "PAPERLESS_TIME_ZONE=Europe/Paris".into(),
+        "PAPERLESS_OCR_LANGUAGE=fra+eng".into(),
+        "PAPERLESS_APPS=allauth.socialaccount.providers.openid_connect".into(),
+        format!("PAPERLESS_SOCIALACCOUNT_PROVIDERS={providers}"),
+        "PAPERLESS_DISABLE_REGULAR_LOGIN=true".into(),
+        "PAPERLESS_REDIRECT_LOGIN_TO_SSO=true".into(),
+        "PAPERLESS_SOCIAL_AUTO_SIGNUP=false".into(),
+        "PAPERLESS_ADMIN_USER=local-admin".into(),
+        format!("PAPERLESS_ADMIN_PASSWORD={admin_password}"),
+        "PAPERLESS_POST_CONSUME_SCRIPT=/usr/src/paperless/post-consume.py".into(),
+        format!(
+            "PAPERLESS_WEBHOOK_SECRET={}",
+            state.config.control_internal_token
+        ),
+        format!("MAKERSBRAIN_WORKSHOP_ID={workshop}"),
+        format!(
+            "MAKERSBRAIN_CONTROL_URL={}",
+            state.config.control_internal_url
+        ),
+    ];
+    let config_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(state.config.paperless_image.as_str(), &environment))
+                .map_err(DriverError::internal)?
+        )
+    );
+    if docker_container_exists(state, container).await? {
+        let inspect = docker_inspect_container(state, container).await?;
+        let current_digest = inspect
+            .pointer("/Config/Labels/makersbrain.config-digest")
+            .and_then(Value::as_str);
+        if current_digest != Some(&config_digest) {
+            docker_delete_container(state, container).await?;
+        } else {
+            if inspect.pointer("/State/Running").and_then(Value::as_bool) != Some(true) {
+                docker_start_container(state, container).await?;
+            }
+            return wait_for_healthy_container(state, container, "Paperless").await;
+        }
+    }
     docker_create_container(
         state,
         container,
         json!({
             "Image":state.config.paperless_image,
-            "Env":[
-                format!("PAPERLESS_REDIS=redis://{redis_user}:{redis_password}@{}",state.config.redis_address),
-                format!("PAPERLESS_REDIS_PREFIX={redis_prefix}"),format!("PAPERLESS_DBHOST={}",state.config.postgres_host),format!("PAPERLESS_DBPORT={}",state.config.postgres_port),format!("PAPERLESS_DBNAME={database}"),format!("PAPERLESS_DBUSER={role}"),format!("PAPERLESS_DBPASS={database_password}"),format!("PAPERLESS_SECRET_KEY={secret_key}"),format!("PAPERLESS_URL=https://{public_hostname}"),"PAPERLESS_TIME_ZONE=Europe/Paris","PAPERLESS_OCR_LANGUAGE=fra+eng","PAPERLESS_APPS=allauth.socialaccount.providers.openid_connect",format!("PAPERLESS_SOCIALACCOUNT_PROVIDERS={providers}"),"PAPERLESS_DISABLE_REGULAR_LOGIN=true","PAPERLESS_REDIRECT_LOGIN_TO_SSO=true","PAPERLESS_SOCIAL_AUTO_SIGNUP=false","PAPERLESS_ADMIN_USER=local-admin",format!("PAPERLESS_ADMIN_PASSWORD={admin_password}"),"PAPERLESS_POST_CONSUME_SCRIPT=/usr/src/paperless/post-consume.py",format!("PAPERLESS_WEBHOOK_SECRET={}",state.config.control_internal_token),format!("MAKERSBRAIN_WORKSHOP_ID={workshop}"),format!("MAKERSBRAIN_CONTROL_URL={}",state.config.control_internal_url)
-            ],
-            "Labels":{"makersbrain.kind":"paperless","makersbrain.workshop":workshop.to_string()},
+            "Env":environment,
+            "Labels":{"makersbrain.kind":"paperless","makersbrain.workshop":workshop.to_string(),"makersbrain.config-digest":config_digest},
             "HostConfig":{"NetworkMode":state.config.docker_network,"Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")]}
         }),
     )
     .await?;
     docker_start_container(state, container).await?;
+    wait_for_healthy_container(state, container, "Paperless").await
+}
+
+async fn wait_for_healthy_container(
+    state: &DriverState,
+    container: &str,
+    label: &str,
+) -> Result<(), DriverError> {
     for _ in 0..90 {
         let inspect = docker_inspect_container(state, container).await?;
         let health = inspect
@@ -678,11 +1096,13 @@ async fn ensure_paperless(
             return Ok(());
         }
         if inspect.pointer("/State/Running").and_then(Value::as_bool) == Some(false) {
-            return Err(DriverError::internal("Paperless stopped during startup"));
+            return Err(DriverError::internal(format!(
+                "{label} stopped during startup"
+            )));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    Err(DriverError::internal("Paperless health timeout"))
+    Err(DriverError::internal(format!("{label} health timeout")))
 }
 
 async fn write_routes(
@@ -694,13 +1114,23 @@ async fn write_routes(
     paperless_container: &str,
 ) -> Result<(), DriverError> {
     let config = format!(
-        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Proto $scheme;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\nserver {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Proto $scheme;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n",
+        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\nserver {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n",
         database_ref
     );
     let path = state.config.route_root.join(format!("{workshop}.conf"));
     let temporary = state.config.route_root.join(format!("{workshop}.conf.tmp"));
+    let previous = std::fs::read(&path).ok();
     std::fs::write(&temporary, config).map_err(DriverError::internal)?;
-    std::fs::rename(temporary, path).map_err(DriverError::internal)?;
+    std::fs::rename(temporary, &path).map_err(DriverError::internal)?;
+    if let Err(error) = docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await
+    {
+        if let Some(previous) = previous {
+            let _ = std::fs::write(&path, previous);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Err(error);
+    }
     let response = state
         .docker
         .post(format!(
@@ -717,6 +1147,71 @@ async fn write_routes(
         )));
     }
     Ok(())
+}
+
+async fn docker_exec(
+    state: &DriverState,
+    container: &str,
+    command: &[&str],
+) -> Result<(), DriverError> {
+    let response = state
+        .docker
+        .post(format!(
+            "http://localhost/v1.47/containers/{container}/exec"
+        ))
+        .json(&json!({"AttachStdout":false,"AttachStderr":false,"Cmd":command}))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker exec create returned {}",
+            response.status()
+        )));
+    }
+    let id = response
+        .json::<Value>()
+        .await
+        .map_err(DriverError::internal)?
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::internal("Docker exec id missing"))?
+        .to_owned();
+    let response = state
+        .docker
+        .post(format!("http://localhost/v1.47/exec/{id}/start"))
+        .json(&json!({"Detach":true,"Tty":false}))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker exec start returned {}",
+            response.status()
+        )));
+    }
+    for _ in 0..50 {
+        let value = state
+            .docker
+            .get(format!("http://localhost/v1.47/exec/{id}/json"))
+            .send()
+            .await
+            .map_err(DriverError::internal)?
+            .json::<Value>()
+            .await
+            .map_err(DriverError::internal)?;
+        if value.get("Running").and_then(Value::as_bool) == Some(false) {
+            return match value.get("ExitCode").and_then(Value::as_i64) {
+                Some(0) => Ok(()),
+                Some(code) => Err(DriverError::internal(format!(
+                    "container command exited with {code}"
+                ))),
+                None => Err(DriverError::internal("Docker exec exit code missing")),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(DriverError::internal("Docker exec timeout"))
 }
 
 async fn docker_container_exists(state: &DriverState, name: &str) -> Result<bool, DriverError> {
@@ -785,6 +1280,24 @@ async fn docker_start_container(state: &DriverState, name: &str) -> Result<(), D
     if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
         return Err(DriverError::internal(format!(
             "Docker start returned {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+async fn docker_stop_container(state: &DriverState, name: &str) -> Result<(), DriverError> {
+    let response = state
+        .docker
+        .post(format!(
+            "http://localhost/v1.47/containers/{name}/stop?t=30"
+        ))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
+        return Err(DriverError::internal(format!(
+            "Docker stop returned {}",
             response.status()
         )));
     }

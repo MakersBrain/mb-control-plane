@@ -3,6 +3,7 @@ name: makersbrain-control
 x-control-env: &control-env
   CONTROL_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
 x-worker: &worker
+  image: makersbrain-control:local
   build: {context: ..}
   restart: unless-stopped
   depends_on:
@@ -21,18 +22,18 @@ x-worker: &worker
     CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
     CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
     CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
-    CONTROL_SECRET__LOCAL_ODOO: ${ODOO_BRIDGE_TOKEN}
-    CONTROL_SECRET__LOCAL_PAPERLESS: ${PAPERLESS_API_TOKEN}
+    CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+  volumes:
+    - tenant-secrets:/run/makersbrain-secrets:ro
 
 services:
   postgres:
     image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: local-superuser-not-published
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local-superuser-not-published}
       CONTROL_POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD}
       RAUTHY_POSTGRES_PASSWORD: ${RAUTHY_POSTGRES_PASSWORD}
-      PAPERLESS_POSTGRES_PASSWORD: ${PAPERLESS_POSTGRES_PASSWORD}
       ODOO_POSTGRES_PASSWORD: ${ODOO_POSTGRES_PASSWORD}
     volumes:
       - control-postgres:/var/lib/postgresql/data
@@ -100,6 +101,7 @@ services:
     restart: unless-stopped
 
   control-migrate:
+    image: makersbrain-control:local
     build: {context: ..}
     command: ["/usr/local/bin/control-migrate"]
     environment:
@@ -108,6 +110,7 @@ services:
     restart: "no"
 
   control-api:
+    image: makersbrain-control:local
     build: {context: ..}
     environment:
       <<: *control-env
@@ -139,9 +142,71 @@ services:
     restart: unless-stopped
 
   integration-fixture:
+    image: makersbrain-control:local
     build: {context: ..}
     command: ["/usr/local/bin/control-fixture"]
     environment: {FIXTURE_TOKEN: "${DEPLOYMENT_DRIVER_TOKEN}"}
+    restart: unless-stopped
+
+  paperless-image:
+    image: makersbrain-control-paperless:local
+    build:
+      context: .
+      dockerfile: Paperless.Dockerfile
+    entrypoint: ["/usr/bin/true"]
+    restart: "no"
+
+  docker-driver:
+    image: makersbrain-control:local
+    build: {context: ..}
+    user: "0:0"
+    command: ["/usr/local/bin/control-docker-driver"]
+    environment:
+      DRIVER_LISTEN: 0.0.0.0:8080
+      DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+      DRIVER_DOCKER_SOCKET: /var/run/docker.sock
+      DRIVER_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
+      DRIVER_POSTGRES_ADMIN_URL: postgresql://postgres:${POSTGRES_SUPERUSER_PASSWORD:-local-superuser-not-published}@postgres:5432/postgres
+      DRIVER_POSTGRES_HOST: postgres
+      DRIVER_POSTGRES_PORT: "5432"
+      DRIVER_ODOO_POSTGRES_PASSWORD: ${ODOO_POSTGRES_PASSWORD}
+      DRIVER_ODOO_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
+      DRIVER_ODOO_IMAGE: makersbrain-control-odoo:local
+      DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+      DRIVER_PAPERLESS_IMAGE: makersbrain-control-paperless:local
+      DRIVER_DOCKER_NETWORK: makersbrain-control-runtime
+      DRIVER_ODOO_CONTAINER: makersbrain-shared-odoo
+      DRIVER_ODOO_VOLUME: makersbrain-control-odoo-data
+      DRIVER_BACKUP_VOLUME: makersbrain-control-backups
+      DRIVER_ODOO_DATA_ROOT: /odoo-data
+      DRIVER_BACKUP_ROOT: /backups
+      DRIVER_REDIS_ADDRESS: redis:6379
+      DRIVER_SECRET_ROOT: /run/makersbrain-secrets
+      DRIVER_ROUTE_ROOT: /routes
+      DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
+      DRIVER_ODOO_BASE_URL: http://odoo:8069
+      DRIVER_CONTROL_INTERNAL_URL: http://control-api:8080
+      DRIVER_CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
+      DRIVER_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1
+      DRIVER_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_DEPLOYMENT_KEY}
+      DRIVER_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
+      DRIVER_PUBLIC_SCHEME: http
+      DRIVER_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - tenant-secrets:/run/makersbrain-secrets
+      - tenant-routes:/routes
+      - odoo-data:/odoo-data
+      - backup-data:/backups
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
+      paperless-image: {condition: service_completed_successfully}
+      odoo: {condition: service_started}
+      redis: {condition: service_healthy}
+      tenant-gateway: {condition: service_started}
+      rauthy: {condition: service_started}
+    healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
   worker-membership: {<<: *worker, command: ["/usr/local/bin/control-worker", "membership-provisioning"]}
@@ -152,6 +217,8 @@ services:
   worker-lifecycle: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]}
 
   odoo:
+    image: makersbrain-control-odoo:local
+    container_name: makersbrain-shared-odoo
     build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
     environment:
       HOST: postgres
@@ -159,55 +226,42 @@ services:
       USER: odoo
       PASSWORD: ${ODOO_POSTGRES_PASSWORD}
       MB_CONTROL_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
-    command: ["odoo", "--database=odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--db_password=${ODOO_POSTGRES_PASSWORD}", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--init=auth_oidc,mb_control_bridge,mb_invoice_capture", "--without-demo=all", "--proxy-mode"]
+    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--db_password=${ODOO_POSTGRES_PASSWORD}", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes: ["odoo-data:/var/lib/odoo"]
-    ports: ["127.0.0.1:${ODOO_HTTP_PORT:-8169}:8069"]
     depends_on: {postgres: {condition: service_healthy}}
     restart: unless-stopped
 
-  paperless-redis:
+  redis:
     image: redis:7-alpine
-    volumes: ["paperless-redis:/data"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes: ["shared-redis:/data"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
     restart: unless-stopped
-  paperless:
-    image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
-    environment:
-      PAPERLESS_REDIS: redis://paperless-redis:6379
-      PAPERLESS_DBHOST: postgres
-      PAPERLESS_DBNAME: paperless
-      PAPERLESS_DBUSER: paperless
-      PAPERLESS_DBPASS: ${PAPERLESS_POSTGRES_PASSWORD}
-      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}
-      PAPERLESS_URL: http://localhost:${PAPERLESS_HTTP_PORT:-8200}
-      PAPERLESS_TIME_ZONE: Europe/Paris
-      PAPERLESS_OCR_LANGUAGE: fra+eng
-      PAPERLESS_APPS: allauth.socialaccount.providers.openid_connect
-      PAPERLESS_SOCIALACCOUNT_PROVIDERS: >-
-        {"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":"makersbrain-paperless-local","secret":"${PAPERLESS_OIDC_CLIENT_SECRET}","settings":{"server_url":"http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1/.well-known/openid-configuration"}}]}}
-      PAPERLESS_DISABLE_REGULAR_LOGIN: "true"
-      PAPERLESS_REDIRECT_LOGIN_TO_SSO: "true"
-      PAPERLESS_SOCIAL_AUTO_SIGNUP: "false"
-      PAPERLESS_ADMIN_USER: local-admin
-      PAPERLESS_ADMIN_MAIL: ${RAUTHY_BOOTSTRAP_ADMIN_EMAIL}
-      PAPERLESS_ADMIN_PASSWORD: ${PAPERLESS_ADMIN_PASSWORD}
-      PAPERLESS_POST_CONSUME_SCRIPT: /usr/src/paperless/post-consume.py
-      PAPERLESS_WEBHOOK_SECRET: ${CONTROL_INTERNAL_TOKEN}
-      MAKERSBRAIN_WORKSHOP_ID: 00000000-0000-0000-0000-000000000001
-      MAKERSBRAIN_CONTROL_URL: http://control-api:8080
+
+  tenant-gateway:
+    image: nginx:1.29-alpine
+    container_name: makersbrain-tenant-gateway
     volumes:
-      - paperless-data:/usr/src/paperless/data
-      - paperless-media:/usr/src/paperless/media
-      - paperless-consume:/usr/src/paperless/consume
-      - ./paperless-post-consume.py:/usr/src/paperless/post-consume.py:ro
-    ports: ["127.0.0.1:${PAPERLESS_HTTP_PORT:-8200}:8000"]
-    depends_on: {postgres: {condition: service_healthy}, paperless-redis: {condition: service_started}}
+      - ./gateway.conf:/etc/nginx/nginx.conf:ro
+      - tenant-routes:/etc/nginx/tenants:ro
+    ports: ["127.0.0.1:${ODOO_HTTP_PORT:-8169}:8080"]
+    depends_on: {odoo: {condition: service_started}}
     restart: unless-stopped
+
+networks:
+  default:
+    name: makersbrain-control-runtime
 
 volumes:
   control-postgres: {}
   rauthy-bootstrap: {}
-  odoo-data: {}
-  paperless-data: {}
-  paperless-media: {}
-  paperless-consume: {}
-  paperless-redis: {}
+  odoo-data:
+    name: makersbrain-control-odoo-data
+  shared-redis:
+    name: makersbrain-control-redis-data
+  tenant-routes:
+    name: makersbrain-control-tenant-routes
+  tenant-secrets:
+    name: makersbrain-control-tenant-secrets
+  backup-data:
+    name: makersbrain-control-backups

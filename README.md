@@ -30,12 +30,13 @@ make configure
 make up
 ```
 
-Open the members UI at `http://localhost:4175`, Rauthy at
-`http://rauthy.localhost:8092`, Odoo at `http://atelier.localhost:8169`, and Paperless
-at `http://localhost:8200`. The `.localhost` name resolves to loopback in
-modern browsers. The local deployment/mail fixture implements the same narrow
-HTTP boundary production infrastructure must supply; it never appears in the
-release contract as a production process.
+Open the members UI at `http://localhost:4175` and Rauthy at
+`http://rauthy.localhost:8092`. After creating a workshop with slug `atelier`,
+the Docker driver publishes Odoo at `http://atelier.localhost:8169` and its
+Paperless instance at `http://docs-atelier.localhost:8169`. The `.localhost`
+name resolves to loopback in modern browsers. The mail fixture remains local;
+tenant provisioning uses the authenticated Docker driver and the same private
+HTTP contract used by later infrastructure drivers.
 
 ### HTTPS workspace through Cloudflare Tunnel
 
@@ -56,28 +57,36 @@ callbacks, starts Rauthy with its exact WebAuthn RP ID, and publishes:
 - `control.dev1.makersbrain.net` — members UI
 - `control-api.dev1.makersbrain.net` — Rust API
 - `auth.dev1.makersbrain.net` — Rauthy
-- `<workshop-slug>.dev1.makersbrain.net` — the single-tenant Odoo POC (for
-  example `atelier.dev1.makersbrain.net`; there is no `odoo-` prefix)
-- `paperless.dev1.makersbrain.net` — Paperless
+- `<workshop-slug>.dev1.makersbrain.net` — that workshop's database on the
+  shared Odoo service (for example `atelier.dev1.makersbrain.net`; there is no
+  `odoo-` prefix)
+- `docs-<workshop-slug>.dev1.makersbrain.net` — that workshop's Paperless
 
 The connector token is written to an ignored mode-0600 token file and passed to
 `cloudflared` with `--token-file`, not as a command argument. This workspace is
 strictly for synthetic test data. Stop it with `make down-tunnel`.
 
-The hostname is a routing attribute, not an Odoo database name. New tenant
-records use an opaque physical identifier (`mb_<uuid>`), and deployment must
-map the registered hostname to the isolated tenant process. The existing local
-POC keeps its historical `odoo` database so its data is not renamed in place;
-it is still unrelated to the configured workshop hostname. Odoo's native
-database list/manager is disabled.
+The hostname is a routing attribute, not an Odoo database name. Every workshop
+uses an opaque physical identifier (`mb_<uuid>`). The gateway replaces any
+client-supplied database header with the exact registered mapping and the
+server-wide Odoo filter accepts only that opaque identifier. One Odoo process
+and filestore volume are shared, while PostgreSQL databases remain isolated.
+Odoo's native database list/manager is disabled.
+
+Paperless is process-isolated per workshop: the driver creates one container,
+one PostgreSQL role/database, and dedicated data, media, and consume volumes.
+All Paperless containers share the Redis process, but each receives a distinct
+ACL user, password, key prefix, and channel prefix. Redis uses AOF persistence
+and `noeviction`; tenant containers cannot access another tenant's keys.
 
 The owner-only **Database & backups** page exposes snapshots, portable backups,
 restore, and non-routable duplicate requests. These are durable
 `tenant.lifecycle` operations with typed slug confirmation, serialization,
 audit events, retry status, and an automatic pre-restore safety snapshot. The
-included deployment fixture validates the contract and returns synthetic
-artifacts; a production deployment driver must stop the tenant and create or
-restore the real PostgreSQL database and filestore as one recovery unit.
+Docker driver operations are authenticated and persist their idempotency
+outcomes. The driver owns tenant databases, volumes, Redis ACLs, Rauthy clients,
+Paperless containers, and gateway routes. Lifecycle operations treat an Odoo
+PostgreSQL database and its filestore namespace as one recovery unit.
 
 Rauthy is the only human credential authority. Odoo and Paperless use tenant
 OIDC clients. The control API links a verified `(issuer, subject)` once and
@@ -87,7 +96,7 @@ enabled only by the Compose harness; production should omit
 
 The API publishes `/openapi.json`. Infrastructure consumes
 `deploy/release-contract.json`; it injects secret values for the declared
-environment names and replaces the development deployment-driver fixture.
+environment names and selects the deployment driver for the target runtime.
 Run `control-migrate` as a one-shot job before the API or workers; the supplied
 Compose topology enforces that dependency on every clean start.
 
@@ -102,8 +111,9 @@ control-worker invoice-capture
 
 The full queue list is in the release contract. Operations use leases, fencing,
 bounded exponential retry, dead letters, and an explicit unknown-outcome state.
-Tenant credentials are referenced in PostgreSQL but resolved only from
-`CONTROL_SECRET__...` environment variables.
+Tenant credentials are referenced in PostgreSQL and resolved from the shared,
+read-only `CONTROL_SECRET_ROOT` mount. The driver is the only process with
+write access to that volume.
 
 ## Azure Document Intelligence
 
