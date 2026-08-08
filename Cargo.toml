@@ -1,0 +1,60 @@
+[package]
+name = "makersbrain-control-plane"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "makersbrain_control_plane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "control-api"
+path = "src/bin/control-api.rs"
+
+[[bin]]
+name = "control-worker"
+path = "src/bin/control-worker.rs"
+
+[[bin]]
+name = "control-fixture"
+path = "src/bin/control-fixture.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http2", "macros"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+lopdf = "0.44"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "http2", "charset"] }
+rand = "0.9"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "time", "json"] }
+thiserror = "2"
+time = { version = "0.3", features = ["serde-well-known", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tower = { version = "0.5", features = ["timeout", "limit", "util"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "limit", "timeout", "sensitive-headers", "catch-panic", "request-id"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+url = { version = "2", features = ["serde"] }
+utoipa = { version = "5", features = ["axum_extras", "uuid", "time", "preserve_order"] }
+utoipa-axum = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[profile.release]
+panic = "unwind"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

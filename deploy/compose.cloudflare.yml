@@ -1,0 +1,64 @@
+services:
+  rauthy:
+    environment:
+      LISTEN_SCHEME: https
+      LISTEN_PORT_HTTPS: "8443"
+      PUB_URL: auth.${PUBLIC_DOMAIN}
+      PROXY_MODE: "true"
+      TRUSTED_PROXIES: |-
+        172.16.0.0/12
+        192.168.80.1/32
+      PEER_IP_HEADER_NAME: CF-Connecting-IP
+      TLS_GENERATE_SELF_SIGNED: "true"
+      RP_ID: auth.${PUBLIC_DOMAIN}
+      RP_ORIGIN: https://auth.${PUBLIC_DOMAIN}:443
+    ports: ["127.0.0.1:${RAUTHY_HTTPS_PORT:-18443}:8443"]
+
+  control-api:
+    environment:
+      CONTROL_PUBLIC_ORIGIN: https://control.${PUBLIC_DOMAIN}/
+      CONTROL_CORS_ORIGIN: https://control.${PUBLIC_DOMAIN}/
+      CONTROL_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1/
+      CONTROL_OIDC_DISCOVERY_URL: https://auth.${PUBLIC_DOMAIN}/auth/v1/.well-known/openid-configuration
+      CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN}
+
+  control-web:
+    build:
+      args:
+        VITE_CONTROL_API_URL: https://control-api.${PUBLIC_DOMAIN}
+        VITE_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1
+        VITE_OIDC_CLIENT_ID: makersbrain-members
+        VITE_OIDC_REDIRECT_URI: https://control.${PUBLIC_DOMAIN}/oauth/callback
+
+  integration-fixture:
+    environment:
+      FIXTURE_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1
+
+  worker-membership:
+    environment: &public-rauthy-worker
+      CONTROL_RAUTHY_ADMIN_URL: https://auth.${PUBLIC_DOMAIN}/auth/v1/
+  worker-invoice:
+    environment: *public-rauthy-worker
+  worker-provisioning:
+    environment: *public-rauthy-worker
+  worker-email:
+    environment: *public-rauthy-worker
+  worker-reconciliation:
+    environment: *public-rauthy-worker
+  worker-lifecycle:
+    environment: *public-rauthy-worker
+
+  paperless:
+    environment:
+      PAPERLESS_URL: https://paperless.${PUBLIC_DOMAIN}
+      PAPERLESS_SOCIALACCOUNT_PROVIDERS: >-
+        {"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":"makersbrain-paperless-local","secret":"${PAPERLESS_OIDC_CLIENT_SECRET}","settings":{"server_url":"https://auth.${PUBLIC_DOMAIN}/auth/v1/.well-known/openid-configuration"}}]}}
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.2
+    user: "0:0"
+    command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/run/secrets/cloudflare_tunnel_token"]
+    network_mode: host
+    volumes:
+      - ./secrets/cloudflare-tunnel-token:/run/secrets/cloudflare_tunnel_token:ro
+    restart: unless-stopped

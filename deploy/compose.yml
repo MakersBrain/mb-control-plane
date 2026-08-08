@@ -1,0 +1,213 @@
+name: makersbrain-control
+
+x-control-env: &control-env
+  CONTROL_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
+x-worker: &worker
+  build: {context: ..}
+  restart: unless-stopped
+  depends_on:
+    postgres: {condition: service_healthy}
+    control-migrate: {condition: service_completed_successfully}
+  environment:
+    <<: *control-env
+    CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
+    CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
+    CONTROL_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT}
+    CONTROL_AZURE_KEY: ${AZURE_DOCUMENT_KEY}
+    CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
+    CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
+    CONTROL_AZURE_POLL_INTERVAL_MS: "2000"
+    CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
+    CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
+    CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+    CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+    CONTROL_SECRET__LOCAL_ODOO: ${ODOO_BRIDGE_TOKEN}
+    CONTROL_SECRET__LOCAL_PAPERLESS: ${PAPERLESS_API_TOKEN}
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local-superuser-not-published
+      CONTROL_POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD}
+      RAUTHY_POSTGRES_PASSWORD: ${RAUTHY_POSTGRES_PASSWORD}
+      PAPERLESS_POSTGRES_PASSWORD: ${PAPERLESS_POSTGRES_PASSWORD}
+      ODOO_POSTGRES_PASSWORD: ${ODOO_POSTGRES_PASSWORD}
+    volumes:
+      - control-postgres:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/01-databases.sh:ro
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 5s, timeout: 3s, retries: 20}
+    restart: unless-stopped
+
+  rauthy-bootstrap:
+    image: alpine:3.22
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cp /source/clients.json /bootstrap/clients.json
+        cp /source/api_keys.json /bootstrap/api_keys.json
+        cp /public/roles.json /bootstrap/roles.json
+        cp /public/scopes.json /bootstrap/scopes.json
+        chown -R 10001:10001 /bootstrap
+        chmod 0700 /bootstrap
+        chmod 0400 /bootstrap/*.json
+    volumes:
+      - ./secrets/rauthy:/source:ro
+      - ./rauthy:/public:ro
+      - rauthy-bootstrap:/bootstrap
+    restart: "no"
+
+  rauthy:
+    image: ghcr.io/sebadob/rauthy:0.36.1@sha256:6f35e2e41753e973336d476c9593b4c1e41ac597803adf6ccaec08c7d8818cd0
+    environment:
+      HIQLITE: "false"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: rauthy
+      PG_DB_NAME: rauthy
+      PG_PASSWORD: ${RAUTHY_POSTGRES_PASSWORD}
+      PG_TLS: disable
+      HQL_NODE_ID: "1"
+      HQL_NODES: "1 localhost:8100 localhost:8200"
+      HQL_SECRET_RAFT: ${RAUTHY_HQL_SECRET_RAFT}
+      HQL_SECRET_API: ${RAUTHY_HQL_SECRET_API}
+      LISTEN_ADDRESS: 0.0.0.0
+      LISTEN_PORT_HTTP: "8092"
+      LISTEN_SCHEME: http
+      PUB_URL: rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}
+      PROXY_MODE: "false"
+      BOOTSTRAP_DIR: /bootstrap
+      BOOTSTRAP_ADMIN_EMAIL: ${RAUTHY_BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${RAUTHY_BOOTSTRAP_ADMIN_PASSWORD}
+      ENC_KEYS: ${RAUTHY_ENC_KEYS}
+      ENC_KEY_ACTIVE: ${RAUTHY_ENC_KEY_ACTIVE}
+      RP_ID: rauthy.localhost
+      RP_ORIGIN: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}
+      RP_NAME: MakersBrain
+      SWAGGER_UI_ENABLE: "false"
+    volumes:
+      - rauthy-bootstrap:/bootstrap:ro
+    ports: ["127.0.0.1:${RAUTHY_HTTP_PORT:-8092}:8092"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      rauthy-bootstrap: {condition: service_completed_successfully}
+    networks:
+      default:
+        aliases: [rauthy.localhost]
+    restart: unless-stopped
+
+  control-migrate:
+    build: {context: ..}
+    command: ["/usr/local/bin/control-migrate"]
+    environment:
+      <<: *control-env
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: "no"
+
+  control-api:
+    build: {context: ..}
+    environment:
+      <<: *control-env
+      CONTROL_LISTEN: 0.0.0.0:8080
+      CONTROL_PUBLIC_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
+      CONTROL_CORS_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
+      CONTROL_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1/
+      CONTROL_OIDC_AUDIENCE: makersbrain-members
+      CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
+      CONTROL_TENANT_DOMAIN: localhost
+      CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
+      CONTROL_ALLOW_SELF_SIGNUP: "true"
+    ports: ["127.0.0.1:${CONTROL_API_PORT:-8080}:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
+    healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/ready"], interval: 10s, timeout: 3s, retries: 10}
+    restart: unless-stopped
+
+  control-web:
+    build:
+      context: ../web
+      args:
+        VITE_CONTROL_API_URL: http://localhost:${CONTROL_API_PORT:-8080}
+        VITE_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
+        VITE_OIDC_CLIENT_ID: makersbrain-members
+        VITE_OIDC_REDIRECT_URI: http://localhost:${CONTROL_WEB_PORT:-4175}/oauth/callback
+    ports: ["127.0.0.1:${CONTROL_WEB_PORT:-4175}:8080"]
+    restart: unless-stopped
+
+  integration-fixture:
+    build: {context: ..}
+    command: ["/usr/local/bin/control-fixture"]
+    environment: {FIXTURE_TOKEN: "${DEPLOYMENT_DRIVER_TOKEN}"}
+    restart: unless-stopped
+
+  worker-membership: {<<: *worker, command: ["/usr/local/bin/control-worker", "membership-provisioning"]}
+  worker-invoice: {<<: *worker, command: ["/usr/local/bin/control-worker", "invoice-capture"]}
+  worker-provisioning: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-provisioning"]}
+  worker-email: {<<: *worker, command: ["/usr/local/bin/control-worker", "email-delivery"]}
+  worker-reconciliation: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
+  worker-lifecycle: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]}
+
+  odoo:
+    build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
+    environment:
+      HOST: postgres
+      PORT: "5432"
+      USER: odoo
+      PASSWORD: ${ODOO_POSTGRES_PASSWORD}
+      MB_CONTROL_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
+    command: ["odoo", "--database=odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--db_password=${ODOO_POSTGRES_PASSWORD}", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--init=auth_oidc,mb_control_bridge,mb_invoice_capture", "--without-demo=all", "--proxy-mode"]
+    volumes: ["odoo-data:/var/lib/odoo"]
+    ports: ["127.0.0.1:${ODOO_HTTP_PORT:-8169}:8069"]
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: unless-stopped
+
+  paperless-redis:
+    image: redis:7-alpine
+    volumes: ["paperless-redis:/data"]
+    restart: unless-stopped
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
+    environment:
+      PAPERLESS_REDIS: redis://paperless-redis:6379
+      PAPERLESS_DBHOST: postgres
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: ${PAPERLESS_POSTGRES_PASSWORD}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}
+      PAPERLESS_URL: http://localhost:${PAPERLESS_HTTP_PORT:-8200}
+      PAPERLESS_TIME_ZONE: Europe/Paris
+      PAPERLESS_OCR_LANGUAGE: fra+eng
+      PAPERLESS_APPS: allauth.socialaccount.providers.openid_connect
+      PAPERLESS_SOCIALACCOUNT_PROVIDERS: >-
+        {"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":"makersbrain-paperless-local","secret":"${PAPERLESS_OIDC_CLIENT_SECRET}","settings":{"server_url":"http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1/.well-known/openid-configuration"}}]}}
+      PAPERLESS_DISABLE_REGULAR_LOGIN: "true"
+      PAPERLESS_REDIRECT_LOGIN_TO_SSO: "true"
+      PAPERLESS_SOCIAL_AUTO_SIGNUP: "false"
+      PAPERLESS_ADMIN_USER: local-admin
+      PAPERLESS_ADMIN_MAIL: ${RAUTHY_BOOTSTRAP_ADMIN_EMAIL}
+      PAPERLESS_ADMIN_PASSWORD: ${PAPERLESS_ADMIN_PASSWORD}
+      PAPERLESS_POST_CONSUME_SCRIPT: /usr/src/paperless/post-consume.py
+      PAPERLESS_WEBHOOK_SECRET: ${CONTROL_INTERNAL_TOKEN}
+      MAKERSBRAIN_WORKSHOP_ID: 00000000-0000-0000-0000-000000000001
+      MAKERSBRAIN_CONTROL_URL: http://control-api:8080
+    volumes:
+      - paperless-data:/usr/src/paperless/data
+      - paperless-media:/usr/src/paperless/media
+      - paperless-consume:/usr/src/paperless/consume
+      - ./paperless-post-consume.py:/usr/src/paperless/post-consume.py:ro
+    ports: ["127.0.0.1:${PAPERLESS_HTTP_PORT:-8200}:8000"]
+    depends_on: {postgres: {condition: service_healthy}, paperless-redis: {condition: service_started}}
+    restart: unless-stopped
+
+volumes:
+  control-postgres: {}
+  rauthy-bootstrap: {}
+  odoo-data: {}
+  paperless-data: {}
+  paperless-media: {}
+  paperless-consume: {}
+  paperless-redis: {}

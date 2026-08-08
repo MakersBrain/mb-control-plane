@@ -23,7 +23,7 @@ env:
   # Odoo 19 extension points. Pin the digest too once one is chosen.
   ODOO_IMAGE: odoo:19
   MODULES: >-
-    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise
+    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,mb_control_bridge,mb_invoice_capture
   # The same list with each name as a `/module` test spec. This is not
   # decoration: `--test-enable` on its own also runs the tests of every
   # dependency Odoo installs — the whole of mail, stock, account and
@@ -31,9 +31,26 @@ env:
   # minutes, and tells us nothing about this repository. Restricting to
   # `/module` specs runs only tests defined in these addons.
   TEST_TAGS: >-
-    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise
+    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/mb_control_bridge,/mb_invoice_capture
 
 jobs:
+  control-plane:
+    name: Control plane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: {toolchain: "1.96", components: "rustfmt,clippy"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22", cache: "npm", cache-dependency-path: "control-plane/web/package-lock.json"}
+      - run: cargo fmt --check --manifest-path control-plane/Cargo.toml
+      - run: cargo clippy --locked --all-targets --manifest-path control-plane/Cargo.toml -- -D warnings
+      - run: cargo test --locked --manifest-path control-plane/Cargo.toml
+      - run: npm ci
+        working-directory: control-plane/web
+      - run: npm run check && npm run build
+        working-directory: control-plane/web
+
   static:
     name: Static checks
     runs-on: ubuntu-latest
