@@ -42,6 +42,7 @@ pub struct DockerDriverConfig {
     backup_root: PathBuf,
     redis_address: String,
     secret_root: PathBuf,
+    secret_volume: String,
     route_root: PathBuf,
     gateway_container: String,
     odoo_base_url: String,
@@ -88,6 +89,7 @@ impl DockerDriverConfig {
             backup_root: required("DRIVER_BACKUP_ROOT")?.into(),
             redis_address: required("DRIVER_REDIS_ADDRESS")?,
             secret_root: required("DRIVER_SECRET_ROOT")?.into(),
+            secret_volume: required("DRIVER_SECRET_VOLUME")?,
             route_root: required("DRIVER_ROUTE_ROOT")?.into(),
             gateway_container: required("DRIVER_GATEWAY_CONTAINER")?,
             odoo_base_url: absolute_http("DRIVER_ODOO_BASE_URL")?,
@@ -283,6 +285,8 @@ async fn provision(
     secure_directory(&tenant_secret_dir).map_err(DriverError::internal)?;
     let paperless_admin = secret_value(&tenant_secret_dir.join("paperless-admin"), 64)
         .map_err(DriverError::internal)?;
+    let _odoo_admin =
+        secret_value(&tenant_secret_dir.join("odoo-admin"), 64).map_err(DriverError::internal)?;
     let paperless_db_password =
         secret_value(&tenant_secret_dir.join("paperless-db"), 64).map_err(DriverError::internal)?;
     let paperless_secret_key = secret_value(&tenant_secret_dir.join("paperless-secret-key"), 96)
@@ -323,6 +327,7 @@ async fn provision(
     )
     .map_err(DriverError::internal)?;
     ensure_odoo_database(state, database_ref, &compact).await?;
+    ensure_odoo_break_glass(state, workshop, database_ref, &compact).await?;
     ensure_paperless(
         state,
         workshop,
@@ -356,6 +361,7 @@ async fn provision(
         "odoo": {
             "base_url": state.config.odoo_base_url,
             "secret_ref": format!("docker/{workshop}/odoo"),
+            "break_glass_secret_ref": format!("docker/{workshop}/odoo-admin"),
             "database": {"database_ref": database_ref, "public_hostname": odoo_hostname}
         },
         "paperless": {
@@ -1055,7 +1061,7 @@ async fn ensure_odoo_database(
         &container,
         json!({
             "Image":state.config.odoo_image,
-            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,mb_invoice_capture","--without-demo=all"],
+            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,mb_invoice_capture,l10n_fr_micro_enterprise","--without-demo=all"],
             "Env":[
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
@@ -1074,6 +1080,49 @@ async fn ensure_odoo_database(
     if code != 0 {
         return Err(DriverError::internal(format!(
             "Odoo initializer exited with {code}"
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_odoo_break_glass(
+    state: &DriverState,
+    workshop: Uuid,
+    database_ref: &str,
+    tenant_key: &str,
+) -> Result<(), DriverError> {
+    let container = format!("mb-odoo-break-glass-{tenant_key}");
+    if docker_container_exists(state, &container).await? {
+        let _ = docker_delete_container(state, &container).await;
+    }
+    docker_create_container(
+        state,
+        &container,
+        json!({
+            "Image":state.config.odoo_image,
+            "Cmd":["odoo","shell",format!("--database={database_ref}"),"--no-http",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--shell-file=/mnt/makersbrain-addons/mb_control_bridge/scripts/set_break_glass_password.py"],
+            "Env":[
+                format!("HOST={}",state.config.postgres_host),
+                format!("PORT={}",state.config.postgres_port),
+                "USER=odoo",
+                format!("PASSWORD={}",state.config.odoo_postgres_password),
+                format!("MB_BREAK_GLASS_PASSWORD_FILE=/run/makersbrain-secrets/docker/{workshop}/odoo-admin")
+            ],
+            "Labels":{"makersbrain.kind":"odoo-break-glass"},
+            "HostConfig":{
+                "NetworkMode":state.config.docker_network,
+                "GroupAdd":["0"],
+                "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume),format!("{}:/run/makersbrain-secrets:ro",state.config.secret_volume)]
+            }
+        }),
+    )
+    .await?;
+    docker_start_container(state, &container).await?;
+    let code = docker_wait_container(state, &container).await?;
+    let _ = docker_delete_container(state, &container).await;
+    if code != 0 {
+        return Err(DriverError::internal(format!(
+            "Odoo break-glass initializer exited with {code}"
         )));
     }
     Ok(())

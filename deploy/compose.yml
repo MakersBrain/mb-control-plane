@@ -187,6 +187,7 @@ services:
       DRIVER_BACKUP_ROOT: /backups
       DRIVER_REDIS_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/makersbrain-secrets
+      DRIVER_SECRET_VOLUME: makersbrain-control-tenant-secrets
       DRIVER_ROUTE_ROOT: /routes
       DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
       DRIVER_ODOO_BASE_URL: http://odoo:8069
