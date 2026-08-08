@@ -910,6 +910,9 @@ fn redis_acl_arguments(username: &str, password: &str, prefix: &str) -> Vec<Stri
         format!(">{password}"),
         format!("~{prefix}*"),
         format!("&{prefix}*"),
+        // Redis checks a PSUBSCRIBE pattern literally against ACL channel
+        // patterns, so the Celery pidbox subscription needs its own rule.
+        format!("&{prefix}/0.celery.pidbox"),
         "+@all".into(),
         // Paperless/Celery needs ordinary data, transaction, Pub/Sub and Lua
         // commands. It must never be able to alter shared Redis configuration,
@@ -1096,7 +1099,7 @@ async fn ensure_paperless(
     for suffix in ["data", "media", "consume"] {
         docker_create_volume(state, &format!("mb-paperless-{workshop}-{suffix}")).await?;
     }
-    let providers = json!({"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":oidc_client_id,"secret":oidc_secret,"settings":{"server_url":format!("{}/.well-known/openid-configuration",state.config.oidc_issuer)}}]}}).to_string();
+    let providers = json!({"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":oidc_client_id,"secret":oidc_secret,"settings":{"server_url":format!("{}/.well-known/openid-configuration",state.config.oidc_issuer),"oauth_pkce_enabled":true,"email_authentication":true}}]}}).to_string();
     let public_origin = state.config.public_origin(public_hostname);
     let environment = vec![
         format!(
@@ -1503,6 +1506,11 @@ mod tests {
         };
         assert!(rules.iter().any(|rule| rule == "~mb:tenant:*"));
         assert!(rules.iter().any(|rule| rule == "&mb:tenant:*"));
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule == "&mb:tenant:/0.celery.pidbox")
+        );
         assert!(position("-@admin") > position("+@all"));
         assert!(position("-@dangerous") > position("+@all"));
         assert!(position("+evalsha") > position("-@dangerous"));

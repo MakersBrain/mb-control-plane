@@ -235,7 +235,9 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
         let client = PaperlessClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
             .map_err(|_| IntegrationError::ContractDrift)?;
         let groups = client.ensure_groups(paperless_group_names(&row.3)?).await?;
-        client.reconcile_user(&row.2, &row.0, active, &groups).await
+        client
+            .reconcile_user(&row.2, &row.0, active, &groups, row.3 == "owner")
+            .await
     }
     .await;
     record_target(

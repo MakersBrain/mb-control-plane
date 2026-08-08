@@ -147,6 +147,7 @@ impl PaperlessClient {
         email: &str,
         active: bool,
         group_ids: &[i64],
+        administrator: bool,
     ) -> Result<(), IntegrationError> {
         let mut lookup = self
             .base_url
@@ -176,7 +177,14 @@ impl PaperlessClient {
         if users.len() > 1 {
             return Err(IntegrationError::ContractDrift);
         }
-        let body = json!({"username":username,"email":email,"is_active":active,"groups":group_ids});
+        let body = json!({
+            "username": username,
+            "email": email,
+            "is_active": active,
+            "groups": group_ids,
+            "is_staff": administrator,
+            "is_superuser": administrator,
+        });
         if let Some(id) = users
             .first()
             .and_then(|user| user.get("id"))
