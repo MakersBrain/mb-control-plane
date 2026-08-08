@@ -330,6 +330,16 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
     .map_err(|_| IntegrationError::ContractDrift)?;
     let metadata = paperless.document(document_id).await?;
     let (mimetype, source) = paperless.original(document_id).await?;
+    let slug = sqlx::query_scalar::<_, String>("select slug from control.workshops where id=$1")
+        .bind(workshop)
+        .fetch_optional(store.pool())
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+        .ok_or(IntegrationError::NotFound)?;
+    let paperless_public_url = format!(
+        "https://docs-{slug}.{}/documents/{document_id}/details",
+        env("CONTROL_TENANT_DOMAIN")?
+    );
     let digest = format!("{:x}", Sha256::digest(&source));
     let (provider, invoice, confidence, pages) =
         if let Some(invoice) = crate::invoice::structured(&source) {
@@ -370,7 +380,7 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
         Duration::from_secs(45),
     )
     .map_err(|_| IntegrationError::ContractDrift)?;
-    odoo.capture_invoice(&json!({"operation_key":format!("invoice:{workshop}:{document_id}:{digest}"),"workshop_id":workshop,"external_document_id":format!("paperless:{document_id}"),"content_digest":digest,"source_filename":metadata.filename,"source_mimetype":mimetype,"source_base64":base64::engine::general_purpose::STANDARD.encode(&source),"provider":provider,"model":if provider=="azure"{"prebuilt-invoice"}else{"structured"},"page_count":pages,"requires_review":requires_review,"field_confidence":confidence,"invoice":invoice})).await?;
+    odoo.capture_invoice(&json!({"operation_key":format!("invoice:{workshop}:{document_id}:{digest}"),"workshop_id":workshop,"external_document_id":format!("paperless:{document_id}"),"source_document_url":paperless_public_url,"content_digest":digest,"source_filename":metadata.filename,"source_mimetype":mimetype,"source_base64":base64::engine::general_purpose::STANDARD.encode(&source),"provider":provider,"model":if provider=="azure"{"prebuilt-invoice"}else{"structured"},"page_count":pages,"requires_review":requires_review,"field_confidence":confidence,"invoice":invoice})).await?;
     if let Ok(tags) = std::env::var("CONTROL_PAPERLESS_CAPTURED_TAG_IDS") {
         let mut ids = tags
             .split(',')
