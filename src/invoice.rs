@@ -87,9 +87,11 @@ pub fn normalize_azure(result: &Value) -> Result<(Value, Value, i64), Integratio
             let field = |name: &str| object.and_then(|o| o.get(name));
             let quantity = number_field(field("Quantity")).unwrap_or(Decimal::ONE);
             let (unit_price, _) = currency_field(field("UnitPrice"));
+            let (line_amount, _) = currency_field(field("Amount"));
             lines.push(json!({
                 "description":string_field(field("Description")).unwrap_or_else(||"Invoice line".into()),
                 "quantity":quantity.to_string(),"unit_price":unit_price,"account_code":"",
+                "line_amount":line_amount,
                 "product_default_code":string_field(field("ProductCode")),
                 "tax_rate":number_field(field("TaxRate")).map(|v|v.to_string())
             }));
@@ -158,6 +160,9 @@ fn string_field(value: Option<&Value>) -> Option<String> {
 }
 fn number_field(value: Option<&Value>) -> Option<Decimal> {
     let value = value?;
+    if let Some(parsed) = content_decimal(value) {
+        return Some(parsed);
+    }
     value
         .get("valueNumber")
         .and_then(Value::as_f64)
@@ -169,10 +174,13 @@ fn currency_field(value: Option<&Value>) -> (String, Option<String>) {
         return ("0".into(), None);
     };
     let object = value.get("valueCurrency").unwrap_or(value);
-    let amount = object
-        .get("amount")
-        .and_then(Value::as_f64)
-        .and_then(Decimal::from_f64_retain)
+    let amount = content_decimal(value)
+        .or_else(|| {
+            object
+                .get("amount")
+                .and_then(Value::as_f64)
+                .and_then(Decimal::from_f64_retain)
+        })
         .unwrap_or(Decimal::ZERO)
         .to_string();
     let currency = object
@@ -180,6 +188,28 @@ fn currency_field(value: Option<&Value>) -> (String, Option<String>) {
         .and_then(Value::as_str)
         .map(str::to_owned);
     (amount, currency)
+}
+
+fn content_decimal(value: &Value) -> Option<Decimal> {
+    let content = value.get("content")?.as_str()?.trim();
+    let mut numeric = content
+        .chars()
+        .filter(|character| character.is_ascii_digit() || matches!(character, '-' | ',' | '.'))
+        .collect::<String>();
+    if numeric.is_empty() {
+        return None;
+    }
+    match (numeric.rfind(','), numeric.rfind('.')) {
+        (Some(comma), Some(dot)) if comma > dot => {
+            numeric = numeric.replace('.', "").replace(',', ".");
+        }
+        (Some(_), Some(_)) => {
+            numeric = numeric.replace(',', "");
+        }
+        (Some(_), None) => numeric = numeric.replace(',', "."),
+        _ => {}
+    }
+    numeric.parse().ok()
 }
 fn decimal(value: Option<String>) -> String {
     value
@@ -244,5 +274,32 @@ mod tests {
         let invoice = structured(&pdf).expect("embedded CII");
         assert_eq!(invoice["invoice_number"], "FX-9");
         assert_eq!(invoice["total_amount"], "42.00");
+    }
+
+    #[test]
+    fn azure_french_decimal_content_takes_precedence_over_scaled_numeric_value() {
+        let result = json!({
+            "documents": [{"fields": {
+                "VendorName": {"content": "Fournisseur"},
+                "InvoiceId": {"content": "FA-1"},
+                "InvoiceDate": {"valueDate": "2026-08-08"},
+                "InvoiceTotal": {"content": "64,55 EUR", "valueCurrency": {"amount": 64.55, "currencyCode": "EUR"}},
+                "SubTotal": {"content": "53,79 EUR", "valueCurrency": {"amount": 53.79, "currencyCode": "EUR"}},
+                "TotalTax": {"content": "10,76 EUR", "valueCurrency": {"amount": 10.76, "currencyCode": "EUR"}},
+                "Items": {"valueArray": [{"valueObject": {
+                    "Description": {"content": "Grès"},
+                    "Quantity": {"content": "12,500", "valueNumber": 12500},
+                    "UnitPrice": {"content": "1,170 EUR", "valueCurrency": {"amount": 1170, "currencyCode": "EUR"}},
+                    "Amount": {"content": "14,63 EUR", "valueCurrency": {"amount": 1463, "currencyCode": "EUR"}}
+                }}]}
+            }}],
+            "pages": [{}]
+        });
+
+        let (invoice, _, _) = normalize_azure(&result).unwrap();
+
+        assert_eq!(invoice["lines"][0]["quantity"], "12.500");
+        assert_eq!(invoice["lines"][0]["unit_price"], "1.170");
+        assert_eq!(invoice["lines"][0]["line_amount"], "14.63");
     }
 }
