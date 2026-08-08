@@ -180,6 +180,8 @@ services:
       DRIVER_DOCKER_NETWORK: makersbrain-control-runtime
       DRIVER_ODOO_CONTAINER: makersbrain-shared-odoo
       DRIVER_ODOO_VOLUME: makersbrain-control-odoo-data
+      DRIVER_ODOO_UID: ${ODOO_RUNTIME_UID:-100}
+      DRIVER_ODOO_GID: ${ODOO_RUNTIME_GID:-101}
       DRIVER_BACKUP_VOLUME: makersbrain-control-backups
       DRIVER_ODOO_DATA_ROOT: /odoo-data
       DRIVER_BACKUP_ROOT: /backups

@@ -35,6 +35,8 @@ pub struct DockerDriverConfig {
     docker_network: String,
     odoo_container: String,
     odoo_volume: String,
+    odoo_uid: u32,
+    odoo_gid: u32,
     backup_volume: String,
     odoo_data_root: PathBuf,
     backup_root: PathBuf,
@@ -79,6 +81,8 @@ impl DockerDriverConfig {
             docker_network: required("DRIVER_DOCKER_NETWORK")?,
             odoo_container: required("DRIVER_ODOO_CONTAINER")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
+            odoo_uid: required("DRIVER_ODOO_UID")?.parse()?,
+            odoo_gid: required("DRIVER_ODOO_GID")?.parse()?,
             backup_volume: required("DRIVER_BACKUP_VOLUME")?,
             odoo_data_root: required("DRIVER_ODOO_DATA_ROOT")?.into(),
             backup_root: required("DRIVER_BACKUP_ROOT")?.into(),
@@ -527,7 +531,7 @@ async fn create_recovery_set(
         .join("filestore")
         .join(database_ref);
     let target_filestore = directory.join("filestore");
-    copy_directory(&source_filestore, &target_filestore).map_err(DriverError::internal)?;
+    copy_directory(&source_filestore, &target_filestore, None).map_err(DriverError::internal)?;
     let manifest = json!({
         "format":"makersbrain-odoo-recovery-v1",
         "workshop_id":workshop,
@@ -590,7 +594,12 @@ async fn restore_recovery_set(
     if target_filestore.exists() {
         std::fs::remove_dir_all(&target_filestore).map_err(DriverError::internal)?;
     }
-    copy_directory(&resolved.join("filestore"), &target_filestore).map_err(DriverError::internal)
+    copy_directory(
+        &resolved.join("filestore"),
+        &target_filestore,
+        Some((state.config.odoo_uid, state.config.odoo_gid)),
+    )
+    .map_err(DriverError::internal)
 }
 
 fn safe_storage_ref(storage_ref: &str, workshop: Uuid) -> Result<PathBuf, DriverError> {
@@ -814,19 +823,31 @@ async fn run_postgres_job(
     Ok(())
 }
 
-fn copy_directory(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_directory(
+    source: &Path,
+    target: &Path,
+    ownership: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::chown;
+
     std::fs::create_dir_all(target)?;
     if !source.exists() {
         return Ok(());
+    }
+    if let Some((uid, gid)) = ownership {
+        chown(target, Some(uid), Some(gid))?;
     }
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let destination = target.join(entry.file_name());
         if file_type.is_dir() {
-            copy_directory(&entry.path(), &destination)?;
+            copy_directory(&entry.path(), &destination, ownership)?;
         } else if file_type.is_file() {
-            std::fs::copy(entry.path(), destination)?;
+            std::fs::copy(entry.path(), &destination)?;
+            if let Some((uid, gid)) = ownership {
+                chown(&destination, Some(uid), Some(gid))?;
+            }
         } else {
             return Err(std::io::Error::other(
                 "recovery sets do not support symbolic links",
@@ -918,6 +939,7 @@ async fn ensure_oidc_clients(
     ensure_rauthy_client(
         state,
         &odoo_id,
+        "MakersBrain Odoo",
         false,
         &format!("{odoo_origin}/auth_oauth/signin"),
         &format!("{odoo_origin}/web/login"),
@@ -926,6 +948,7 @@ async fn ensure_oidc_clients(
     ensure_rauthy_client(
         state,
         &paperless_id,
+        "MakersBrain Documents",
         true,
         &format!("{paperless_origin}/accounts/oidc/rauthy/login/callback/"),
         &format!("{paperless_origin}/"),
@@ -961,6 +984,7 @@ async fn ensure_oidc_clients(
 async fn ensure_rauthy_client(
     state: &DriverState,
     id: &str,
+    name: &str,
     confidential: bool,
     redirect: &str,
     logout: &str,
@@ -976,7 +1000,7 @@ async fn ensure_rauthy_client(
         let response = state
             .rauthy
             .post(format!("{}/clients", state.config.rauthy_admin_url))
-            .json(&json!({"id":id,"name":id,"confidential":confidential,"redirect_uris":[redirect],"post_logout_redirect_uris":[logout]}))
+            .json(&json!({"id":id,"name":name,"confidential":confidential,"redirect_uris":[redirect],"post_logout_redirect_uris":[logout]}))
             .send().await.map_err(DriverError::internal)?;
         if !response.status().is_success() {
             return Err(DriverError::internal(format!(
@@ -995,10 +1019,11 @@ async fn ensure_rauthy_client(
         .origin()
         .ascii_serialization();
     let response = state.rauthy.put(endpoint).json(&json!({
-        "name":id,"confidential":confidential,"redirect_uris":[redirect],
+        "name":name,"confidential":confidential,"redirect_uris":[redirect],
         "post_logout_redirect_uris":[logout],"allowed_origins":[origin],"enabled":true,
-        "flows_enabled":["authorization_code","refresh_token"],"access_token_alg":"EdDSA",
-        "id_token_alg":"EdDSA","auth_code_lifetime":60,"access_token_lifetime":300,
+        "flows_enabled":["authorization_code","refresh_token"],"access_token_alg":"RS256",
+        // The pinned OCA auth_oidc verifier intentionally accepts RS256 only.
+        "id_token_alg":"RS256","auth_code_lifetime":60,"access_token_lifetime":300,
         "scopes":["openid","profile","email"],"default_scopes":["openid","profile","email"],
         "challenges":["S256"],"force_mfa":false,"client_uri":origin,
         "contacts":null,"backchannel_logout_uri":null,"restrict_group_prefix":null,
@@ -1174,7 +1199,7 @@ async fn write_routes(
     paperless_container: &str,
 ) -> Result<(), DriverError> {
     let config = format!(
-        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\nserver {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n",
+        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\nserver {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n",
         database_ref
     );
     let path = state.config.route_root.join(format!("{workshop}.conf"));
@@ -1481,5 +1506,28 @@ mod tests {
         assert!(position("-@admin") > position("+@all"));
         assert!(position("-@dangerous") > position("+@all"));
         assert!(position("+evalsha") > position("-@dangerous"));
+    }
+
+    #[test]
+    fn restored_filestore_uses_the_configured_runtime_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!("mb-filestore-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("ab")).unwrap();
+        std::fs::write(source.join("ab/attachment"), "asset").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+
+        copy_directory(&source, &target, Some((metadata.uid(), metadata.gid()))).unwrap();
+
+        let restored = std::fs::metadata(target.join("ab/attachment")).unwrap();
+        assert_eq!(restored.uid(), metadata.uid());
+        assert_eq!(restored.gid(), metadata.gid());
+        assert_eq!(
+            std::fs::read_to_string(target.join("ab/attachment")).unwrap(),
+            "asset"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
