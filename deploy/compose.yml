@@ -5,6 +5,9 @@ x-control-env: &control-env
 x-worker: &worker
   image: makersbrain-control:local
   build: {context: ..}
+  # The driver writes root-owned 0640 tenant secrets; workers join only the
+  # container root group so they can read the shared volume without being root.
+  user: "10001:0"
   restart: unless-stopped
   depends_on:
     postgres: {condition: service_healthy}

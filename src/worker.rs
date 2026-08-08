@@ -479,7 +479,10 @@ async fn driver(
         .ok_or(IntegrationError::ContractDrift)?;
     let url = env("CONTROL_DEPLOYMENT_DRIVER_URL")?;
     let token = env("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
-    let client = http_client(&token)?;
+    // First-time Odoo and Paperless initialization can legitimately take several
+    // minutes. The operation lease is heartbeated while this request is in flight,
+    // and the driver persists idempotent outcomes for ambiguous disconnects.
+    let client = http_client(&token, Duration::from_secs(900))?;
     let response = client
         .post(format!(
             "{}/v1/tenants/{workshop}/{action}",
@@ -772,7 +775,7 @@ async fn deliver_mail(store: &Store, operation: &LeasedOperation) -> Result<(), 
         .and_then(|v| Uuid::parse_str(v).ok())
         .ok_or(IntegrationError::ContractDrift)?;
     let row=sqlx::query_as::<_,(String,String,Value)>("update control.outbox set state='sending',attempts=attempts+1 where id=$1 and state in('queued','deferred') returning recipient,template,payload").bind(outbox).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
-    let client = http_client(&env("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
+    let client = http_client(&env("CONTROL_MAIL_WEBHOOK_TOKEN")?, Duration::from_secs(30))?;
     let response = client
         .post(env("CONTROL_MAIL_WEBHOOK_URL")?)
         .json(&json!({"to":row.0,"template":row.1,"data":row.2}))
@@ -797,7 +800,7 @@ async fn deliver_mail(store: &Store, operation: &LeasedOperation) -> Result<(), 
     Ok(())
 }
 
-fn http_client(token: &str) -> Result<reqwest::Client, IntegrationError> {
+fn http_client(token: &str, timeout: Duration) -> Result<reqwest::Client, IntegrationError> {
     let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| IntegrationError::ContractDrift)?;
     value.set_sensitive(true);
@@ -805,7 +808,7 @@ fn http_client(token: &str) -> Result<reqwest::Client, IntegrationError> {
     headers.insert(reqwest::header::AUTHORIZATION, value);
     reqwest::Client::builder()
         .default_headers(headers)
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| IntegrationError::ContractDrift)

@@ -133,6 +133,7 @@ struct DriverState {
 
 pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.secret_root)?;
+    normalize_secret_permissions(&config.secret_root)?;
     std::fs::create_dir_all(&config.route_root)?;
     std::fs::create_dir_all(&config.backup_root)?;
     let ledger = PgPoolOptions::new()
@@ -264,11 +265,10 @@ async fn provision(
     let database_ref = opaque_database(payload, "database_ref")?;
     let odoo_hostname = hostname(payload, "public_hostname")?;
     let paperless_hostname = hostname(payload, "paperless_hostname")?;
-    let compact = workshop.simple().to_string();
-    let short = &compact[..12];
+    let compact = tenant_key(workshop);
     let paperless_database = format!("pl_{compact}");
     let paperless_role = paperless_database.clone();
-    let paperless_container = format!("mb-paperless-{short}");
+    let paperless_container = format!("mb-paperless-{compact}");
     let redis_user = format!("pl_{compact}");
     let redis_prefix = format!("mb:{compact}:");
     let tenant_secret_dir = state
@@ -312,13 +312,13 @@ async fn provision(
     )
     .await?;
     let (odoo_client_id, paperless_client_id, paperless_oidc_secret) =
-        ensure_oidc_clients(state, short, odoo_hostname, paperless_hostname).await?;
+        ensure_oidc_clients(state, &compact, odoo_hostname, paperless_hostname).await?;
     write_secret(
         &tenant_secret_dir.join("paperless-oidc"),
         &paperless_oidc_secret,
     )
     .map_err(DriverError::internal)?;
-    ensure_odoo_database(state, database_ref, short).await?;
+    ensure_odoo_database(state, database_ref, &compact).await?;
     ensure_paperless(
         state,
         workshop,
@@ -363,6 +363,10 @@ async fn provision(
         "paperless_oidc": {"client_id": paperless_client_id, "issuer": state.config.oidc_issuer},
         "redis": {"shared": true, "prefix": redis_prefix, "acl_user": redis_user}
     }))
+}
+
+fn tenant_key(workshop: Uuid) -> String {
+    workshop.simple().to_string()
 }
 
 async fn lifecycle(
@@ -637,16 +641,50 @@ fn hostname<'a>(payload: &'a Value, key: &str) -> Result<&'a str, DriverError> {
 fn secure_directory(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))
+}
+
+fn normalize_secret_permissions(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tenants = root.join("docker");
+    std::fs::create_dir_all(&tenants)?;
+    std::fs::set_permissions(&tenants, std::fs::Permissions::from_mode(0o750))?;
+    for tenant in std::fs::read_dir(&tenants)? {
+        let tenant = tenant?;
+        let file_type = tenant.file_type()?;
+        if !file_type.is_dir()
+            || tenant
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+                .is_none()
+        {
+            return Err(std::io::Error::other(
+                "tenant secret root contains an unexpected entry",
+            ));
+        }
+        std::fs::set_permissions(tenant.path(), std::fs::Permissions::from_mode(0o750))?;
+        for secret in std::fs::read_dir(tenant.path())? {
+            let secret = secret?;
+            if !secret.file_type()?.is_file() {
+                return Err(std::io::Error::other(
+                    "tenant secret directory contains a non-file entry",
+                ));
+            }
+            std::fs::set_permissions(secret.path(), std::fs::Permissions::from_mode(0o640))?;
+        }
+    }
+    Ok(())
 }
 
 fn write_secret(path: &Path, value: &str) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
+    options.write(true).create(true).truncate(true).mode(0o640);
     let mut file = options.open(path)?;
     std::io::Write::write_all(&mut file, value.as_bytes())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
 }
 
 fn secret_value(path: &Path, length: usize) -> std::io::Result<String> {
@@ -853,12 +891,12 @@ async fn ensure_redis_acl(
 
 async fn ensure_oidc_clients(
     state: &DriverState,
-    short: &str,
+    tenant_key: &str,
     odoo_hostname: &str,
     paperless_hostname: &str,
 ) -> Result<(String, String, String), DriverError> {
-    let odoo_id = format!("makersbrain-odoo-{short}");
-    let paperless_id = format!("makersbrain-paperless-{short}");
+    let odoo_id = format!("makersbrain-odoo-{tenant_key}");
+    let paperless_id = format!("makersbrain-paperless-{tenant_key}");
     let odoo_origin = state.config.public_origin(odoo_hostname);
     let paperless_origin = state.config.public_origin(paperless_hostname);
     ensure_rauthy_client(
@@ -962,9 +1000,9 @@ async fn ensure_rauthy_client(
 async fn ensure_odoo_database(
     state: &DriverState,
     database_ref: &str,
-    short: &str,
+    tenant_key: &str,
 ) -> Result<(), DriverError> {
-    let container = format!("mb-odoo-init-{short}");
+    let container = format!("mb-odoo-init-{tenant_key}");
     if docker_container_exists(state, &container).await? {
         let _ = docker_delete_container(state, &container).await;
     }
@@ -974,7 +1012,13 @@ async fn ensure_odoo_database(
         json!({
             "Image":state.config.odoo_image,
             "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,mb_invoice_capture","--without-demo=all"],
-            "Env":[format!("MB_CONTROL_BRIDGE_TOKEN={}",state.config.odoo_bridge_token)],
+            "Env":[
+                format!("HOST={}",state.config.postgres_host),
+                format!("PORT={}",state.config.postgres_port),
+                "USER=odoo",
+                format!("PASSWORD={}",state.config.odoo_postgres_password),
+                format!("MB_CONTROL_BRIDGE_TOKEN={}",state.config.odoo_bridge_token)
+            ],
             "Labels":{"makersbrain.kind":"odoo-init"},
             "HostConfig":{"NetworkMode":state.config.docker_network,"Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)]}
         }),
@@ -1372,5 +1416,38 @@ mod tests {
     fn public_hostnames_cannot_inject_gateway_configuration() {
         assert!(hostname(&json!({"host":"atelier.dev1.makersbrain.net"}), "host").is_ok());
         assert!(hostname(&json!({"host":"atelier; return 200"}), "host").is_err());
+    }
+
+    #[test]
+    fn docker_resource_names_use_the_complete_workshop_identity() {
+        let first = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
+        let second = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        assert_ne!(tenant_key(first), tenant_key(second));
+        assert_eq!(tenant_key(first).len(), 32);
+    }
+
+    #[test]
+    fn existing_tenant_secrets_are_migrated_to_worker_readable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("mb-secrets-{}", Uuid::new_v4()));
+        let tenant = root.join("docker/00000000-0000-0000-0000-000000000201");
+        std::fs::create_dir_all(&tenant).unwrap();
+        let secret = tenant.join("odoo");
+        std::fs::write(&secret, "sensitive").unwrap();
+        std::fs::set_permissions(&tenant, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        normalize_secret_permissions(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&tenant).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
