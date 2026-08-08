@@ -1100,8 +1100,13 @@ async fn ensure_odoo_break_glass(
         &container,
         json!({
             "Image":state.config.odoo_image,
-            "Cmd":["odoo","shell",format!("--database={database_ref}"),"--no-http",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--shell-file=/mnt/makersbrain-addons/mb_control_bridge/scripts/set_break_glass_password.py"],
+            "Cmd":[
+                "/bin/sh",
+                "-ec",
+                "exec odoo shell --database=\"$MB_ODOO_DATABASE\" --no-http --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$PASSWORD\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons < /mnt/makersbrain-addons/mb_control_bridge/scripts/set_break_glass_password.py"
+            ],
             "Env":[
+                format!("MB_ODOO_DATABASE={database_ref}"),
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
                 "USER=odoo",
