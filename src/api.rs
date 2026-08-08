@@ -74,6 +74,11 @@ pub fn app(state: AppState) -> Router {
             post(accept_ownership_transfer),
         )
         .route("/v1/workshops/{id}/integrations", get(integrations))
+        .route("/v1/workshops/{id}/modules", get(modules))
+        .route(
+            "/v1/workshops/{id}/modules/{module_key}/enable",
+            post(enable_module),
+        )
         .route("/v1/workshops/{id}/database", get(database))
         .route(
             "/v1/workshops/{id}/database/snapshots",
@@ -804,6 +809,155 @@ async fn integrations(
     authority(&state, who.user_id, id).await?;
     let rows=sqlx::query_as::<_,(String,String,String,i32,i32,Option<String>)>("select service,base_url,health,desired_epoch,applied_epoch,safe_error_class from control.service_instances where workshop_id=$1 order by service").bind(id).fetch_all(state.store.pool()).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|r|json!({"service":r.0,"url":r.1,"health":r.2,"desired_epoch":r.3,"applied_epoch":r.4,"error":r.5})).collect())))
+}
+
+async fn modules(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let who = principal(&state, &headers).await?;
+    let (role, _) = authority(&state, who.user_id, id).await?;
+    let rows = sqlx::query_as::<_, (String, String, Option<Uuid>, Option<String>, Option<String>)>(
+        "select wm.module_key,wm.state,wm.operation_id,o.state,o.failure_class
+         from control.workshop_modules wm
+         left join control.operations o on o.id=wm.operation_id
+         where wm.workshop_id=$1",
+    )
+    .bind(id)
+    .fetch_all(state.store.pool())
+    .await?;
+    let states = rows
+        .into_iter()
+        .map(|row| (row.0, (row.1, row.2, row.3, row.4)))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(Json(Value::Array(
+        crate::modules::CATALOG
+            .iter()
+            .map(|bundle| {
+                let state = states.get(bundle.key);
+                let operation_state = state.and_then(|value| value.2.as_deref());
+                let visible_state = match operation_state {
+                    Some("dead_letter") => "failed",
+                    _ => state.map_or("available", |value| value.0.as_str()),
+                };
+                json!({
+                    "key":bundle.key,
+                    "name":bundle.name,
+                    "description":bundle.description,
+                    "state":visible_state,
+                    "operation_id":state.and_then(|value|value.1),
+                    "error":state.and_then(|value|value.3.as_deref()),
+                    "can_manage":role.can_manage_modules(),
+                })
+            })
+            .collect(),
+    )))
+}
+
+async fn enable_module(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, module_key)): Path<(Uuid, String)>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let who = principal(&state, &headers).await?;
+    let (role, _) = authority(&state, who.user_id, id).await?;
+    if !role.can_manage_modules() {
+        return Err(ApiError::Forbidden);
+    }
+    if crate::modules::bundle(&module_key).is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let client_key = idempotency(&headers)?;
+    let stored_key = format!("module:{id}:{module_key}:{client_key}");
+    if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
+        "select id from control.operations
+         where kind='module.enable' and requested_by=$1 and idempotency_key=$2",
+    )
+    .bind(who.user_id)
+    .bind(&stored_key)
+    .fetch_optional(state.store.pool())
+    .await?
+    {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"operation_id":existing,"replayed":true})),
+        ));
+    }
+    if let Some((module_state, operation_id)) = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "select state,operation_id from control.workshop_modules
+         where workshop_id=$1 and module_key=$2",
+    )
+    .bind(id)
+    .bind(&module_key)
+    .fetch_optional(state.store.pool())
+    .await?
+    {
+        if module_state == "enabled" {
+            return Ok((StatusCode::OK, Json(json!({"state":"enabled"}))));
+        }
+        if let Some(operation_id) = operation_id {
+            let active = sqlx::query_scalar::<_, bool>(
+                "select state in ('pending','in_flight','awaiting_reconciliation')
+                 from control.operations where id=$1",
+            )
+            .bind(operation_id)
+            .fetch_optional(state.store.pool())
+            .await?
+            .unwrap_or(false);
+            if active {
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({"operation_id":operation_id,"replayed":true})),
+                ));
+            }
+        }
+    }
+    let correlation = Uuid::new_v4();
+    let payload = json!({"module_key":module_key});
+    let mut tx = state.store.begin().await?;
+    let operation_id = Store::enqueue(
+        &mut tx,
+        NewOperation {
+            kind: OperationKind::ModuleEnable,
+            workshop_id: Some(id),
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: Some(who.user_id),
+            correlation_id: correlation,
+            idempotency_key: &stored_key,
+        },
+    )
+    .await?;
+    sqlx::query(
+        "insert into control.workshop_modules(workshop_id,module_key,state,operation_id,requested_by)
+         values($1,$2,'requested',$3,$4)
+         on conflict(workshop_id,module_key) do update set
+           state='requested',operation_id=excluded.operation_id,requested_by=excluded.requested_by,
+           requested_at=now(),enabled_at=null",
+    )
+    .bind(id)
+    .bind(&module_key)
+    .bind(operation_id)
+    .bind(who.user_id)
+    .execute(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        Some(who.user_id),
+        Some(id),
+        "module.enable",
+        "workshop_module",
+        module_key,
+        correlation,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"operation_id":operation_id})),
+    ))
 }
 
 async fn database(

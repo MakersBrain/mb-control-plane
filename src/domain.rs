@@ -41,6 +41,10 @@ impl WorkshopRole {
     pub fn can_manage_database(self) -> bool {
         self == Self::Owner
     }
+
+    pub fn can_manage_modules(self) -> bool {
+        matches!(self, Self::Owner | Self::StudioManager)
+    }
 }
 
 pub fn opaque_database_ref(id: uuid::Uuid) -> String {
@@ -72,6 +76,7 @@ pub enum OperationKind {
     TenantReconcile,
     TenantLifecycle,
     EmailDelivery,
+    ModuleEnable,
 }
 
 impl OperationKind {
@@ -84,6 +89,7 @@ impl OperationKind {
             Self::TenantReconcile => "tenant.reconcile",
             Self::TenantLifecycle => "tenant.lifecycle",
             Self::EmailDelivery => "email.delivery",
+            Self::ModuleEnable => "module.enable",
         }
     }
 
@@ -96,6 +102,7 @@ impl OperationKind {
             Self::TenantReconcile => "tenant-reconciliation",
             Self::TenantLifecycle => "tenant-lifecycle",
             Self::EmailDelivery => "email-delivery",
+            Self::ModuleEnable => "tenant-reconciliation",
         }
     }
 }

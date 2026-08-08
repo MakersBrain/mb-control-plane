@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::domain::IntegrationError;
 use crate::integrations::azure::AzureInvoiceClient;
 use crate::integrations::odoo::{
-    EntitlementCommand, MembershipCommand, OdooClient, TenantBootstrapCommand,
+    EntitlementCommand, MembershipCommand, ModuleEnableCommand, OdooClient, TenantBootstrapCommand,
 };
 use crate::integrations::paperless::PaperlessClient;
 use crate::integrations::rauthy::RauthyClient;
@@ -80,8 +80,51 @@ async fn handle(store: &Store, operation: &LeasedOperation) -> Result<(), Integr
         "tenant.reconcile" => driver(store, operation, "reconcile").await.map(|_| ()),
         "tenant.lifecycle" => lifecycle(store, operation).await,
         "email.delivery" => deliver_mail(store, operation).await,
+        "module.enable" => enable_module(store, operation).await,
         _ => Err(IntegrationError::ContractDrift),
     }
+}
+
+async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
+    let workshop = operation
+        .workshop_id
+        .ok_or(IntegrationError::ContractDrift)?;
+    let module_key = operation
+        .payload
+        .get("module_key")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let bundle = crate::modules::bundle(module_key).ok_or(IntegrationError::ContractDrift)?;
+    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
+    let odoo = OdooClient::new(
+        &odoo_url,
+        &secret(&odoo_ref)?,
+        database_ref.as_deref(),
+        Duration::from_secs(120),
+    )
+    .map_err(|_| IntegrationError::ContractDrift)?;
+    odoo.enable_modules(&ModuleEnableCommand {
+        operation_key: format!("module-enable:{workshop}:{module_key}:{}", operation.id),
+        workshop_id: workshop,
+        module_key: module_key.into(),
+        modules: bundle
+            .odoo_modules
+            .iter()
+            .map(|module| (*module).into())
+            .collect(),
+    })
+    .await?;
+    sqlx::query(
+        "update control.workshop_modules set state='enabled',enabled_at=now()
+         where workshop_id=$1 and module_key=$2 and operation_id=$3",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .bind(operation.id)
+    .execute(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    Ok(())
 }
 
 fn env(name: &str) -> Result<String, IntegrationError> {

@@ -6,6 +6,7 @@ pub mod docker_driver;
 pub mod domain;
 pub mod integrations;
 pub mod invoice;
+pub mod modules;
 pub mod openapi;
 pub mod persistence;
 pub mod worker;

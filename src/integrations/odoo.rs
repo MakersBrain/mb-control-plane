@@ -50,6 +50,14 @@ pub struct TenantBootstrapCommand {
     pub oidc_issuer: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleEnableCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+    pub module_key: String,
+    pub modules: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AppliedCommand {
     pub applied: bool,
@@ -158,6 +166,13 @@ impl OdooClient {
 
     pub async fn capture_invoice(&self, command: &Value) -> Result<Value, IntegrationError> {
         self.post("/mb_control/v1/invoices/capture", command).await
+    }
+
+    pub async fn enable_modules(
+        &self,
+        command: &ModuleEnableCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/modules/enable", command).await
     }
 }
 

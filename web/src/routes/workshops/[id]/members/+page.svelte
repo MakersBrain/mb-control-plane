@@ -35,7 +35,7 @@
 
 <svelte:head><title>{workshop?.display_name || 'Members'} · MakersBrain</title></svelte:head>
 <p><a href="/">← Workshops</a></p>
-{#if workshop}<div class="row"><div><h1>{workshop.display_name}</h1><p class="muted">You are {workshop.role}</p></div><div class="actions"><a class="button secondary" href={`/workshops/${id}/database`}>Database & backups</a><span class="status">{workshop.status}</span></div></div>{/if}
+{#if workshop}<div class="row"><div><h1>{workshop.display_name}</h1><p class="muted">You are {workshop.role}</p></div><div class="actions"><a class="button secondary" href={`/workshops/${id}/modules`}>Modules</a><a class="button secondary" href={`/workshops/${id}/database`}>Database & backups</a><span class="status">{workshop.status}</span></div></div>{/if}
 {#if error}<p class="error">{error}</p>{/if}
 
 {#each transfers as transfer}

@@ -23,6 +23,12 @@ pub fn document() -> Value {
         ("/v1/workshops/{id}/ownership-transfers", "post", true),
         ("/v1/ownership-transfers/{id}/accept", "post", true),
         ("/v1/workshops/{id}/integrations", "get", true),
+        ("/v1/workshops/{id}/modules", "get", true),
+        (
+            "/v1/workshops/{id}/modules/{module_key}/enable",
+            "post",
+            true,
+        ),
         ("/v1/workshops/{id}/database", "get", true),
         ("/v1/workshops/{id}/database/snapshots", "post", true),
         ("/v1/workshops/{id}/database/backups", "post", true),
