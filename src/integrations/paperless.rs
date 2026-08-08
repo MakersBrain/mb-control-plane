@@ -27,6 +27,35 @@ pub struct Document {
     pub tags: Vec<i64>,
 }
 
+#[derive(Deserialize)]
+struct PaperlessDocument {
+    id: i64,
+    title: String,
+    filename: Option<String>,
+    original_file_name: Option<String>,
+    #[serde(default)]
+    tags: Vec<i64>,
+}
+
+fn decode_document(body: &[u8], expected_id: i64) -> Result<Document, IntegrationError> {
+    let document: PaperlessDocument =
+        serde_json::from_slice(body).map_err(|_| IntegrationError::ContractDrift)?;
+    let filename = document
+        .filename
+        .or(document.original_file_name)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(IntegrationError::ContractDrift)?;
+    if document.id != expected_id {
+        return Err(IntegrationError::ContractDrift);
+    }
+    Ok(Document {
+        id: document.id,
+        title: document.title,
+        filename,
+        tags: document.tags,
+    })
+}
+
 impl PaperlessClient {
     pub fn new(base_url: &str, token: &str, timeout: Duration) -> anyhow::Result<Self> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
@@ -88,12 +117,7 @@ impl PaperlessClient {
         let (_, body) = self
             .get(&format!("/api/documents/{id}/"), MAX_METADATA_BYTES)
             .await?;
-        let document: Document =
-            serde_json::from_slice(&body).map_err(|_| IntegrationError::ContractDrift)?;
-        if document.id != id || document.filename.is_empty() {
-            return Err(IntegrationError::ContractDrift);
-        }
-        Ok(document)
+        decode_document(&body, id)
     }
 
     pub async fn original(&self, id: i64) -> Result<(String, Vec<u8>), IntegrationError> {
@@ -258,5 +282,21 @@ impl PaperlessClient {
         )
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paperless_original_filename_is_used_when_archive_filename_is_null() {
+        let document = decode_document(
+            br#"{"id":1,"title":"Phone scan","filename":null,"original_file_name":"invoice.jpg","tags":[]}"#,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(document.filename, "invoice.jpg");
     }
 }
