@@ -47,7 +47,7 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "time", "json"] }
 thiserror = "2"
-time = { version = "0.3", features = ["serde-well-known", "macros"] }
+time = { version = "0.3", features = ["serde-human-readable", "serde-well-known", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 tower = { version = "0.5", features = ["timeout", "limit", "util"] }
 tower-http = { version = "0.7", features = ["trace", "cors", "limit", "timeout", "sensitive-headers", "catch-panic", "request-id"] }

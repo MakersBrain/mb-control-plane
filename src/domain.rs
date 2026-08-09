@@ -222,4 +222,13 @@ mod tests {
         );
         assert!(normalize_email("not an address").is_err());
     }
+
+    #[test]
+    fn api_timestamps_serialize_as_human_readable_strings() {
+        assert!(
+            serde_json::to_value(time::OffsetDateTime::UNIX_EPOCH)
+                .unwrap()
+                .is_string()
+        );
+    }
 }
