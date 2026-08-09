@@ -1,10 +1,16 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1.96-bookworm AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=control-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    cargo fetch --locked
 COPY migrations ./migrations
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/source/target \
+RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=control-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=control-cargo-target,target=/source/target,sharing=locked \
     cargo build --locked --release --bins && \
     mkdir -p /out && \
     cp target/release/control-api \
@@ -14,7 +20,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
        target/release/control-docker-driver /out/
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,id=control-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=control-apt-cache,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl
 RUN useradd --system --uid 10001 --home /nonexistent control
 COPY --from=builder /out/control-api /usr/local/bin/control-api
 COPY --from=builder /out/control-migrate /usr/local/bin/control-migrate
