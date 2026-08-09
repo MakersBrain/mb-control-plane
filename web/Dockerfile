@@ -10,6 +10,7 @@ ARG VITE_CONTROL_API_URL=""
 ARG VITE_OIDC_ISSUER
 ARG VITE_OIDC_CLIENT_ID=makersbrain-members
 ARG VITE_OIDC_REDIRECT_URI
+ARG VITE_ACCOUNT_URL
 RUN npm run build && node scripts/externalize-bootstrap.mjs
 
 FROM nginx:1.28-alpine

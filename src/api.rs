@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
@@ -55,6 +55,21 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/version", get(version))
         .route("/openapi.json", get(openapi))
         .route("/v1/me", get(me))
+        .route("/v1/platform/overview", get(platform_overview))
+        .route("/v1/platform/workshops", get(platform_workshops))
+        .route("/v1/platform/workshops/{id}", get(platform_workshop))
+        .route(
+            "/v1/platform/workshops/{id}/reconcile",
+            post(platform_reconcile_workshop),
+        )
+        .route("/v1/platform/operations", get(platform_operations))
+        .route("/v1/platform/users", get(platform_users))
+        .route("/v1/platform/status", get(platform_status))
+        .route(
+            "/v1/platform/email-deliveries",
+            get(platform_email_deliveries),
+        )
+        .route("/v1/platform/audit-events", get(platform_audit_events))
         .route("/v1/identity/link", post(link_identity))
         .route("/v1/workshops", get(workshops).post(create_workshop))
         .route("/v1/workshops/{id}", get(workshop))
@@ -91,6 +106,10 @@ pub fn app(state: AppState) -> Router {
             post(create_snapshot),
         )
         .route("/v1/workshops/{id}/database/backups", post(create_backup))
+        .route(
+            "/v1/workshops/{id}/database/backups/{recovery_id}/download",
+            post(download_backup),
+        )
         .route(
             "/v1/workshops/{id}/database/restores",
             post(restore_database),
@@ -205,8 +224,227 @@ async fn openapi() -> impl IntoResponse {
 async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let who = principal(&state, &headers).await?;
     Ok(Json(
-        json!({"id": who.user_id, "email": who.email, "subject": who.subject}),
+        json!({"id": who.user_id, "email": who.email, "subject": who.subject,"is_operator":is_operator(&state,&who)}),
     ))
+}
+
+fn is_operator(state: &AppState, who: &Principal) -> bool {
+    state.config.operator_emails.contains(&who.email)
+}
+
+async fn operator(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
+    let who = principal(state, headers).await?;
+    if !is_operator(state, &who) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(who)
+}
+
+async fn platform_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let workshops = sqlx::query_as::<_, (i64, i64, i64)>(
+        "select count(*),count(*) filter(where status in ('active','trial')),count(*) filter(where status in ('past_due','restricted','suspended','deleting')) from control.workshops where status<>'deleted'",
+    )
+    .fetch_one(state.store.pool())
+    .await?;
+    let users = sqlx::query_as::<_, (i64, i64)>(
+        "select count(*),count(*) filter(where disabled_at is not null) from control.users",
+    )
+    .fetch_one(state.store.pool())
+    .await?;
+    let operations = sqlx::query_as::<_, (i64, i64, i64)>(
+        "select count(*) filter(where state in ('pending','awaiting_reconciliation')),count(*) filter(where state='in_flight'),count(*) filter(where state='dead_letter') from control.operations",
+    )
+    .fetch_one(state.store.pool())
+    .await?;
+    let degraded_services = sqlx::query_scalar::<_, i64>(
+        "select count(*) from control.service_instances where health in ('degraded','failed')",
+    )
+    .fetch_one(state.store.pool())
+    .await?;
+    let attention = sqlx::query_as::<_, (Uuid,String,String,Option<String>,Option<Uuid>,Option<String>,OffsetDateTime,i16)>(
+        "select o.id,o.kind,o.state,o.failure_class,o.workshop_id,w.display_name,o.created_at,o.progress_percent from control.operations o left join control.workshops w on w.id=o.workshop_id where o.state in ('dead_letter','in_flight','awaiting_reconciliation') order by case when o.state='dead_letter' then 0 else 1 end,o.created_at limit 12",
+    )
+    .fetch_all(state.store.pool())
+    .await?;
+    Ok(Json(json!({
+        "workshops":{"total":workshops.0,"healthy":workshops.1,"attention":workshops.2},
+        "users":{"total":users.0,"disabled":users.1},
+        "operations":{"queued":operations.0,"running":operations.1,"failed":operations.2},
+        "degraded_services":degraded_services,
+        "attention":attention.into_iter().map(|row|json!({"id":row.0,"kind":row.1,"state":row.2,"failure_class":row.3,"workshop_id":row.4,"workshop_name":row.5,"created_at":api_timestamp(row.6),"progress_percent":row.7})).collect::<Vec<_>>()
+    })))
+}
+
+async fn platform_workshops(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, (Uuid,String,String,String,String,OffsetDateTime,i64,i64)>(
+        "select w.id,w.slug,w.display_name,w.status,w.plan,w.created_at,count(distinct m.user_id) filter(where m.status='active'),count(distinct s.id) filter(where s.health in ('degraded','failed')) from control.workshops w left join control.memberships m on m.workshop_id=w.id left join control.service_instances s on s.workshop_id=w.id where w.status<>'deleted' group by w.id order by w.created_at desc,w.id",
+    )
+    .fetch_all(state.store.pool())
+    .await?;
+    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"slug":row.1,"display_name":row.2,"status":row.3,"plan":row.4,"created_at":api_timestamp(row.5),"member_count":row.6,"degraded_service_count":row.7})).collect())))
+}
+
+async fn platform_workshop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let workshop = sqlx::query_as::<_, (String,String,String,String,Option<String>,Option<String>,OffsetDateTime)>(
+        "select slug,display_name,status,plan,legal_name,country_code,created_at from control.workshops where id=$1 and status<>'deleted'",
+    ).bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+    let members = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String)>(
+        "select u.id,u.email,u.display_name,m.role,m.status from control.memberships m join control.users u on u.id=m.user_id where m.workshop_id=$1 order by u.email",
+    ).bind(id).fetch_all(state.store.pool()).await?;
+    let services = sqlx::query_as::<_, (String,String,String,Option<String>,Option<String>,i32,i32)>(
+        "select service,base_url,health,release_id,safe_error_class,desired_epoch,applied_epoch from control.service_instances where workshop_id=$1 order by service",
+    ).bind(id).fetch_all(state.store.pool()).await?;
+    let entitlement = sqlx::query_as::<_, (i64,String,String,Value,Option<OffsetDateTime>,OffsetDateTime)>(
+        "select version,plan,status,limits,expires_at,updated_at from control.entitlements where workshop_id=$1",
+    ).bind(id).fetch_optional(state.store.pool()).await?;
+    let usage = sqlx::query_as::<_, (String,i64,OffsetDateTime)>(
+        "select metric,quantity,updated_at from control.usage_counters where workshop_id=$1 and period=date_trunc('month',current_date)::date order by metric",
+    ).bind(id).fetch_all(state.store.pool()).await?;
+    let primary_hostname = sqlx::query_scalar::<_, String>(
+        "select public_hostname from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null and public_hostname is not null",
+    ).bind(id).fetch_optional(state.store.pool()).await?;
+    let operations = platform_operation_rows(&state, Some(id), None, 30).await?;
+    Ok(Json(json!({
+        "id":id,"slug":workshop.0,"display_name":workshop.1,"status":workshop.2,"plan":workshop.3,"legal_name":workshop.4,"country_code":workshop.5,"created_at":api_timestamp(workshop.6),
+        "members":members.into_iter().map(|row|json!({"id":row.0,"email":row.1,"display_name":row.2,"role":row.3,"status":row.4})).collect::<Vec<_>>(),
+        "services":services.into_iter().map(|row|json!({"service":row.0,"url":row.1,"health":row.2,"release_id":row.3,"error":row.4,"desired_epoch":row.5,"applied_epoch":row.6})).collect::<Vec<_>>(),
+        "entitlement":entitlement.map(|row|json!({"version":row.0,"plan":row.1,"status":row.2,"limits":row.3,"expires_at":row.4.map(api_timestamp),"updated_at":api_timestamp(row.5)})),
+        "usage":usage.into_iter().map(|row|json!({"metric":row.0,"quantity":row.1,"updated_at":api_timestamp(row.2)})).collect::<Vec<_>>(),
+        "primary_hostname":primary_hostname,
+        "operations":operations
+    })))
+}
+
+async fn platform_reconcile_workshop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let who = operator(&state, &headers).await?;
+    let key = idempotency(&headers)?;
+    queue_tenant_reconciliation(&state, id, Some(who.user_id), &format!("operator:{key}")).await
+}
+
+#[derive(Deserialize)]
+struct PlatformOperationQuery {
+    state: Option<String>,
+    workshop_id: Option<Uuid>,
+    limit: Option<i64>,
+}
+
+async fn platform_operations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PlatformOperationQuery>,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    if query.state.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "pending" | "in_flight" | "awaiting_reconciliation" | "succeeded" | "dead_letter"
+        )
+    }) {
+        return Err(ApiError::Validation("invalid operation state"));
+    }
+    Ok(Json(Value::Array(
+        platform_operation_rows(
+            &state,
+            query.workshop_id,
+            query.state.as_deref(),
+            query.limit.unwrap_or(100).clamp(1, 200),
+        )
+        .await?,
+    )))
+}
+
+async fn platform_operation_rows(
+    state: &AppState,
+    workshop: Option<Uuid>,
+    operation_state: Option<&str>,
+    limit: i64,
+) -> ApiResult<Vec<Value>> {
+    let rows = sqlx::query_as::<_, (Uuid,String,String,Option<String>,Option<Uuid>,Option<String>,i32,i32,OffsetDateTime,Option<OffsetDateTime>,i16,Option<String>,Option<String>)>(
+        "select o.id,o.kind,o.state,o.failure_class,o.workshop_id,w.display_name,o.attempt,o.max_attempts,o.created_at,o.finished_at,o.progress_percent,o.progress_phase,o.progress_message from control.operations o left join control.workshops w on w.id=o.workshop_id where ($1::uuid is null or o.workshop_id=$1) and ($2::text is null or o.state=$2) order by o.created_at desc,o.id desc limit $3",
+    ).bind(workshop).bind(operation_state).bind(limit).fetch_all(state.store.pool()).await?;
+    Ok(rows.into_iter().map(|row|json!({"id":row.0,"kind":row.1,"state":row.2,"failure_class":row.3,"workshop_id":row.4,"workshop_name":row.5,"attempt":row.6,"max_attempts":row.7,"created_at":api_timestamp(row.8),"finished_at":row.9.map(api_timestamp),"progress_percent":row.10,"progress_phase":row.11,"progress_message":row.12})).collect())
+}
+
+async fn platform_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,OffsetDateTime,Option<OffsetDateTime>,bool,i64)>(
+        "select u.id,u.email,u.display_name,u.locale,u.created_at,u.disabled_at,exists(select 1 from control.external_identities i where i.user_id=u.id and i.disabled_at is null),count(m.workshop_id) filter(where m.status='active') from control.users u left join control.memberships m on m.user_id=u.id group by u.id order by u.created_at desc,u.id",
+    ).fetch_all(state.store.pool()).await?;
+    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"email":row.1,"display_name":row.2,"locale":row.3,"created_at":api_timestamp(row.4),"disabled_at":row.5.map(api_timestamp),"identity_linked":row.6,"workshop_count":row.7})).collect())))
+}
+
+async fn platform_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let queues = sqlx::query_as::<_, (String,i64,i64,i64,Option<OffsetDateTime>,Option<OffsetDateTime>)>(
+        "with known(queue) as (values ('identity-operations'),('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),min(o.created_at) filter(where o.state in ('pending','in_flight','awaiting_reconciliation')),max(o.finished_at) from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue",
+    ).fetch_all(state.store.pool()).await?;
+    let services = sqlx::query_as::<_, (String,String,i64)>(
+        "select service,health,count(*) from control.service_instances group by service,health order by service,health",
+    ).fetch_all(state.store.pool()).await?;
+    let newest_backup = sqlx::query_as::<_, (Uuid,Uuid,String,OffsetDateTime,Option<String>)>(
+        "select r.id,r.workshop_id,w.display_name,r.ready_at,r.source_release from control.workshop_recovery_points r join control.workshops w on w.id=r.workshop_id where r.kind='backup' and r.state='ready' and r.verification_state='verified' order by r.ready_at desc nulls last limit 1",
+    ).fetch_optional(state.store.pool()).await?;
+    let rehearsal = sqlx::query_as::<_, (Uuid,Uuid,String,Option<String>,OffsetDateTime,Option<OffsetDateTime>)>(
+        "select h.id,h.workshop_id,h.state,h.safe_error,h.started_at,h.finished_at from control.workshop_recovery_rehearsals h order by h.started_at desc limit 1",
+    ).fetch_optional(state.store.pool()).await?;
+    Ok(Json(json!({
+        "release":{"api":env!("CARGO_PKG_VERSION"),"schema":crate::persistence::EMBEDDED_SCHEMA_RELEASE},
+        "queues":queues.into_iter().map(|row|json!({"queue":row.0,"queued":row.1,"running":row.2,"failed":row.3,"oldest_active_at":row.4.map(api_timestamp),"last_finished_at":row.5.map(api_timestamp)})).collect::<Vec<_>>(),
+        "services":services.into_iter().map(|row|json!({"service":row.0,"health":row.1,"count":row.2})).collect::<Vec<_>>(),
+        "newest_verified_backup":newest_backup.map(|row|json!({"id":row.0,"workshop_id":row.1,"workshop_name":row.2,"ready_at":api_timestamp(row.3),"source_release":row.4})),
+        "latest_rehearsal":rehearsal.map(|row|json!({"id":row.0,"workshop_id":row.1,"state":row.2,"safe_error":row.3,"started_at":api_timestamp(row.4),"finished_at":row.5.map(api_timestamp)}))
+    })))
+}
+
+async fn platform_email_deliveries(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, (Uuid,String,String,String,i32,OffsetDateTime,OffsetDateTime,Option<OffsetDateTime>)>(
+        "select id,recipient,template,state,attempts,next_attempt_at,created_at,sent_at from control.outbox order by created_at desc,id desc limit 200",
+    ).fetch_all(state.store.pool()).await?;
+    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"recipient":row.1,"template":row.2,"state":row.3,"attempts":row.4,"next_attempt_at":api_timestamp(row.5),"created_at":api_timestamp(row.6),"sent_at":row.7.map(api_timestamp)})).collect())))
+}
+
+#[derive(Deserialize)]
+struct PlatformAuditQuery {
+    limit: Option<i64>,
+}
+
+async fn platform_audit_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PlatformAuditQuery>,
+) -> ApiResult<Json<Value>> {
+    operator(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, (Uuid,Option<String>,Option<Uuid>,Option<String>,String,Option<String>,Option<String>,Uuid,String,Value,OffsetDateTime)>(
+        "select a.id,u.email,a.workshop_id,w.display_name,a.action,a.target_type,a.target_id,a.correlation_id,a.outcome,a.detail,a.created_at from control.audit_events a left join control.users u on u.id=a.actor_user_id left join control.workshops w on w.id=a.workshop_id order by a.created_at desc,a.id desc limit $1",
+    ).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(state.store.pool()).await?;
+    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"actor_email":row.1,"workshop_id":row.2,"workshop_name":row.3,"action":row.4,"target_type":row.5,"target_id":row.6,"correlation_id":row.7,"outcome":row.8,"detail":row.9,"created_at":api_timestamp(row.10)})).collect())))
 }
 
 async fn link_identity(
@@ -369,14 +607,16 @@ async fn members(
 ) -> ApiResult<Json<Value>> {
     let who = principal(&state, &headers).await?;
     authority(&state, who.user_id, id).await?;
-    let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String,i32,Value)>(
+    let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String,i32,Value,Option<Uuid>,Option<String>)>(
         "select u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,
-           coalesce(jsonb_object_agg(t.target,jsonb_build_object('state',t.state,'desired_epoch',t.desired_epoch,'applied_epoch',t.applied_epoch,'error',t.safe_error_class)) filter(where t.target is not null),'{}')
+           coalesce(jsonb_object_agg(t.target,jsonb_build_object('state',t.state,'desired_epoch',t.desired_epoch,'applied_epoch',t.applied_epoch,'error',t.safe_error_class,'observed_at',t.observed_at)) filter(where t.target is not null),'{}'),
+           latest.id,latest.state
          from control.memberships m join control.users u on u.id=m.user_id
          left join control.membership_targets t on t.workshop_id=m.workshop_id and t.user_id=m.user_id
-         where m.workshop_id=$1 group by u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch order by u.email",
+         left join lateral (select id,state from control.operations where workshop_id=m.workshop_id and target_user_id=m.user_id and kind='membership.reconcile' order by created_at desc,id desc limit 1) latest on true
+         where m.workshop_id=$1 group by u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,latest.id,latest.state order by u.email",
     ).bind(id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r| json!({"id":r.0,"email":r.1,"display_name":r.2,"role":r.3,"status":r.4,"authority_epoch":r.5,"targets":r.6})).collect())))
+    Ok(Json(Value::Array(rows.into_iter().map(|r| json!({"id":r.0,"email":r.1,"display_name":r.2,"role":r.3,"status":r.4,"authority_epoch":r.5,"targets":r.6,"operation_id":r.7,"operation_state":r.8})).collect())))
 }
 
 #[derive(Deserialize)]
@@ -1012,28 +1252,13 @@ async fn database(
     .bind(id)
     .fetch_all(state.store.pool())
     .await?;
-    let recovery = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            String,
-            String,
-            String,
-            Option<i64>,
-            OffsetDateTime,
-            Option<OffsetDateTime>,
-            Option<Uuid>,
-            Option<String>,
-            Vec<String>,
-            String,
-            String,
-            Option<OffsetDateTime>,
-            Option<OffsetDateTime>,
-        ),
-    >(
+    let recovery = sqlx::query_as::<_, RecoveryPointRow>(
         "select r.id,r.kind,r.label,r.state,r.size_bytes,r.created_at,r.ready_at,
-                r.operation_id,o.state,r.component_scope,r.format_version,
-                r.storage_location,r.verified_at,r.expires_at
+                r.operation_id,o.state as operation_state,r.component_scope,r.format_version,
+                r.storage_location,r.verified_at,r.expires_at,
+                coalesce(o.progress_percent,0) as progress_percent,
+                o.progress_phase,o.progress_message,
+                o.progress_updated_at,r.archive_size_bytes
          from control.workshop_recovery_points r
          left join control.operations o on o.id=r.operation_id
          where r.workshop_id=$1 and r.state<>'deleted'
@@ -1046,8 +1271,82 @@ async fn database(
         "can_manage": role.can_manage_database(),
         "primary": primary.map(|row| json!({"id":row.0,"public_hostname":row.1,"state":row.2,"created_at":api_timestamp(row.3),"last_restored_at":row.4.map(api_timestamp)})),
         "duplicates": duplicates.into_iter().map(|row| json!({"id":row.0,"label":row.1,"state":row.2,"routable":false,"created_at":api_timestamp(row.3)})).collect::<Vec<_>>(),
-        "recovery_points": recovery.into_iter().map(|row| json!({"id":row.0,"kind":row.1,"label":row.2,"state":row.3,"size_bytes":row.4,"created_at":api_timestamp(row.5),"ready_at":row.6.map(api_timestamp),"operation_id":row.7,"operation_state":row.8,"component_scope":row.9,"format_version":row.10,"storage_location":row.11,"verified_at":row.12.map(api_timestamp),"expires_at":row.13.map(api_timestamp)})).collect::<Vec<_>>()
+        "recovery_points": recovery.into_iter().map(|row| {
+            let downloadable = row.kind == "backup" && row.state == "ready" && row.verified_at.is_some() && row.archive_size_bytes.is_some();
+            json!({"id":row.id,"kind":row.kind,"label":row.label,"state":row.state,"size_bytes":row.size_bytes,"created_at":api_timestamp(row.created_at),"ready_at":row.ready_at.map(api_timestamp),"operation_id":row.operation_id,"operation_state":row.operation_state,"component_scope":row.component_scope,"format_version":row.format_version,"storage_location":row.storage_location,"verified_at":row.verified_at.map(api_timestamp),"expires_at":row.expires_at.map(api_timestamp),"progress_percent":row.progress_percent,"progress_phase":row.progress_phase,"progress_message":row.progress_message,"progress_updated_at":row.progress_updated_at.map(api_timestamp),"archive_size_bytes":row.archive_size_bytes,"downloadable":downloadable})
+        }).collect::<Vec<_>>()
     })))
+}
+
+#[derive(sqlx::FromRow)]
+struct RecoveryPointRow {
+    id: Uuid,
+    kind: String,
+    label: String,
+    state: String,
+    size_bytes: Option<i64>,
+    created_at: OffsetDateTime,
+    ready_at: Option<OffsetDateTime>,
+    operation_id: Option<Uuid>,
+    operation_state: Option<String>,
+    component_scope: Vec<String>,
+    format_version: String,
+    storage_location: String,
+    verified_at: Option<OffsetDateTime>,
+    expires_at: Option<OffsetDateTime>,
+    progress_percent: i16,
+    progress_phase: Option<String>,
+    progress_message: Option<String>,
+    progress_updated_at: Option<OffsetDateTime>,
+    archive_size_bytes: Option<i64>,
+}
+
+async fn download_backup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((workshop, recovery)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<Value>> {
+    let who = principal(&state, &headers).await?;
+    require_database_owner(&state, who.user_id, workshop).await?;
+    let downloadable = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_recovery_points
+         where id=$1 and workshop_id=$2 and kind='backup' and state='ready'
+           and verification_state='verified' and archive_object_key is not null)",
+    )
+    .bind(recovery)
+    .bind(workshop)
+    .fetch_one(state.store.pool())
+    .await?;
+    if !downloadable {
+        return Err(ApiError::Conflict(
+            "backup archive is not ready for download",
+        ));
+    }
+    let response = reqwest::Client::builder()
+        .timeout(state.config.request_timeout)
+        .build()
+        .map_err(|error| ApiError::Internal(error.into()))?
+        .post(format!(
+            "{}v1/tenants/{workshop}/download",
+            state.config.deployment_driver_url.as_str()
+        ))
+        .bearer_auth(&state.config.deployment_driver_token)
+        .header("idempotency-key", Uuid::new_v4().to_string())
+        .json(&json!({"recovery_point_id": recovery}))
+        .send()
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    if !status.is_success() {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "deployment driver refused backup download"
+        )));
+    }
+    Ok(Json(value))
 }
 
 #[derive(Deserialize)]
@@ -1382,9 +1681,11 @@ async fn operation(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let who = principal(&state, &headers).await?;
-    let row=sqlx::query_as::<_,(String,String,Option<Uuid>,i32,i32,Option<String>,OffsetDateTime,Option<OffsetDateTime>)>("select kind,state,workshop_id,attempt,max_attempts,failure_class,created_at,finished_at from control.operations where id=$1").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+    let row=sqlx::query_as::<_,(String,String,Option<Uuid>,i32,i32,Option<String>,OffsetDateTime,Option<OffsetDateTime>,i16,Option<String>,Option<String>,Option<OffsetDateTime>)>("select kind,state,workshop_id,attempt,max_attempts,failure_class,created_at,finished_at,progress_percent,progress_phase,progress_message,progress_updated_at from control.operations where id=$1").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
     if let Some(workshop) = row.2 {
-        authority(&state, who.user_id, workshop).await?;
+        if !is_operator(&state, &who) {
+            authority(&state, who.user_id, workshop).await?;
+        }
     } else if who.user_id
         != sqlx::query_scalar::<_, Uuid>("select requested_by from control.operations where id=$1")
             .bind(id)
@@ -1394,7 +1695,7 @@ async fn operation(
         return Err(ApiError::NotFound);
     }
     Ok(Json(
-        json!({"id":id,"kind":row.0,"state":row.1,"workshop_id":row.2,"attempt":row.3,"max_attempts":row.4,"failure_class":row.5,"created_at":api_timestamp(row.6),"finished_at":row.7.map(api_timestamp)}),
+        json!({"id":id,"kind":row.0,"state":row.1,"workshop_id":row.2,"attempt":row.3,"max_attempts":row.4,"failure_class":row.5,"created_at":api_timestamp(row.6),"finished_at":row.7.map(api_timestamp),"progress_percent":row.8,"progress_phase":row.9,"progress_message":row.10,"progress_updated_at":row.11.map(api_timestamp)}),
     ))
 }
 
@@ -1411,7 +1712,9 @@ async fn retry_operation(
     .fetch_optional(state.store.pool())
     .await?
     .ok_or(ApiError::NotFound)?;
-    if let Some(workshop) = row.0 {
+    if let Some(workshop) = row.0
+        && !is_operator(&state, &who)
+    {
         let role = authority(&state, who.user_id, workshop).await?.0;
         if (row.1 == "tenant.lifecycle" && !role.can_manage_database())
             || (row.1 != "tenant.lifecycle" && !role.can_manage_members())
@@ -1419,12 +1722,24 @@ async fn retry_operation(
             return Err(ApiError::Forbidden);
         }
     }
-    let changed=sqlx::query("update control.operations set state='pending',attempt=0,next_attempt_at=now(),failure_class=null,finished_at=null where id=$1 and state='dead_letter'").bind(id).execute(state.store.pool()).await?;
+    let mut tx = state.store.begin().await?;
+    let changed=sqlx::query("update control.operations set state='pending',attempt=0,next_attempt_at=now(),failure_class=null,finished_at=null where id=$1 and state='dead_letter'").bind(id).execute(&mut *tx).await?;
     if changed.rows_affected() != 1 {
         return Err(ApiError::Conflict(
             "only dead-letter operations can be retried",
         ));
     }
+    audit(
+        &mut tx,
+        Some(who.user_id),
+        row.0,
+        "operation.retry",
+        "operation",
+        id.to_string(),
+        Uuid::new_v4(),
+    )
+    .await?;
+    tx.commit().await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({"id":id,"state":"pending"})),
@@ -1489,6 +1804,16 @@ async fn reconcile_tenant(
     Path(workshop_id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     internal(&state, &headers)?;
+    let correlation = Uuid::new_v4();
+    queue_tenant_reconciliation(&state, workshop_id, None, &format!("manual:{correlation}")).await
+}
+
+async fn queue_tenant_reconciliation(
+    state: &AppState,
+    workshop_id: Uuid,
+    requested_by: Option<Uuid>,
+    key: &str,
+) -> ApiResult<(StatusCode, Json<Value>)> {
     let tenant = sqlx::query_as::<_, (Uuid, String, String, String)>(
         "select d.id,w.slug,d.database_ref,d.public_hostname
          from control.workshops w
@@ -1525,10 +1850,20 @@ async fn reconcile_tenant(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: None,
+            requested_by,
             correlation_id: correlation,
-            idempotency_key: &format!("manual:{correlation}"),
+            idempotency_key: key,
         },
+    )
+    .await?;
+    audit(
+        &mut tx,
+        requested_by,
+        Some(workshop_id),
+        "tenant.reconcile",
+        "workshop",
+        workshop_id.to_string(),
+        correlation,
     )
     .await?;
     tx.commit().await?;

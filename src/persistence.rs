@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0008_recovery_rehearsal_driver_action";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0009_recovery_archives_and_progress";
 
 #[derive(Clone)]
 pub struct Store {
@@ -185,6 +185,10 @@ impl Store {
             "update control.operations set state=$4,failure_class=$5,
                 next_attempt_at=now()+make_interval(secs=>$6),
                 leased_by=null,lease_expires_at=null,
+                progress_percent=case when $4='succeeded' then 100 else progress_percent end,
+                progress_phase=case when $4='succeeded' then 'complete' else progress_phase end,
+                progress_message=case when $4='succeeded' then 'Complete' else progress_message end,
+                progress_updated_at=now(),
                 finished_at=case when $7 then now() else null end
              where id=$1 and leased_by=$2 and attempt=$3 and state='in_flight'",
         )

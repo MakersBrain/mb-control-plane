@@ -28,7 +28,8 @@ workshops/<workshop-id>/recovery/<recovery-id>/
 ├── paperless/data.tar.zst.enc        # index and auxiliary data
 ├── paperless/consume.tar.zst.enc     # unprocessed uploads
 ├── manifest.json.enc
-└── complete.json                     # uploaded last
+├── complete.json                     # component-set commit marker
+└── makersbrain-workshop-backup.tar   # downloadable bundle of the files above
 ```
 
 The manifest records:
@@ -63,8 +64,9 @@ use the recorded Paperless image version before a separate application upgrade:
    authenticated client-side encryption directly into multipart S3 uploads.
    Plaintext backup artifacts must not be staged persistently on disk.
 7. Upload the encrypted manifest after all components have succeeded.
-8. Verify remote sizes, checksums and encryption authentication, then upload
-   `complete.json` as the commit marker.
+8. Build the single-file portable archive on the server, upload every object,
+   verify remote sizes and checksums, then upload `complete.json` last as the
+   component-set commit marker.
 9. Restart Paperless, release Odoo database quiescence, reopen routes and resume
    queued operations.
 10. Mark the recovery point `ready` only after remote verification. Otherwise

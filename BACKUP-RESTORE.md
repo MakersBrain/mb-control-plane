@@ -2,9 +2,10 @@
 
 The control UI replaces Odoo's native database manager. Only a workshop owner
 can request lifecycle actions, and callers never submit or see a physical
-database name, filesystem path, bucket name, object key, or storage URL. The
-deployment driver resolves an authenticated recovery ID against control-plane
-state.
+database name, filesystem path, bucket name, or object key. The deployment
+driver resolves an authenticated recovery ID against control-plane state. A
+download request returns only a ten-minute, read-only signed URL for the
+verified portable archive.
 
 The API supports:
 
@@ -43,6 +44,15 @@ infrastructure restores secret references from the approved secret manager.
 
 ## Portable backup
 
+A snapshot is an environment-local recovery point optimized for quick rollback.
+It depends on the current deployment and is not downloadable. A backup is the
+portable form: the server-side lifecycle worker creates one
+`makersbrain-workshop-backup.tar` containing the encrypted components, encrypted
+manifest and completion marker, uploads it to S3, and verifies it before making
+the Download action available. Requesting a download never sends S3 credentials
+to the API or browser; the isolated driver signs the verified archive for ten
+minutes using its read-only identity.
+
 The backup helper streams PostgreSQL dumps and tar archives through zstd and age
 before writing a local ciphertext staging object. It then uses AWS CLI managed
 multipart transfers to the environment's private Scaleway S3 bucket. Every
@@ -78,6 +88,12 @@ verified portable backup at least monthly by downloading, authenticating,
 decrypting and restoring its database dumps into disposable databases. The
 result is persisted in `workshop_recovery_rehearsals` and the live workshop is
 never modified.
+
+Lifecycle progress is persisted on the operation as phase, message and
+percentage. The control UI refreshes active operations once per second, so
+capture, encryption, packaging, S3 upload and verification remain visible after
+a page reload. Percentages are phase-based because the helper intentionally does
+not expose S3 transfer internals or credentials to application workers.
 
 ## Restore
 

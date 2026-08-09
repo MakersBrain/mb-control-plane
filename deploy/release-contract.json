@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 1,
   "release": "0.1.0",
-  "schema_release": "0008_recovery_rehearsal_driver_action",
+  "schema_release": "0009_recovery_archives_and_progress",
   "schema_compatibility": ">=0008_recovery_rehearsal_driver_action,<0009",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
@@ -30,6 +30,7 @@
     "email_worker": ["CONTROL_DATABASE_URL", "CONTROL_MAIL_WEBHOOK_URL", "CONTROL_MAIL_WEBHOOK_TOKEN"]
   },
   "optional_environment": {
+    "platform_operators": ["CONTROL_OPERATOR_EMAILS"],
     "azure_invoice_extraction": ["CONTROL_AZURE_ENDPOINT", "CONTROL_AZURE_KEY", "CONTROL_AZURE_API_VERSION", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS", "CONTROL_AZURE_POLL_INTERVAL_MS"],
     "paperless": ["DRIVER_PAPERLESS_IMAGE"],
     "portable_backups": ["DRIVER_BACKUP_AGENT_IMAGE", "BACKUP_S3_BUCKET", "BACKUP_S3_ENDPOINT", "BACKUP_S3_REGION", "BACKUP_S3_ACCESS_KEY_ID", "BACKUP_S3_SECRET_ACCESS_KEY", "RESTORE_S3_ACCESS_KEY_ID", "RESTORE_S3_SECRET_ACCESS_KEY", "BACKUP_AGE_RECIPIENT", "BACKUP_AGE_IDENTITY_FILE", "BACKUP_ENCRYPTION_KEY_ID", "BACKUP_RETENTION_DAYS", "CONTROL_BACKUP_SCHEDULER_ENABLED", "CONTROL_BACKUP_INTERVAL_SECONDS"]
@@ -46,5 +47,5 @@
   "invoice_capture": {"optional_module": "invoice-capture", "depends_on": ["documents"], "azure_module": "azure-invoice-extraction", "azure_optional": true},
   "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge"], "optional_modules": ["mb_invoice_capture"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another"},
   "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
-  "rollback": {"application": "requires an application release compatible with 0008_recovery_rehearsal_driver_action", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
+  "rollback": {"application": "requires an application release compatible with 0009_recovery_archives_and_progress", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
 }

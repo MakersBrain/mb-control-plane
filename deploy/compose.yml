@@ -126,7 +126,10 @@ services:
       CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: localhost
       CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
+      CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
       CONTROL_ALLOW_SELF_SIGNUP: "true"
+      CONTROL_OPERATOR_EMAILS: ${CONTROL_OPERATOR_EMAILS:-}
     ports: ["127.0.0.1:${CONTROL_API_PORT:-8080}:8080"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -142,6 +145,7 @@ services:
         VITE_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
         VITE_OIDC_CLIENT_ID: makersbrain-members
         VITE_OIDC_REDIRECT_URI: http://localhost:${CONTROL_WEB_PORT:-4175}/oauth/callback
+        VITE_ACCOUNT_URL: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}
     ports: ["127.0.0.1:${CONTROL_WEB_PORT:-4175}:8080"]
     restart: unless-stopped
 

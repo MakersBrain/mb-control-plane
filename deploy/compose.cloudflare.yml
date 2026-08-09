@@ -29,6 +29,7 @@ services:
         VITE_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1
         VITE_OIDC_CLIENT_ID: makersbrain-members
         VITE_OIDC_REDIRECT_URI: https://control.${PUBLIC_DOMAIN}/oauth/callback
+        VITE_ACCOUNT_URL: https://auth.${PUBLIC_DOMAIN}
 
   integration-fixture:
     environment:

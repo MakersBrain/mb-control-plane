@@ -423,9 +423,12 @@ async fn tenant(
     }
     if !matches!(
         action.as_str(),
-        "provision" | "reconcile" | "lifecycle" | "rehearse"
+        "provision" | "reconcile" | "lifecycle" | "rehearse" | "download"
     ) {
         return Err(DriverError(StatusCode::NOT_FOUND, "unknown action".into()));
+    }
+    if action == "download" {
+        return download_backup(&state, workshop, &payload).await.map(Json);
     }
     let idempotency_key = headers
         .get("idempotency-key")
@@ -474,6 +477,64 @@ async fn tenant(
             Err(error)
         }
     }
+}
+
+async fn download_backup(
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
+) -> Result<Value, DriverError> {
+    let recovery = payload_uuid(payload, "recovery_point_id")?;
+    let object_key = sqlx::query_scalar::<_, String>(
+        "select archive_object_key from control.workshop_recovery_points
+         where id=$1 and workshop_id=$2 and kind='backup' and state='ready'
+           and verification_state='verified' and archive_object_key is not null",
+    )
+    .bind(recovery)
+    .bind(workshop)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| DriverError::bad("backup archive is not ready for download"))?;
+    let s3 = state
+        .config
+        .s3_backup
+        .as_ref()
+        .ok_or_else(|| DriverError::bad("portable S3 backups are not configured"))?;
+    let image = state
+        .config
+        .backup_agent_image
+        .as_ref()
+        .ok_or_else(|| DriverError::bad("backup agent image is not configured"))?;
+    let result_name = format!("presigned-{}.txt", Uuid::new_v4());
+    let result_path = state.config.backup_root.join(&result_name);
+    run_docker_job(
+        state,
+        &format!("mb-presign-{}", &recovery.simple().to_string()[..12]),
+        json!({
+            "Image": image,
+            "User": "0:0",
+            "Cmd": ["sh", "-ec", format!("set -eu; umask 077; aws --endpoint-url \"$S3_ENDPOINT\" s3 presign --expires-in 600 \"s3://$S3_BUCKET/$ARCHIVE_KEY\" > /backups/{result_name}")],
+            "Env": [
+                format!("AWS_ACCESS_KEY_ID={}", s3.reader_access_key_id),
+                format!("AWS_SECRET_ACCESS_KEY={}", s3.reader_secret_access_key),
+                format!("AWS_DEFAULT_REGION={}", s3.region),
+                format!("S3_ENDPOINT={}", s3.endpoint),
+                format!("S3_BUCKET={}", s3.bucket),
+                format!("ARCHIVE_KEY={object_key}"),
+            ],
+            "Labels": {"makersbrain.kind":"s3-backup-presign-job"},
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
+        }),
+    )
+    .await?;
+    let url = std::fs::read_to_string(&result_path)
+        .map_err(DriverError::internal)?
+        .trim()
+        .to_owned();
+    let _ = std::fs::remove_file(&result_path);
+    Url::parse(&url).map_err(DriverError::internal)?;
+    Ok(json!({"url":url,"expires_in":600,"filename":format!("makersbrain-{recovery}.tar")}))
 }
 
 async fn rehearse(
@@ -1375,6 +1436,14 @@ async fn create_remote_recovery_set(
     kind: &str,
     component_scope: &[String],
 ) -> Result<Value, DriverError> {
+    update_recovery_progress(
+        state,
+        recovery,
+        10,
+        "capturing",
+        "Capturing workshop databases and files",
+    )
+    .await?;
     let s3 = state
         .config
         .s3_backup
@@ -1438,6 +1507,14 @@ async fn create_remote_recovery_set(
             "Labels": {"makersbrain.kind":"encrypted-backup-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": binds}
         }),
+    )
+    .await?;
+    update_recovery_progress(
+        state,
+        recovery,
+        45,
+        "encrypting",
+        "Encrypted workshop components created",
     )
     .await?;
 
@@ -1537,9 +1614,47 @@ async fn create_remote_recovery_set(
         serde_json::to_vec_pretty(&complete).map_err(DriverError::internal)?,
     )
     .map_err(DriverError::internal)?;
+    update_recovery_progress(
+        state,
+        recovery,
+        60,
+        "packaging",
+        "Building portable archive",
+    )
+    .await?;
+    const ARCHIVE_NAME: &str = "makersbrain-workshop-backup.tar";
+    run_docker_job(
+        state,
+        &format!("mb-archive-{}", &recovery.simple().to_string()[..12]),
+        json!({
+            "Image": image,
+            "User": "0:0",
+            "Cmd": ["sh", "-ec", format!("set -eu; umask 077; root=/backups/{}; tar -C \"$root\" -cf \"$root/{ARCHIVE_NAME}\" odoo {} manifest.json.enc complete.json", relative.to_string_lossy(), if includes_paperless { "paperless" } else { "" })],
+            "Labels": {"makersbrain.kind":"portable-backup-archive-job"},
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
+        }),
+    )
+    .await?;
     let object_prefix = format!("workshops/{workshop}/recovery/{recovery}");
+    update_recovery_progress(
+        state,
+        recovery,
+        72,
+        "uploading",
+        "Uploading encrypted archive to S3",
+    )
+    .await?;
     upload_and_verify_s3(state, &relative, &object_prefix, &manifest).await?;
-    let size_bytes = directory_size(&directory).map_err(DriverError::internal)?;
+    update_recovery_progress(
+        state,
+        recovery,
+        92,
+        "verifying",
+        "Verifying the uploaded archive",
+    )
+    .await?;
+    let archive_component = recovery_component("portable-archive", ARCHIVE_NAME, &directory)?;
+    let size_bytes = archive_component.size_bytes;
     let storage_ref = format!("s3://{}/{object_prefix}", s3.bucket);
     let mut recorded_components = manifest.components.clone();
     let mut manifest_component = recovery_component("manifest", "manifest.json.enc", &directory)?;
@@ -1550,6 +1665,7 @@ async fn create_remote_recovery_set(
         "complete.json",
         &directory,
     )?);
+    recorded_components.push(archive_component.clone());
     std::fs::remove_dir_all(&directory).map_err(DriverError::internal)?;
     Ok(json!({
         "storage_ref": storage_ref,
@@ -1563,7 +1679,33 @@ async fn create_remote_recovery_set(
         "object_prefix": object_prefix,
         "retention_days": s3.retention_days,
         "components": recorded_components,
+        "archive_object_key": format!("{object_prefix}/{ARCHIVE_NAME}"),
+        "archive_size_bytes": archive_component.size_bytes,
+        "archive_digest": archive_component.sha256,
     }))
+}
+
+async fn update_recovery_progress(
+    state: &DriverState,
+    recovery: Uuid,
+    percent: i16,
+    phase: &str,
+    message: &str,
+) -> Result<(), DriverError> {
+    sqlx::query(
+        "update control.operations o set progress_percent=$2,progress_phase=$3,
+                progress_message=$4,progress_updated_at=now()
+         from control.workshop_recovery_points r
+         where r.id=$1 and r.operation_id=o.id and o.state='in_flight'",
+    )
+    .bind(recovery)
+    .bind(percent)
+    .bind(phase)
+    .bind(message)
+    .execute(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?;
+    Ok(())
 }
 
 async fn upload_and_verify_s3(
@@ -1580,9 +1722,10 @@ async fn upload_and_verify_s3(
         .map(|component| component.path.clone())
         .collect::<Vec<_>>();
     object_paths.push("manifest.json.enc".to_owned());
+    object_paths.push("makersbrain-workshop-backup.tar".to_owned());
     let files = object_paths.join(" ");
     let command = format!(
-        "set -eu; set -o pipefail; root=/backups/{}; for file in {files}; do aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; local_sum=$(sha256sum \"$root/$file\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/$file\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"; done; aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/complete.json\" \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\"; local_sum=$(sha256sum \"$root/complete.json\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"",
+        "set -eu; set -o pipefail; root=/backups/{}; for file in {files}; do if [ \"$file\" = makersbrain-workshop-backup.tar ]; then aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors --content-type application/x-tar --content-disposition 'attachment; filename=\"makersbrain-workshop-backup.tar\"' \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; else aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; fi; local_sum=$(sha256sum \"$root/$file\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/$file\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"; done; aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/complete.json\" \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\"; local_sum=$(sha256sum \"$root/complete.json\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"",
         relative.to_string_lossy()
     );
     run_docker_job(

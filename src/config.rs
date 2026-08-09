@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -23,7 +24,10 @@ pub struct Config {
     pub oidc_discovery_url: Url,
     pub tenant_domain: String,
     pub internal_token: String,
+    pub deployment_driver_url: Url,
+    pub deployment_driver_token: String,
     pub allow_self_signup: bool,
+    pub operator_emails: HashSet<String>,
     pub request_timeout: Duration,
 }
 
@@ -48,8 +52,16 @@ impl Config {
             oidc_discovery_url: absolute_url("CONTROL_OIDC_DISCOVERY_URL")?,
             tenant_domain: tenant_domain()?,
             internal_token: required("CONTROL_INTERNAL_TOKEN")?,
+            deployment_driver_url: absolute_url("CONTROL_DEPLOYMENT_DRIVER_URL")?,
+            deployment_driver_token: required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
             allow_self_signup: std::env::var("CONTROL_ALLOW_SELF_SIGNUP")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            operator_emails: std::env::var("CONTROL_OPERATOR_EMAILS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect(),
             request_timeout: Duration::from_secs(20),
         })
     }

@@ -38,6 +38,16 @@ name resolves to loopback in modern browsers. The mail fixture remains local;
 tenant provisioning uses the authenticated Docker driver and the same private
 HTTP contract used by later infrastructure drivers.
 
+The same frontend contains a permission-separated platform operator console at
+`http://localhost:4175/platform`. Only verified accounts listed, comma
+separated, in `CONTROL_OPERATOR_EMAILS` receive the operator navigation or API
+access. Workshop ownership never grants platform authority. The console shows
+fleet and account directories, per-workshop service health, signed entitlement
+state and metering, durable operation progress and safe failure classes, queue
+and recovery evidence, email delivery metadata, retry and reconciliation
+controls, and the append-only audit journal; it never returns operation or
+email payloads, signed tokens, or credentials.
+
 ### HTTPS workspace through Cloudflare Tunnel
 
 `../../makersbrain-infra/environments/development/developer-tunnels` owns the

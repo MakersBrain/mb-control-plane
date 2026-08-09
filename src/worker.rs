@@ -854,6 +854,15 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
         .get("action")
         .and_then(Value::as_str)
         .ok_or(IntegrationError::ContractDrift)?;
+    sqlx::query(
+        "update control.operations set progress_percent=2,progress_phase='preparing',
+                progress_message='Preparing workshop recovery operation',progress_updated_at=now()
+         where id=$1 and state='in_flight'",
+    )
+    .bind(operation.id)
+    .execute(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
     match action {
         "snapshot" | "backup" => {
             let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
@@ -952,6 +961,9 @@ async fn record_recovery_ready(
     let paperless_version = result.get("paperless_version").and_then(Value::as_str);
     let encryption_key_id = result.get("encryption_key_id").and_then(Value::as_str);
     let object_prefix = result.get("object_prefix").and_then(Value::as_str);
+    let archive_object_key = result.get("archive_object_key").and_then(Value::as_str);
+    let archive_size_bytes = result.get("archive_size_bytes").and_then(Value::as_i64);
+    let archive_digest = result.get("archive_digest").and_then(Value::as_str);
     let retention_days = result
         .get("retention_days")
         .and_then(Value::as_i64)
@@ -964,8 +976,8 @@ async fn record_recovery_ready(
         .begin()
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
-    sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$4,format_version=$5,storage_location=$6,source_release=$7,paperless_version=$8,encryption_key_id=$9,object_prefix=$10,expires_at=case when kind='backup' then now()+make_interval(days=>$11) else expires_at end where id=$1")
-        .bind(recovery).bind(storage_ref).bind(size_bytes).bind(manifest_digest).bind(format_version).bind(storage_location).bind(source_release).bind(paperless_version).bind(encryption_key_id).bind(object_prefix).bind(i32::try_from(retention_days).map_err(|_|IntegrationError::ContractDrift)?).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+    sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$4,format_version=$5,storage_location=$6,source_release=$7,paperless_version=$8,encryption_key_id=$9,object_prefix=$10,expires_at=case when kind='backup' then now()+make_interval(days=>$11) else expires_at end,archive_object_key=$12,archive_size_bytes=$13,archive_digest=$14 where id=$1")
+        .bind(recovery).bind(storage_ref).bind(size_bytes).bind(manifest_digest).bind(format_version).bind(storage_location).bind(source_release).bind(paperless_version).bind(encryption_key_id).bind(object_prefix).bind(i32::try_from(retention_days).map_err(|_|IntegrationError::ContractDrift)?).bind(archive_object_key).bind(archive_size_bytes).bind(archive_digest).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
     sqlx::query("delete from control.workshop_recovery_components where recovery_point_id=$1")
         .bind(recovery)
         .execute(&mut *tx)

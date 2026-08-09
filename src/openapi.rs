@@ -6,6 +6,15 @@ pub fn document() -> Value {
     let routes = [
         ("/v1/version", "get", false),
         ("/v1/me", "get", true),
+        ("/v1/platform/overview", "get", true),
+        ("/v1/platform/workshops", "get", true),
+        ("/v1/platform/workshops/{id}", "get", true),
+        ("/v1/platform/workshops/{id}/reconcile", "post", true),
+        ("/v1/platform/operations", "get", true),
+        ("/v1/platform/users", "get", true),
+        ("/v1/platform/status", "get", true),
+        ("/v1/platform/email-deliveries", "get", true),
+        ("/v1/platform/audit-events", "get", true),
         ("/v1/identity/link", "post", true),
         ("/v1/workshops", "get", true),
         ("/v1/workshops", "post", true),
@@ -35,6 +44,11 @@ pub fn document() -> Value {
         ("/v1/workshops/{id}/database/restores", "post", true),
         ("/v1/workshops/{id}/database/duplicates", "post", true),
         ("/v1/operations/{id}", "get", true),
+        (
+            "/v1/workshops/{id}/database/backups/{recovery_id}/download",
+            "post",
+            true,
+        ),
         ("/v1/operations/{id}/retry", "post", true),
     ];
     let mut paths = Map::new();
@@ -63,6 +77,24 @@ mod tests {
             "/v1/operations/{id}/retry",
             "/v1/workshops/{id}/database",
             "/v1/workshops/{id}/database/restores",
+        ] {
+            assert!(value["paths"].get(path).is_some(), "missing {path}")
+        }
+    }
+
+    #[test]
+    fn contract_contains_operator_observability_and_repair_routes() {
+        let value = document();
+        for path in [
+            "/v1/platform/overview",
+            "/v1/platform/workshops",
+            "/v1/platform/workshops/{id}",
+            "/v1/platform/workshops/{id}/reconcile",
+            "/v1/platform/operations",
+            "/v1/platform/users",
+            "/v1/platform/status",
+            "/v1/platform/email-deliveries",
+            "/v1/platform/audit-events",
         ] {
             assert!(value["paths"].get(path).is_some(), "missing {path}")
         }
