@@ -320,7 +320,7 @@ async fn create_workshop(
         .bind(database_id).bind(workshop_id).bind(&database_ref).bind(&public_hostname).execute(&mut *tx).await?;
     sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key)
                  values($1,'tenant.provision','tenant-provisioning',$2,$3,1,$4,$3,$5,$6)")
-        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname})).bind(correlation_id).bind(&key).execute(&mut *tx).await?;
+        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname,"paperless_enabled":false})).bind(correlation_id).bind(&key).execute(&mut *tx).await?;
     audit(
         &mut tx,
         Some(who.user_id),
@@ -849,6 +849,7 @@ async fn modules(
                     "operation_id":state.and_then(|value|value.1),
                     "error":state.and_then(|value|value.3.as_deref()),
                     "can_manage":role.can_manage_modules(),
+                    "dependencies":bundle.dependencies,
                 })
             })
             .collect(),
@@ -865,8 +866,29 @@ async fn enable_module(
     if !role.can_manage_modules() {
         return Err(ApiError::Forbidden);
     }
-    if crate::modules::bundle(&module_key).is_none() {
-        return Err(ApiError::NotFound);
+    let bundle = crate::modules::bundle(&module_key).ok_or(ApiError::NotFound)?;
+    if !bundle.dependencies.is_empty() {
+        let enabled = sqlx::query_scalar::<_, String>(
+            "select module_key from control.workshop_modules
+             where workshop_id=$1 and state='enabled' and module_key = any($2)",
+        )
+        .bind(id)
+        .bind(bundle.dependencies)
+        .fetch_all(state.store.pool())
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        if let Some(missing) = bundle
+            .dependencies
+            .iter()
+            .find(|dependency| !enabled.contains(**dependency))
+        {
+            return Err(ApiError::Conflict(match *missing {
+                "documents" => "enable Documents first",
+                "invoice-capture" => "enable Invoice capture first",
+                _ => "enable the required module first",
+            }));
+        }
     }
     let client_key = idempotency(&headers)?;
     let stored_key = format!("module:{id}:{module_key}:{client_key}");
@@ -1382,6 +1404,16 @@ async fn paperless_event(
         .and_then(Value::as_i64)
         .filter(|id| *id > 0)
         .ok_or(ApiError::Validation("document_id is required"))?;
+    let capture_enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules
+         where workshop_id=$1 and module_key='invoice-capture' and state='enabled')",
+    )
+    .bind(workshop_id)
+    .fetch_one(state.store.pool())
+    .await?;
+    if !capture_enabled {
+        return Ok((StatusCode::OK, Json(json!({"ignored":true}))));
+    }
     let mut tx = state.store.begin().await?;
     let correlation = Uuid::new_v4();
     let key = format!(
@@ -1430,11 +1462,19 @@ async fn reconcile_tenant(
     .await?
     .ok_or(ApiError::NotFound)?;
     let paperless_hostname = format!("docs-{}.{}", tenant.1, state.config.tenant_domain);
+    let paperless_enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules
+         where workshop_id=$1 and module_key='documents' and state='enabled')",
+    )
+    .bind(workshop_id)
+    .fetch_one(state.store.pool())
+    .await?;
     let payload = json!({
         "database_id": tenant.0,
         "database_ref": tenant.2,
         "public_hostname": tenant.3,
         "paperless_hostname": paperless_hostname,
+        "paperless_enabled": paperless_enabled,
     });
     let mut tx = state.store.begin().await?;
     let correlation = Uuid::new_v4();
@@ -1481,7 +1521,14 @@ async fn seed_targets(
     user: Uuid,
     epoch: i32,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("insert into control.membership_targets(workshop_id,user_id,target,desired_epoch) select $1,$2,target,$3 from unnest(array['rauthy','odoo','paperless']) target on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
+    sqlx::query("insert into control.membership_targets(workshop_id,user_id,target,desired_epoch)
+        select $1,$2,target,$3 from unnest(array['rauthy','odoo']) target
+        union all
+        select $1,$2,'paperless',$3 where exists (
+            select 1 from control.workshop_modules
+            where workshop_id=$1 and module_key='documents' and state='enabled'
+        )
+        on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
         .bind(workshop).bind(user).bind(epoch).execute(&mut **tx).await?;
     Ok(())
 }

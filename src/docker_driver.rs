@@ -31,7 +31,7 @@ pub struct DockerDriverConfig {
     odoo_bridge_token: String,
     odoo_image: String,
     postgres_image: String,
-    paperless_image: String,
+    paperless_image: Option<String>,
     docker_network: String,
     odoo_container: String,
     odoo_volume: String,
@@ -78,7 +78,9 @@ impl DockerDriverConfig {
             odoo_bridge_token: required("DRIVER_ODOO_BRIDGE_TOKEN")?,
             odoo_image: required("DRIVER_ODOO_IMAGE")?,
             postgres_image: required("DRIVER_POSTGRES_IMAGE")?,
-            paperless_image: required("DRIVER_PAPERLESS_IMAGE")?,
+            paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             docker_network: required("DRIVER_DOCKER_NETWORK")?,
             odoo_container: required("DRIVER_ODOO_CONTAINER")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
@@ -270,91 +272,36 @@ async fn provision(
 ) -> Result<Value, DriverError> {
     let database_ref = opaque_database(payload, "database_ref")?;
     let odoo_hostname = hostname(payload, "public_hostname")?;
-    let paperless_hostname = hostname(payload, "paperless_hostname")?;
+    let paperless_enabled = payload
+        .get("paperless_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let paperless_hostname = if paperless_enabled {
+        Some(hostname(payload, "paperless_hostname")?)
+    } else {
+        None
+    };
     let compact = tenant_key(workshop);
-    let paperless_database = format!("pl_{compact}");
-    let paperless_role = paperless_database.clone();
-    let paperless_container = format!("mb-paperless-{compact}");
-    let redis_user = format!("pl_{compact}");
-    let redis_prefix = format!("mb:{compact}:");
     let tenant_secret_dir = state
         .config
         .secret_root
         .join("docker")
         .join(workshop.to_string());
     secure_directory(&tenant_secret_dir).map_err(DriverError::internal)?;
-    let paperless_admin = secret_value(&tenant_secret_dir.join("paperless-admin"), 64)
-        .map_err(DriverError::internal)?;
     let _odoo_admin =
         secret_value(&tenant_secret_dir.join("odoo-admin"), 64).map_err(DriverError::internal)?;
-    let paperless_db_password =
-        secret_value(&tenant_secret_dir.join("paperless-db"), 64).map_err(DriverError::internal)?;
-    let paperless_secret_key = secret_value(&tenant_secret_dir.join("paperless-secret-key"), 96)
-        .map_err(DriverError::internal)?;
-    let redis_password =
-        secret_value(&tenant_secret_dir.join("redis"), 64).map_err(DriverError::internal)?;
     write_secret(
         &tenant_secret_dir.join("odoo"),
         &state.config.odoo_bridge_token,
     )
     .map_err(DriverError::internal)?;
-    write_secret(
-        &tenant_secret_dir.join("paperless"),
-        &format!("basic:local-admin:{paperless_admin}"),
-    )
-    .map_err(DriverError::internal)?;
 
     ensure_database(&state.postgres, database_ref, "odoo", None).await?;
-    ensure_database(
-        &state.postgres,
-        &paperless_database,
-        &paperless_role,
-        Some(&paperless_db_password),
-    )
-    .await?;
-    ensure_redis_acl(
-        &state.config.redis_address,
-        &redis_user,
-        &redis_password,
-        &redis_prefix,
-    )
-    .await?;
-    let (odoo_client_id, paperless_client_id, paperless_oidc_secret) =
+    let (odoo_client_id, paperless_oidc) =
         ensure_oidc_clients(state, &compact, odoo_hostname, paperless_hostname).await?;
-    write_secret(
-        &tenant_secret_dir.join("paperless-oidc"),
-        &paperless_oidc_secret,
-    )
-    .map_err(DriverError::internal)?;
     ensure_odoo_database(state, database_ref, &compact).await?;
     ensure_odoo_break_glass(state, workshop, database_ref, &compact).await?;
-    ensure_paperless(
-        state,
-        workshop,
-        &paperless_container,
-        &paperless_database,
-        &paperless_role,
-        &paperless_db_password,
-        &paperless_admin,
-        &paperless_secret_key,
-        &redis_user,
-        &redis_password,
-        &redis_prefix,
-        &paperless_client_id,
-        &paperless_oidc_secret,
-        paperless_hostname,
-    )
-    .await?;
-    write_routes(
-        state,
-        workshop,
-        database_ref,
-        odoo_hostname,
-        paperless_hostname,
-        &paperless_container,
-    )
-    .await?;
-    Ok(json!({
+    let mut response = json!({
         "workshop_id": workshop,
         "action": "provision",
         "release_id": env!("CARGO_PKG_VERSION"),
@@ -364,15 +311,92 @@ async fn provision(
             "break_glass_secret_ref": format!("docker/{workshop}/odoo-admin"),
             "database": {"database_ref": database_ref, "public_hostname": odoo_hostname}
         },
-        "paperless": {
-            "base_url": format!("http://{paperless_container}:8000"),
-            "public_hostname": paperless_hostname,
-            "secret_ref": format!("docker/{workshop}/paperless")
-        },
         "odoo_oidc": {"client_id": odoo_client_id, "issuer": state.config.oidc_issuer},
-        "paperless_oidc": {"client_id": paperless_client_id, "issuer": state.config.oidc_issuer},
-        "redis": {"shared": true, "prefix": redis_prefix, "acl_user": redis_user}
-    }))
+    });
+
+    let route =
+        if let (Some(paperless_hostname), Some((paperless_client_id, paperless_oidc_secret))) =
+            (paperless_hostname, paperless_oidc)
+        {
+            let paperless_database = format!("pl_{compact}");
+            let paperless_role = paperless_database.clone();
+            let paperless_container = format!("mb-paperless-{compact}");
+            let redis_user = format!("pl_{compact}");
+            let redis_prefix = format!("mb:{compact}:");
+            let paperless_admin = secret_value(&tenant_secret_dir.join("paperless-admin"), 64)
+                .map_err(DriverError::internal)?;
+            let paperless_db_password = secret_value(&tenant_secret_dir.join("paperless-db"), 64)
+                .map_err(DriverError::internal)?;
+            let paperless_secret_key =
+                secret_value(&tenant_secret_dir.join("paperless-secret-key"), 96)
+                    .map_err(DriverError::internal)?;
+            let redis_password = secret_value(&tenant_secret_dir.join("redis"), 64)
+                .map_err(DriverError::internal)?;
+            write_secret(
+                &tenant_secret_dir.join("paperless"),
+                &format!("basic:local-admin:{paperless_admin}"),
+            )
+            .map_err(DriverError::internal)?;
+            write_secret(
+                &tenant_secret_dir.join("paperless-oidc"),
+                &paperless_oidc_secret,
+            )
+            .map_err(DriverError::internal)?;
+            ensure_database(
+                &state.postgres,
+                &paperless_database,
+                &paperless_role,
+                Some(&paperless_db_password),
+            )
+            .await?;
+            ensure_redis_acl(
+                &state.config.redis_address,
+                &redis_user,
+                &redis_password,
+                &redis_prefix,
+            )
+            .await?;
+            ensure_paperless(
+                state,
+                workshop,
+                &paperless_container,
+                &paperless_database,
+                &paperless_role,
+                &paperless_db_password,
+                &paperless_admin,
+                &paperless_secret_key,
+                &redis_user,
+                &redis_password,
+                &redis_prefix,
+                &paperless_client_id,
+                &paperless_oidc_secret,
+                paperless_hostname,
+            )
+            .await?;
+            response["paperless"] = json!({
+                "base_url": format!("http://{paperless_container}:8000"),
+                "public_hostname": paperless_hostname,
+                "secret_ref": format!("docker/{workshop}/paperless")
+            });
+            response["paperless_oidc"] =
+                json!({"client_id": paperless_client_id, "issuer": state.config.oidc_issuer});
+            response["redis"] =
+                json!({"shared": true, "prefix": redis_prefix, "acl_user": redis_user});
+            Some((paperless_hostname, paperless_container))
+        } else {
+            None
+        };
+    write_routes(
+        state,
+        workshop,
+        database_ref,
+        odoo_hostname,
+        route
+            .as_ref()
+            .map(|(hostname, container)| (*hostname, container.as_str())),
+    )
+    .await?;
+    Ok(response)
 }
 
 fn tenant_key(workshop: Uuid) -> String {
@@ -939,12 +963,10 @@ async fn ensure_oidc_clients(
     state: &DriverState,
     tenant_key: &str,
     odoo_hostname: &str,
-    paperless_hostname: &str,
-) -> Result<(String, String, String), DriverError> {
+    paperless_hostname: Option<&str>,
+) -> Result<(String, Option<(String, String)>), DriverError> {
     let odoo_id = format!("makersbrain-odoo-{tenant_key}");
-    let paperless_id = format!("makersbrain-paperless-{tenant_key}");
     let odoo_origin = state.config.public_origin(odoo_hostname);
-    let paperless_origin = state.config.public_origin(paperless_hostname);
     ensure_rauthy_client(
         state,
         &odoo_id,
@@ -954,6 +976,11 @@ async fn ensure_oidc_clients(
         &format!("{odoo_origin}/web/login"),
     )
     .await?;
+    let Some(paperless_hostname) = paperless_hostname else {
+        return Ok((odoo_id, None));
+    };
+    let paperless_id = format!("makersbrain-paperless-{tenant_key}");
+    let paperless_origin = state.config.public_origin(paperless_hostname);
     ensure_rauthy_client(
         state,
         &paperless_id,
@@ -987,7 +1014,7 @@ async fn ensure_oidc_clients(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| DriverError::internal("Rauthy did not return a client secret"))?;
-    Ok((odoo_id, paperless_id, secret))
+    Ok((odoo_id, Some((paperless_id, secret))))
 }
 
 async fn ensure_rauthy_client(
@@ -1061,7 +1088,7 @@ async fn ensure_odoo_database(
         &container,
         json!({
             "Image":state.config.odoo_image,
-            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,mb_invoice_capture,l10n_fr_micro_enterprise","--without-demo=all"],
+            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,l10n_fr_micro_enterprise","--without-demo=all"],
             "Env":[
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
@@ -1150,6 +1177,11 @@ async fn ensure_paperless(
     oidc_secret: &str,
     public_hostname: &str,
 ) -> Result<(), DriverError> {
+    let paperless_image = state
+        .config
+        .paperless_image
+        .as_deref()
+        .ok_or_else(|| DriverError::bad("Paperless is not configured for this deployment"))?;
     for suffix in ["data", "media", "consume"] {
         docker_create_volume(state, &format!("mb-paperless-{workshop}-{suffix}")).await?;
     }
@@ -1191,8 +1223,7 @@ async fn ensure_paperless(
     let config_digest = format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&(state.config.paperless_image.as_str(), &environment))
-                .map_err(DriverError::internal)?
+            serde_json::to_vec(&(paperless_image, &environment)).map_err(DriverError::internal)?
         )
     );
     if docker_container_exists(state, container).await? {
@@ -1213,7 +1244,7 @@ async fn ensure_paperless(
         state,
         container,
         json!({
-            "Image":state.config.paperless_image,
+            "Image":paperless_image,
             "Env":environment,
             "Labels":{"makersbrain.kind":"paperless","makersbrain.workshop":workshop.to_string(),"makersbrain.config-digest":config_digest},
             "HostConfig":{"NetworkMode":state.config.docker_network,"Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")]}
@@ -1252,13 +1283,17 @@ async fn write_routes(
     workshop: Uuid,
     database_ref: &str,
     odoo_hostname: &str,
-    paperless_hostname: &str,
-    paperless_container: &str,
+    paperless: Option<(&str, &str)>,
 ) -> Result<(), DriverError> {
-    let config = format!(
-        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\nserver {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n",
+    let mut config = format!(
+        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\n",
         database_ref
     );
+    if let Some((paperless_hostname, paperless_container)) = paperless {
+        config.push_str(&format!(
+            "server {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n"
+        ));
+    }
     let path = state.config.route_root.join(format!("{workshop}.conf"));
     let temporary = state.config.route_root.join(format!("{workshop}.conf.tmp"));
     let previous = std::fs::read(&path).ok();

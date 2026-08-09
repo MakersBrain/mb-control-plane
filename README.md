@@ -119,13 +119,18 @@ write access to that volume.
 
 ## Azure Document Intelligence
 
-Development uses the S0 resource at
-`https://makersbrain-development-documents.cognitiveservices.azure.com/`.
-Infrastructure publishes its live key to
+Paperless, invoice capture, and Azure extraction are enable-only workshop
+modules. Enable them in that order from the control UI. New workshops provision
+only Odoo and identity; existing workshops with a Paperless service are
+backfilled as enabled by migration `0006_optional_document_services`.
+
+Azure credentials are optional at process startup and are read only after a
+workshop enables `azure-invoice-extraction`. Enabling that module fails safely
+when `CONTROL_AZURE_ENDPOINT` or `CONTROL_AZURE_KEY` is absent. Infrastructure
+may publish the key to
 `makersbrain-runtime/dev/invoice-capture/AZURE_DOCUMENT_KEY` with
 `../../makersbrain-infra/scripts/azure-document-key.sh`; the key is never read
-from OpenTofu state by this package. Deployment maps that secret and the public
-endpoint to `CONTROL_AZURE_KEY` and `CONTROL_AZURE_ENDPOINT`.
+from OpenTofu state by this package.
 
 The invoice worker protects the trial subscription at three layers:
 
@@ -138,8 +143,12 @@ The invoice worker protects the trial subscription at three layers:
 Polling never runs faster than two seconds. Azure's successful-analyze and 429
 `Retry-After` values take precedence; a throttled POST is returned to the queue
 and its persisted `next_attempt_at` honors the provider delay (bounded to one
-hour) as well as exponential backoff. This prevents a restart or duplicate
-delivery from consuming the page allowance again.
+  hour) as well as exponential backoff. This prevents a restart or duplicate
+  delivery from consuming the page allowance again.
+
+With invoice capture enabled but Azure disabled, structured UBL, CII, and
+Factur-X invoices continue to import locally. Unstructured documents remain in
+Paperless for manual handling and do not consume an Azure request.
 
 See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for paired recovery and
 [`../CONTROL-PLANE-DESIGN.md`](../CONTROL-PLANE-DESIGN.md) for the architecture.

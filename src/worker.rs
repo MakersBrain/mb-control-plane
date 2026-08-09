@@ -95,25 +95,38 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
         .and_then(Value::as_str)
         .ok_or(IntegrationError::ContractDrift)?;
     let bundle = crate::modules::bundle(module_key).ok_or(IntegrationError::ContractDrift)?;
-    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
-    let odoo = OdooClient::new(
-        &odoo_url,
-        &secret(&odoo_ref)?,
-        database_ref.as_deref(),
-        Duration::from_secs(120),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
-    odoo.enable_modules(&ModuleEnableCommand {
-        operation_key: format!("module-enable:{workshop}:{module_key}:{}", operation.id),
-        workshop_id: workshop,
-        module_key: module_key.into(),
-        modules: bundle
-            .odoo_modules
-            .iter()
-            .map(|module| (*module).into())
-            .collect(),
-    })
-    .await?;
+    if bundle.service == Some("paperless") {
+        enable_paperless(store, operation, workshop).await?;
+    } else if module_key == "azure-invoice-extraction" {
+        AzureInvoiceClient::new(
+            &env("CONTROL_AZURE_ENDPOINT")?,
+            &env("CONTROL_AZURE_KEY")?,
+            &std::env::var("CONTROL_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
+    } else if !bundle.odoo_modules.is_empty() {
+        let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
+        let odoo = OdooClient::new(
+            &odoo_url,
+            &secret(&odoo_ref)?,
+            database_ref.as_deref(),
+            Duration::from_secs(120),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
+        odoo.enable_modules(&ModuleEnableCommand {
+            operation_key: format!("module-enable:{workshop}:{module_key}:{}", operation.id),
+            workshop_id: workshop,
+            module_key: module_key.into(),
+            modules: bundle
+                .odoo_modules
+                .iter()
+                .map(|module| (*module).into())
+                .collect(),
+        })
+        .await?;
+    }
     sqlx::query(
         "update control.workshop_modules set state='enabled',enabled_at=now()
          where workshop_id=$1 and module_key=$2 and operation_id=$3",
@@ -124,6 +137,95 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
     .execute(store.pool())
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
+    Ok(())
+}
+
+async fn enable_paperless(
+    store: &Store,
+    operation: &LeasedOperation,
+    workshop: Uuid,
+) -> Result<(), IntegrationError> {
+    let tenant = sqlx::query_as::<_, (Uuid, String, String, String)>(
+        "select d.id,w.slug,d.database_ref,d.public_hostname
+         from control.workshops w
+         join control.odoo_databases d on d.workshop_id=w.id
+         where w.id=$1 and w.status<>'deleted' and d.kind='primary'
+           and d.deleted_at is null and d.public_hostname is not null",
+    )
+    .bind(workshop)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::NotFound)?;
+    let paperless_hostname = format!("docs-{}.{}", tenant.1, env("CONTROL_TENANT_DOMAIN")?);
+    let payload = json!({
+        "database_id": tenant.0,
+        "database_ref": tenant.2,
+        "public_hostname": tenant.3,
+        "paperless_hostname": paperless_hostname,
+        "paperless_enabled": true,
+    });
+    let value = driver_request(store, operation.id, workshop, "reconcile", &payload).await?;
+    let paperless = value
+        .get("paperless")
+        .ok_or(IntegrationError::ContractDrift)?;
+    upsert_service(store, workshop, "paperless", paperless, &value).await?;
+
+    let members = sqlx::query_as::<_, (Uuid, i32)>(
+        "select user_id,authority_epoch from control.memberships where workshop_id=$1",
+    )
+    .bind(workshop)
+    .fetch_all(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    for (user, epoch) in members {
+        sqlx::query(
+            "insert into control.membership_targets(workshop_id,user_id,target,desired_epoch)
+             values($1,$2,'paperless',$3)
+             on conflict(workshop_id,user_id,target) do update set
+               desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null",
+        )
+        .bind(workshop)
+        .bind(user)
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+        let payload = json!({"active":true});
+        let key = format!("documents-enable:{workshop}:{user}:{epoch}");
+        let exists = sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.operations
+             where kind='membership.reconcile' and requested_by is null and idempotency_key=$1)",
+        )
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+        if !exists {
+            Store::enqueue(
+                &mut tx,
+                crate::persistence::NewOperation {
+                    kind: crate::domain::OperationKind::MembershipReconcile,
+                    workshop_id: Some(workshop),
+                    target_user_id: Some(user),
+                    desired_epoch: Some(epoch),
+                    payload: &payload,
+                    requested_by: None,
+                    correlation_id: Uuid::new_v4(),
+                    idempotency_key: &key,
+                },
+            )
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
 }
 
@@ -273,28 +375,44 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
         if active { "ready" } else { "disabled" },
     )
     .await?;
-    let paperless_result = async {
-        let (url, reference, _) = service(store, workshop, "paperless").await?;
-        let client = PaperlessClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
-            .map_err(|_| IntegrationError::ContractDrift)?;
-        let groups = client.ensure_groups(paperless_group_names(&row.3)?).await?;
-        client
-            .reconcile_user(&row.2, &row.0, active, &groups, row.3 == "owner")
-            .await
-    }
-    .await;
-    record_target(
-        store,
-        workshop,
-        user,
-        "paperless",
-        epoch,
-        &paperless_result,
-        if active { "ready" } else { "disabled" },
+    let has_paperless_target = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.membership_targets
+         where workshop_id=$1 and user_id=$2 and target='paperless')",
     )
-    .await?;
-    for result in [rauthy_result, odoo_result, paperless_result] {
-        result?
+    .bind(workshop)
+    .bind(user)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let paperless_result = if has_paperless_target {
+        let result = async {
+            let (url, reference, _) = service(store, workshop, "paperless").await?;
+            let client = PaperlessClient::new(&url, &secret(&reference)?, Duration::from_secs(20))
+                .map_err(|_| IntegrationError::ContractDrift)?;
+            let groups = client.ensure_groups(paperless_group_names(&row.3)?).await?;
+            client
+                .reconcile_user(&row.2, &row.0, active, &groups, row.3 == "owner")
+                .await
+        }
+        .await;
+        record_target(
+            store,
+            workshop,
+            user,
+            "paperless",
+            epoch,
+            &result,
+            if active { "ready" } else { "disabled" },
+        )
+        .await?;
+        Some(result)
+    } else {
+        None
+    };
+    rauthy_result?;
+    odoo_result?;
+    if let Some(result) = paperless_result {
+        result?;
     }
     Ok(())
 }
@@ -384,36 +502,45 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
         env("CONTROL_TENANT_DOMAIN")?
     );
     let digest = format!("{:x}", Sha256::digest(&source));
-    let (provider, invoice, confidence, pages) =
-        if let Some(invoice) = crate::invoice::structured(&source) {
-            ("structured", invoice, json!({}), 1_i64)
-        } else {
-            reserve_azure(
-                store,
-                operation.id,
-                workshop,
-                estimated_pages(&source, &mimetype),
-            )
-            .await?;
-            throttle_azure_submission(store).await?;
-            let azure = AzureInvoiceClient::new(
-                &env("CONTROL_AZURE_ENDPOINT")?,
-                &env("CONTROL_AZURE_KEY")?,
-                &std::env::var("CONTROL_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
-                Duration::from_secs(45),
-                Duration::from_millis(
-                    std::env::var("CONTROL_AZURE_POLL_INTERVAL_MS")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(2_000_u64)
-                        .max(2_000),
-                ),
-            )
-            .map_err(|_| IntegrationError::ContractDrift)?;
-            let result = azure.analyze(&source, &mimetype).await?;
-            let (invoice, confidence, pages) = crate::invoice::normalize_azure(&result)?;
-            ("azure", invoice, confidence, pages)
-        };
+    let (provider, invoice, confidence, pages) = if let Some(invoice) =
+        crate::invoice::structured(&source)
+    {
+        ("structured", invoice, json!({}), 1_i64)
+    } else {
+        if !module_enabled(store, workshop, "azure-invoice-extraction").await? {
+            tracing::info!(
+                workshop = %workshop,
+                document_id,
+                "unstructured invoice retained in Paperless because Azure extraction is disabled"
+            );
+            return Ok(());
+        }
+        reserve_azure(
+            store,
+            operation.id,
+            workshop,
+            estimated_pages(&source, &mimetype),
+        )
+        .await?;
+        throttle_azure_submission(store).await?;
+        let azure = AzureInvoiceClient::new(
+            &env("CONTROL_AZURE_ENDPOINT")?,
+            &env("CONTROL_AZURE_KEY")?,
+            &std::env::var("CONTROL_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
+            Duration::from_secs(45),
+            Duration::from_millis(
+                std::env::var("CONTROL_AZURE_POLL_INTERVAL_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(2_000_u64)
+                    .max(2_000),
+            ),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
+        let result = azure.analyze(&source, &mimetype).await?;
+        let (invoice, confidence, pages) = crate::invoice::normalize_azure(&result)?;
+        ("azure", invoice, confidence, pages)
+    };
     let requires_review = crate::invoice::requires_review(&invoice, &confidence);
     let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
     let odoo = OdooClient::new(
@@ -437,6 +564,22 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
         }
     }
     Ok(())
+}
+
+async fn module_enabled(
+    store: &Store,
+    workshop: Uuid,
+    module_key: &str,
+) -> Result<bool, IntegrationError> {
+    sqlx::query_scalar(
+        "select exists(select 1 from control.workshop_modules
+         where workshop_id=$1 and module_key=$2 and state='enabled')",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)
 }
 
 fn estimated_pages(source: &[u8], mimetype: &str) -> i64 {
@@ -532,52 +675,13 @@ async fn driver(
     let workshop = operation
         .workshop_id
         .ok_or(IntegrationError::ContractDrift)?;
-    let url = env("CONTROL_DEPLOYMENT_DRIVER_URL")?;
-    let token = env("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
-    // First-time Odoo and Paperless initialization can legitimately take several
-    // minutes. The operation lease is heartbeated while this request is in flight,
-    // and the driver persists idempotent outcomes for ambiguous disconnects.
-    let client = http_client(&token, Duration::from_secs(900))?;
-    let response = client
-        .post(format!(
-            "{}/v1/tenants/{workshop}/{action}",
-            url.trim_end_matches('/')
-        ))
-        .header("idempotency-key", operation.id.to_string())
-        .json(&operation.payload)
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
-    let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|_| IntegrationError::ContractDrift)?;
-    if !status.is_success() {
-        return Err(super_classify(status));
+    let value = driver_request(store, operation.id, workshop, action, &operation.payload).await?;
+    for service_name in ["odoo", "paperless"] {
+        if let Some(service) = value.get(service_name) {
+            upsert_service(store, workshop, service_name, service, &value).await?;
+        }
     }
     if action == "provision" {
-        for service_name in ["odoo", "paperless"] {
-            let service = value
-                .get(service_name)
-                .ok_or(IntegrationError::ContractDrift)?;
-            let base = service
-                .get("base_url")
-                .and_then(Value::as_str)
-                .ok_or(IntegrationError::ContractDrift)?;
-            let secret_ref = service
-                .get("secret_ref")
-                .and_then(Value::as_str)
-                .ok_or(IntegrationError::ContractDrift)?;
-            sqlx::query("insert into control.service_instances(id,workshop_id,service,base_url,secret_ref,release_id,health,applied_epoch) values($1,$2,$3,$4,$5,$6,'ready',1) on conflict(workshop_id,service) do update set base_url=excluded.base_url,secret_ref=excluded.secret_ref,release_id=excluded.release_id,health='ready',last_observed_at=now()")
-        .bind(Uuid::new_v4()).bind(workshop).bind(service_name).bind(base).bind(secret_ref).bind(value.get("release_id").and_then(Value::as_str)).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-        }
         let expected_ref = operation
             .payload
             .get("database_ref")
@@ -672,6 +776,66 @@ async fn driver(
             .map_err(|_| IntegrationError::Unavailable)?;
     }
     Ok(value)
+}
+
+async fn driver_request(
+    _store: &Store,
+    operation_id: Uuid,
+    workshop: Uuid,
+    action: &str,
+    payload: &Value,
+) -> Result<Value, IntegrationError> {
+    let url = env("CONTROL_DEPLOYMENT_DRIVER_URL")?;
+    let token = env("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
+    // First-time Odoo and Paperless initialization can legitimately take several
+    // minutes. The operation lease is heartbeated while this request is in flight,
+    // and the driver persists idempotent outcomes for ambiguous disconnects.
+    let client = http_client(&token, Duration::from_secs(900))?;
+    let response = client
+        .post(format!(
+            "{}/v1/tenants/{workshop}/{action}",
+            url.trim_end_matches('/')
+        ))
+        .header("idempotency-key", operation_id.to_string())
+        .json(payload)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                IntegrationError::UnknownOutcome
+            } else {
+                IntegrationError::Unavailable
+            }
+        })?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| IntegrationError::ContractDrift)?;
+    if !status.is_success() {
+        return Err(super_classify(status));
+    }
+    Ok(value)
+}
+
+async fn upsert_service(
+    store: &Store,
+    workshop: Uuid,
+    service_name: &str,
+    service: &Value,
+    response: &Value,
+) -> Result<(), IntegrationError> {
+    let base = service
+        .get("base_url")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let secret_ref = service
+        .get("secret_ref")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    sqlx::query("insert into control.service_instances(id,workshop_id,service,base_url,secret_ref,release_id,health,applied_epoch) values($1,$2,$3,$4,$5,$6,'ready',1) on conflict(workshop_id,service) do update set base_url=excluded.base_url,secret_ref=excluded.secret_ref,release_id=excluded.release_id,health='ready',last_observed_at=now()")
+        .bind(Uuid::new_v4()).bind(workshop).bind(service_name).bind(base).bind(secret_ref).bind(response.get("release_id").and_then(Value::as_str)).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+    Ok(())
 }
 
 async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
@@ -817,7 +981,14 @@ async fn seed_membership_targets(
     user: Uuid,
     epoch: i32,
 ) -> Result<(), IntegrationError> {
-    sqlx::query("insert into control.membership_targets(workshop_id,user_id,target,desired_epoch) select $1,$2,target,$3 from unnest(array['rauthy','odoo','paperless']) target on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
+    sqlx::query("insert into control.membership_targets(workshop_id,user_id,target,desired_epoch)
+        select $1,$2,target,$3 from unnest(array['rauthy','odoo']) target
+        union all
+        select $1,$2,'paperless',$3 where exists (
+            select 1 from control.workshop_modules
+            where workshop_id=$1 and module_key='documents' and state='enabled'
+        )
+        on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
         .bind(workshop).bind(user).bind(epoch).execute(&mut **tx).await.map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
 }

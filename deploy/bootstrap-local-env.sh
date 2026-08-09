@@ -6,10 +6,6 @@ if [ -e "$target" ]; then
   echo "$target already exists; refusing to overwrite local credentials" >&2
   exit 1
 fi
-if [ -z "${AZURE_DOCUMENT_KEY:-}" ]; then
-  echo "AZURE_DOCUMENT_KEY must be injected by the secret manager" >&2
-  exit 1
-fi
 command -v openssl >/dev/null 2>&1 || { echo "openssl is required" >&2; exit 1; }
 
 random_hex() { openssl rand -hex 32; }
@@ -39,8 +35,8 @@ umask 077
     "ODOO_BRIDGE_TOKEN=$(random_hex)" \
     "CONTROL_RAUTHY_ADMIN_KEY='makersbrain-runtime\$$(random_hex)'" \
     "CONTROL_RAUTHY_DEPLOYMENT_KEY='makersbrain-deployment\$$(random_hex)'" \
-    "AZURE_DOCUMENT_ENDPOINT=https://makersbrain-development-documents.cognitiveservices.azure.com/" \
-    "AZURE_DOCUMENT_KEY=$AZURE_DOCUMENT_KEY" \
+    "AZURE_DOCUMENT_ENDPOINT=${AZURE_DOCUMENT_ENDPOINT:-}" \
+    "AZURE_DOCUMENT_KEY=${AZURE_DOCUMENT_KEY:-}" \
     "MAIL_WEBHOOK_URL=http://integration-fixture:8080/send" \
     "MAIL_WEBHOOK_TOKEN=$(random_hex)" \
     "DEPLOYMENT_DRIVER_URL=http://docker-driver:8080" \

@@ -2,6 +2,7 @@ name: makersbrain-control
 
 x-control-env: &control-env
   CONTROL_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
+  CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
 x-worker: &worker
   image: makersbrain-control:local
   build: {context: ..}
@@ -16,8 +17,8 @@ x-worker: &worker
     <<: *control-env
     CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
     CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
-    CONTROL_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT}
-    CONTROL_AZURE_KEY: ${AZURE_DOCUMENT_KEY}
+    CONTROL_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT:-}
+    CONTROL_AZURE_KEY: ${AZURE_DOCUMENT_KEY:-}
     CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
     CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
     CONTROL_AZURE_POLL_INTERVAL_MS: "2000"
@@ -207,7 +208,6 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       control-migrate: {condition: service_completed_successfully}
-      paperless-image: {condition: service_completed_successfully}
       odoo: {condition: service_started}
       redis: {condition: service_healthy}
       tenant-gateway: {condition: service_started}

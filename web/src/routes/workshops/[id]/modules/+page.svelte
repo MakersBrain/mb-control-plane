@@ -36,6 +36,16 @@
 			busy = '';
 		}
 	}
+
+	function missingDependencies(module: any) {
+		return (module.dependencies || []).filter((key: string) =>
+			!modules.some((candidate) => candidate.key === key && candidate.state === 'enabled')
+		);
+	}
+
+	function moduleName(key: string) {
+		return modules.find((module) => module.key === key)?.name || key;
+	}
 </script>
 
 <svelte:head><title>Modules · {workshop?.display_name || 'MakersBrain'}</title></svelte:head>
@@ -56,9 +66,13 @@
 			</div>
 			<p class="muted">{module.description}</p>
 			{#if module.state === 'available' || module.state === 'failed'}
-				<button disabled={!module.can_manage || busy === module.key} onclick={() => enable(module.key)}>
+				{@const missing = missingDependencies(module)}
+				<button disabled={!module.can_manage || busy === module.key || missing.length > 0} onclick={() => enable(module.key)}>
 					{busy === module.key ? 'Enabling…' : module.state === 'failed' ? 'Retry' : 'Enable'}
 				</button>
+				{#if missing.length > 0}
+					<p class="muted">Requires {missing.map(moduleName).join(', ')}.</p>
+				{/if}
 			{:else if module.state === 'requested'}
 				<p class="muted">Installation is queued. Refresh to update its state.</p>
 			{:else}
@@ -70,5 +84,5 @@
 
 <aside class="card" style="margin-top:1rem">
 	<strong>Core services</strong>
-	<p class="muted">Identity, French accounting, invoice capture, and document processing are managed by MakersBrain and remain enabled.</p>
+	<p class="muted">Identity, Odoo, and French accounting are always enabled. Documents, invoice capture, and Azure extraction are optional.</p>
 </aside>

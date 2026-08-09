@@ -23,28 +23,30 @@ the selected Odoo PostgreSQL database and its matching filestore namespace.
 This is the implemented replacement for Odoo's native database manager; it is
 not presented as an encrypted whole-tenant disaster-recovery export.
 
-The production disaster-recovery contract is a separate paired, encrypted
-recovery set per workshop: the Odoo PostgreSQL database and filestore, the
-Paperless PostgreSQL database and media/data, plus the control rows for the
-workshop, memberships, external identities, service instances, entitlements,
-operations, usage, and audit. `makersbrain-infra` owns that Phase-4 orchestration
-and encryption. Secret values are never part of either set; infrastructure
-restores their references from its secret manager.
+The production disaster-recovery contract is a separate encrypted recovery set
+per workshop: the Odoo PostgreSQL database and filestore; when the `documents`
+module is enabled, the Paperless PostgreSQL database and media/data; plus the
+control rows for the workshop, memberships, modules, external identities,
+service instances, entitlements, operations, usage, and audit.
+`makersbrain-infra` owns that Phase-4 orchestration and encryption. Secret
+values are never part of either set; infrastructure restores their references
+from its secret manager.
 
-Before an Odoo or Paperless upgrade, stop admission for that tenant, let active
-operations finish, record the image digests, and take all members of the set
-under one recovery-set identifier. Keep the previous images until the restore
-drill passes.
+Before an Odoo or enabled Paperless upgrade, stop admission for that tenant,
+let active operations finish, record the image digests, and take all members of
+the set under one recovery-set identifier. Keep the previous images until the
+restore drill passes.
 
 A restore is successful only when:
 
 1. Odoo opens the company and its attachments with the restored filestore.
-2. Paperless returns the same document ids and SHA-256 original digests.
+2. When Documents is enabled, Paperless returns the same document ids and
+   SHA-256 original digests.
 3. Control-plane service instances point to the restored endpoints and a
    reconciliation reaches every desired membership epoch.
 4. Replaying the last invoice operation creates no duplicate capture or bill.
-5. A Rauthy subject can sign in to the control UI, Odoo, and Paperless while a
-   subject from another workshop is denied.
+5. A Rauthy subject can sign in to the control UI and Odoo, plus Paperless when
+   enabled, while a subject from another workshop is denied.
 
 Monitor backup age, queue depth, oldest lease, dead letters, membership drift,
 service health, and Azure page usage. Alert before tenant deletion, entitlement
