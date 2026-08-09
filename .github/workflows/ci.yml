@@ -23,7 +23,7 @@ env:
   # Odoo 19 extension points. Pin the digest too once one is chosen.
   ODOO_IMAGE: odoo:19
   MODULES: >-
-    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,mb_control_bridge,mb_invoice_capture
+    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,l10n_fr_micro_urssaf,mb_control_bridge,mb_invoice_capture
   # The same list with each name as a `/module` test spec. This is not
   # decoration: `--test-enable` on its own also runs the tests of every
   # dependency Odoo installs — the whole of mail, stock, account and
@@ -31,7 +31,7 @@ env:
   # minutes, and tells us nothing about this repository. Restricting to
   # `/module` specs runs only tests defined in these addons.
   TEST_TAGS: >-
-    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/mb_control_bridge,/mb_invoice_capture
+    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/l10n_fr_micro_urssaf,/mb_control_bridge,/mb_invoice_capture
 
 jobs:
   control-plane:
