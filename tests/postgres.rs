@@ -86,6 +86,11 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
         rehearsal_table.as_deref(),
         Some("control.workshop_recovery_rehearsals")
     );
+    sqlx::query("insert into control.deployment_driver_operations(idempotency_key,workshop_id,action,request_digest) values('rehearsal-migration-check',$1,'rehearse',repeat('0',64))")
+        .bind(workshop)
+        .execute(store.pool())
+        .await
+        .expect("the driver ledger must accept rehearsal actions");
 
     sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Full workshop',$4,array['odoo','paperless'],'makersbrain-workshop-recovery-v2')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await.unwrap();

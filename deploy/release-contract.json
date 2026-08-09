@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 1,
   "release": "0.1.0",
-  "schema_release": "0007_workshop_recovery_sets",
-  "schema_compatibility": ">=0007_workshop_recovery_sets,<0008",
+  "schema_release": "0008_recovery_rehearsal_driver_action",
+  "schema_compatibility": ">=0008_recovery_rehearsal_driver_action,<0009",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "web": {"build_context": "control-plane/web", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
@@ -46,5 +46,5 @@
   "invoice_capture": {"optional_module": "invoice-capture", "depends_on": ["documents"], "azure_module": "azure-invoice-extraction", "azure_optional": true},
   "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge"], "optional_modules": ["mb_invoice_capture"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another"},
   "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
-  "rollback": {"application": "requires an application release compatible with 0007_workshop_recovery_sets", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
+  "rollback": {"application": "requires an application release compatible with 0008_recovery_rehearsal_driver_action", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
 }
