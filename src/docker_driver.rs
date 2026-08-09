@@ -2268,8 +2268,15 @@ fn encrypted_recovery_component(
         return Err(DriverError::bad("invalid plaintext recovery checksum"));
     }
     std::fs::remove_file(checksum_path).map_err(DriverError::internal)?;
-    let (size_bytes, sha256) =
-        digest_path(&directory.join(relative)).map_err(DriverError::internal)?;
+    let encrypted_path = directory.join(relative);
+    let metadata = std::fs::metadata(&encrypted_path).map_err(DriverError::internal)?;
+    if !metadata.is_file() {
+        return Err(DriverError::bad(
+            "encrypted recovery component is not a regular file",
+        ));
+    }
+    let size_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    let sha256 = digest_file(&encrypted_path).map_err(DriverError::internal)?;
     Ok(RecoveryComponent {
         name: name.to_owned(),
         path: relative.to_owned(),
@@ -3656,6 +3663,31 @@ mod tests {
         );
         std::fs::write(root.join("odoo/filestore/asset"), "tampered").unwrap();
         assert!(verify_recovery_directory(&root, workshop, &["odoo".into()]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn encrypted_components_record_raw_ciphertext_sha256() {
+        let root = std::env::temp_dir().join(format!("mb-encrypted-component-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("odoo")).unwrap();
+        std::fs::write(root.join("odoo/database.dump.enc"), b"ciphertext").unwrap();
+        std::fs::write(
+            root.join("odoo/database.dump.plain.sha256"),
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        let component = encrypted_recovery_component(
+            "odoo-database",
+            "odoo/database.dump.enc",
+            "odoo/database.dump.plain.sha256",
+            &root,
+        )
+        .unwrap();
+        assert_eq!(component.size_bytes, 10);
+        assert_eq!(
+            component.sha256,
+            format!("{:x}", Sha256::digest(b"ciphertext"))
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
