@@ -91,7 +91,7 @@ async fn rehearse_due_recoveries(
              select 1 from control.workshop_recovery_rehearsals h
              where h.workshop_id=r.workshop_id
                and ((h.state='succeeded' and h.started_at > now()-interval '30 days')
-                 or h.started_at > now()-interval '24 hours')
+                 or (h.recovery_point_id=r.id and h.started_at > now()-interval '24 hours'))
            )
          order by r.workshop_id,r.ready_at desc nulls last",
     )
