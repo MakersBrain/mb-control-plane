@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0008_recovery_rehearsal_driver_action";
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,

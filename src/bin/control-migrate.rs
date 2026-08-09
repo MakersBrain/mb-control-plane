@@ -1,7 +1,5 @@
 use makersbrain_control_plane::Config;
-use makersbrain_control_plane::persistence::Store;
-
-const EMBEDDED_SCHEMA_RELEASE: &str = "0008_recovery_rehearsal_driver_action";
+use makersbrain_control_plane::persistence::{EMBEDDED_SCHEMA_RELEASE, Store};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
