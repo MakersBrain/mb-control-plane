@@ -704,6 +704,7 @@ async fn lifecycle(
     workshop: Uuid,
     payload: &Value,
 ) -> Result<Value, DriverError> {
+    let deleting = payload.get("action").and_then(Value::as_str) == Some("delete");
     let paperless_container = format!("mb-paperless-{}", tenant_key(workshop));
     let paperless_running = if docker_container_exists(state, &paperless_container).await? {
         docker_inspect_container(state, &paperless_container)
@@ -724,7 +725,7 @@ async fn lifecycle(
             lifecycle_quiesced(state, workshop, payload).await
         }
         .await;
-        let restart = if paperless_running {
+        let restart = if paperless_running && !(deleting && operation.is_ok()) {
             match docker_start_container(state, &paperless_container).await {
                 Ok(()) => {
                     wait_for_healthy_container(state, &paperless_container, "Paperless").await
@@ -744,6 +745,10 @@ async fn lifecycle(
     let is_restore = payload.get("action").and_then(Value::as_str) == Some("restore");
     if is_restore && result.is_err() {
         tracing::error!(%workshop, "leaving workshop route in maintenance after unresolved restore failure");
+        return result;
+    }
+    if deleting && result.is_ok() {
+        tracing::info!(%workshop, "workshop final backup verified; retaining maintenance quarantine");
         return result;
     }
     let route_restore = leave_workshop_maintenance(state, workshop, &previous_routes).await;
@@ -783,11 +788,11 @@ async fn lifecycle_quiesced(
     let result = async {
         drain_database_sessions(state, &database_ref).await?;
         match action {
-        "snapshot" | "backup" => {
+        "snapshot" | "backup" | "delete" => {
             let recovery = payload_uuid(payload, "recovery_point_id")?;
             let scope = recovery_scope(state, workshop, recovery).await?;
             let recovery_point =
-                create_recovery_set(state, workshop, recovery, &database_ref, action, &scope)
+                create_recovery_set(state, workshop, recovery, &database_ref, if action == "delete" { "backup" } else { action }, &scope)
                     .await?;
             Ok(json!({"action":action,"recovery_point":recovery_point}))
         }
@@ -887,8 +892,13 @@ async fn lifecycle_quiesced(
         }
     }
     .await;
-    let resume = set_database_connection_limit(state, &database_ref, previous_limit).await;
-    if resume.is_ok() {
+    let retain_quarantine = action == "delete" && result.is_ok();
+    let resume = if retain_quarantine {
+        Ok(())
+    } else {
+        set_database_connection_limit(state, &database_ref, previous_limit).await
+    };
+    if resume.is_ok() && !retain_quarantine {
         sqlx::query(
             "update control.odoo_databases set connection_limit_before_lifecycle=null where id=$1",
         )

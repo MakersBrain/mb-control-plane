@@ -59,6 +59,10 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/platform/workshops", get(platform_workshops))
         .route("/v1/platform/workshops/{id}", get(platform_workshop))
         .route(
+            "/v1/platform/workshops/{id}/deletion",
+            post(platform_delete_workshop),
+        )
+        .route(
             "/v1/platform/workshops/{id}/reconcile",
             post(platform_reconcile_workshop),
         )
@@ -299,7 +303,7 @@ async fn platform_workshop(
 ) -> ApiResult<Json<Value>> {
     operator(&state, &headers).await?;
     let workshop = sqlx::query_as::<_, (String,String,String,String,Option<String>,Option<String>,OffsetDateTime)>(
-        "select slug,display_name,status,plan,legal_name,country_code,created_at from control.workshops where id=$1 and status<>'deleted'",
+        "select slug,display_name,status,plan,legal_name,country_code,created_at from control.workshops where id=$1",
     ).bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
     let members = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String)>(
         "select u.id,u.email,u.display_name,m.role,m.status from control.memberships m join control.users u on u.id=m.user_id where m.workshop_id=$1 order by u.email",
@@ -317,6 +321,9 @@ async fn platform_workshop(
         "select public_hostname from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null and public_hostname is not null",
     ).bind(id).fetch_optional(state.store.pool()).await?;
     let operations = platform_operation_rows(&state, Some(id), None, 30).await?;
+    let deletion = sqlx::query_as::<_, (String,Uuid,Uuid,OffsetDateTime,Option<OffsetDateTime>,OffsetDateTime,Option<String>)>(
+        "select state,operation_id,final_recovery_point_id,requested_at,quarantined_at,purge_after,failure_class from control.workshop_deletions where workshop_id=$1",
+    ).bind(id).fetch_optional(state.store.pool()).await?;
     Ok(Json(json!({
         "id":id,"slug":workshop.0,"display_name":workshop.1,"status":workshop.2,"plan":workshop.3,"legal_name":workshop.4,"country_code":workshop.5,"created_at":api_timestamp(workshop.6),
         "members":members.into_iter().map(|row|json!({"id":row.0,"email":row.1,"display_name":row.2,"role":row.3,"status":row.4})).collect::<Vec<_>>(),
@@ -324,8 +331,109 @@ async fn platform_workshop(
         "entitlement":entitlement.map(|row|json!({"version":row.0,"plan":row.1,"status":row.2,"limits":row.3,"expires_at":row.4.map(api_timestamp),"updated_at":api_timestamp(row.5)})),
         "usage":usage.into_iter().map(|row|json!({"metric":row.0,"quantity":row.1,"updated_at":api_timestamp(row.2)})).collect::<Vec<_>>(),
         "primary_hostname":primary_hostname,
-        "operations":operations
+        "operations":operations,
+        "deletion":deletion.map(|row|json!({"state":row.0,"operation_id":row.1,"final_recovery_point_id":row.2,"requested_at":api_timestamp(row.3),"quarantined_at":row.4.map(api_timestamp),"purge_after":api_timestamp(row.5),"failure_class":row.6}))
     })))
+}
+
+#[derive(Deserialize)]
+struct DeleteWorkshopBody {
+    confirmation: String,
+}
+
+async fn platform_delete_workshop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DeleteWorkshopBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let who = operator(&state, &headers).await?;
+    confirm_slug(&state, id, &body.confirmation).await?;
+    let client_key = idempotency(&headers)?;
+    let stored_key = format!("platform:{id}:delete:{client_key}");
+    if let Some(existing) = existing_lifecycle_operation(&state, who.user_id, &stored_key).await? {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"operation_id":existing,"replayed":true})),
+        ));
+    }
+    let recovery_id = Uuid::new_v4();
+    let correlation = Uuid::new_v4();
+    let mut tx = state.store.begin().await?;
+    lock_lifecycle(&mut tx, id).await?;
+    let (slug, previous_status) = sqlx::query_as::<_, (String, String)>(
+        "select slug,status from control.workshops where id=$1 for update",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    if slug != body.confirmation {
+        return Err(ApiError::Validation(
+            "confirmation must exactly match the workshop slug",
+        ));
+    }
+    if matches!(previous_status.as_str(), "deleting" | "deleted")
+        || sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.workshop_deletions where workshop_id=$1)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+    {
+        return Err(ApiError::Conflict("workshop deletion is already scheduled"));
+    }
+    let database_id = primary_database(&mut tx, id).await?;
+    ensure_lifecycle_idle(&mut tx, id).await?;
+    let documents_enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
+    ).bind(id).fetch_one(&mut *tx).await?;
+    let component_scope = if documents_enabled {
+        vec!["odoo", "paperless"]
+    } else {
+        vec!["odoo"]
+    };
+    let payload =
+        json!({"action":"delete","database_id":database_id,"recovery_point_id":recovery_id});
+    let operation_id = Store::enqueue(
+        &mut tx,
+        NewOperation {
+            kind: OperationKind::TenantLifecycle,
+            workshop_id: Some(id),
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: Some(who.user_id),
+            correlation_id: correlation,
+            idempotency_key: &stored_key,
+        },
+    )
+    .await?;
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Final pre-deletion backup',$5,$6,'makersbrain-workshop-recovery-v2')")
+        .bind(recovery_id).bind(id).bind(database_id).bind(operation_id).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
+    sqlx::query("insert into control.workshop_deletions(workshop_id,previous_status,requested_by,operation_id,final_recovery_point_id,purge_after) values($1,$2,$3,$4,$5,now()+interval '30 days')")
+        .bind(id).bind(&previous_status).bind(who.user_id).bind(operation_id).bind(recovery_id).execute(&mut *tx).await?;
+    sqlx::query("update control.workshops set status='restricted',version=version+1 where id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(who.user_id),
+        Some(id),
+        "workshop.delete.schedule",
+        "workshop",
+        id.to_string(),
+        correlation,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({"operation_id":operation_id,"recovery_point_id":recovery_id,"retention_days":30}),
+        ),
+    ))
 }
 
 async fn platform_reconcile_workshop(

@@ -864,13 +864,25 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
     match action {
-        "snapshot" | "backup" => {
+        "snapshot" | "backup" | "delete" => {
             let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
             let database = payload_uuid(&operation.payload, "database_id")?;
             sqlx::query("update control.odoo_databases set state='snapshotting' where id=$1 and state='ready'")
                 .bind(database).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
             sqlx::query("update control.workshop_recovery_points set state='creating',verification_state='pending' where id=$1 and state in ('queued','failed')")
                 .bind(recovery).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+            if action == "delete" {
+                let workshop = operation
+                    .workshop_id
+                    .ok_or(IntegrationError::ContractDrift)?;
+                sqlx::query("update control.workshop_deletions set state='quarantining',failure_class=null where workshop_id=$1")
+                    .bind(workshop).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+                sqlx::query("update control.workshops set status='deleting' where id=$1")
+                    .bind(workshop)
+                    .execute(store.pool())
+                    .await
+                    .map_err(|_| IntegrationError::Unavailable)?;
+            }
         }
         "restore" => {
             let database = payload_uuid(&operation.payload, "database_id")?;
@@ -895,18 +907,41 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
     }
     let value = driver(store, operation, "lifecycle").await?;
     match action {
-        "snapshot" | "backup" => {
+        "snapshot" | "backup" | "delete" => {
             let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
             let result = value
                 .get("recovery_point")
                 .ok_or(IntegrationError::ContractDrift)?;
             record_recovery_ready(store, recovery, result).await?;
             let database = payload_uuid(&operation.payload, "database_id")?;
-            sqlx::query("update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'")
+            sqlx::query(if action == "delete" { "update control.odoo_databases set state='suspended' where id=$1 and state='snapshotting'" } else { "update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'" })
                 .bind(database)
                 .execute(store.pool())
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;
+            if action == "delete" {
+                let workshop = operation
+                    .workshop_id
+                    .ok_or(IntegrationError::ContractDrift)?;
+                let mut tx = store
+                    .begin()
+                    .await
+                    .map_err(|_| IntegrationError::Unavailable)?;
+                sqlx::query("update control.workshop_deletions set state='retained',quarantined_at=now(),failure_class=null where workshop_id=$1")
+                    .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+                sqlx::query(
+                    "update control.workshops set status='deleted',version=version+1 where id=$1",
+                )
+                .bind(workshop)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
+                sqlx::query("update control.service_instances set health='suspended',safe_error_class=null,last_observed_at=now() where workshop_id=$1")
+                    .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+                tx.commit()
+                    .await
+                    .map_err(|_| IntegrationError::Unavailable)?;
+            }
         }
         "restore" => {
             let database = payload_uuid(&operation.payload, "database_id")?;
@@ -1009,7 +1044,7 @@ async fn record_recovery_ready(
 
 async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
     let action = operation.payload.get("action").and_then(Value::as_str);
-    if matches!(action, Some("snapshot" | "backup"))
+    if matches!(action, Some("snapshot" | "backup" | "delete"))
         && let Ok(database) = payload_uuid(&operation.payload, "database_id")
         && let Err(error) = sqlx::query(
             "update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'",
@@ -1031,7 +1066,7 @@ async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
         tracing::error!(operation=%operation.id,error=%error,"could not mark restore safety snapshot failed");
     }
     let result = match action {
-        Some("snapshot" | "backup") => {
+        Some("snapshot" | "backup" | "delete") => {
             payload_uuid(&operation.payload, "recovery_point_id").map(|id| {
                 (
                     "update control.workshop_recovery_points set state='failed',verification_state='failed' where id=$1",
@@ -1057,6 +1092,13 @@ async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
         && let Err(error) = sqlx::query(query).bind(id).execute(store.pool()).await
     {
         tracing::error!(operation=%operation.id,error=%error,"could not mark lifecycle resource failed");
+    }
+    if action == Some("delete")
+        && let Some(workshop) = operation.workshop_id
+        && let Err(error) = sqlx::query("with failed as (update control.workshop_deletions set state='failed',failure_class='lifecycle_failed' where workshop_id=$1 returning previous_status) update control.workshops set status=failed.previous_status from failed where id=$1")
+            .bind(workshop).execute(store.pool()).await
+    {
+        tracing::error!(operation=%operation.id,error=%error,"could not release failed workshop deletion");
     }
 }
 
