@@ -13,9 +13,6 @@
 			void establish(page.url.pathname + page.url.search);
 		}
 	});
-	$effect(() => {
-		if (!publicRoute && session.lost) void signIn(page.url.pathname + page.url.search);
-	});
 	function leave() {
 		const url = logoutUrl(currentIdToken());
 		discard();
@@ -25,6 +22,12 @@
 
 {#if publicRoute}
 	{@render children()}
+{:else if session.lost}
+	<main class="auth-state card">
+		<h1>Your session needs to be renewed</h1>
+		<p class="muted">Sign in again to continue. If access is refused, this page will stop here instead of repeatedly redirecting you.</p>
+		<button onclick={() => signIn(page.url.pathname + page.url.search)}>Sign in again</button>
+	</main>
 {:else if session.ready && session.me}
 	<div class="app-shell">
 		<header class="topbar">

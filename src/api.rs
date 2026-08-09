@@ -1256,7 +1256,7 @@ async fn database(
         "select r.id,r.kind,r.label,r.state,r.size_bytes,r.created_at,r.ready_at,
                 r.operation_id,o.state as operation_state,r.component_scope,r.format_version,
                 r.storage_location,r.verified_at,r.expires_at,
-                coalesce(o.progress_percent,0) as progress_percent,
+                coalesce(o.progress_percent,0::smallint) as progress_percent,
                 o.progress_phase,o.progress_message,
                 o.progress_updated_at,r.archive_size_bytes
          from control.workshop_recovery_points r
