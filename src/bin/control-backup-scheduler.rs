@@ -187,6 +187,21 @@ async fn schedule_due_backups(store: &Store) -> anyhow::Result<()> {
             tx.rollback().await?;
             continue;
         }
+        let still_due = !sqlx::query_scalar::<_, bool>(
+            "select exists(
+                select 1 from control.workshop_recovery_points
+                where workshop_id=$1 and kind='backup'
+                  and created_at > now()-interval '24 hours'
+                  and state in ('queued','creating','ready')
+            )",
+        )
+        .bind(workshop)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !still_due {
+            tx.rollback().await?;
+            continue;
+        }
         let documents = sqlx::query_scalar::<_, bool>(
             "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
         )
@@ -200,10 +215,19 @@ async fn schedule_due_backups(store: &Store) -> anyhow::Result<()> {
         };
         let recovery = Uuid::new_v4();
         let correlation = Uuid::new_v4();
-        let key = format!(
-            "nightly-backup:{workshop}:{}",
-            OffsetDateTime::now_utc().date()
-        );
+        let date = OffsetDateTime::now_utc().date();
+        let attempts = sqlx::query_scalar::<_, i64>(
+            "select count(*) from control.workshop_recovery_points where workshop_id=$1 and kind='backup' and created_at::date=$2",
+        )
+        .bind(workshop)
+        .bind(date)
+        .fetch_one(&mut *tx)
+        .await?;
+        let key = if attempts == 0 {
+            format!("nightly-backup:{workshop}:{date}")
+        } else {
+            format!("nightly-backup:{workshop}:{date}:retry-{}", attempts + 1)
+        };
         let payload =
             json!({"action":"backup","database_id":database,"recovery_point_id":recovery});
         let operation = Store::enqueue(
