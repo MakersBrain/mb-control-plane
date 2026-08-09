@@ -55,6 +55,32 @@ async fn rehearse_due_recoveries(
     driver_url: &str,
     driver_token: &str,
 ) -> anyhow::Result<()> {
+    let retries = sqlx::query_as::<_, (Uuid, Uuid, Uuid)>(
+        "select h.id,h.workshop_id,h.recovery_point_id
+         from control.workshop_recovery_rehearsals h
+         join control.workshop_recovery_points r on r.id=h.recovery_point_id
+         where h.state='failed' and h.finished_at < now()-interval '1 minute'
+           and h.safe_error in ('driver_rejected','driver_unavailable')
+           and r.state='ready' and r.verification_state='verified'
+           and (r.expires_at is null or r.expires_at > now())
+         order by h.finished_at limit 20",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    for (rehearsal, workshop, recovery) in retries {
+        sqlx::query("update control.workshop_recovery_rehearsals set state='running',started_at=now(),finished_at=null,safe_error=null where id=$1 and state='failed'")
+            .bind(rehearsal).execute(store.pool()).await?;
+        run_rehearsal(
+            store,
+            client,
+            driver_url,
+            driver_token,
+            rehearsal,
+            workshop,
+            recovery,
+        )
+        .await?;
+    }
     let due = sqlx::query_as::<_, (Uuid, Uuid)>(
         "select distinct on (r.workshop_id) r.workshop_id,r.id
          from control.workshop_recovery_points r
@@ -75,32 +101,54 @@ async fn rehearse_due_recoveries(
         let rehearsal = Uuid::new_v4();
         sqlx::query("insert into control.workshop_recovery_rehearsals(id,recovery_point_id,workshop_id,state) values($1,$2,$3,'running')")
             .bind(rehearsal).bind(recovery).bind(workshop).execute(store.pool()).await?;
-        let request = client
-            .post(format!("{driver_url}/v1/tenants/{workshop}/rehearse"))
-            .bearer_auth(driver_token)
-            .header("idempotency-key", format!("rehearsal:{rehearsal}"))
-            .json(&json!({"recovery_point_id":recovery}))
-            .send()
-            .await;
-        let (state, safe_error) = match request {
-            Ok(response) if response.status().is_success() => ("succeeded", None),
-            Ok(response) => {
-                tracing::error!(%workshop,%recovery,status=%response.status(),"recovery rehearsal failed");
-                ("failed", Some("driver_rejected"))
-            }
-            Err(error) => {
-                tracing::error!(%workshop,%recovery,error=%error,"recovery rehearsal unavailable");
-                ("failed", Some("driver_unavailable"))
-            }
-        };
-        sqlx::query("update control.workshop_recovery_rehearsals set state=$2,safe_error=$3,finished_at=now() where id=$1")
-            .bind(rehearsal).bind(state).bind(safe_error).execute(store.pool()).await?;
-        sqlx::query("insert into control.audit_events(id,actor_user_id,workshop_id,action,target_type,target_id,correlation_id,outcome,detail) values($1,null,$2,'database.recovery.rehearse','workshop_recovery_point',$3,$4,$5,$6)")
-            .bind(Uuid::new_v4()).bind(workshop).bind(recovery.to_string()).bind(rehearsal)
-            .bind(if state == "succeeded" { "succeeded" } else { "failed" })
-            .bind(json!({"rehearsal_id":rehearsal,"safe_error":safe_error})).execute(store.pool()).await?;
-        tracing::info!(%workshop,%recovery,%rehearsal,%state,"monthly recovery rehearsal completed");
+        run_rehearsal(
+            store,
+            client,
+            driver_url,
+            driver_token,
+            rehearsal,
+            workshop,
+            recovery,
+        )
+        .await?;
     }
+    Ok(())
+}
+
+async fn run_rehearsal(
+    store: &Store,
+    client: &reqwest::Client,
+    driver_url: &str,
+    driver_token: &str,
+    rehearsal: Uuid,
+    workshop: Uuid,
+    recovery: Uuid,
+) -> anyhow::Result<()> {
+    let request = client
+        .post(format!("{driver_url}/v1/tenants/{workshop}/rehearse"))
+        .bearer_auth(driver_token)
+        .header("idempotency-key", format!("rehearsal:{rehearsal}"))
+        .json(&json!({"recovery_point_id":recovery}))
+        .send()
+        .await;
+    let (state, safe_error) = match request {
+        Ok(response) if response.status().is_success() => ("succeeded", None),
+        Ok(response) => {
+            tracing::error!(%workshop,%recovery,status=%response.status(),"recovery rehearsal failed");
+            ("failed", Some("driver_rejected"))
+        }
+        Err(error) => {
+            tracing::error!(%workshop,%recovery,error=%error,"recovery rehearsal unavailable");
+            ("failed", Some("driver_unavailable"))
+        }
+    };
+    sqlx::query("update control.workshop_recovery_rehearsals set state=$2,safe_error=$3,finished_at=now() where id=$1")
+        .bind(rehearsal).bind(state).bind(safe_error).execute(store.pool()).await?;
+    sqlx::query("insert into control.audit_events(id,actor_user_id,workshop_id,action,target_type,target_id,correlation_id,outcome,detail) values($1,null,$2,'database.recovery.rehearse','workshop_recovery_point',$3,$4,$5,$6)")
+        .bind(Uuid::new_v4()).bind(workshop).bind(recovery.to_string()).bind(rehearsal)
+        .bind(if state == "succeeded" { "succeeded" } else { "failed" })
+        .bind(json!({"rehearsal_id":rehearsal,"safe_error":safe_error})).execute(store.pool()).await?;
+    tracing::info!(%workshop,%recovery,%rehearsal,%state,"monthly recovery rehearsal completed");
     Ok(())
 }
 
