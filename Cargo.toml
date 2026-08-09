@@ -26,6 +26,10 @@ path = "src/bin/control-fixture.rs"
 name = "control-docker-driver"
 path = "src/bin/control-docker-driver.rs"
 
+[[bin]]
+name = "control-backup-scheduler"
+path = "src/bin/control-backup-scheduler.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

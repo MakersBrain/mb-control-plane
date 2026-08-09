@@ -36,10 +36,10 @@ async fn tenant(
             .unwrap_or("duplicate");
         let result = match lifecycle {
             "snapshot" | "backup" => {
-                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"recovery_point":{"storage_ref":format!("fixture/{workshop}/{recovery}"),"size_bytes":1048576}})
+                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"recovery_point":{"storage_ref":format!("fixture/{workshop}/{recovery}"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"makersbrain-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
             }
             "restore" => {
-                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"safety_recovery_point":{"storage_ref":format!("fixture/{workshop}/safety"),"size_bytes":1048576}})
+                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"safety_recovery_point":{"storage_ref":format!("fixture/{workshop}/safety"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"makersbrain-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
             }
             "duplicate" => {
                 json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"duplicate":{"ready":true,"routable":false}})

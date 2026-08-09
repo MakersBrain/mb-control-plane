@@ -477,6 +477,16 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
     let workshop = operation
         .workshop_id
         .ok_or(IntegrationError::ContractDrift)?;
+    let database_ready = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.odoo_databases where workshop_id=$1 and kind='primary' and state='ready' and deleted_at is null)",
+    )
+    .bind(workshop)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if !database_ready {
+        return Err(IntegrationError::Unavailable);
+    }
     let document_id = operation
         .payload
         .get("document_id")
@@ -847,7 +857,10 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
     match action {
         "snapshot" | "backup" => {
             let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
-            sqlx::query("update control.odoo_recovery_points set state='creating' where id=$1 and state in ('queued','failed')")
+            let database = payload_uuid(&operation.payload, "database_id")?;
+            sqlx::query("update control.odoo_databases set state='snapshotting' where id=$1 and state='ready'")
+                .bind(database).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+            sqlx::query("update control.workshop_recovery_points set state='creating',verification_state='pending' where id=$1 and state in ('queued','failed')")
                 .bind(recovery).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
         }
         "restore" => {
@@ -858,7 +871,7 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
                 .execute(store.pool())
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;
-            sqlx::query("update control.odoo_recovery_points set state='creating' where id=$1 and state in ('queued','failed')")
+            sqlx::query("update control.workshop_recovery_points set state='creating',verification_state='pending' where id=$1 and state in ('queued','failed')")
                 .bind(safety).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
         }
         "duplicate" => {
@@ -878,16 +891,13 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
             let result = value
                 .get("recovery_point")
                 .ok_or(IntegrationError::ContractDrift)?;
-            let storage_ref = result
-                .get("storage_ref")
-                .and_then(Value::as_str)
-                .ok_or(IntegrationError::ContractDrift)?;
-            let size_bytes = result
-                .get("size_bytes")
-                .and_then(Value::as_i64)
-                .ok_or(IntegrationError::ContractDrift)?;
-            sqlx::query("update control.odoo_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now() where id=$1")
-                .bind(recovery).bind(storage_ref).bind(size_bytes).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+            record_recovery_ready(store, recovery, result).await?;
+            let database = payload_uuid(&operation.payload, "database_id")?;
+            sqlx::query("update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'")
+                .bind(database)
+                .execute(store.pool())
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
         }
         "restore" => {
             let database = payload_uuid(&operation.payload, "database_id")?;
@@ -895,20 +905,14 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
             let result = value
                 .get("safety_recovery_point")
                 .ok_or(IntegrationError::ContractDrift)?;
-            let storage_ref = result
-                .get("storage_ref")
-                .and_then(Value::as_str)
-                .ok_or(IntegrationError::ContractDrift)?;
-            let size_bytes = result
-                .get("size_bytes")
-                .and_then(Value::as_i64)
-                .ok_or(IntegrationError::ContractDrift)?;
+            record_recovery_ready(store, safety, result).await?;
+            if value.get("restore_status").and_then(Value::as_str) == Some("rolled_back") {
+                return Err(IntegrationError::Rejected);
+            }
             let mut tx = store
                 .begin()
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;
-            sqlx::query("update control.odoo_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now() where id=$1")
-                .bind(safety).bind(storage_ref).bind(size_bytes).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
             sqlx::query("update control.odoo_databases set state='ready',last_restored_at=now() where id=$1")
                 .bind(database).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
             tx.commit()
@@ -925,12 +929,89 @@ async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), Int
     Ok(())
 }
 
+async fn record_recovery_ready(
+    store: &Store,
+    recovery: Uuid,
+    result: &Value,
+) -> Result<(), IntegrationError> {
+    let string = |key| {
+        result
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::ContractDrift)
+    };
+    let storage_ref = string("storage_ref")?;
+    let size_bytes = result
+        .get("size_bytes")
+        .and_then(Value::as_i64)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let manifest_digest = string("manifest_digest")?;
+    let format_version = string("format_version")?;
+    let storage_location = string("storage_location")?;
+    let source_release = string("source_release")?;
+    let paperless_version = result.get("paperless_version").and_then(Value::as_str);
+    let encryption_key_id = result.get("encryption_key_id").and_then(Value::as_str);
+    let object_prefix = result.get("object_prefix").and_then(Value::as_str);
+    let retention_days = result
+        .get("retention_days")
+        .and_then(Value::as_i64)
+        .unwrap_or(35);
+    let components = result
+        .get("components")
+        .and_then(Value::as_array)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$4,format_version=$5,storage_location=$6,source_release=$7,paperless_version=$8,encryption_key_id=$9,object_prefix=$10,expires_at=case when kind='backup' then now()+make_interval(days=>$11) else expires_at end where id=$1")
+        .bind(recovery).bind(storage_ref).bind(size_bytes).bind(manifest_digest).bind(format_version).bind(storage_location).bind(source_release).bind(paperless_version).bind(encryption_key_id).bind(object_prefix).bind(i32::try_from(retention_days).map_err(|_|IntegrationError::ContractDrift)?).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+    sqlx::query("delete from control.workshop_recovery_components where recovery_point_id=$1")
+        .bind(recovery)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    for component in components {
+        let name = component
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::ContractDrift)?;
+        let path = component
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::ContractDrift)?;
+        let bytes = component
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .ok_or(IntegrationError::ContractDrift)?;
+        let digest = component
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::ContractDrift)?;
+        let plaintext_digest = component.get("plaintext_sha256").and_then(Value::as_str);
+        sqlx::query("insert into control.workshop_recovery_components(recovery_point_id,component,object_key,size_bytes,digest,plaintext_digest,state,verified_at) values($1,$2,$3,$4,$5,$6,'verified',now())")
+            .bind(recovery).bind(name).bind(path).bind(bytes).bind(digest).bind(plaintext_digest).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+    }
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
+}
+
 async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
     let action = operation.payload.get("action").and_then(Value::as_str);
+    if matches!(action, Some("snapshot" | "backup"))
+        && let Ok(database) = payload_uuid(&operation.payload, "database_id")
+        && let Err(error) = sqlx::query(
+            "update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'",
+        )
+        .bind(database)
+        .execute(store.pool())
+        .await
+    {
+        tracing::error!(operation=%operation.id,error=%error,"could not release snapshotting database state");
+    }
     if action == Some("restore")
         && let Ok(safety) = payload_uuid(&operation.payload, "safety_recovery_point_id")
         && let Err(error) =
-            sqlx::query("update control.odoo_recovery_points set state='failed' where id=$1")
+            sqlx::query("update control.workshop_recovery_points set state='failed',verification_state='failed' where id=$1 and state='creating'")
                 .bind(safety)
                 .execute(store.pool())
                 .await
@@ -941,14 +1022,14 @@ async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
         Some("snapshot" | "backup") => {
             payload_uuid(&operation.payload, "recovery_point_id").map(|id| {
                 (
-                    "update control.odoo_recovery_points set state='failed' where id=$1",
+                    "update control.workshop_recovery_points set state='failed',verification_state='failed' where id=$1",
                     id,
                 )
             })
         }
         Some("restore") => payload_uuid(&operation.payload, "database_id").map(|id| {
             (
-                "update control.odoo_databases set state='failed' where id=$1",
+                "update control.odoo_databases set state='failed' where id=$1 and state='restoring'",
                 id,
             )
         }),

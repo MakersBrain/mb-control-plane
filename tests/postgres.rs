@@ -65,4 +65,34 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
         invalid.is_err(),
         "human hostnames must not be accepted as physical database references"
     );
+
+    let recovery_table = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "select to_regclass('control.workshop_recovery_points')::text,to_regclass('control.odoo_recovery_points')::text",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        recovery_table.0.as_deref(),
+        Some("control.workshop_recovery_points")
+    );
+    assert_eq!(recovery_table.1, None, "the Odoo-only table was migrated");
+    let rehearsal_table: Option<String> =
+        sqlx::query_scalar("select to_regclass('control.workshop_recovery_rehearsals')::text")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rehearsal_table.as_deref(),
+        Some("control.workshop_recovery_rehearsals")
+    );
+
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Full workshop',$4,array['odoo','paperless'],'makersbrain-workshop-recovery-v2')")
+        .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await.unwrap();
+    let invalid_scope = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Missing Odoo',$4,array['paperless'],'makersbrain-workshop-recovery-v2')")
+        .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await;
+    assert!(
+        invalid_scope.is_err(),
+        "every workshop recovery set must include Odoo"
+    );
 }

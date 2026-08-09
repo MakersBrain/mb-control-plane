@@ -17,7 +17,8 @@ RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registr
        target/release/control-migrate \
        target/release/control-worker \
        target/release/control-fixture \
-       target/release/control-docker-driver /out/
+       target/release/control-docker-driver \
+       target/release/control-backup-scheduler /out/
 
 FROM debian:bookworm-slim
 RUN --mount=type=cache,id=control-apt-lists,target=/var/lib/apt/lists,sharing=locked \
@@ -31,6 +32,7 @@ COPY --from=builder /out/control-migrate /usr/local/bin/control-migrate
 COPY --from=builder /out/control-worker /usr/local/bin/control-worker
 COPY --from=builder /out/control-fixture /usr/local/bin/control-fixture
 COPY --from=builder /out/control-docker-driver /usr/local/bin/control-docker-driver
+COPY --from=builder /out/control-backup-scheduler /usr/local/bin/control-backup-scheduler
 USER 10001:10001
 EXPOSE 8080
 CMD ["/usr/local/bin/control-api"]

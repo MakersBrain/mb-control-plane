@@ -81,14 +81,26 @@ and `noeviction`; tenant containers cannot access another tenant's keys or
 channels and cannot run Redis ACL, configuration, persistence, replication, or
 other shared-service administration commands.
 
-The owner-only **Database & backups** page exposes snapshots, portable backups,
+The owner-only **Workshop recovery** page exposes snapshots, portable backups,
 restore, and non-routable duplicate requests. These are durable
 `tenant.lifecycle` operations with typed slug confirmation, serialization,
-audit events, retry status, and an automatic pre-restore safety snapshot. The
+audit events, retry status, and an automatic encrypted S3 safety backup. The
 Docker driver operations are authenticated and persist their idempotency
 outcomes. The driver owns tenant databases, volumes, Redis ACLs, Rauthy clients,
-Paperless containers, and gateway routes. Lifecycle operations treat an Odoo
-PostgreSQL database and its filestore namespace as one recovery unit.
+Paperless containers, and gateway routes. Lifecycle operations treat Odoo and,
+when active, Paperless PostgreSQL plus the data/media/consume volumes as one
+recovery unit. The shared Odoo process remains available to other workshops
+while the selected workshop receives maintenance responses.
+
+`control-backup-scheduler` queues one full workshop backup per 24-hour window
+and performs a monthly isolated restore rehearsal of the newest verified S3
+set. Rehearsals restore dumps only into disposable databases, persist their
+result, and never cut over live workshop data.
+Portable backups require the complete `BACKUP_S3_*`, `RESTORE_S3_*`, and
+`BACKUP_AGE_*` configuration declared in `deploy/.env.example`; snapshots remain
+available without S3. The dedicated helper image performs streaming zstd + age
+encryption and AWS CLI multipart transfers. Application workers never receive
+those credentials or the restore identity.
 
 Rauthy is the only human credential authority. Odoo and Paperless use tenant
 OIDC clients. The control API links a verified `(issuer, subject)` once and

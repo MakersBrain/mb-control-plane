@@ -48,7 +48,7 @@
 
 	const makeRecovery = (kind: 'snapshots' | 'backups') => start(kind, { label: recoveryLabel || undefined }, kind === 'snapshots' ? 'Snapshot queued.' : 'Portable backup queued.');
 	async function restore(point: any) {
-		await start('restores', { recovery_point_id: point.id, confirmation: restoreConfirmation }, 'Restore queued. An automatic safety snapshot will be created first.');
+		await start('restores', { recovery_point_id: point.id, confirmation: restoreConfirmation }, 'Restore queued. A verified S3 safety backup will be created first.');
 		restoreConfirmation = '';
 	}
 	async function duplicate() {
@@ -62,7 +62,7 @@
 
 <svelte:head><title>{workshop?.display_name || 'Database'} · MakersBrain</title></svelte:head>
 <p><a href={`/workshops/${id}/members`}>← Workshop</a></p>
-<div class="row"><div><h1>Database & recovery</h1><p class="muted">Backups and controlled Odoo database operations.</p></div>{#if database?.primary}<span class="status">{database.primary.state}</span>{/if}</div>
+<div class="row"><div><h1>Workshop recovery</h1><p class="muted">Consistent recovery points for Odoo and active document services.</p></div>{#if database?.primary}<span class="status">{database.primary.state}</span>{/if}</div>
 {#if error}<p class="error">{error}</p>{/if}
 {#if notice}<p class="notice">{notice}</p>{/if}
 
@@ -77,7 +77,7 @@
 {#if database?.can_manage}
 	<section class="grid database-actions">
 		<form class="card form" onsubmit={(event) => { event.preventDefault(); void makeRecovery('snapshots'); }}>
-			<h2>Create recovery point</h2><p class="muted">Snapshots are fast recovery points. Backups are portable export bundles.</p>
+			<h2>Create recovery point</h2><p class="muted">Snapshots stay local. Portable backups are encrypted, verified and retained in S3. Paperless is included whenever Documents is active.</p>
 			<label>Optional label<input bind:value={recoveryLabel} maxlength="120" placeholder="Before stock import" /></label>
 			<div class="actions"><button disabled={busy}>Create snapshot</button><button class="secondary" type="button" disabled={busy} onclick={() => void makeRecovery('backups')}>Create backup</button></div>
 		</form>
@@ -93,8 +93,8 @@
 <section class="stack"><h2>Recovery points</h2>
 	{#if !database?.recovery_points?.length}<p class="card muted">No snapshots or backups yet.</p>{/if}
 	{#each database?.recovery_points || [] as point}
-		<article class="card recovery-row"><div><strong>{point.label}</strong><div class="muted">{point.kind} · {when(point.created_at)} · {size(point.size_bytes)}</div></div><span class="status">{point.operation_state || point.state}</span>
-			{#if database.can_manage && point.state === 'ready'}<div class="restore"><label>Type <code>{workshop.slug}</code> to restore<input bind:value={restoreConfirmation} /></label><button class="danger" disabled={busy || restoreConfirmation !== workshop.slug} onclick={() => void restore(point)}>Restore</button></div>{/if}
+		<article class="card recovery-row"><div><strong>{point.label}</strong><div class="muted">{point.kind} · {(point.component_scope || ['odoo']).join(' + ')} · {point.storage_location} · {when(point.created_at)} · {size(point.size_bytes)}</div>{#if point.expires_at}<div class="muted">Retained until {when(point.expires_at)}</div>{/if}</div><span class="status">{point.operation_state || point.state}{point.verified_at ? ' · verified' : ''}</span>
+			{#if database.can_manage && point.state === 'ready' && point.verified_at}<div class="restore"><label>Type <code>{workshop.slug}</code> to restore<input bind:value={restoreConfirmation} /></label><button class="danger" disabled={busy || restoreConfirmation !== workshop.slug} onclick={() => void restore(point)}>Restore complete workshop</button></div>{/if}
 		</article>
 	{/each}
 </section>

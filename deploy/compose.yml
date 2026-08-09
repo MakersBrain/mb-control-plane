@@ -160,6 +160,14 @@ services:
     entrypoint: ["/usr/bin/true"]
     restart: "no"
 
+  backup-image:
+    image: makersbrain-control-backup:local
+    build:
+      context: .
+      dockerfile: Backup.Dockerfile
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
   docker-driver:
     image: makersbrain-control:local
     build: {context: ..}
@@ -179,16 +187,28 @@ services:
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
       DRIVER_PAPERLESS_IMAGE: makersbrain-control-paperless:local
       DRIVER_DOCKER_NETWORK: makersbrain-control-runtime
-      DRIVER_ODOO_CONTAINER: makersbrain-shared-odoo
       DRIVER_ODOO_VOLUME: makersbrain-control-odoo-data
       DRIVER_ODOO_UID: ${ODOO_RUNTIME_UID:-100}
       DRIVER_ODOO_GID: ${ODOO_RUNTIME_GID:-101}
       DRIVER_BACKUP_VOLUME: makersbrain-control-backups
       DRIVER_ODOO_DATA_ROOT: /odoo-data
       DRIVER_BACKUP_ROOT: /backups
+      DRIVER_BACKUP_AGENT_IMAGE: makersbrain-control-backup:local
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      RESTORE_S3_ACCESS_KEY_ID: ${RESTORE_S3_ACCESS_KEY_ID:-}
+      RESTORE_S3_SECRET_ACCESS_KEY: ${RESTORE_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+      BACKUP_AGE_IDENTITY_FILE: ${BACKUP_AGE_IDENTITY_FILE:-}
+      BACKUP_ENCRYPTION_KEY_ID: ${BACKUP_ENCRYPTION_KEY_ID:-}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
       DRIVER_REDIS_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/makersbrain-secrets
       DRIVER_SECRET_VOLUME: makersbrain-control-tenant-secrets
+      DRIVER_BACKUP_SECRET_VOLUME: makersbrain-control-backup-secrets
       DRIVER_ROUTE_ROOT: /routes
       DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
       DRIVER_ODOO_BASE_URL: http://odoo:8069
@@ -202,6 +222,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - tenant-secrets:/run/makersbrain-secrets
+      - backup-secrets:/run/makersbrain-backup-secrets:ro
       - tenant-routes:/routes
       - odoo-data:/odoo-data
       - backup-data:/backups
@@ -212,6 +233,7 @@ services:
       redis: {condition: service_healthy}
       tenant-gateway: {condition: service_started}
       rauthy: {condition: service_started}
+      backup-image: {condition: service_completed_successfully}
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
@@ -221,6 +243,14 @@ services:
   worker-email: {<<: *worker, command: ["/usr/local/bin/control-worker", "email-delivery"]}
   worker-reconciliation: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
   worker-lifecycle: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]}
+
+  backup-scheduler:
+    <<: *worker
+    command: ["/usr/local/bin/control-backup-scheduler"]
+    environment:
+      <<: *control-env
+      CONTROL_BACKUP_INTERVAL_SECONDS: ${CONTROL_BACKUP_INTERVAL_SECONDS:-3600}
+      CONTROL_BACKUP_SCHEDULER_ENABLED: ${CONTROL_BACKUP_SCHEDULER_ENABLED:-false}
 
   odoo:
     image: makersbrain-control-odoo:local
@@ -271,3 +301,5 @@ volumes:
     name: makersbrain-control-tenant-secrets
   backup-data:
     name: makersbrain-control-backups
+  backup-secrets:
+    name: makersbrain-control-backup-secrets

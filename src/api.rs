@@ -1018,11 +1018,17 @@ async fn database(
             Option<OffsetDateTime>,
             Option<Uuid>,
             Option<String>,
+            Vec<String>,
+            String,
+            String,
+            Option<OffsetDateTime>,
+            Option<OffsetDateTime>,
         ),
     >(
         "select r.id,r.kind,r.label,r.state,r.size_bytes,r.created_at,r.ready_at,
-                r.operation_id,o.state
-         from control.odoo_recovery_points r
+                r.operation_id,o.state,r.component_scope,r.format_version,
+                r.storage_location,r.verified_at,r.expires_at
+         from control.workshop_recovery_points r
          left join control.operations o on o.id=r.operation_id
          where r.workshop_id=$1 and r.state<>'deleted'
          order by r.created_at desc",
@@ -1034,7 +1040,7 @@ async fn database(
         "can_manage": role.can_manage_database(),
         "primary": primary.map(|row| json!({"id":row.0,"public_hostname":row.1,"state":row.2,"created_at":row.3,"last_restored_at":row.4})),
         "duplicates": duplicates.into_iter().map(|row| json!({"id":row.0,"label":row.1,"state":row.2,"routable":false,"created_at":row.3})).collect::<Vec<_>>(),
-        "recovery_points": recovery.into_iter().map(|row| json!({"id":row.0,"kind":row.1,"label":row.2,"state":row.3,"size_bytes":row.4,"created_at":row.5,"ready_at":row.6,"operation_id":row.7,"operation_state":row.8})).collect::<Vec<_>>()
+        "recovery_points": recovery.into_iter().map(|row| json!({"id":row.0,"kind":row.1,"label":row.2,"state":row.3,"size_bytes":row.4,"created_at":row.5,"ready_at":row.6,"operation_id":row.7,"operation_state":row.8,"component_scope":row.9,"format_version":row.10,"storage_location":row.11,"verified_at":row.12,"expires_at":row.13})).collect::<Vec<_>>()
     })))
 }
 
@@ -1092,6 +1098,17 @@ async fn create_recovery_point(
     lock_lifecycle(&mut tx, workshop).await?;
     let database_id = primary_database(&mut tx, workshop).await?;
     ensure_lifecycle_idle(&mut tx, workshop).await?;
+    let documents_enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
+    )
+    .bind(workshop)
+    .fetch_one(&mut *tx)
+    .await?;
+    let component_scope = if documents_enabled {
+        vec!["odoo", "paperless"]
+    } else {
+        vec!["odoo"]
+    };
     let payload = json!({"action":kind,"database_id":database_id,"recovery_point_id":recovery_id});
     let operation_id = Store::enqueue(
         &mut tx,
@@ -1107,14 +1124,14 @@ async fn create_recovery_point(
         },
     )
     .await?;
-    sqlx::query("insert into control.odoo_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by) values($1,$2,$3,$4,$5,$6,$7)")
-        .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(who.user_id).execute(&mut *tx).await?;
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,$5,$6,$7,$8,'makersbrain-workshop-recovery-v2')")
+        .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
     audit(
         &mut tx,
         Some(who.user_id),
         Some(workshop),
         &format!("database.{kind}"),
-        "odoo_recovery_point",
+        "workshop_recovery_point",
         recovery_id.to_string(),
         correlation,
     )
@@ -1149,9 +1166,25 @@ async fn restore_database(
     lock_lifecycle(&mut tx, id).await?;
     let database_id = primary_database(&mut tx, id).await?;
     ensure_lifecycle_idle(&mut tx, id).await?;
-    let storage_ref = sqlx::query_scalar::<_, String>("select storage_ref from control.odoo_recovery_points where id=$1 and workshop_id=$2 and database_id=$3 and state='ready' and storage_ref is not null")
-        .bind(body.recovery_point_id).bind(id).bind(database_id).fetch_optional(&mut *tx).await?.ok_or(ApiError::Validation("recovery point is not ready"))?;
-    let payload = json!({"action":"restore","database_id":database_id,"recovery_point_id":body.recovery_point_id,"storage_ref":storage_ref,"safety_recovery_point_id":safety_id});
+    let recovery_scope = sqlx::query_scalar::<_, Vec<String>>("select component_scope from control.workshop_recovery_points where id=$1 and workshop_id=$2 and database_id=$3 and state='ready' and verification_state='verified' and storage_ref is not null and (expires_at is null or expires_at > now())")
+        .bind(body.recovery_point_id).bind(id).bind(database_id).fetch_optional(&mut *tx).await?.ok_or(ApiError::Validation("recovery point is not ready and verified"))?;
+    let documents_enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if recovery_scope.iter().any(|item| item == "paperless") != documents_enabled {
+        return Err(ApiError::Validation(
+            "recovery point module scope does not match the workshop",
+        ));
+    }
+    let safety_scope = if documents_enabled {
+        vec!["odoo", "paperless"]
+    } else {
+        vec!["odoo"]
+    };
+    let payload = json!({"action":"restore","database_id":database_id,"recovery_point_id":body.recovery_point_id,"safety_recovery_point_id":safety_id});
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -1166,8 +1199,8 @@ async fn restore_database(
         },
     )
     .await?;
-    sqlx::query("insert into control.odoo_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'snapshot','Automatic pre-restore snapshot',$4)")
-        .bind(safety_id).bind(id).bind(database_id).bind(who.user_id).execute(&mut *tx).await?;
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'backup','Automatic pre-restore safety backup',$4,$5,'makersbrain-workshop-recovery-v2')")
+        .bind(safety_id).bind(id).bind(database_id).bind(who.user_id).bind(&safety_scope).execute(&mut *tx).await?;
     sqlx::query("update control.odoo_databases set state='restoring' where id=$1")
         .bind(database_id)
         .execute(&mut *tx)
@@ -1177,7 +1210,7 @@ async fn restore_database(
         Some(who.user_id),
         Some(id),
         "database.restore",
-        "odoo_recovery_point",
+        "workshop_recovery_point",
         body.recovery_point_id.to_string(),
         correlation,
     )
