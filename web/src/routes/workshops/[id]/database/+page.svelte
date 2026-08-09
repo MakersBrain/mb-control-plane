@@ -55,7 +55,11 @@
 		await start('duplicates', { label: duplicateLabel, confirmation: duplicateConfirmation }, 'Non-routable duplicate queued.');
 		duplicateConfirmation = '';
 	}
-	const when = (value?: string) => value ? new Date(value).toLocaleString() : '—';
+	const when = (value?: string) => {
+		if (!value) return '—';
+		const parsed = new Date(value);
+		return Number.isNaN(parsed.getTime()) ? '—' : parsed.toLocaleString();
+	};
 	const size = (value?: number) => value == null ? '—' : `${(value / 1048576).toFixed(1)} MB`;
 	const workshopUrl = (hostname: string) => hostname.endsWith('.localhost') ? `http://${hostname}:8169` : `https://${hostname}`;
 </script>

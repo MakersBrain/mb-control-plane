@@ -11,7 +11,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -27,6 +27,12 @@ use crate::domain::{OperationKind, WorkshopRole, normalize_email, opaque_databas
 use crate::persistence::{NewOperation, Store};
 
 type ApiResult<T> = Result<T, ApiError>;
+
+fn api_timestamp(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .expect("database timestamp is representable as RFC 3339")
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1038,9 +1044,9 @@ async fn database(
     .await?;
     Ok(Json(json!({
         "can_manage": role.can_manage_database(),
-        "primary": primary.map(|row| json!({"id":row.0,"public_hostname":row.1,"state":row.2,"created_at":row.3,"last_restored_at":row.4})),
-        "duplicates": duplicates.into_iter().map(|row| json!({"id":row.0,"label":row.1,"state":row.2,"routable":false,"created_at":row.3})).collect::<Vec<_>>(),
-        "recovery_points": recovery.into_iter().map(|row| json!({"id":row.0,"kind":row.1,"label":row.2,"state":row.3,"size_bytes":row.4,"created_at":row.5,"ready_at":row.6,"operation_id":row.7,"operation_state":row.8,"component_scope":row.9,"format_version":row.10,"storage_location":row.11,"verified_at":row.12,"expires_at":row.13})).collect::<Vec<_>>()
+        "primary": primary.map(|row| json!({"id":row.0,"public_hostname":row.1,"state":row.2,"created_at":api_timestamp(row.3),"last_restored_at":row.4.map(api_timestamp)})),
+        "duplicates": duplicates.into_iter().map(|row| json!({"id":row.0,"label":row.1,"state":row.2,"routable":false,"created_at":api_timestamp(row.3)})).collect::<Vec<_>>(),
+        "recovery_points": recovery.into_iter().map(|row| json!({"id":row.0,"kind":row.1,"label":row.2,"state":row.3,"size_bytes":row.4,"created_at":api_timestamp(row.5),"ready_at":row.6.map(api_timestamp),"operation_id":row.7,"operation_state":row.8,"component_scope":row.9,"format_version":row.10,"storage_location":row.11,"verified_at":row.12.map(api_timestamp),"expires_at":row.13.map(api_timestamp)})).collect::<Vec<_>>()
     })))
 }
 
@@ -1388,7 +1394,7 @@ async fn operation(
         return Err(ApiError::NotFound);
     }
     Ok(Json(
-        json!({"id":id,"kind":row.0,"state":row.1,"workshop_id":row.2,"attempt":row.3,"max_attempts":row.4,"failure_class":row.5,"created_at":row.6,"finished_at":row.7}),
+        json!({"id":id,"kind":row.0,"state":row.1,"workshop_id":row.2,"attempt":row.3,"max_attempts":row.4,"failure_class":row.5,"created_at":api_timestamp(row.6),"finished_at":row.7.map(api_timestamp)}),
     ))
 }
 
@@ -1578,4 +1584,17 @@ async fn audit(
     sqlx::query("insert into control.audit_events(id,actor_user_id,workshop_id,action,target_type,target_id,correlation_id,outcome) values($1,$2,$3,$4,$5,$6,$7,'accepted')")
         .bind(Uuid::new_v4()).bind(actor).bind(workshop).bind(action).bind(target_type).bind(target_id).bind(correlation).execute(&mut **tx).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_timestamp;
+
+    #[test]
+    fn api_timestamps_are_rfc3339_for_browser_parsers() {
+        assert_eq!(
+            api_timestamp(time::OffsetDateTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
+        );
+    }
 }
