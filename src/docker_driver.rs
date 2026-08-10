@@ -3426,15 +3426,7 @@ async fn write_routes(
     odoo_hostname: &str,
     paperless: Option<(&str, &str)>,
 ) -> Result<(), DriverError> {
-    let mut config = format!(
-        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    proxy_pass http://odoo:8069;\n  }}\n}}\n",
-        database_ref
-    );
-    if let Some((paperless_hostname, paperless_container)) = paperless {
-        config.push_str(&format!(
-            "server {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_pass http://{paperless_container}:8000;\n  }}\n}}\n"
-        ));
-    }
+    let config = route_config(database_ref, odoo_hostname, paperless);
     let path = state.config.route_root.join(format!("{workshop}.conf"));
     let temporary = state.config.route_root.join(format!("{workshop}.conf.tmp"));
     let previous = std::fs::read(&path).ok();
@@ -3465,6 +3457,23 @@ async fn write_routes(
         )));
     }
     Ok(())
+}
+
+fn route_config(
+    database_ref: &str,
+    odoo_hostname: &str,
+    paperless: Option<(&str, &str)>,
+) -> String {
+    let mut config = format!(
+        "server {{\n  listen 8080;\n  server_name {odoo_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    set $tenant_upstream \"odoo:8069\";\n    proxy_pass http://$tenant_upstream;\n  }}\n}}\n",
+        database_ref
+    );
+    if let Some((paperless_hostname, paperless_container)) = paperless {
+        config.push_str(&format!(
+            "server {{\n  listen 8080;\n  server_name {paperless_hostname};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    set $tenant_upstream \"{paperless_container}:8000\";\n    proxy_pass http://$tenant_upstream;\n  }}\n}}\n"
+        ));
+    }
+    config
 }
 
 async fn docker_exec(
@@ -3698,6 +3707,29 @@ mod tests {
         let second = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
         assert_ne!(tenant_key(first), tenant_key(second));
         assert_eq!(tenant_key(first).len(), 32);
+    }
+
+    #[test]
+    fn tenant_routes_resolve_container_addresses_dynamically() {
+        let config = route_config(
+            "mb_00000000000000000000000000000001",
+            "atelier.dev1.makersbrain.net",
+            Some((
+                "docs-atelier.dev1.makersbrain.net",
+                "mb-paperless-00000000000000000000000000000001",
+            )),
+        );
+        assert!(config.contains("set $tenant_upstream \"odoo:8069\";"));
+        assert!(config.contains(
+            "set $tenant_upstream \"mb-paperless-00000000000000000000000000000001:8000\";"
+        ));
+        assert_eq!(
+            config
+                .matches("proxy_pass http://$tenant_upstream;")
+                .count(),
+            2
+        );
+        assert!(!config.contains("proxy_pass http://odoo:8069;"));
     }
 
     #[test]
