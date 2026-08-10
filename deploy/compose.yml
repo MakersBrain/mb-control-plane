@@ -13,15 +13,16 @@ x-worker: &worker
   depends_on:
     postgres: {condition: service_healthy}
     control-migrate: {condition: service_completed_successfully}
+    document-extraction: {condition: service_healthy}
   environment:
     <<: *control-env
     CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
     CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
-    CONTROL_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT:-}
-    CONTROL_AZURE_KEY: ${AZURE_DOCUMENT_KEY:-}
     CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
+    CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
     CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
-    CONTROL_AZURE_POLL_INTERVAL_MS: "2000"
+    CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
+    CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
     CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
     CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
     CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
@@ -31,6 +32,23 @@ x-worker: &worker
     - tenant-secrets:/run/makersbrain-secrets:ro
 
 services:
+  document-extraction:
+    image: makersbrain-control:local
+    build: {context: ..}
+    command: ["/usr/local/bin/document-extraction-broker"]
+    environment:
+      BROKER_LISTEN: 0.0.0.0:8080
+      BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
+      BROKER_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT:-}
+      BROKER_AZURE_KEY: ${AZURE_DOCUMENT_KEY:-}
+      BROKER_AZURE_API_VERSION: ${AZURE_DOCUMENT_API_VERSION:-2024-11-30}
+      BROKER_AZURE_POLL_INTERVAL_MS: "2000"
+      BROKER_VISION_ENDPOINT: ${INVENTORY_VISION_ENDPOINT:-}
+      BROKER_VISION_KEY: ${INVENTORY_VISION_KEY:-}
+      BROKER_VISION_MODEL: ${INVENTORY_VISION_MODEL:-}
+    healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
+    restart: unless-stopped
+
   postgres:
     image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
@@ -243,6 +261,7 @@ services:
 
   worker-membership: {<<: *worker, command: ["/usr/local/bin/control-worker", "membership-provisioning"]}
   worker-invoice: {<<: *worker, command: ["/usr/local/bin/control-worker", "invoice-capture"]}
+  worker-inventory: {<<: *worker, command: ["/usr/local/bin/control-worker", "inventory-capture"]}
   worker-provisioning: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-provisioning"]}
   worker-email: {<<: *worker, command: ["/usr/local/bin/control-worker", "email-delivery"]}
   worker-reconciliation: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
@@ -268,6 +287,7 @@ services:
       USER: odoo
       PASSWORD: ${ODOO_POSTGRES_PASSWORD}
       MB_CONTROL_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
+      MB_CONTROL_API_URL: http://control-api:8080
     command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--db_password=${ODOO_POSTGRES_PASSWORD}", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes: ["odoo-data:/var/lib/odoo"]
     depends_on: {postgres: {condition: service_healthy}}

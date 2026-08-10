@@ -129,6 +129,10 @@ pub fn app(state: AppState) -> Router {
             post(paperless_event),
         )
         .route(
+            "/internal/v1/workshops/{workshop_id}/inventory-captures",
+            post(inventory_capture),
+        )
+        .route(
             "/internal/v1/tenants/{workshop_id}/reconcile",
             post(reconcile_tenant),
         )
@@ -197,6 +201,36 @@ fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     if supplied != Some(state.config.internal_token.as_str()) {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(())
+}
+
+async fn tenant_bridge(state: &AppState, headers: &HeaderMap, workshop: Uuid) -> ApiResult<()> {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthenticated)?;
+    let reference = sqlx::query_scalar::<_, String>(
+        "select secret_ref from control.service_instances
+         where workshop_id=$1 and service='odoo'",
+    )
+    .bind(workshop)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::Unauthenticated)?;
+    let expected = crate::worker::secret(&reference).map_err(|_| ApiError::Unauthenticated)?;
+    let supplied = supplied.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = supplied.len() ^ expected.len();
+    for index in 0..supplied.len().max(expected.len()) {
+        difference |= usize::from(
+            supplied.get(index).copied().unwrap_or_default()
+                ^ expected.get(index).copied().unwrap_or_default(),
+        );
+    }
+    if difference != 0 {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())
@@ -507,7 +541,7 @@ async fn platform_status(
 ) -> ApiResult<Json<Value>> {
     operator(&state, &headers).await?;
     let queues = sqlx::query_as::<_, (String,i64,i64,i64,Option<OffsetDateTime>,Option<OffsetDateTime>)>(
-        "with known(queue) as (values ('identity-operations'),('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),min(o.created_at) filter(where o.state in ('pending','in_flight','awaiting_reconciliation')),max(o.finished_at) from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue",
+        "with known(queue) as (values ('identity-operations'),('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),min(o.created_at) filter(where o.state in ('pending','in_flight','awaiting_reconciliation')),max(o.finished_at) from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue",
     ).fetch_all(state.store.pool()).await?;
     let services = sqlx::query_as::<_, (String,String,i64)>(
         "select service,health,count(*) from control.service_instances group by service,health order by service,health",
@@ -1903,6 +1937,82 @@ async fn paperless_event(
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({"operation_id":operation})),
+    ))
+}
+
+async fn inventory_capture(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workshop_id): Path<Uuid>,
+    Json(payload): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    tenant_bridge(&state, &headers, workshop_id).await?;
+    let capture_id = payload
+        .get("capture_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ApiError::Validation("capture_id must be a UUID"))?;
+    if payload.get("task").and_then(Value::as_str) != Some("inventory_label") {
+        return Err(ApiError::Validation("task must be inventory_label"));
+    }
+    let assets = payload
+        .get("assets")
+        .and_then(Value::as_array)
+        .filter(|assets| !assets.is_empty() && assets.len() <= 2)
+        .ok_or(ApiError::Validation("one or two assets are required"))?;
+    for asset in assets {
+        let valid_id = asset
+            .get("asset_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| Uuid::parse_str(value).is_ok());
+        let valid_role = matches!(
+            asset.get("role").and_then(Value::as_str),
+            Some("front" | "lot_detail")
+        );
+        let valid_digest = asset
+            .get("content_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        if !valid_id
+            || !valid_role
+            || !valid_digest
+            || asset.as_object().is_none_or(|v| v.len() != 3)
+        {
+            return Err(ApiError::Validation("asset descriptor is invalid"));
+        }
+    }
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules
+         where workshop_id=$1 and module_key='inventory-capture' and state='enabled')",
+    )
+    .bind(workshop_id)
+    .fetch_one(state.store.pool())
+    .await?;
+    if !enabled {
+        return Err(ApiError::Forbidden);
+    }
+    let key = idempotency(&headers)?;
+    let mut tx = state.store.begin().await?;
+    let operation = Store::enqueue(
+        &mut tx,
+        NewOperation {
+            kind: OperationKind::InventoryCaptureExtract,
+            workshop_id: Some(workshop_id),
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: None,
+            correlation_id: Uuid::new_v4(),
+            idempotency_key: key,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"operation_id": operation, "capture_id": capture_id})),
     ))
 }
 

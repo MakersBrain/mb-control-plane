@@ -1,4 +1,6 @@
 pub mod azure;
+pub mod extraction;
+pub mod inventory_vision;
 pub mod odoo;
 pub mod paperless;
 pub mod rauthy;

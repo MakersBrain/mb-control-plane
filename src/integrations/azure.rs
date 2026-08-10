@@ -71,9 +71,24 @@ impl AzureInvoiceClient {
     }
 
     pub async fn analyze(&self, source: &[u8], mimetype: &str) -> Result<Value, IntegrationError> {
+        self.analyze_model("prebuilt-invoice", source, mimetype)
+            .await
+    }
+
+    pub async fn analyze_model(
+        &self,
+        model: &str,
+        source: &[u8],
+        mimetype: &str,
+    ) -> Result<Value, IntegrationError> {
+        if !matches!(model, "prebuilt-invoice" | "prebuilt-read") {
+            return Err(IntegrationError::ContractDrift);
+        }
         let mut url = self
             .endpoint
-            .join("/documentintelligence/documentModels/prebuilt-invoice:analyze")
+            .join(&format!(
+                "/documentintelligence/documentModels/{model}:analyze"
+            ))
             .map_err(|_| IntegrationError::ContractDrift)?;
         url.query_pairs_mut()
             .append_pair("_overload", "analyzeDocument")

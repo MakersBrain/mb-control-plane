@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
-use crate::integrations::azure::AzureInvoiceClient;
+use crate::integrations::extraction::ExtractionBrokerClient;
 use crate::integrations::odoo::{
     EntitlementCommand, MembershipCommand, ModuleEnableCommand, OdooClient, TenantBootstrapCommand,
 };
@@ -14,11 +14,12 @@ use crate::integrations::paperless::PaperlessClient;
 use crate::integrations::rauthy::RauthyClient;
 use crate::persistence::{LeasedOperation, OperationOutcome, Store};
 
-const QUEUES: [&str; 7] = [
+const QUEUES: [&str; 8] = [
     "identity-operations",
     "tenant-provisioning",
     "membership-provisioning",
     "invoice-capture",
+    "inventory-capture",
     "email-delivery",
     "tenant-reconciliation",
     "tenant-lifecycle",
@@ -76,6 +77,7 @@ async fn handle(store: &Store, operation: &LeasedOperation) -> Result<(), Integr
         "membership.reconcile" => membership(store, operation).await,
         "entitlement.apply" => entitlement(store, operation).await,
         "invoice.capture" => invoice(store, operation).await,
+        "inventory.capture.extract" => inventory_capture(store, operation).await,
         "tenant.provision" => driver(store, operation, "provision").await.map(|_| ()),
         "tenant.reconcile" => driver(store, operation, "reconcile").await.map(|_| ()),
         "tenant.lifecycle" => lifecycle(store, operation).await,
@@ -97,15 +99,15 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
     let bundle = crate::modules::bundle(module_key).ok_or(IntegrationError::ContractDrift)?;
     if bundle.service == Some("paperless") {
         enable_paperless(store, operation, workshop).await?;
-    } else if module_key == "azure-invoice-extraction" {
-        AzureInvoiceClient::new(
-            &env("CONTROL_AZURE_ENDPOINT")?,
-            &env("CONTROL_AZURE_KEY")?,
-            &std::env::var("CONTROL_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
-        .map_err(|_| IntegrationError::ContractDrift)?;
+    } else if matches!(
+        module_key,
+        "azure-invoice-extraction" | "azure-label-extraction"
+    ) {
+        extraction_broker(Duration::from_secs(5))?.ready().await?;
+    } else if module_key == "inventory-ai-fallback" {
+        extraction_broker(Duration::from_secs(5))?
+            .vision_ready()
+            .await?;
     } else if !bundle.odoo_modules.is_empty() {
         let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
         let odoo = OdooClient::new(
@@ -235,7 +237,16 @@ fn env(name: &str) -> Result<String, IntegrationError> {
         .filter(|v| !v.trim().is_empty())
         .ok_or(IntegrationError::Unauthorized)
 }
-fn secret(reference: &str) -> Result<String, IntegrationError> {
+
+fn extraction_broker(timeout: Duration) -> Result<ExtractionBrokerClient, IntegrationError> {
+    ExtractionBrokerClient::new(
+        &env("CONTROL_EXTRACTION_BROKER_URL")?,
+        &env("CONTROL_EXTRACTION_BROKER_TOKEN")?,
+        timeout,
+    )
+    .map_err(|_| IntegrationError::ContractDrift)
+}
+pub(crate) fn secret(reference: &str) -> Result<String, IntegrationError> {
     if reference.is_empty() || reference.len() > 180 {
         return Err(IntegrationError::ContractDrift);
     }
@@ -533,22 +544,21 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
         )
         .await?;
         throttle_azure_submission(store).await?;
-        let azure = AzureInvoiceClient::new(
-            &env("CONTROL_AZURE_ENDPOINT")?,
-            &env("CONTROL_AZURE_KEY")?,
-            &std::env::var("CONTROL_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
-            Duration::from_secs(45),
-            Duration::from_millis(
-                std::env::var("CONTROL_AZURE_POLL_INTERVAL_MS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(2_000_u64)
-                    .max(2_000),
-            ),
-        )
-        .map_err(|_| IntegrationError::ContractDrift)?;
-        let result = azure.analyze(&source, &mimetype).await?;
-        let (invoice, confidence, pages) = crate::invoice::normalize_azure(&result)?;
+        let result = extraction_broker(Duration::from_secs(120))?
+            .invoice(&source, &mimetype)
+            .await?;
+        let invoice = result
+            .get("invoice")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        let confidence = result
+            .get("confidence")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        let pages = result
+            .get("pages")
+            .and_then(Value::as_i64)
+            .ok_or(IntegrationError::ContractDrift)?;
         ("azure", invoice, confidence, pages)
     };
     let requires_review = crate::invoice::requires_review(&invoice, &confidence);
@@ -573,6 +583,214 @@ async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), Integ
             paperless.mark_capture(document_id, &ids).await?
         }
     }
+    Ok(())
+}
+
+async fn inventory_capture(
+    store: &Store,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
+    let workshop = operation
+        .workshop_id
+        .ok_or(IntegrationError::ContractDrift)?;
+    let capture_id = operation
+        .payload
+        .get("capture_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(IntegrationError::ContractDrift)?;
+    let descriptors = operation
+        .payload
+        .get("assets")
+        .and_then(Value::as_array)
+        .filter(|assets| !assets.is_empty() && assets.len() <= 2)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
+    let odoo = OdooClient::new(
+        &odoo_url,
+        &secret(&odoo_ref)?,
+        database_ref.as_deref(),
+        Duration::from_secs(45),
+    )
+    .map_err(|_| IntegrationError::ContractDrift)?;
+    let mut assets = Vec::with_capacity(descriptors.len());
+    let mut input_digests = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let asset_id = descriptor
+            .get("asset_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or(IntegrationError::ContractDrift)?;
+        let expected = descriptor
+            .get("content_sha256")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::ContractDrift)?
+            .to_ascii_lowercase();
+        let asset = odoo.inventory_asset(capture_id, asset_id).await?;
+        let actual = format!("{:x}", Sha256::digest(&asset.content));
+        if asset.sha256 != expected || actual != expected {
+            return Err(IntegrationError::ContractDrift);
+        }
+        input_digests.push(expected);
+        assets.push((asset_id, asset));
+    }
+    let attempt_id = Uuid::new_v4();
+    let operation_key = format!("inventory:{capture_id}:{}", operation.id);
+    if !module_enabled(store, workshop, "azure-label-extraction").await? {
+        odoo.capture_inventory_result(&json!({
+            "operation_key": operation_key,
+            "capture_id": capture_id,
+            "attempt_id": attempt_id,
+            "kind": "ocr",
+            "provider": "manual-only",
+            "model": "none",
+            "version": env!("CARGO_PKG_VERSION"),
+            "state": "failed",
+            "input_digests": input_digests,
+            "normalized_response": {"candidates": [], "warnings": ["label extraction is not enabled"]},
+            "raw_response": {},
+            "usage": {"images": 0},
+            "failure_code": "provider_disabled"
+        })).await?;
+        return Ok(());
+    }
+    reserve_azure_inventory(store, operation.id, workshop, assets.len() as i64).await?;
+    let broker = extraction_broker(Duration::from_secs(120))?;
+    let mut tokens = Vec::new();
+    let mut codes = Vec::new();
+    let mut candidates = Vec::new();
+    for (asset_id, asset) in &assets {
+        throttle_azure_submission(store).await?;
+        let result = broker
+            .inventory_label(&asset.content, &asset.mimetype, &asset_id.to_string())
+            .await?;
+        let normalized = result
+            .get("normalized")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        tokens.extend(
+            normalized["ocr_tokens"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        codes.extend(normalized["codes"].as_array().cloned().unwrap_or_default());
+        candidates.extend(
+            normalized["candidates"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    let needs_vision = candidates.is_empty();
+    let ocr_tokens = Value::Array(tokens.clone());
+    odoo.capture_inventory_result(&json!({
+        "operation_key": operation_key,
+        "capture_id": capture_id,
+        "attempt_id": attempt_id,
+        "kind": "ocr",
+        "provider": "azure-document-intelligence",
+        "model": "prebuilt-read",
+        "version": "broker-v1",
+        "state": "succeeded",
+        "input_digests": input_digests,
+        "normalized_response": {"ocr_tokens": tokens, "codes": codes, "candidates": candidates},
+        "raw_response": {"retained": false},
+        "usage": {"images": assets.len()}
+    }))
+    .await?;
+    if needs_vision && module_enabled(store, workshop, "inventory-ai-fallback").await? {
+        let vision_assets = assets
+            .iter()
+            .map(|(asset_id, asset)| {
+                (
+                    asset_id.to_string(),
+                    asset.mimetype.clone(),
+                    asset.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let vision = broker.inventory_vision(&vision_assets, &ocr_tokens).await?;
+        let normalized = vision
+            .get("normalized")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        odoo.capture_inventory_result(&json!({
+            "operation_key": format!("inventory:{capture_id}:{}:vision", operation.id),
+            "capture_id": capture_id,
+            "attempt_id": Uuid::new_v4(),
+            "parent_attempt_id": attempt_id,
+            "kind": "multimodal",
+            "provider": vision.get("provider").and_then(Value::as_str).unwrap_or("multimodal-vision"),
+            "model": vision.get("model").and_then(Value::as_str).unwrap_or("configured"),
+            "version": vision.get("version").and_then(Value::as_str).unwrap_or("broker-v1"),
+            "state": "succeeded",
+            "input_digests": input_digests,
+            "normalized_response": normalized,
+            "raw_response": {"retained": false},
+            "usage": {"images": assets.len()}
+        }))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn reserve_azure_inventory(
+    store: &Store,
+    operation: Uuid,
+    workshop: Uuid,
+    images: i64,
+) -> Result<(), IntegrationError> {
+    let limit = std::env::var("CONTROL_AZURE_MONTHLY_IMAGE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(500);
+    let mut transaction = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let reserved = sqlx::query_scalar::<_, i64>(
+        "insert into control.usage_reservations(operation_id,workshop_id,metric,quantity)
+         values($1,$2,'azure_inventory_images',$3)
+         on conflict(operation_id) do nothing returning quantity",
+    )
+    .bind(operation)
+    .bind(workshop)
+    .bind(images)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if reserved.is_none() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        return Ok(());
+    }
+    let quantity = sqlx::query_scalar::<_, i64>(
+        "insert into control.usage_counters(workshop_id,period,metric,quantity)
+         select $1,date_trunc('month',current_date)::date,'azure_inventory_images',$2 where $2<=$3
+         on conflict(workshop_id,period,metric) do update set
+         quantity=control.usage_counters.quantity+excluded.quantity,updated_at=now()
+         where control.usage_counters.quantity+excluded.quantity<=$3 returning quantity",
+    )
+    .bind(workshop)
+    .bind(images)
+    .bind(limit)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if quantity.is_none() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        return Err(IntegrationError::Rejected);
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
 }
 

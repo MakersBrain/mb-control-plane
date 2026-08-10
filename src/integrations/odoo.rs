@@ -10,6 +10,7 @@ use crate::domain::IntegrationError;
 use super::{bounded_body, classify_status};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_ASSET_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct OdooClient {
@@ -67,6 +68,13 @@ pub struct AppliedCommand {
     pub epoch: Option<i32>,
     #[serde(default)]
     pub version: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InventoryAsset {
+    pub content: Vec<u8>,
+    pub mimetype: String,
+    pub sha256: String,
 }
 
 impl OdooClient {
@@ -166,6 +174,68 @@ impl OdooClient {
 
     pub async fn capture_invoice(&self, command: &Value) -> Result<Value, IntegrationError> {
         self.post("/mb_control/v1/invoices/capture", command).await
+    }
+
+    pub async fn inventory_asset(
+        &self,
+        capture_id: Uuid,
+        asset_id: Uuid,
+    ) -> Result<InventoryAsset, IntegrationError> {
+        let url = self
+            .base_url
+            .join(&format!(
+                "/mb_control/v1/inventory-captures/{capture_id}/assets/{asset_id}"
+            ))
+            .map_err(|_| IntegrationError::ContractDrift)?;
+        let response = self.http.get(url).send().await.map_err(|error| {
+            if error.is_timeout() {
+                IntegrationError::UnknownOutcome
+            } else {
+                IntegrationError::Unavailable
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_status(status));
+        }
+        let mimetype = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| matches!(*value, "image/jpeg" | "image/png"))
+            .ok_or(IntegrationError::ContractDrift)?
+            .to_owned();
+        let sha256 = response
+            .headers()
+            .get("x-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(IntegrationError::ContractDrift)?
+            .to_ascii_lowercase();
+        let declared_length = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value <= MAX_ASSET_BYTES)
+            .ok_or(IntegrationError::ContractDrift)?;
+        let content = bounded_body(response, MAX_ASSET_BYTES).await?.to_vec();
+        if content.len() != declared_length {
+            return Err(IntegrationError::ContractDrift);
+        }
+        Ok(InventoryAsset {
+            content,
+            mimetype,
+            sha256,
+        })
+    }
+
+    pub async fn capture_inventory_result(
+        &self,
+        command: &Value,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/inventory-captures/results", command)
+            .await
     }
 
     pub async fn enable_modules(

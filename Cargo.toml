@@ -30,6 +30,10 @@ path = "src/bin/control-docker-driver.rs"
 name = "control-backup-scheduler"
 path = "src/bin/control-backup-scheduler.rs"
 
+[[bin]]
+name = "document-extraction-broker"
+path = "src/bin/document-extraction-broker.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -41,6 +45,7 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 lopdf = "0.44"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "http2", "charset"] }
 rand = "0.9"
+regex = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
