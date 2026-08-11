@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 1,
   "release": "0.1.0",
-  "schema_release": "0011_inventory_capture",
-  "schema_compatibility": ">=0010_retained_workshop_deletion,<0011",
+  "schema_release": "0012_inventory_ai_usage",
+  "schema_compatibility": ">=0011_inventory_capture,<0012",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "web": {"build_context": "control-plane/web", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
@@ -35,7 +35,7 @@
   "optional_environment": {
     "platform_operators": ["CONTROL_OPERATOR_EMAILS"],
     "azure_document_extraction": ["BROKER_AZURE_API_VERSION", "BROKER_AZURE_POLL_INTERVAL_MS", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS"],
-    "inventory_vision_fallback": ["BROKER_VISION_ENDPOINT", "BROKER_VISION_KEY", "BROKER_VISION_MODEL"],
+    "inventory_vision_fallback": ["BROKER_VISION_ENDPOINT", "BROKER_VISION_KEY", "BROKER_VISION_MODEL", "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT"],
     "paperless": ["DRIVER_PAPERLESS_IMAGE"],
     "portable_backups": ["DRIVER_BACKUP_AGENT_IMAGE", "BACKUP_S3_BUCKET", "BACKUP_S3_ENDPOINT", "BACKUP_S3_REGION", "BACKUP_S3_ACCESS_KEY_ID", "BACKUP_S3_SECRET_ACCESS_KEY", "RESTORE_S3_ACCESS_KEY_ID", "RESTORE_S3_SECRET_ACCESS_KEY", "BACKUP_AGE_RECIPIENT", "BACKUP_AGE_IDENTITY_FILE", "BACKUP_ENCRYPTION_KEY_ID", "BACKUP_RETENTION_DAYS", "CONTROL_BACKUP_SCHEDULER_ENABLED", "CONTROL_BACKUP_INTERVAL_SECONDS"]
   },
@@ -52,5 +52,5 @@
   "inventory_capture": {"optional_module": "inventory-capture", "azure_module": "azure-label-extraction", "azure_optional": true, "source_images_in_queue": false},
   "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge"], "optional_modules": ["mb_invoice_capture", "mb_inventory_capture", "mb_inventory_capture_catalogue"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another"},
   "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
-  "rollback": {"application": "requires an application release compatible with 0010_retained_workshop_deletion", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
+  "rollback": {"application": "requires an application release compatible with 0011_inventory_capture", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
 }

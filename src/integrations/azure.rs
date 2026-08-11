@@ -153,10 +153,38 @@ impl AzureInvoiceClient {
                 serde_json::from_slice(&body).map_err(|_| IntegrationError::ContractDrift)?;
             match operation.status.as_str() {
                 "notStarted" | "running" => continue,
-                "succeeded" => return operation.result.ok_or(IntegrationError::ContractDrift),
+                "succeeded" => {
+                    let result = operation.result.ok_or(IntegrationError::ContractDrift)?;
+                    self.delete_analyze_result(operation_url.clone()).await?;
+                    return Ok(result);
+                }
                 "failed" => return Err(IntegrationError::Rejected),
                 _ => return Err(IntegrationError::ContractDrift),
             }
+        }
+        Err(IntegrationError::Unavailable)
+    }
+
+    async fn delete_analyze_result(&self, operation_url: Url) -> Result<(), IntegrationError> {
+        for retry in 0..3 {
+            let response = self
+                .http
+                .delete(operation_url.clone())
+                .send()
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
+            if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND
+            {
+                return Ok(());
+            }
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && retry < 2 {
+                let delay = retry_after(response.headers())
+                    .unwrap_or(Duration::from_secs(2))
+                    .min(Duration::from_secs(30));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            return Err(classify_status(response.status()));
         }
         Err(IntegrationError::Unavailable)
     }

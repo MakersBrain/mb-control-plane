@@ -1947,6 +1947,39 @@ async fn inventory_capture(
     Json(payload): Json<Value>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     tenant_bridge(&state, &headers, workshop_id).await?;
+    let object = payload
+        .as_object()
+        .filter(|value| {
+            value.len() == 4
+                && value
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "capture_id" | "assets" | "task" | "hints"))
+        })
+        .ok_or(ApiError::Validation("inventory capture payload is invalid"))?;
+    let _hints = object
+        .get("hints")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.len() <= 2
+                && value
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "brand" | "languages"))
+                && value.get("brand").is_none_or(|brand| {
+                    brand
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty() && text.len() <= 100)
+                })
+                && value.get("languages").is_none_or(|languages| {
+                    languages.as_array().is_some_and(|items| {
+                        items.len() <= 5
+                            && items.iter().all(|item| {
+                                item.as_str()
+                                    .is_some_and(|text| !text.is_empty() && text.len() <= 16)
+                            })
+                    })
+                })
+        })
+        .ok_or(ApiError::Validation("inventory capture hints are invalid"))?;
     let capture_id = payload
         .get("capture_id")
         .and_then(Value::as_str)

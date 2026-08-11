@@ -113,4 +113,8 @@ impl InventoryVisionClient {
             .ok_or(IntegrationError::ContractDrift)?;
         serde_json::from_str(content).map_err(|_| IntegrationError::ContractDrift)
     }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 }

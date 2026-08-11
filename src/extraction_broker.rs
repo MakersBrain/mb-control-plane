@@ -20,6 +20,7 @@ const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub struct BrokerState {
     token: String,
     azure: Option<AzureInvoiceClient>,
+    azure_version: String,
     vision: Option<InventoryVisionClient>,
 }
 
@@ -52,13 +53,15 @@ impl BrokerState {
         if endpoint.trim().is_empty() != key.trim().is_empty() {
             anyhow::bail!("both Azure endpoint and key must be configured together");
         }
+        let azure_version =
+            std::env::var("BROKER_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into());
         let azure = if endpoint.trim().is_empty() {
             None
         } else {
             Some(AzureInvoiceClient::new(
                 &endpoint,
                 &key,
-                &std::env::var("BROKER_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into()),
+                &azure_version,
                 Duration::from_secs(45),
                 Duration::from_millis(
                     std::env::var("BROKER_AZURE_POLL_INTERVAL_MS")
@@ -95,6 +98,7 @@ impl BrokerState {
         Ok(Self {
             token: required("BROKER_TOKEN")?,
             azure,
+            azure_version,
             vision,
         })
     }
@@ -134,11 +138,23 @@ async fn vision_ready(State(state): State<Arc<BrokerState>>) -> StatusCode {
 }
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
+    let Some(supplied) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        == Some(expected)
+    else {
+        return false;
+    };
+    let supplied = supplied.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = supplied.len() ^ expected.len();
+    for index in 0..supplied.len().max(expected.len()) {
+        difference |= usize::from(
+            supplied.get(index).copied().unwrap_or_default()
+                ^ expected.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
 }
 
 async fn extract(
@@ -173,7 +189,7 @@ async fn extract(
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
             let (invoice, confidence, pages) =
                 crate::invoice::normalize_azure(&result).map_err(|_| StatusCode::BAD_GATEWAY)?;
-            json!({"provider":"azure-document-intelligence","model":"prebuilt-invoice","version":"2024-11-30",
+            json!({"provider":"azure-document-intelligence","model":"prebuilt-invoice","version":state.azure_version.as_str(),
                    "invoice":invoice,"confidence":confidence,"pages":pages})
         }
         "inventory_label" => {
@@ -191,7 +207,7 @@ async fn extract(
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
             let normalized = crate::inventory_label::normalize_azure_read(&result, asset_id)
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
-            json!({"provider":"azure-document-intelligence","model":"prebuilt-read","version":"2024-11-30",
+            json!({"provider":"azure-document-intelligence","model":"prebuilt-read","version":state.azure_version.as_str(),
                    "normalized":normalized})
         }
         _ => return Err(StatusCode::BAD_REQUEST),
@@ -237,7 +253,25 @@ async fn inventory_vision(
     let normalized = crate::inventory_label::normalize_vision(&result, &request.ocr_tokens)
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(json!({
-        "provider":"multimodal-vision","model":"configured","version":"broker-v1",
+        "provider":"multimodal-vision","model":vision.model(),"version":"broker-v1",
         "normalized":normalized
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_auth_requires_an_exact_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer exact-secret".parse().unwrap(),
+        );
+        assert!(authorized(&headers, "exact-secret"));
+        assert!(!authorized(&headers, "exact-secreu"));
+        assert!(!authorized(&headers, "exact-secret-longer"));
+        assert!(!authorized(&HeaderMap::new(), "exact-secret"));
+    }
 }

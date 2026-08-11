@@ -132,8 +132,14 @@ pub fn normalize_azure_read(result: &Value, asset_id: &str) -> Result<Value, Int
     let mut tokens = Vec::new();
     let mut codes = Vec::new();
     for page in pages {
-        let width = page.get("width").and_then(Value::as_f64).filter(|value| *value > 0.0);
-        let height = page.get("height").and_then(Value::as_f64).filter(|value| *value > 0.0);
+        let width = page
+            .get("width")
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0);
+        let height = page
+            .get("height")
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0);
         for word in page
             .get("words")
             .and_then(Value::as_array)
@@ -194,14 +200,24 @@ fn normalized_region(value: Option<&Value>, width: Option<f64>, height: Option<f
         return Value::Null;
     }
     let coordinates = points.iter().map(Value::as_f64).collect::<Option<Vec<_>>>();
-    let Some(coordinates) = coordinates else { return Value::Null };
+    let Some(coordinates) = coordinates else {
+        return Value::Null;
+    };
     let xs = coordinates.iter().step_by(2).copied().collect::<Vec<_>>();
-    let ys = coordinates.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+    let ys = coordinates
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .copied()
+        .collect::<Vec<_>>();
     let min_x = xs.iter().copied().fold(f64::INFINITY, f64::min) / width;
     let max_x = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max) / width;
     let min_y = ys.iter().copied().fold(f64::INFINITY, f64::min) / height;
     let max_y = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max) / height;
-    if [min_x, min_y, max_x, max_y].iter().all(|value| (0.0..=1.0).contains(value)) {
+    if [min_x, min_y, max_x, max_y]
+        .iter()
+        .all(|value| (0.0..=1.0).contains(value))
+    {
         json!([min_x, min_y, max_x, max_y])
     } else {
         Value::Null
@@ -278,9 +294,13 @@ mod tests {
                 "asset_id":"detail","reported_region":[0.1,0.2,0.4,0.3],"confidence":0.78}],
             "warnings":["O may be zero"]
         });
-        let normalized = normalize_vision(&result, &json!([
-            {"text":"LOT"},{"text":"801B"}
-        ])).unwrap();
+        let normalized = normalize_vision(
+            &result,
+            &json!([
+                {"text":"LOT"},{"text":"801B"}
+            ]),
+        )
+        .unwrap();
         assert_eq!(normalized["candidates"][0]["grounding_state"], "unverified");
         assert_eq!(normalized["candidates"][0]["raw_value"], "8O1B");
     }

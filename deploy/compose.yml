@@ -3,6 +3,19 @@ name: makersbrain-control
 x-control-env: &control-env
   CONTROL_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
   CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+x-worker-env: &worker-env
+  <<: *control-env
+  CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
+  CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
+  CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
+  CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
+  CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT: "100"
+  CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
+  CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
+  CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
+  CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+  CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+  CONTROL_SECRET_ROOT: /run/makersbrain-secrets
 x-worker: &worker
   image: makersbrain-control:local
   build: {context: ..}
@@ -13,23 +26,20 @@ x-worker: &worker
   depends_on:
     postgres: {condition: service_healthy}
     control-migrate: {condition: service_completed_successfully}
-    document-extraction: {condition: service_healthy}
   environment:
-    <<: *control-env
-    CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
-    CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
-    CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
-    CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
-    CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
-    CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
-    CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
-    CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
-    CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
-    CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
-    CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
-    CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+    <<: *worker-env
   volumes:
     - tenant-secrets:/run/makersbrain-secrets:ro
+x-extraction-worker: &extraction-worker
+  <<: *worker
+  depends_on:
+    postgres: {condition: service_healthy}
+    control-migrate: {condition: service_completed_successfully}
+    document-extraction: {condition: service_healthy}
+  environment:
+    <<: *worker-env
+    CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
+    CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
 
 services:
   document-extraction:
@@ -260,11 +270,11 @@ services:
     restart: unless-stopped
 
   worker-membership: {<<: *worker, command: ["/usr/local/bin/control-worker", "membership-provisioning"]}
-  worker-invoice: {<<: *worker, command: ["/usr/local/bin/control-worker", "invoice-capture"]}
-  worker-inventory: {<<: *worker, command: ["/usr/local/bin/control-worker", "inventory-capture"]}
+  worker-invoice: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "invoice-capture"]}
+  worker-inventory: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "inventory-capture"]}
   worker-provisioning: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-provisioning"]}
   worker-email: {<<: *worker, command: ["/usr/local/bin/control-worker", "email-delivery"]}
-  worker-reconciliation: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
+  worker-reconciliation: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
   worker-lifecycle: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]}
 
   backup-scheduler:

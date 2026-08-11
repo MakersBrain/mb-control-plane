@@ -682,7 +682,7 @@ async fn inventory_capture(
                 .unwrap_or_default(),
         );
     }
-    let needs_vision = candidates.is_empty();
+    let needs_vision = codes.is_empty() || candidates.is_empty();
     let ocr_tokens = Value::Array(tokens.clone());
     odoo.capture_inventory_result(&json!({
         "operation_key": operation_key,
@@ -700,6 +700,7 @@ async fn inventory_capture(
     }))
     .await?;
     if needs_vision && module_enabled(store, workshop, "inventory-ai-fallback").await? {
+        reserve_inventory_ai(store, operation.id, workshop, assets.len() as i64).await?;
         let vision_assets = assets
             .iter()
             .map(|(asset_id, asset)| {
@@ -741,7 +742,43 @@ async fn reserve_azure_inventory(
     workshop: Uuid,
     images: i64,
 ) -> Result<(), IntegrationError> {
-    let limit = std::env::var("CONTROL_AZURE_MONTHLY_IMAGE_LIMIT")
+    reserve_inventory_usage(
+        store,
+        operation,
+        workshop,
+        images,
+        "azure_inventory_images",
+        "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT",
+    )
+    .await
+}
+
+async fn reserve_inventory_ai(
+    store: &Store,
+    operation: Uuid,
+    workshop: Uuid,
+    images: i64,
+) -> Result<(), IntegrationError> {
+    reserve_inventory_usage(
+        store,
+        operation,
+        workshop,
+        images,
+        "inventory_ai_images",
+        "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT",
+    )
+    .await
+}
+
+async fn reserve_inventory_usage(
+    store: &Store,
+    operation: Uuid,
+    workshop: Uuid,
+    images: i64,
+    metric: &str,
+    limit_variable: &str,
+) -> Result<(), IntegrationError> {
+    let limit = std::env::var(limit_variable)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(500);
@@ -751,11 +788,12 @@ async fn reserve_azure_inventory(
         .map_err(|_| IntegrationError::Unavailable)?;
     let reserved = sqlx::query_scalar::<_, i64>(
         "insert into control.usage_reservations(operation_id,workshop_id,metric,quantity)
-         values($1,$2,'azure_inventory_images',$3)
-         on conflict(operation_id) do nothing returning quantity",
+         values($1,$2,$3,$4)
+         on conflict(operation_id,metric) do nothing returning quantity",
     )
     .bind(operation)
     .bind(workshop)
+    .bind(metric)
     .bind(images)
     .fetch_optional(&mut *transaction)
     .await
@@ -769,12 +807,13 @@ async fn reserve_azure_inventory(
     }
     let quantity = sqlx::query_scalar::<_, i64>(
         "insert into control.usage_counters(workshop_id,period,metric,quantity)
-         select $1,date_trunc('month',current_date)::date,'azure_inventory_images',$2 where $2<=$3
+         select $1,date_trunc('month',current_date)::date,$2,$3 where $3<=$4
          on conflict(workshop_id,period,metric) do update set
          quantity=control.usage_counters.quantity+excluded.quantity,updated_at=now()
-         where control.usage_counters.quantity+excluded.quantity<=$3 returning quantity",
+         where control.usage_counters.quantity+excluded.quantity<=$4 returning quantity",
     )
     .bind(workshop)
+    .bind(metric)
     .bind(images)
     .bind(limit)
     .fetch_optional(&mut *transaction)
@@ -838,7 +877,7 @@ async fn reserve_azure(
     let reserved = sqlx::query_scalar::<_, i64>(
         "insert into control.usage_reservations(operation_id,workshop_id,metric,quantity)
          values($1,$2,'azure_invoice_pages',$3)
-         on conflict(operation_id) do nothing returning quantity",
+         on conflict(operation_id,metric) do nothing returning quantity",
     )
     .bind(operation)
     .bind(workshop)
