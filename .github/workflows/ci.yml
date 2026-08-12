@@ -23,7 +23,7 @@ env:
   # Odoo 19 extension points. Pin the digest too once one is chosen.
   ODOO_IMAGE: odoo:19
   MODULES: >-
-    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,l10n_fr_micro_urssaf,mb_control_bridge,mb_invoice_capture
+    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,l10n_fr_micro_urssaf,mb_control_bridge,mb_ai_bridge,mb_invoice_capture,mb_inventory_capture,mb_inventory_capture_catalogue
   # The same list with each name as a `/module` test spec. This is not
   # decoration: `--test-enable` on its own also runs the tests of every
   # dependency Odoo installs — the whole of mail, stock, account and
@@ -31,7 +31,7 @@ env:
   # minutes, and tells us nothing about this repository. Restricting to
   # `/module` specs runs only tests defined in these addons.
   TEST_TAGS: >-
-    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/l10n_fr_micro_urssaf,/mb_control_bridge,/mb_invoice_capture
+    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/l10n_fr_micro_urssaf,/mb_control_bridge,/mb_ai_bridge,/mb_invoice_capture,/mb_inventory_capture,/mb_inventory_capture_catalogue
 
 jobs:
   control-plane:
@@ -69,6 +69,37 @@ jobs:
 
       - name: Manifests, data paths, assets, XML, access rules, dependency graph
         run: python3 tools/check_addons.py
+
+      # Catalogue completeness and safety, plus the source scanner that catches
+      # user-facing text extraction cannot see because it is not wrapped in
+      # `_()` or `_t()`. Stricter than `msgfmt` on purpose: Odoo's exporter does
+      # not emit the `#, python-format` flags gettext needs to validate
+      # placeholders, so `%(product)s` disappearing in translation is a runtime
+      # crash that only this checker catches.
+      #
+      # This lane does not prove the committed POT still matches the source —
+      # that needs a database with the addons installed, so it lives in the
+      # `i18n` lane below.
+      - name: Install polib
+        run: pip install polib
+
+      - name: Translation catalogues and source marking
+        run: python3 tools/check_i18n.py --all --summary
+
+      # gettext's own opinion, which is narrower than the checker above but
+      # independent of it: a malformed header or a format string gettext cannot
+      # parse fails here even if our parser accepted it.
+      - name: gettext validation
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gettext
+          status=0
+          for f in addons/*/i18n/fr.po; do
+            msgfmt --check-header --check-format -o /dev/null "$f" || status=1
+          done
+          for f in addons/*/i18n/*.pot; do
+            msgfmt --check-format -o /dev/null "$f" || status=1
+          done
+          exit $status
 
   install:
     name: Clean install
@@ -151,6 +182,83 @@ jobs:
           }
           run_odoo -d ci_upgrade -i "$MODULES" --stop-after-init --log-level=warn
           run_odoo -d ci_upgrade -u "$MODULES" --stop-after-init --log-level=warn
+
+  i18n:
+    name: Catalogue freshness
+    runs-on: ubuntu-latest
+    needs: static
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+        options: >-
+          --health-cmd "pg_isready -U odoo -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The committed POT files must equal what Odoo extracts from the current
+      # source. The `static` lane proves the catalogues are complete and safe
+      # against the committed POT; it cannot prove the POT itself is current,
+      # because extraction needs a database with the addons installed and their
+      # views and model metadata loaded.
+      #
+      # French is loaded before the addons are installed, which is also the
+      # order a deployment uses: it makes the install path import each addon's
+      # fr.po, so a catalogue that Odoo refuses fails here rather than in
+      # production.
+      #
+      # Every addon in `addons/` is installed, not the shorter `MODULES` list
+      # the other lanes use — a translation gate that skipped addons would be
+      # a gate with holes in it.
+      #
+      # `--user root` because the exporter writes into the mounted workspace and
+      # the image runs as uid 101. Nothing after this step writes to the tree.
+      - name: Export every POT and assert no drift
+        run: |
+          mkdir -p oca
+          ALL_MODULES=$(ls addons | paste -sd, -)
+          docker run --rm --network host --user root \
+            -v "$PWD/addons:/mnt/makersbrain-addons" \
+            "$ODOO_IMAGE" \
+            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo \
+                 -d ci_i18n -i base --stop-after-init --without-demo=all --log-level=warn
+          docker run --rm --network host --user root \
+            -v "$PWD/addons:/mnt/makersbrain-addons" \
+            "$ODOO_IMAGE" \
+            odoo i18n loadlang \
+                 --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo -d ci_i18n -l fr_FR
+          docker run --rm --network host --user root \
+            -v "$PWD/addons:/mnt/makersbrain-addons" \
+            "$ODOO_IMAGE" \
+            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo \
+                 -d ci_i18n -i "$ALL_MODULES" --stop-after-init --without-demo=all --log-level=warn
+          docker run --rm --network host --user root \
+            -v "$PWD/addons:/mnt/makersbrain-addons" \
+            "$ODOO_IMAGE" \
+            odoo i18n export \
+                 --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
+                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
+                 --data-dir=/tmp/odoo -d ci_i18n $(ls addons | tr '\n' ' ') -l pot
+          sudo chown -R "$(id -u):$(id -g)" addons
+          # `add -N` so a POT added in this very commit is visible to `git diff`
+          # rather than being silently skipped as untracked. `-I` because the
+          # exporter stamps both date headers on every run, which is not drift.
+          git add -N -- 'addons/*/i18n/*.pot'
+          git diff --exit-code -I '^"(POT-Creation-Date|PO-Revision-Date)' \
+            -- 'addons/*/i18n/*.pot' \
+            || { echo "::error::Committed POT files are stale. Re-export them."; exit 1; }
 
   test:
     name: Server and browser tests
