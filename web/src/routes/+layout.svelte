@@ -4,6 +4,7 @@
 	import { ACCOUNT_URL } from '$lib/config';
 	import { currentIdToken, discard, establish, session } from '$lib/session.svelte';
 	import { logoutUrl, signIn } from '$lib/oidc';
+	import BrandMark from '$lib/components/BrandMark.svelte';
 	let { children } = $props();
 	const publicRoute = $derived(page.url.pathname.startsWith('/oauth/') || page.url.pathname === '/signed-out' || page.url.pathname.startsWith('/invitations/'));
 	let started = false;
@@ -32,7 +33,7 @@
 	<div class="app-shell">
 		<header class="topbar">
 			<div class="topbar-inner">
-				<a class="brand" href="/" aria-label="MakersBrain home"><span class="brand-mark" aria-hidden="true">M</span><span>MakersBrain</span></a>
+				<a class="brand" href="/" aria-label="MakersBrain home"><BrandMark /><span>MakersBrain</span></a>
 				<nav class="global-nav" aria-label="Main navigation"><a href="/" class:active={page.url.pathname === '/'}>Workshops</a>{#if session.me.is_operator}<a href="/platform" class:active={page.url.pathname.startsWith('/platform')}>Platform</a>{/if}</nav>
 				<div class="account-menu">
 					<a class="account-link" href={ACCOUNT_URL} target="_blank" rel="noreferrer">Account & security</a>
