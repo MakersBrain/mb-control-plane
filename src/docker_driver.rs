@@ -3229,7 +3229,7 @@ async fn ensure_odoo_database(
         &container,
         json!({
             "Image":state.config.odoo_image,
-            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,l10n_fr_micro_enterprise","--without-demo=all"],
+            "Cmd":["odoo",format!("--database={database_ref}"),"--stop-after-init","--no-database-list",format!("--db_host={}",state.config.postgres_host),format!("--db_port={}",state.config.postgres_port),"--db_user=odoo",format!("--db_password={}",state.config.odoo_postgres_password),"--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons","--init=auth_oidc,mb_control_bridge,mb_brand,l10n_fr_micro_enterprise","--without-demo=all"],
             "Env":[
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
