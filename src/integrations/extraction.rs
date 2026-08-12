@@ -83,6 +83,7 @@ impl ExtractionBrokerClient {
         &self,
         assets: &[(String, String, Vec<u8>)],
         ocr_tokens: &Value,
+        provider_order: &[String],
     ) -> Result<Value, IntegrationError> {
         let url = self
             .endpoint
@@ -101,7 +102,7 @@ impl ExtractionBrokerClient {
             .http
             .post(url)
             .json(&json!({
-                "assets":encoded,"ocr_tokens":ocr_tokens,
+                "assets":encoded,"ocr_tokens":ocr_tokens,"provider_order":provider_order,
             }))
             .send()
             .await
@@ -128,6 +129,36 @@ impl ExtractionBrokerClient {
     ) -> Result<Value, IntegrationError> {
         self.extract("inventory_label", source, mimetype, Some(asset_id))
             .await
+    }
+
+    pub async fn product_lookup(
+        &self,
+        provider: &str,
+        gtin14: &str,
+    ) -> Result<Value, IntegrationError> {
+        let url = self
+            .endpoint
+            .join("/v1/products/lookup")
+            .map_err(|_| IntegrationError::ContractDrift)?;
+        let response = self
+            .http
+            .post(url)
+            .json(&json!({"provider":provider,"gtin14":gtin14}))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    IntegrationError::UnknownOutcome
+                } else {
+                    IntegrationError::Unavailable
+                }
+            })?;
+        let status = response.status();
+        let body = bounded_body(response, MAX_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            return Err(classify_status(status));
+        }
+        serde_json::from_slice(&body).map_err(|_| IntegrationError::ContractDrift)
     }
 
     async fn extract(

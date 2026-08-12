@@ -1,4 +1,6 @@
-use makersbrain_control_plane::persistence::Store;
+use makersbrain_control_plane::domain::OperationKind;
+use makersbrain_control_plane::persistence::{NewOperation, Store};
+use serde_json::json;
 use uuid::Uuid;
 
 async fn store() -> Store {
@@ -99,5 +101,87 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
     assert!(
         invalid_scope.is_err(),
         "every workshop recovery set must include Odoo"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn enqueue_replays_only_an_identical_idempotent_operation() {
+    let store = store().await;
+    let key = format!("inventory-test:{}", Uuid::new_v4());
+    let payload = json!({"capture_id": Uuid::new_v4(), "assets": []});
+    let correlation = Uuid::new_v4();
+
+    let mut first_tx = store.begin().await.unwrap();
+    let first = Store::enqueue(
+        &mut first_tx,
+        NewOperation {
+            kind: OperationKind::InventoryCaptureExtract,
+            workshop_id: None,
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: None,
+            correlation_id: correlation,
+            idempotency_key: &key,
+        },
+    )
+    .await
+    .unwrap();
+    first_tx.commit().await.unwrap();
+
+    let mut replay_tx = store.begin().await.unwrap();
+    let replay = Store::enqueue(
+        &mut replay_tx,
+        NewOperation {
+            kind: OperationKind::InventoryCaptureExtract,
+            workshop_id: None,
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: None,
+            correlation_id: correlation,
+            idempotency_key: &key,
+        },
+    )
+    .await
+    .unwrap();
+    replay_tx.commit().await.unwrap();
+    assert_eq!(first, replay);
+
+    let leased = store
+        .lease("inventory-capture", "checkpoint-test-worker")
+        .await
+        .unwrap()
+        .expect("operation should be leaseable");
+    assert_eq!(leased.id, first);
+    let checkpoint = json!({"callbacks":[{"operation_key":"stable","attempt_id":Uuid::new_v4()}]});
+    store
+        .save_operation_checkpoint(&leased, &checkpoint)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.operation_checkpoint(first).await.unwrap(),
+        Some(checkpoint)
+    );
+
+    let changed_payload = json!({"capture_id": Uuid::new_v4(), "assets": []});
+    let mut conflict_tx = store.begin().await.unwrap();
+    assert!(
+        Store::enqueue(
+            &mut conflict_tx,
+            NewOperation {
+                kind: OperationKind::InventoryCaptureExtract,
+                workshop_id: None,
+                target_user_id: None,
+                desired_epoch: None,
+                payload: &changed_payload,
+                requested_by: None,
+                correlation_id: correlation,
+                idempotency_key: &key,
+            }
+        )
+        .await
+        .is_err()
     );
 }

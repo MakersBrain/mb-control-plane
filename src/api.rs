@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -24,6 +25,7 @@ use crate::Config;
 use crate::api_error::ApiError;
 use crate::auth::{Authenticator, Principal};
 use crate::domain::{OperationKind, WorkshopRole, normalize_email, opaque_database_ref};
+use crate::integrations::extraction::ExtractionBrokerClient;
 use crate::persistence::{NewOperation, Store};
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -131,6 +133,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/v1/workshops/{workshop_id}/inventory-captures",
             post(inventory_capture),
+        )
+        .route(
+            "/internal/v1/workshops/{workshop_id}/inventory-product-lookups",
+            post(inventory_product_lookup),
         )
         .route(
             "/internal/v1/tenants/{workshop_id}/reconcile",
@@ -1960,10 +1966,13 @@ async fn inventory_capture(
         .get("hints")
         .and_then(Value::as_object)
         .filter(|value| {
-            value.len() <= 2
-                && value
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "brand" | "languages"))
+            value.len() <= 4
+                && value.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "brand" | "languages" | "allow_ai" | "provider_order"
+                    )
+                })
                 && value.get("brand").is_none_or(|brand| {
                     brand
                         .as_str()
@@ -1976,6 +1985,18 @@ async fn inventory_capture(
                                 item.as_str()
                                     .is_some_and(|text| !text.is_empty() && text.len() <= 16)
                             })
+                    })
+                })
+                && value.get("allow_ai").is_none_or(Value::is_boolean)
+                && value.get("provider_order").is_none_or(|providers| {
+                    providers.as_array().is_some_and(|items| {
+                        items.len() <= 2
+                            && items.iter().all(|item| {
+                                item.as_str().is_some_and(|name| {
+                                    matches!(name, "azure" | "gemini" | "openai" | "claude")
+                                })
+                            })
+                            && (items.len() < 2 || items[0] != items[1])
                     })
                 })
         })
@@ -2000,7 +2021,7 @@ async fn inventory_capture(
             .is_some_and(|value| Uuid::parse_str(value).is_ok());
         let valid_role = matches!(
             asset.get("role").and_then(Value::as_str),
-            Some("front" | "lot_detail")
+            Some("front" | "lot_detail" | "crop" | "ocr_variant")
         );
         let valid_digest = asset
             .get("content_sha256")
@@ -2047,6 +2068,172 @@ async fn inventory_capture(
         StatusCode::ACCEPTED,
         Json(json!({"operation_id": operation, "capture_id": capture_id})),
     ))
+}
+
+const PRODUCT_LOOKUP_SCHEMA_VERSION: i32 = 1;
+
+async fn inventory_product_lookup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workshop_id): Path<Uuid>,
+    Json(payload): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    tenant_bridge(&state, &headers, workshop_id).await?;
+    let object = payload
+        .as_object()
+        .filter(|value| value.len() == 1 && value.contains_key("gtin14"))
+        .ok_or(ApiError::Validation("product lookup payload is invalid"))?;
+    let gtin14 = object
+        .get("gtin14")
+        .and_then(Value::as_str)
+        .filter(|value| valid_gtin14(value))
+        .ok_or(ApiError::Validation("gtin14 must be checksum-valid"))?;
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.workshop_modules
+         where workshop_id=$1 and module_key='inventory-capture' and state='enabled')",
+    )
+    .bind(workshop_id)
+    .fetch_one(state.store.pool())
+    .await?;
+    if !enabled {
+        return Err(ApiError::Forbidden);
+    }
+    sqlx::query(
+        "delete from control.product_lookup_cache where ctid in (
+            select ctid from control.product_lookup_cache
+            where expires_at < now() - interval '7 days' limit 100
+        )",
+    )
+    .execute(state.store.pool())
+    .await?;
+    let provider = "upcitemdb";
+    if let Some(candidates) = cached_product_lookup(
+        state.store.pool(),
+        provider,
+        PRODUCT_LOOKUP_SCHEMA_VERSION,
+        gtin14,
+    )
+    .await?
+    {
+        return Ok(Json(json!({
+            "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
+            "gtin14":gtin14,"cache":"hit","candidates":candidates
+        })));
+    }
+
+    let mut tx = state.store.begin().await?;
+    let cache_key = format!("{provider}:{PRODUCT_LOOKUP_SCHEMA_VERSION}:{gtin14}");
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&cache_key)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(candidates) = sqlx::query_scalar::<_, Value>(
+        "select candidates from control.product_lookup_cache
+         where provider=$1 and schema_version=$2 and gtin14=$3 and expires_at>now()",
+    )
+    .bind(provider)
+    .bind(PRODUCT_LOOKUP_SCHEMA_VERSION)
+    .bind(gtin14)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        tx.commit().await?;
+        return Ok(Json(json!({
+            "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
+            "gtin14":gtin14,"cache":"coalesced_hit","candidates":candidates
+        })));
+    }
+
+    let broker_url = std::env::var("CONTROL_EXTRACTION_BROKER_URL")
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let broker_token = std::env::var("CONTROL_EXTRACTION_BROKER_TOKEN")
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let broker = ExtractionBrokerClient::new(&broker_url, &broker_token, Duration::from_secs(12))
+        .map_err(ApiError::Internal)?;
+    let response = broker
+        .product_lookup(provider, gtin14)
+        .await
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+    let candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 5 && items.iter().all(Value::is_object))
+        .cloned()
+        .ok_or(ApiError::Internal(anyhow::anyhow!(
+            "product lookup contract drift"
+        )))?;
+    if response.get("provider").and_then(Value::as_str) != Some(provider)
+        || response.get("schema_version").and_then(Value::as_i64)
+            != Some(i64::from(PRODUCT_LOOKUP_SCHEMA_VERSION))
+        || response.get("gtin14").and_then(Value::as_str) != Some(gtin14)
+    {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "product lookup contract drift"
+        )));
+    }
+    let outcome = if candidates.is_empty() {
+        "negative"
+    } else {
+        "positive"
+    };
+    let ttl_seconds = if candidates.is_empty() {
+        24 * 60 * 60
+    } else {
+        30 * 24 * 60 * 60
+    };
+    let candidates = Value::Array(candidates);
+    sqlx::query(
+        "insert into control.product_lookup_cache
+            (provider,schema_version,gtin14,outcome,candidates,retrieved_at,expires_at)
+         values ($1,$2,$3,$4,$5,now(),now()+($6::bigint * interval '1 second'))
+         on conflict (provider,schema_version,gtin14) do update set
+            outcome=excluded.outcome,candidates=excluded.candidates,
+            retrieved_at=excluded.retrieved_at,expires_at=excluded.expires_at",
+    )
+    .bind(provider)
+    .bind(PRODUCT_LOOKUP_SCHEMA_VERSION)
+    .bind(gtin14)
+    .bind(outcome)
+    .bind(&candidates)
+    .bind(ttl_seconds)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({
+        "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
+        "gtin14":gtin14,"cache":"miss","candidates":candidates
+    })))
+}
+
+async fn cached_product_lookup(
+    pool: &sqlx::PgPool,
+    provider: &str,
+    schema_version: i32,
+    gtin14: &str,
+) -> ApiResult<Option<Value>> {
+    Ok(sqlx::query_scalar(
+        "select candidates from control.product_lookup_cache
+         where provider=$1 and schema_version=$2 and gtin14=$3 and expires_at>now()",
+    )
+    .bind(provider)
+    .bind(schema_version)
+    .bind(gtin14)
+    .fetch_optional(pool)
+    .await?)
+}
+
+fn valid_gtin14(value: &str) -> bool {
+    if value.len() != 14 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let digits = value.bytes().map(|byte| byte - b'0').collect::<Vec<_>>();
+    let sum = digits[..13]
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, digit)| u32::from(*digit) * if index % 2 == 0 { 3 } else { 1 })
+        .sum::<u32>();
+    ((10 - sum % 10) % 10) as u8 == digits[13]
 }
 
 async fn reconcile_tenant(
@@ -2174,7 +2361,7 @@ async fn audit(
 
 #[cfg(test)]
 mod tests {
-    use super::api_timestamp;
+    use super::{api_timestamp, valid_gtin14};
 
     #[test]
     fn api_timestamps_are_rfc3339_for_browser_parsers() {
@@ -2182,5 +2369,12 @@ mod tests {
             api_timestamp(time::OffsetDateTime::UNIX_EPOCH),
             "1970-01-01T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn product_lookup_accepts_only_checksum_valid_gtin14() {
+        assert!(valid_gtin14("00097539118054"));
+        assert!(!valid_gtin14("00097539118055"));
+        assert!(!valid_gtin14("097539118054"));
     }
 }

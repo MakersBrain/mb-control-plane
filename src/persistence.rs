@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0012_inventory_ai_usage";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0014_operation_checkpoints";
 
 #[derive(Clone)]
 pub struct Store {
@@ -90,7 +90,14 @@ impl Store {
             "insert into control.operations (
                 id, kind, queue, workshop_id, target_user_id, desired_epoch,
                 payload, requested_by, correlation_id, idempotency_key
-             ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id",
+             ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             on conflict (kind, requested_by, idempotency_key) do update
+                set idempotency_key=excluded.idempotency_key
+             where control.operations.workshop_id is not distinct from excluded.workshop_id
+               and control.operations.target_user_id is not distinct from excluded.target_user_id
+               and control.operations.desired_epoch is not distinct from excluded.desired_epoch
+               and control.operations.payload=excluded.payload
+             returning id",
         )
         .bind(Uuid::new_v4())
         .bind(operation.kind.as_str())
@@ -104,6 +111,37 @@ impl Store {
         .bind(operation.idempotency_key)
         .fetch_one(&mut **transaction)
         .await
+    }
+
+    pub async fn operation_checkpoint(&self, operation_id: Uuid) -> anyhow::Result<Option<Value>> {
+        Ok(
+            sqlx::query_scalar("select checkpoint from control.operations where id=$1")
+                .bind(operation_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    pub async fn save_operation_checkpoint(
+        &self,
+        operation: &LeasedOperation,
+        checkpoint: &Value,
+    ) -> anyhow::Result<()> {
+        let changed = sqlx::query(
+            "update control.operations set checkpoint=$3
+             where id=$1 and state='in_flight' and leased_by=$2 and checkpoint is null",
+        )
+        .bind(operation.id)
+        .bind(&operation.leased_by)
+        .bind(checkpoint)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            anyhow::bail!("operation checkpoint could not be persisted");
+        }
+        Ok(())
     }
 
     pub async fn lease(

@@ -613,6 +613,13 @@ async fn inventory_capture(
         Duration::from_secs(45),
     )
     .map_err(|_| IntegrationError::ContractDrift)?;
+    if let Some(checkpoint) = store
+        .operation_checkpoint(operation.id)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+    {
+        return deliver_inventory_checkpoint(&odoo, &checkpoint).await;
+    }
     let mut assets = Vec::with_capacity(descriptors.len());
     let mut input_digests = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
@@ -637,7 +644,7 @@ async fn inventory_capture(
     let attempt_id = Uuid::new_v4();
     let operation_key = format!("inventory:{capture_id}:{}", operation.id);
     if !module_enabled(store, workshop, "azure-label-extraction").await? {
-        odoo.capture_inventory_result(&json!({
+        let checkpoint = json!({"callbacks": [json!({
             "operation_key": operation_key,
             "capture_id": capture_id,
             "attempt_id": attempt_id,
@@ -651,8 +658,12 @@ async fn inventory_capture(
             "raw_response": {},
             "usage": {"images": 0},
             "failure_code": "provider_disabled"
-        })).await?;
-        return Ok(());
+        })]});
+        store
+            .save_operation_checkpoint(operation, &checkpoint)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        return deliver_inventory_checkpoint(&odoo, &checkpoint).await;
     }
     reserve_azure_inventory(store, operation.id, workshop, assets.len() as i64).await?;
     let broker = extraction_broker(Duration::from_secs(120))?;
@@ -682,9 +693,16 @@ async fn inventory_capture(
                 .unwrap_or_default(),
         );
     }
-    let needs_vision = codes.is_empty() || candidates.is_empty();
+    let lot_focused = descriptors.iter().all(|descriptor| {
+        matches!(
+            descriptor.get("role").and_then(Value::as_str),
+            Some("lot_detail" | "crop" | "ocr_variant")
+        )
+    });
+    let needs_vision =
+        inventory_needs_vision(lot_focused, !codes.is_empty(), !candidates.is_empty());
     let ocr_tokens = Value::Array(tokens.clone());
-    odoo.capture_inventory_result(&json!({
+    let ocr_callback = json!({
         "operation_key": operation_key,
         "capture_id": capture_id,
         "attempt_id": attempt_id,
@@ -697,13 +715,32 @@ async fn inventory_capture(
         "normalized_response": {"ocr_tokens": tokens, "codes": codes, "candidates": candidates},
         "raw_response": {"retained": false},
         "usage": {"images": assets.len()}
-    }))
-    .await?;
-    if needs_vision && module_enabled(store, workshop, "inventory-ai-fallback").await? {
-        reserve_inventory_ai(store, operation.id, workshop, assets.len() as i64).await?;
+    });
+    let mut callbacks = vec![ocr_callback];
+    let tenant_allows_ai = operation
+        .payload
+        .pointer("/hints/allow_ai")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if needs_vision
+        && tenant_allows_ai
+        && module_enabled(store, workshop, "inventory-ai-fallback").await?
+    {
+        let vision_inputs = assets
+            .iter()
+            .zip(descriptors.iter())
+            .filter(|(_, descriptor)| {
+                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
+            })
+            .collect::<Vec<_>>();
+        reserve_inventory_ai(store, operation.id, workshop, vision_inputs.len() as i64).await?;
         let vision_assets = assets
             .iter()
-            .map(|(asset_id, asset)| {
+            .zip(descriptors.iter())
+            .filter(|(_, descriptor)| {
+                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
+            })
+            .map(|((asset_id, asset), _)| {
                 (
                     asset_id.to_string(),
                     asset.mimetype.clone(),
@@ -711,12 +748,34 @@ async fn inventory_capture(
                 )
             })
             .collect::<Vec<_>>();
-        let vision = broker.inventory_vision(&vision_assets, &ocr_tokens).await?;
+        let vision_digests = assets
+            .iter()
+            .zip(descriptors.iter())
+            .filter(|(_, descriptor)| {
+                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
+            })
+            .map(|((_, asset), _)| asset.sha256.clone())
+            .collect::<Vec<_>>();
+        let provider_order = operation
+            .payload
+            .pointer("/hints/provider_order")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let vision = broker
+            .inventory_vision(&vision_assets, &ocr_tokens, &provider_order)
+            .await?;
         let normalized = vision
             .get("normalized")
             .cloned()
             .ok_or(IntegrationError::ContractDrift)?;
-        odoo.capture_inventory_result(&json!({
+        callbacks.push(json!({
             "operation_key": format!("inventory:{capture_id}:{}:vision", operation.id),
             "capture_id": capture_id,
             "attempt_id": Uuid::new_v4(),
@@ -725,15 +784,40 @@ async fn inventory_capture(
             "provider": vision.get("provider").and_then(Value::as_str).unwrap_or("multimodal-vision"),
             "model": vision.get("model").and_then(Value::as_str).unwrap_or("configured"),
             "version": vision.get("version").and_then(Value::as_str).unwrap_or("broker-v1"),
+            "request_id": vision.get("request_id").and_then(Value::as_str).unwrap_or(""),
             "state": "succeeded",
-            "input_digests": input_digests,
+            "input_digests": vision_digests,
             "normalized_response": normalized,
             "raw_response": {"retained": false},
-            "usage": {"images": assets.len()}
-        }))
-        .await?;
+            "usage": vision.get("usage").cloned().unwrap_or_else(|| json!({"images":vision_assets.len()})),
+            "latency_ms": vision.get("latency_ms").and_then(Value::as_u64)
+        }));
+    }
+    let checkpoint = json!({"callbacks": callbacks});
+    store
+        .save_operation_checkpoint(operation, &checkpoint)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    deliver_inventory_checkpoint(&odoo, &checkpoint).await
+}
+
+async fn deliver_inventory_checkpoint(
+    odoo: &OdooClient,
+    checkpoint: &Value,
+) -> Result<(), IntegrationError> {
+    let callbacks = checkpoint
+        .get("callbacks")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= 2)
+        .ok_or(IntegrationError::ContractDrift)?;
+    for callback in callbacks {
+        odoo.capture_inventory_result(callback).await?;
     }
     Ok(())
+}
+
+fn inventory_needs_vision(lot_focused: bool, has_codes: bool, has_lot_candidates: bool) -> bool {
+    !has_lot_candidates || (!lot_focused && !has_codes)
 }
 
 async fn reserve_azure_inventory(
@@ -1467,5 +1551,12 @@ mod tests {
     #[test]
     fn pdf_page_estimate_is_bounded_below() {
         assert_eq!(estimated_pages(b"not a pdf", "application/pdf"), 1);
+    }
+    #[test]
+    fn resolved_lot_crop_does_not_spend_a_multimodal_call() {
+        assert!(!inventory_needs_vision(true, false, true));
+        assert!(inventory_needs_vision(true, false, false));
+        assert!(inventory_needs_vision(false, false, true));
+        assert!(!inventory_needs_vision(false, true, true));
     }
 }

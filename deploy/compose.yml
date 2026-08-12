@@ -53,9 +53,26 @@ services:
       BROKER_AZURE_KEY: ${AZURE_DOCUMENT_KEY:-}
       BROKER_AZURE_API_VERSION: ${AZURE_DOCUMENT_API_VERSION:-2024-11-30}
       BROKER_AZURE_POLL_INTERVAL_MS: "2000"
+      BROKER_VISION_PRIMARY: ${INVENTORY_VISION_PRIMARY:-}
+      BROKER_VISION_SECONDARY: ${INVENTORY_VISION_SECONDARY:-}
+      BROKER_OPENAI_ENDPOINT: ${INVENTORY_OPENAI_ENDPOINT:-}
+      BROKER_OPENAI_KEY: ${INVENTORY_OPENAI_KEY:-}
+      BROKER_OPENAI_MODEL: ${INVENTORY_OPENAI_MODEL:-}
+      BROKER_AZURE_MULTIMODAL_ENDPOINT: ${INVENTORY_AZURE_MULTIMODAL_ENDPOINT:-}
+      BROKER_AZURE_MULTIMODAL_KEY: ${INVENTORY_AZURE_MULTIMODAL_KEY:-}
+      BROKER_AZURE_MULTIMODAL_MODEL: ${INVENTORY_AZURE_MULTIMODAL_MODEL:-}
+      BROKER_GEMINI_ENDPOINT: ${INVENTORY_GEMINI_ENDPOINT:-}
+      BROKER_GEMINI_KEY: ${INVENTORY_GEMINI_KEY:-}
+      BROKER_GEMINI_MODEL: ${INVENTORY_GEMINI_MODEL:-}
+      BROKER_CLAUDE_ENDPOINT: ${INVENTORY_CLAUDE_ENDPOINT:-}
+      BROKER_CLAUDE_KEY: ${INVENTORY_CLAUDE_KEY:-}
+      BROKER_CLAUDE_MODEL: ${INVENTORY_CLAUDE_MODEL:-}
+      # Deprecated compatibility path for an OpenAI Chat Completions-compatible API.
       BROKER_VISION_ENDPOINT: ${INVENTORY_VISION_ENDPOINT:-}
       BROKER_VISION_KEY: ${INVENTORY_VISION_KEY:-}
       BROKER_VISION_MODEL: ${INVENTORY_VISION_MODEL:-}
+      BROKER_UPCITEMDB_ENDPOINT: ${INVENTORY_UPCITEMDB_ENDPOINT:-}
+      BROKER_UPCITEMDB_KEY: ${INVENTORY_UPCITEMDB_KEY:-}
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
@@ -154,6 +171,8 @@ services:
       CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: localhost
       CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
+      CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
+      CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
       CONTROL_ALLOW_SELF_SIGNUP: "true"
@@ -162,6 +181,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       control-migrate: {condition: service_completed_successfully}
+      document-extraction: {condition: service_healthy}
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/ready"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 

@@ -16,12 +16,12 @@ pub fn normalize_vision(result: &Value, ocr_tokens: &Value) -> Result<Value, Int
     let products = result
         .get("product_candidates")
         .and_then(Value::as_array)
-        .filter(|items| items.len() <= 5)
+        .filter(|items| items.len() <= 3)
         .ok_or(IntegrationError::ContractDrift)?;
     let lots = result
         .get("lot_candidates")
         .and_then(Value::as_array)
-        .filter(|items| items.len() <= 5)
+        .filter(|items| items.len() <= 3)
         .ok_or(IntegrationError::ContractDrift)?;
     let warnings = bounded_strings(result.get("warnings"), 10, 300)?;
     let deterministic_text = ocr_tokens
@@ -86,7 +86,8 @@ pub fn normalize_vision(result: &Value, ocr_tokens: &Value) -> Result<Value, Int
         );
         candidates.push(json!({"kind":"lot","raw_value":raw,"normalized_value":raw,
             "source":"ai_suggestion","confidence":confidence,"explanation":evidence,
-            "reported_region":region,"grounding_state":if grounded{"grounded"}else{"unverified"}}));
+            "asset_id":asset_id,"reported_region":region,
+            "grounding_state":if grounded{"grounded"}else{"unverified"}}));
     }
     Ok(
         json!({"status":result["status"],"product_candidates":clean_products,
@@ -234,20 +235,24 @@ fn lot_candidates(tokens: &[Value]) -> Vec<Value> {
         let text = token.get("text").and_then(Value::as_str).unwrap_or("");
         let captured = marker
             .captures(text)
-            .and_then(|captures| captures.get(1).map(|value| value.as_str().to_owned()))
+            .and_then(|captures| {
+                captures
+                    .get(1)
+                    .map(|value| (value.as_str().to_owned(), token))
+            })
             .or_else(|| {
                 if matches!(text.to_ascii_lowercase().as_str(), "lot" | "batch" | "l") {
-                    tokens
-                        .get(index + 1)
-                        .and_then(|next| next.get("text"))
-                        .and_then(Value::as_str)
-                        .filter(|next| standalone.is_match(next))
-                        .map(str::to_owned)
+                    tokens.get(index + 1).and_then(|next| {
+                        next.get("text")
+                            .and_then(Value::as_str)
+                            .filter(|value| standalone.is_match(value))
+                            .map(|value| (value.to_owned(), next))
+                    })
                 } else {
                     None
                 }
             });
-        if let Some(raw) = captured {
+        if let Some((raw, evidence_token)) = captured {
             if values.iter().any(|item: &Value| {
                 item.get("normalized_value") == Some(&Value::String(raw.clone()))
             }) {
@@ -258,9 +263,10 @@ fn lot_candidates(tokens: &[Value]) -> Vec<Value> {
                 "raw_value": raw,
                 "normalized_value": raw,
                 "source": "azure_read_lot_marker",
-                "confidence": token.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
+                "confidence": evidence_token.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
                 "grounding_state": "grounded",
-                "reported_region": token.get("polygon").cloned().unwrap_or(Value::Null),
+                "asset_id": evidence_token.get("asset_id").cloned().unwrap_or(Value::Null),
+                "reported_region": evidence_token.get("polygon").cloned().unwrap_or(Value::Null),
             }));
         }
     }
@@ -283,6 +289,7 @@ mod tests {
         .unwrap();
         assert_eq!(normalized["candidates"][0]["raw_value"], "001A-09");
         assert_eq!(normalized["candidates"][0]["grounding_state"], "grounded");
+        assert_eq!(normalized["candidates"][0]["confidence"], 0.91);
     }
 
     #[test]
