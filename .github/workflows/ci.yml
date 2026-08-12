@@ -1,8 +1,8 @@
 name: CI
 
-# Four lanes, ordered by how fast they fail. `static` needs no container and
-# finishes in seconds, so a broken manifest never costs an eight-minute image
-# pull. The three Odoo lanes run in parallel behind it.
+# Six jobs, with the Odoo jobs ordered around the fast static gate. `static`
+# needs no container and finishes in seconds, so a broken manifest never costs
+# an eight-minute image pull. The four Odoo jobs run in parallel behind it.
 #
 # GitHub Actions is the assumption here, not a requirement: every lane is a
 # handful of `odoo` invocations against a Postgres service, so the translation
@@ -22,21 +22,24 @@ env:
   # Bumping this is a deliberate act: the addons declare 19.0.x versions and use
   # Odoo 19 extension points. Pin the digest too once one is chosen.
   ODOO_IMAGE: odoo:19
-  MODULES: >-
-    mb_workshop_base,mb_label,mb_label_pos,mb_ceramics_firing,mb_kiln_bridge,mb_catalogue_sync,mb_depot,mb_payment_sumup,mb_pos_sumup,mb_account_payment_sumup,l10n_fr_micro_enterprise,l10n_fr_micro_urssaf,mb_control_bridge,mb_ai_bridge,mb_invoice_capture,mb_inventory_capture,mb_inventory_capture_catalogue
-  # The same list with each name as a `/module` test spec. This is not
-  # decoration: `--test-enable` on its own also runs the tests of every
-  # dependency Odoo installs — the whole of mail, stock, account and
-  # point_of_sale — which is thousands of upstream tests, takes well past ten
-  # minutes, and tells us nothing about this repository. Restricting to
-  # `/module` specs runs only tests defined in these addons.
-  TEST_TAGS: >-
-    /mb_workshop_base,/mb_label,/mb_label_pos,/mb_ceramics_firing,/mb_kiln_bridge,/mb_catalogue_sync,/mb_depot,/mb_payment_sumup,/mb_pos_sumup,/mb_account_payment_sumup,/l10n_fr_micro_enterprise,/l10n_fr_micro_urssaf,/mb_control_bridge,/mb_ai_bridge,/mb_invoice_capture,/mb_inventory_capture,/mb_inventory_capture_catalogue
 
 jobs:
   control-plane:
     name: Control plane
     runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: control_test
+          POSTGRES_USER: control
+          POSTGRES_PASSWORD: control
+        options: >-
+          --health-cmd "pg_isready -U control -d control_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+        ports: ["5432:5432"]
+    env:
+      CONTROL_TEST_DATABASE_URL: postgres://control:control@localhost:5432/control_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,6 +49,8 @@ jobs:
       - run: cargo fmt --check --manifest-path control-plane/Cargo.toml
       - run: cargo clippy --locked --all-targets --manifest-path control-plane/Cargo.toml -- -D warnings
       - run: cargo test --locked --manifest-path control-plane/Cargo.toml
+      - name: PostgreSQL integration tests
+        run: cargo test --locked --manifest-path control-plane/Cargo.toml --test postgres -- --ignored --test-threads=1
       - run: npm ci
         working-directory: control-plane/web
       - run: npm run check && npm run build
@@ -129,6 +134,7 @@ jobs:
         # what proves it. See SPEC.md, "Licence boundary".
         run: |
           mkdir -p oca
+          MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
           docker run --rm --network host \
             -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
             -v "$PWD/oca:/mnt/oca-addons:ro" \
@@ -171,6 +177,7 @@ jobs:
       - name: Install, then upgrade
         run: |
           mkdir -p oca
+          MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
           run_odoo() {
             docker run --rm --network host \
               -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
@@ -279,11 +286,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The 192 server test methods. `--test-tags` implies `--test-enable`,
+      # Every repository server test. `--test-tags` implies `--test-enable`,
       # which implies `--stop-after-init`. Odoo exits non-zero when a test
       # fails, so the result needs no log scraping.
       #
-      # The 17 Hoot tests are NOT in this lane. They run inside a browser,
+      # The 23 Hoot tests are NOT in this lane. They run inside a browser,
       # driven by `web`'s own WebSuite.test_unit_desktop, and the odoo:19 image
       # ships no browser — so the tag needed is `/web:WebSuite.test_unit_desktop
       # [@mb_label,@mb_label_pos]` against an image that has Chromium. Building
@@ -303,6 +310,8 @@ jobs:
       - name: Run the suite
         run: |
           mkdir -p oca
+          MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
+          TEST_TAGS=$(printf '%s' "$MODULES" | sed 's#^#/#; s#,#,/#g')
           docker run --rm --network host \
             -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
             "$ODOO_IMAGE" \
