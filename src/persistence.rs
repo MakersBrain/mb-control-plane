@@ -1,11 +1,12 @@
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0014_operation_checkpoints";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0031_periodic_reconciliation_fleet_fence";
 
 #[derive(Clone)]
 pub struct Store {
@@ -35,6 +36,8 @@ pub struct LeasedOperation {
     pub max_attempts: i32,
     pub leased_by: String,
     pub reconciling: bool,
+    pub trace_parent: Option<String>,
+    pub trace_state: Option<String>,
 }
 
 pub enum OperationOutcome {
@@ -45,6 +48,32 @@ pub enum OperationOutcome {
 }
 
 impl Store {
+    pub async fn start_worker(
+        &self,
+        worker_id: &str,
+        queue: &str,
+        release_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("insert into control.worker_heartbeats(worker_id,queue,release_id) values($1,$2,$3) on conflict(worker_id) do update set queue=excluded.queue,release_id=excluded.release_id,started_at=now(),last_heartbeat_at=now(),active_operation_id=null,shutdown_at=null")
+            .bind(worker_id).bind(queue).bind(release_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn heartbeat_worker(
+        &self,
+        worker_id: &str,
+        active_operation_id: Option<Uuid>,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query("update control.worker_heartbeats set last_heartbeat_at=now(),active_operation_id=$2 where worker_id=$1 and shutdown_at is null")
+            .bind(worker_id).bind(active_operation_id).execute(&self.pool).await?.rows_affected()==1)
+    }
+
+    pub async fn shutdown_worker(&self, worker_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("update control.worker_heartbeats set last_heartbeat_at=now(),active_operation_id=null,shutdown_at=now() where worker_id=$1 and shutdown_at is null")
+            .bind(worker_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(12)
@@ -64,6 +93,81 @@ impl Store {
         let mut migrator = sqlx::migrate!("./migrations");
         migrator.dangerous_set_table_name("public._sqlx_migrations");
         migrator.run(&self.pool).await?;
+        self.sync_capability_registry().await?;
+        Ok(())
+    }
+
+    async fn sync_capability_registry(&self) -> anyhow::Result<()> {
+        let registry = crate::modules::embedded_registry()?;
+        let digest = crate::modules::embedded_registry_digest();
+        let mut tx = self.begin().await?;
+        let stored = sqlx::query_scalar::<_, String>(
+            "insert into control.capability_registry_versions(version,source_digest,active)
+             values($1,$2,false) on conflict(version) do update set version=excluded.version
+             returning source_digest",
+        )
+        .bind(i32::try_from(registry.version)?)
+        .bind(&digest)
+        .fetch_one(&mut *tx)
+        .await?;
+        if stored != digest {
+            anyhow::bail!("capability registry version was reused with different content");
+        }
+        for entry in &registry.capabilities {
+            let adapter = if !entry.odoo_modules.is_empty() {
+                "odoo_modules"
+            } else if entry.service.as_deref() == Some("paperless") {
+                "paperless_service"
+            } else {
+                "broker_provider"
+            };
+            let changed = sqlx::query(
+                "insert into control.capability_registry_entries(
+                    registry_version,capability_key,dependencies,odoo_modules,service,
+                    minimum_release,enforcement_adapter
+                 ) values($1,$2,$3,$4,$5,$6,$7)
+                 on conflict(registry_version,capability_key) do update set
+                    capability_key=excluded.capability_key
+                 where control.capability_registry_entries.dependencies=excluded.dependencies
+                   and control.capability_registry_entries.odoo_modules=excluded.odoo_modules
+                   and control.capability_registry_entries.service is not distinct from excluded.service
+                   and control.capability_registry_entries.minimum_release=excluded.minimum_release
+                   and control.capability_registry_entries.enforcement_adapter=excluded.enforcement_adapter",
+            )
+            .bind(i32::try_from(registry.version)?)
+            .bind(&entry.key)
+            .bind(&entry.dependencies)
+            .bind(&entry.odoo_modules)
+            .bind(&entry.service)
+            .bind(&registry.minimum_application_release)
+            .bind(adapter)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                anyhow::bail!("capability registry entry was reused with different content");
+            }
+        }
+        let count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from control.capability_registry_entries where registry_version=$1",
+        )
+        .bind(i32::try_from(registry.version)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        if usize::try_from(count).ok() != Some(registry.capabilities.len()) {
+            anyhow::bail!(
+                "capability registry database entries do not exactly match the release registry"
+            );
+        }
+        sqlx::query("update control.capability_registry_versions set active=false where active and version<>$1")
+            .bind(i32::try_from(registry.version)?)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("update control.capability_registry_versions set active=true where version=$1")
+            .bind(i32::try_from(registry.version)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -86,11 +190,18 @@ impl Store {
         transaction: &mut Transaction<'_, Postgres>,
         operation: NewOperation<'_>,
     ) -> Result<Uuid, sqlx::Error> {
+        let mut trace_context = std::collections::HashMap::new();
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&tracing::Span::current().context(), &mut trace_context);
+        });
+        let trace_parent = trace_context.remove("traceparent");
+        let trace_state = trace_context.remove("tracestate");
         sqlx::query_scalar(
             "insert into control.operations (
                 id, kind, queue, workshop_id, target_user_id, desired_epoch,
-                payload, requested_by, correlation_id, idempotency_key
-             ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                payload, requested_by, correlation_id, idempotency_key,
+                trace_parent,trace_state
+             ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              on conflict (kind, requested_by, idempotency_key) do update
                 set idempotency_key=excluded.idempotency_key
              where control.operations.workshop_id is not distinct from excluded.workshop_id
@@ -109,6 +220,8 @@ impl Store {
         .bind(operation.requested_by)
         .bind(operation.correlation_id)
         .bind(operation.idempotency_key)
+        .bind(trace_parent)
+        .bind(trace_state)
         .fetch_one(&mut **transaction)
         .await
     }
@@ -161,6 +274,8 @@ impl Store {
                 i32,
                 i32,
                 String,
+                Option<String>,
+                Option<String>,
             ),
         >(
             "update control.operations operation set
@@ -176,7 +291,8 @@ impl Store {
              where operation.id=candidate.id
              returning operation.id,operation.kind,operation.workshop_id,
                 operation.target_user_id,operation.desired_epoch,operation.payload,
-                operation.attempt,operation.max_attempts,candidate.previous_state",
+                operation.attempt,operation.max_attempts,candidate.previous_state,
+                operation.trace_parent,operation.trace_state",
         )
         .bind(queue)
         .bind(worker)
@@ -193,6 +309,8 @@ impl Store {
             max_attempts: row.7,
             leased_by: worker.to_owned(),
             reconciling: matches!(row.8.as_str(), "in_flight" | "awaiting_reconciliation"),
+            trace_parent: row.9,
+            trace_state: row.10,
         }))
     }
 

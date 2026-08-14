@@ -24,6 +24,7 @@ pub struct Principal {
     pub issuer: String,
     pub subject: String,
     pub email: String,
+    pub recent_strong_authentication: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub struct VerifiedToken {
     pub issuer: String,
     pub subject: String,
     pub email: String,
+    pub recent_strong_authentication: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +53,9 @@ struct Claims {
     email: Option<String>,
     #[serde(default)]
     email_verified: bool,
+    #[serde(default)]
+    amr: Vec<String>,
+    auth_time: Option<i64>,
 }
 
 struct VerificationKey {
@@ -143,14 +148,18 @@ impl Authenticator {
             issuer: token.issuer,
             subject: token.subject,
             email,
+            recent_strong_authentication: token.recent_strong_authentication,
         })
     }
 
     async fn verify(&self, token: &str) -> Result<VerifiedToken, ApiError> {
         let header = decode_header(token).map_err(|_| ApiError::Unauthenticated)?;
         let kid = header.kid.ok_or(ApiError::Unauthenticated)?;
-        let key = self.key_for(&kid).await.map_err(|error| {
-            tracing::warn!(%error, "unable to select token verification key");
+        let key = self.key_for(&kid).await.map_err(|_| {
+            tracing::warn!(
+                error_class = "verification_key_unavailable",
+                "unable to select token verification key"
+            );
             ApiError::Unauthenticated
         })?;
         let mut validation = Validation::new(key.algorithm);
@@ -170,10 +179,16 @@ impl Authenticator {
             claims.email.as_deref().ok_or(ApiError::Unauthenticated)?,
         )
         .map_err(|_| ApiError::Unauthenticated)?;
+        let recent_strong_authentication = recent_strong_authentication(
+            &claims.amr,
+            claims.auth_time,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        );
         Ok(VerifiedToken {
             issuer: claims.iss,
             subject: claims.sub,
             email,
+            recent_strong_authentication,
         })
     }
 
@@ -291,5 +306,63 @@ impl Authenticator {
             anyhow::bail!("OIDC metadata exceeds size limit");
         }
         Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+fn recent_strong_authentication(amr: &[String], auth_time: Option<i64>, now: i64) -> bool {
+    const MAX_AGE_SECONDS: i64 = 10 * 60;
+    let Some(auth_time) = auth_time else {
+        return false;
+    };
+    if auth_time > now.saturating_add(CLOCK_LEEWAY_SECONDS as i64)
+        || now.saturating_sub(auth_time) > MAX_AGE_SECONDS
+    {
+        return false;
+    }
+    let has = |method: &str| amr.iter().any(|value| value.eq_ignore_ascii_case(method));
+    has("mfa")
+        || has("webauthn")
+        || has("passkey")
+        || has("fido2")
+        || ((has("otp") || has("totp")) && has("pwd"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recent_strong_authentication;
+
+    #[test]
+    fn step_up_requires_recent_strong_evidence() {
+        let methods = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(recent_strong_authentication(
+            &methods(&["pwd", "mfa"]),
+            Some(1_000),
+            1_300
+        ));
+        assert!(recent_strong_authentication(
+            &methods(&["webauthn"]),
+            Some(1_000),
+            1_300
+        ));
+        assert!(!recent_strong_authentication(
+            &methods(&["pwd"]),
+            Some(1_000),
+            1_300
+        ));
+        assert!(!recent_strong_authentication(
+            &methods(&["pwd", "mfa"]),
+            Some(1_000),
+            1_601
+        ));
+        assert!(!recent_strong_authentication(
+            &methods(&["pwd", "mfa"]),
+            None,
+            1_300
+        ));
     }
 }

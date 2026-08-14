@@ -4,11 +4,12 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { formatInstant, sentence } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	let overview = $state<any>();
+	import type { PlatformOverviewResponse } from '$lib/generated/control-api';
+	let overview = $state<PlatformOverviewResponse>();
 	let error = $state('');
 	let loading = $state(true);
 	$effect(() => { void load(); const timer = window.setInterval(() => void load(false), 10000); return () => window.clearInterval(timer); });
-	async function load(showError = true) { try { overview = await request('/v1/platform/overview'); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
+	async function load(showError = true) { try { overview = await request<PlatformOverviewResponse>('/v1/platform/overview'); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
 </script>
 
 <svelte:head><title>Platform overview · MakersBrain</title></svelte:head>

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "minimum_application_release": "0.1.0",
+  "capabilities": [
+    {"key":"ceramics-production","dependencies":["firings"],"odoo_modules":["mb_ceramics_workflow"]},
+    {"key":"catalogue","dependencies":[],"odoo_modules":["mb_catalogue_sync"]},
+    {"key":"firings","dependencies":[],"odoo_modules":["mb_ceramics_firing"]},
+    {"key":"kiln-connectivity","dependencies":["firings"],"odoo_modules":["mb_kiln_bridge"]},
+    {"key":"labels","dependencies":[],"odoo_modules":["mb_label","mb_label_pos"]},
+    {"key":"depot","dependencies":[],"odoo_modules":["mb_depot"]},
+    {"key":"sumup","dependencies":[],"odoo_modules":["mb_payment_sumup","mb_account_payment_sumup","mb_pos_sumup"]},
+    {"key":"inventory-capture","dependencies":[],"odoo_modules":["mb_inventory_capture"]},
+    {"key":"azure-label-extraction","dependencies":["inventory-capture"],"odoo_modules":[]},
+    {"key":"inventory-ai-fallback","dependencies":["inventory-capture"],"odoo_modules":[]},
+    {"key":"documents","dependencies":[],"odoo_modules":[],"service":"paperless"},
+    {"key":"invoice-capture","dependencies":["documents"],"odoo_modules":["mb_invoice_capture"]},
+    {"key":"azure-invoice-extraction","dependencies":["invoice-capture"],"odoo_modules":[]}
+  ]
+}

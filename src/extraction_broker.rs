@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::integrations::azure::AzureInvoiceClient;
 use crate::integrations::inventory_vision::{InventoryVisionClient, VisionProviderKind};
@@ -17,13 +19,26 @@ use crate::integrations::product_lookup::UpcItemDbClient;
 
 const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone)]
 pub struct BrokerState {
     token: String,
     azure: Option<AzureInvoiceClient>,
     azure_version: String,
     vision: Vec<InventoryVisionClient>,
     product_lookup: Option<UpcItemDbClient>,
+    metrics: Mutex<BTreeMap<ProviderMetricKey, ProviderMetric>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProviderMetricKey {
+    provider: &'static str,
+    operation: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Default)]
+struct ProviderMetric {
+    requests: u64,
+    latency_micros: u128,
 }
 
 #[derive(Deserialize)]
@@ -57,9 +72,9 @@ struct ProductLookupRequest {
 
 impl BrokerState {
     pub fn from_env() -> anyhow::Result<Self> {
-        let required = |name| anyhow::Ok(std::env::var(name)?.trim().to_owned());
-        let endpoint = std::env::var("BROKER_AZURE_ENDPOINT").unwrap_or_default();
-        let key = std::env::var("BROKER_AZURE_KEY").unwrap_or_default();
+        let required = |name| crate::runtime_secret::required(name).map_err(anyhow::Error::msg);
+        let endpoint = broker_environment("BROKER_AZURE_ENDPOINT")?.unwrap_or_default();
+        let key = broker_environment("BROKER_AZURE_KEY")?.unwrap_or_default();
         if endpoint.trim().is_empty() != key.trim().is_empty() {
             anyhow::bail!("both Azure endpoint and key must be configured together");
         }
@@ -83,13 +98,14 @@ impl BrokerState {
             )?)
         };
         let vision = vision_clients_from_env()?;
-        let lookup_endpoint = std::env::var("BROKER_UPCITEMDB_ENDPOINT").unwrap_or_default();
+        let lookup_endpoint = broker_environment("BROKER_UPCITEMDB_ENDPOINT")?.unwrap_or_default();
         let product_lookup = if lookup_endpoint.trim().is_empty() {
             None
         } else {
+            let lookup_key = broker_environment("BROKER_UPCITEMDB_KEY")?;
             Some(UpcItemDbClient::new(
                 &lookup_endpoint,
-                std::env::var("BROKER_UPCITEMDB_KEY").ok().as_deref(),
+                lookup_key.as_deref(),
             )?)
         };
         Ok(Self {
@@ -98,6 +114,7 @@ impl BrokerState {
             azure_version,
             vision,
             product_lookup,
+            metrics: Mutex::new(BTreeMap::new()),
         })
     }
 }
@@ -110,6 +127,7 @@ pub fn app(state: BrokerState) -> Router {
         )
         .route("/health/ready", get(ready))
         .route("/health/vision-ready", get(vision_ready))
+        .route("/internal/metrics", get(metrics))
         .route("/v1/extract", post(extract))
         .route("/v1/inventory-label/vision", post(inventory_vision))
         .route("/v1/products/lookup", post(product_lookup))
@@ -117,7 +135,78 @@ pub fn app(state: BrokerState) -> Router {
         .layer(SetSensitiveRequestHeadersLayer::new([
             header::AUTHORIZATION,
         ]))
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::info_span!(
+                    "broker_http_request",
+                    http_request_method = %request.method(),
+                    http_route = %request.uri().path()
+                )
+            },
+        ))
         .with_state(Arc::new(state))
+}
+
+fn record_provider_metric(
+    state: &BrokerState,
+    provider: &'static str,
+    operation: &'static str,
+    outcome: &'static str,
+    elapsed: Duration,
+) {
+    if let Ok(mut metrics) = state.metrics.lock() {
+        let metric = metrics
+            .entry(ProviderMetricKey {
+                provider,
+                operation,
+                outcome,
+            })
+            .or_default();
+        metric.requests = metric.requests.saturating_add(1);
+        metric.latency_micros = metric.latency_micros.saturating_add(elapsed.as_micros());
+    }
+}
+
+async fn metrics(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, String), StatusCode> {
+    if !authorized(&headers, &state.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let metrics = state
+        .metrics
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut body = String::from(
+        "# HELP makersbrain_provider_requests_total Provider calls by bounded provider, operation and outcome.\n\
+# TYPE makersbrain_provider_requests_total counter\n\
+# HELP makersbrain_provider_latency_seconds_sum Accumulated provider latency by bounded provider, operation and outcome.\n\
+# TYPE makersbrain_provider_latency_seconds_sum counter\n",
+    );
+    for (key, metric) in metrics.iter() {
+        let labels = format!(
+            "provider=\"{}\",operation=\"{}\",outcome=\"{}\"",
+            key.provider, key.operation, key.outcome
+        );
+        body.push_str(&format!(
+            "makersbrain_provider_requests_total{{{labels}}} {}\nmakersbrain_provider_latency_seconds_sum{{{labels}}} {}\n",
+            metric.requests,
+            metric.latency_micros as f64 / 1_000_000.0
+        ));
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        "text/plain; version=0.0.4; charset=utf-8"
+            .parse()
+            .expect("static metrics content type"),
+    );
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    Ok((response_headers, body))
 }
 
 async fn ready(State(state): State<Arc<BrokerState>>) -> StatusCode {
@@ -182,10 +271,18 @@ async fn extract(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let response = match request.task.as_str() {
         "invoice" => {
+            let started = Instant::now();
             let result = azure
                 .analyze_model("prebuilt-invoice", &source, &request.mimetype)
-                .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                .await;
+            record_provider_metric(
+                &state,
+                "azure-document-intelligence",
+                "invoice",
+                if result.is_ok() { "success" } else { "failure" },
+                started.elapsed(),
+            );
+            let result = result.map_err(|_| StatusCode::BAD_GATEWAY)?;
             let (invoice, confidence, pages) =
                 crate::invoice::normalize_azure(&result).map_err(|_| StatusCode::BAD_GATEWAY)?;
             json!({"provider":"azure-document-intelligence","model":"prebuilt-invoice","version":state.azure_version.as_str(),
@@ -200,10 +297,18 @@ async fn extract(
                 .as_deref()
                 .filter(|value| !value.is_empty() && value.len() <= 64)
                 .ok_or(StatusCode::BAD_REQUEST)?;
+            let started = Instant::now();
             let result = azure
                 .analyze_model("prebuilt-read", &source, &request.mimetype)
-                .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                .await;
+            record_provider_metric(
+                &state,
+                "azure-document-intelligence",
+                "inventory-ocr",
+                if result.is_ok() { "success" } else { "failure" },
+                started.elapsed(),
+            );
+            let result = result.map_err(|_| StatusCode::BAD_GATEWAY)?;
             let normalized = crate::inventory_label::normalize_azure_read(&result, asset_id)
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
             json!({"provider":"azure-document-intelligence","model":"prebuilt-read","version":state.azure_version.as_str(),
@@ -263,7 +368,16 @@ async fn inventory_vision(
     }
     let mut last_status = StatusCode::BAD_GATEWAY;
     for vision in vision_order {
-        let analysis = match vision.analyze(&assets, &request.ocr_tokens).await {
+        let started = Instant::now();
+        let result = vision.analyze(&assets, &request.ocr_tokens).await;
+        record_provider_metric(
+            &state,
+            vision.provider(),
+            "inventory-vision",
+            if result.is_ok() { "success" } else { "failure" },
+            started.elapsed(),
+        );
+        let analysis = match result {
             Ok(result) => result,
             Err(error @ crate::domain::IntegrationError::TooLarge) => {
                 last_status = StatusCode::PAYLOAD_TOO_LARGE;
@@ -317,14 +431,20 @@ async fn product_lookup(
         .product_lookup
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let candidates = provider
-        .lookup(&request.gtin14)
-        .await
-        .map_err(|error| match error {
-            crate::domain::IntegrationError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-            crate::domain::IntegrationError::Unauthorized => StatusCode::BAD_GATEWAY,
-            _ => StatusCode::BAD_GATEWAY,
-        })?;
+    let started = Instant::now();
+    let result = provider.lookup(&request.gtin14).await;
+    record_provider_metric(
+        &state,
+        "upcitemdb",
+        "product-lookup",
+        if result.is_ok() { "success" } else { "failure" },
+        started.elapsed(),
+    );
+    let candidates = result.map_err(|error| match error {
+        crate::domain::IntegrationError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        crate::domain::IntegrationError::Unauthorized => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_GATEWAY,
+    })?;
     Ok(Json(json!({
         "provider":"upcitemdb","schema_version":1,
         "gtin14":request.gtin14,"candidates":candidates
@@ -332,8 +452,8 @@ async fn product_lookup(
 }
 
 fn vision_clients_from_env() -> anyhow::Result<Vec<InventoryVisionClient>> {
-    let primary = std::env::var("BROKER_VISION_PRIMARY").unwrap_or_default();
-    let secondary = std::env::var("BROKER_VISION_SECONDARY").unwrap_or_default();
+    let primary = broker_environment("BROKER_VISION_PRIMARY")?.unwrap_or_default();
+    let secondary = broker_environment("BROKER_VISION_SECONDARY")?.unwrap_or_default();
     if primary.trim().is_empty() && !secondary.trim().is_empty() {
         anyhow::bail!("vision secondary requires a configured primary");
     }
@@ -344,9 +464,9 @@ fn vision_clients_from_env() -> anyhow::Result<Vec<InventoryVisionClient>> {
             .collect();
     }
 
-    let endpoint = std::env::var("BROKER_VISION_ENDPOINT").unwrap_or_default();
-    let key = std::env::var("BROKER_VISION_KEY").unwrap_or_default();
-    let model = std::env::var("BROKER_VISION_MODEL").unwrap_or_default();
+    let endpoint = broker_environment("BROKER_VISION_ENDPOINT")?.unwrap_or_default();
+    let key = broker_environment("BROKER_VISION_KEY")?.unwrap_or_default();
+    let model = broker_environment("BROKER_VISION_MODEL")?.unwrap_or_default();
     let configured = [endpoint.as_str(), key.as_str(), model.as_str()]
         .iter()
         .filter(|value| !value.trim().is_empty())
@@ -407,13 +527,17 @@ fn vision_client_from_env(provider: VisionProviderKind) -> anyhow::Result<Invent
         VisionProviderKind::Claude => "BROKER_CLAUDE",
         VisionProviderKind::OpenAiCompatible => unreachable!(),
     };
-    let endpoint = std::env::var(format!("{prefix}_ENDPOINT"))
-        .map_err(|_| anyhow::anyhow!("{prefix}_ENDPOINT is required"))?;
-    let key = std::env::var(format!("{prefix}_KEY"))
-        .map_err(|_| anyhow::anyhow!("{prefix}_KEY is required"))?;
-    let model = std::env::var(format!("{prefix}_MODEL"))
-        .map_err(|_| anyhow::anyhow!("{prefix}_MODEL is required"))?;
+    let endpoint = crate::runtime_secret::required(&format!("{prefix}_ENDPOINT"))
+        .map_err(anyhow::Error::msg)?;
+    let key =
+        crate::runtime_secret::required(&format!("{prefix}_KEY")).map_err(anyhow::Error::msg)?;
+    let model =
+        crate::runtime_secret::required(&format!("{prefix}_MODEL")).map_err(anyhow::Error::msg)?;
     InventoryVisionClient::new(provider, &endpoint, &key, &model)
+}
+
+fn broker_environment(name: &str) -> anyhow::Result<Option<String>> {
+    crate::runtime_secret::environment(name).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
@@ -454,6 +578,32 @@ mod tests {
         assert!(!authorized(&headers, "exact-secreu"));
         assert!(!authorized(&headers, "exact-secret-longer"));
         assert!(!authorized(&HeaderMap::new(), "exact-secret"));
+    }
+
+    #[test]
+    fn provider_metrics_have_only_bounded_privacy_safe_dimensions() {
+        let state = BrokerState {
+            token: "secret".into(),
+            azure: None,
+            azure_version: "fixture".into(),
+            vision: Vec::new(),
+            product_lookup: None,
+            metrics: Mutex::new(BTreeMap::new()),
+        };
+        record_provider_metric(
+            &state,
+            "upcitemdb",
+            "product-lookup",
+            "success",
+            Duration::from_millis(125),
+        );
+        let metrics = state.metrics.lock().unwrap();
+        let (key, metric) = metrics.first_key_value().unwrap();
+        assert_eq!(key.provider, "upcitemdb");
+        assert_eq!(key.operation, "product-lookup");
+        assert_eq!(key.outcome, "success");
+        assert_eq!(metric.requests, 1);
+        assert_eq!(metric.latency_micros, 125_000);
     }
 
     #[test]

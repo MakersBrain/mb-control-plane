@@ -6,6 +6,10 @@ schema, Rauthy verification, Paperless/Azure/Odoo adapters, container builds,
 and the machine-readable deployment contract. It does not import source code
 or runtime files from sibling repositories.
 
+See the [current architecture](../CONTROL-PLANE-ARCHITECTURE.md), the
+[gated roadmap](../CONTROL-PLANE-ROADMAP.md), and the
+[database identity runbook](docs/database-identities.md).
+
 ## Verify
 
 ```sh
@@ -21,14 +25,52 @@ migration ledger is explicitly fixed at `public._sqlx_migrations`; never make
 it search-path-dependent because the database role and application schema are
 both named `control`.
 
+After two synthetic workshops have been provisioned in a staging topology, run
+the black-box Odoo isolation gate with the gateway origin, each exact host,
+workshop UUID and opaque database reference, plus absolute mode-0600 token-file
+paths:
+
+```sh
+CONTROL_TOPOLOGY_GATEWAY_ORIGIN=https://gateway.example.test \
+CONTROL_TOPOLOGY_A_HOST=one.example.test \
+CONTROL_TOPOLOGY_A_WORKSHOP=00000000-0000-4000-8000-000000000001 \
+CONTROL_TOPOLOGY_A_DATABASE=mb_00000000000040008000000000000001 \
+CONTROL_TOPOLOGY_A_TOKEN_FILE=/secure/one-token \
+CONTROL_TOPOLOGY_B_HOST=two.example.test \
+CONTROL_TOPOLOGY_B_WORKSHOP=00000000-0000-4000-8000-000000000002 \
+CONTROL_TOPOLOGY_B_DATABASE=mb_00000000000040008000000000000002 \
+CONTROL_TOPOLOGY_B_TOKEN_FILE=/secure/two-token \
+make topology-odoo-isolation-check
+```
+
+The gate forges the other database header on each request, proves the exact host
+wins, rejects the other workshop's credential, and rejects an unknown host. It
+never prints or passes a token as a command-line argument.
+
 ## Run the complete local topology
 
 ```sh
-cp deploy/.env.example deploy/.env
-# Replace every placeholder; never commit this file.
+./deploy/bootstrap-local-env.sh
 make configure
 make up
 ```
+
+The bootstrap writes non-secret configuration and only `@/run/secrets/...`
+references to `deploy/.env`; credential values are read-only files inside the
+mode-0700 `deploy/secrets/runtime` directory. Rendered Compose output is covered by a recognizable
+secret-canary test. Never replace a reference with plaintext in `.env`.
+Existing local installations using the earlier plaintext environment format can
+be converted in place, without regenerating credentials, with
+`./deploy/migrate-local-env-secrets.sh --apply`; the command refuses partial or
+already-migrated state.
+
+Personal mode is intentionally unavailable with the repository defaults. A
+production deployment must set all six governance settings documented beside
+`CONTROL_DATA_MODE` in `.env.example`. The five evidence values must be bounded,
+non-placeholder references to controller-approved records; the region must be
+`paris`, `azure-france-central`, or `azure-west-europe`. The mandatory migration
+gate runs before every active processor, so missing governance evidence prevents
+Rauthy, Odoo, extraction, workers, the driver, and tenant routing from starting.
 
 Open the members UI at `http://localhost:4175` and Rauthy at
 `http://rauthy.localhost:8092`. After creating a workshop with slug `atelier`,
@@ -53,12 +95,15 @@ email payloads, signed tokens, or credentials.
 `../../makersbrain-infra/environments/development/developer-tunnels` owns the
 remotely managed tunnel, DNS, exact service routes, and the development-only
 workshop wildcard. After that state
-has been applied, put its sensitive connector token and the allocated domain in
-the ignored `deploy/.env`:
+has been applied, put only the allocated domain in the ignored `deploy/.env`
+and import the connector token from a separately protected file:
 
 ```dotenv
 PUBLIC_DOMAIN=dev1.makersbrain.net
-CLOUDFLARE_TUNNEL_TOKEN=<sensitive connector token>
+```
+
+```sh
+./deploy/install-tunnel-token.sh --from-file /secure/path/to/cloudflare-token
 ```
 
 Then run `make up-tunnel`. This regenerates the Rauthy clients with exact HTTPS
@@ -72,7 +117,7 @@ callbacks, starts Rauthy with its exact WebAuthn RP ID, and publishes:
   `odoo-` prefix)
 - `docs-<workshop-slug>.dev1.makersbrain.net` — that workshop's Paperless
 
-The connector token is written to an ignored mode-0600 token file and passed to
+The connector token is written inside the ignored mode-0700 secret directory and passed to
 `cloudflared` with `--token-file`, not as a command argument. This workspace is
 strictly for synthetic test data. Stop it with `make down-tunnel`.
 
@@ -119,7 +164,7 @@ enabled only by the Compose harness; production should omit
 `CONTROL_ALLOW_SELF_SIGNUP` and pre-provision or invite users.
 
 The API publishes `/openapi.json`. Infrastructure consumes
-`deploy/release-contract.json`; it injects secret values for the declared
+`deploy/release-contract.json`; it resolves secret references for the declared
 environment names and selects the deployment driver for the target runtime.
 Run `control-migrate` as a one-shot job before the API or workers; the supplied
 Compose topology enforces that dependency on every clean start.
@@ -172,5 +217,8 @@ With invoice capture enabled but Azure disabled, structured UBL, CII, and
 Factur-X invoices continue to import locally. Unstructured documents remain in
 Paperless for manual handling and do not consume an Azure request.
 
-See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for paired recovery and
-[`../CONTROL-PLANE-DESIGN.md`](../CONTROL-PLANE-DESIGN.md) for the architecture.
+See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for paired recovery,
+[`../CONTROL-PLANE-ARCHITECTURE.md`](../CONTROL-PLANE-ARCHITECTURE.md) for
+verified current state and
+[`../CONTROL-PLANE-ROADMAP.md`](../CONTROL-PLANE-ROADMAP.md) for incomplete
+capabilities and release gates.

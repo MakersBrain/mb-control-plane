@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "record_version": "draft-2026-08-14",
+  "status": "controller-approval-required",
+  "production_personal_data_allowed": false,
+  "controller": null,
+  "representative": null,
+  "dpo": null,
+  "record_owner": "project-owner-initial-technical-administrator",
+  "processing_region_policy": {
+    "preferred": "paris",
+    "fallback": "azure-west-europe",
+    "boundary": "EEA",
+    "non_eea_transfer_allowed": false
+  },
+  "activities": [
+    {
+      "id": "identity-authority-and-access",
+      "inventory_datasets": ["user-directory", "external-identity", "workshop-authority", "platform-authority"],
+      "purposes": ["authenticate users", "authorize workshop and platform access", "apply least privilege"],
+      "data_subject_categories": ["platform users", "workshop members", "platform operators"],
+      "personal_data_categories": ["contact identity", "OIDC identifiers", "membership and role history"],
+      "processor_register_entries": ["hosting", "identity"],
+      "recipient_categories": ["authorized platform processes", "tenant Odoo and Paperless"],
+      "transfers": "EEA-only; no non-EEA transfer is enabled",
+      "erasure_time_limits": "controller-approved retention policies are required before production",
+      "security_measures": ["OIDC authorization code with PKCE", "step-up authentication", "per-process database roles", "pseudonymous audit subjects"]
+    },
+    {
+      "id": "workshop-service-delivery",
+      "inventory_datasets": ["invitations", "mail-delivery", "usage-and-entitlement", "tenant-business-data"],
+      "purposes": ["onboard members", "deliver transactional messages", "enforce entitlements", "operate workshop business services"],
+      "data_subject_categories": ["invitees", "workshop users", "customers", "suppliers", "document subjects"],
+      "personal_data_categories": ["contact details", "delivery metadata", "business records", "documents and OCR metadata"],
+      "processor_register_entries": ["hosting", "transactional_mail", "identity", "document_extraction", "object_storage"],
+      "recipient_categories": ["authorized workshop users", "approved service processors"],
+      "transfers": "EEA-only; provider activation requires Article 28 and region evidence",
+      "erasure_time_limits": "controller-approved tenant and platform retention policies are required before production",
+      "security_measures": ["signed fragment-delivered invitations", "database-per-workshop isolation", "exact-host routing", "encrypted recovery sets", "human review of extraction results"]
+    },
+    {
+      "id": "operations-security-and-continuity",
+      "inventory_datasets": ["operations-and-audit", "recovery-and-deletion-evidence", "application-telemetry", "worker-runtime-evidence"],
+      "purposes": ["execute reliable commands", "detect and investigate incidents", "recover services", "evidence accountability"],
+      "data_subject_categories": ["platform users", "operators", "persons represented in tenant recovery data"],
+      "personal_data_categories": ["pseudonymous identifiers", "authorization history", "correlation and lifecycle timestamps", "encrypted recovery data"],
+      "processor_register_entries": ["hosting", "object_storage", "telemetry"],
+      "recipient_categories": ["authorized operations and security personnel", "approved backup and telemetry processors"],
+      "transfers": "EEA-only with geographically separate encrypted backup copies",
+      "erasure_time_limits": "versioned retention approval is required; restored erasures replay before routing",
+      "security_measures": ["append-only audit boundary", "idempotent durable operations", "privacy-safe telemetry allowlist", "encrypted backups", "restore maintenance fence"]
+    },
+    {
+      "id": "data-subject-rights-and-incident-response",
+      "inventory_datasets": ["privacy-rights-and-incidents"],
+      "purposes": ["exercise GDPR rights", "coordinate processor actions", "assess and respond to breaches"],
+      "data_subject_categories": ["rights requesters", "affected persons", "incident responders"],
+      "personal_data_categories": ["request scope and decisions", "encrypted processor lookup data", "incident and notification evidence"],
+      "processor_register_entries": ["hosting", "object_storage", "identity"],
+      "recipient_categories": ["requesting subject", "controller and DPO", "applicable processors", "supervisory authority when required"],
+      "transfers": "EEA-only; exports are not sent to an unapproved processor",
+      "erasure_time_limits": "export content expires after at most seven days or first consumption; other periods require controller approval",
+      "security_measures": ["authenticated request ownership", "AES-256-GCM export and lookup protection", "single-use export", "processor acknowledgement fence", "72-hour deadline calculation"]
+    },
+    {
+      "id": "tenant-integration-authentication",
+      "inventory_datasets": ["tenant-integration-credential-verifiers"],
+      "purposes": ["authenticate the exact tenant bridge without a shared bearer credential"],
+      "data_subject_categories": [],
+      "personal_data_categories": [],
+      "processor_register_entries": ["hosting"],
+      "recipient_categories": ["tenant Odoo verifier"],
+      "transfers": "not applicable to the verifier itself",
+      "erasure_time_limits": "rotate with the tenant credential and remove on workshop deletion",
+      "security_measures": ["unique random tenant credential", "SHA-256 verifier at rest", "file-scoped plaintext delivery"]
+    }
+  ],
+  "approval": {
+    "controller_ref": null,
+    "processing_record_ref": null,
+    "approved_at": null,
+    "review_due_at": null
+  }
+}

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkshopRole {
     Viewer,
@@ -78,6 +78,10 @@ pub enum OperationKind {
     TenantLifecycle,
     EmailDelivery,
     ModuleEnable,
+    ModuleRestrict,
+    OdooReleaseAdopt,
+    PrivacyRetention,
+    PrivacyDataSubjectRequest,
 }
 
 impl OperationKind {
@@ -92,6 +96,10 @@ impl OperationKind {
             Self::TenantLifecycle => "tenant.lifecycle",
             Self::EmailDelivery => "email.delivery",
             Self::ModuleEnable => "module.enable",
+            Self::ModuleRestrict => "module.restrict",
+            Self::OdooReleaseAdopt => "odoo.release.adopt",
+            Self::PrivacyRetention => "privacy.retention",
+            Self::PrivacyDataSubjectRequest => "privacy.data_subject_request",
         }
     }
 
@@ -106,6 +114,9 @@ impl OperationKind {
             Self::TenantLifecycle => "tenant-lifecycle",
             Self::EmailDelivery => "email-delivery",
             Self::ModuleEnable => "tenant-reconciliation",
+            Self::ModuleRestrict => "tenant-reconciliation",
+            Self::OdooReleaseAdopt => "release-adoption",
+            Self::PrivacyRetention | Self::PrivacyDataSubjectRequest => "privacy-operations",
         }
     }
 }
@@ -212,6 +223,11 @@ mod tests {
             OperationKind::TenantReconcile,
             OperationKind::TenantLifecycle,
             OperationKind::EmailDelivery,
+            OperationKind::ModuleEnable,
+            OperationKind::ModuleRestrict,
+            OperationKind::OdooReleaseAdopt,
+            OperationKind::PrivacyRetention,
+            OperationKind::PrivacyDataSubjectRequest,
         ] {
             assert!(!kind.as_str().is_empty());
             assert!(!kind.queue().is_empty());

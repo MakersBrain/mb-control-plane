@@ -1,13 +1,31 @@
 #!/bin/sh
 set -eu
 if [ ! -f deploy/.env ]; then
-  echo "copy deploy/.env.example to deploy/.env and replace every placeholder" >&2
+  echo "run deploy/bootstrap-local-env.sh first" >&2
+  exit 1
+fi
+if [ ! -d deploy/secrets/runtime ]; then
+  echo "deploy/secrets/runtime is missing; run deploy/migrate-local-env-secrets.sh --apply for a legacy .env" >&2
   exit 1
 fi
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 set -a
 . deploy/.env
 set +a
+for name in CONTROL_RAUTHY_ADMIN_KEY CONTROL_RAUTHY_DEPLOYMENT_KEY
+do
+  eval "value=\${$name-}"
+  case "$value" in
+    @/run/secrets/*)
+      leaf=${value#@/run/secrets/}
+      case "$leaf" in ''|*/*|*..*) echo "unsafe secret reference for $name" >&2; exit 1;; esac
+      secret_path="deploy/secrets/runtime/$leaf"
+      [ -f "$secret_path" ] || { echo "missing secret reference for $name" >&2; exit 1; }
+      value=$(cat "$secret_path")
+      export "$name=$value"
+      ;;
+  esac
+done
 case "$CONTROL_RAUTHY_ADMIN_KEY" in makersbrain-runtime\$*) ;; *) echo "CONTROL_RAUTHY_ADMIN_KEY must be makersbrain-runtime\$<secret>" >&2; exit 1;; esac
 rauthy_key_secret=${CONTROL_RAUTHY_ADMIN_KEY#*\$}
 case "$rauthy_key_secret" in *[!A-Za-z0-9]*) echo "the Rauthy API-key secret must be alphanumeric" >&2; exit 1;; esac

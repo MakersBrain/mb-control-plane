@@ -5,11 +5,11 @@
 	import WorkshopNav from '$lib/components/WorkshopNav.svelte';
 	import { isPending, sentence } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	import type { WorkshopSummary } from '$lib/types';
+	import type { Module, WorkshopSummary } from '$lib/types';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
-	let modules = $state<any[]>([]);
+	let modules = $state<Module[]>([]);
 	let error = $state('');
 	let notice = $state('');
 	let busy = $state('');
@@ -24,22 +24,22 @@
 
 	async function load(showError = true) {
 		try {
-			[workshop, modules] = await Promise.all([request<WorkshopSummary>(`/v1/workshops/${id}`), request<any[]>(`/v1/workshops/${id}/modules`)]);
+			[workshop, modules] = await Promise.all([request<WorkshopSummary>(`/v1/workshops/${id}`), request<Module[]>(`/v1/workshops/${id}/modules`)]);
 			if (showError) error = '';
 		} catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); }
 	}
 
-	async function enable(moduleKey: string) {
-		busy = moduleKey; error = ''; notice = '';
+	async function enable(module: Module) {
+		busy = module.key; error = ''; notice = '';
 		try {
-			await request(`/v1/workshops/${id}/modules/${moduleKey}/enable`, { method: 'POST', headers: { 'idempotency-key': crypto.randomUUID() } });
-			notice = `${moduleName(moduleKey)} is queued for installation.`;
+			await request(`/v1/workshops/${id}/modules/${module.key}/enable`, { method: 'POST', headers: { 'idempotency-key': crypto.randomUUID(), 'if-match': module.etag } });
+			notice = `${moduleName(module.key)} is queued for installation.`;
 			await load();
 		} catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
 		finally { busy = ''; }
 	}
 
-	const missingDependencies = (module: any) => (module.dependencies || []).filter((key: string) => !modules.some((candidate) => candidate.key === key && candidate.state === 'enabled'));
+	const missingDependencies = (module: Module) => module.dependencies.filter((key) => !modules.some((candidate) => candidate.key === key && candidate.state === 'enabled'));
 	const moduleName = (key: string) => modules.find((module) => module.key === key)?.name || sentence(key);
 </script>
 
@@ -57,13 +57,24 @@
 			<div class="row"><div><h2>{module.name}</h2></div><StatusBadge state={module.state} /></div>
 			<p class="muted module-description">{module.description}</p>
 			{#if module.error}<p class="error">{sentence(module.error)}</p>{/if}
+			{#if !module.entitled}<p class="muted dependency">This capability is not included in the workshop’s active signed entitlement.</p>{/if}
+			{#if !module.release_available}<p class="muted dependency">The workshop’s active application release does not provide this capability.</p>{/if}
 			{#if module.state === 'available' || module.state === 'failed'}
-				<button disabled={!module.can_manage || busy === module.key || missing.length > 0} onclick={() => enable(module.key)}>{busy === module.key ? 'Queuing…' : module.state === 'failed' ? 'Retry installation' : 'Enable module'}</button>
+				<button disabled={!module.can_manage || busy === module.key || missing.length > 0} onclick={() => enable(module)}>{busy === module.key ? 'Queuing…' : module.state === 'failed' ? 'Retry installation' : 'Enable module'}</button>
 				{#if missing.length > 0}<p class="muted dependency">Enable {missing.map(moduleName).join(', ')} first.</p>{/if}
-			{:else if module.state === 'requested' && module.operation_id}
+			{:else if ['requested', 'installing'].includes(module.state) && module.operation_id}
 				<OperationCard id={module.operation_id} compact onsettled={load} />
-			{:else if module.state === 'requested'}
+			{:else if ['requested', 'installing'].includes(module.state)}
 				<p class="muted">Installation is queued.</p>
+			{:else if module.state === 'restricting' && module.operation_id}
+				<p class="muted">Access is blocked while downstream restriction evidence is verified.</p>
+				<OperationCard id={module.operation_id} compact onsettled={load} />
+			{:else if module.state === 'restricting'}
+				<p class="error">Access is blocked, but downstream enforcement needs operator attention.</p>
+			{:else if module.state === 'unavailable'}
+				<p class="muted">Upgrade this workshop to a compatible application release before enabling it.</p>
+			{:else if module.state === 'restricted'}
+				<p class="muted">Installed data is retained, but processing is disabled until entitlement is restored.</p>
 			{:else}
 				<p class="notice">Ready for this workshop.</p>
 			{/if}

@@ -1,17 +1,19 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Body;
+use axum::extract::{MatchedPath, Path, Query, State};
+use axum::http::Request;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine;
-use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
@@ -19,16 +21,70 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::Config;
 use crate::api_error::ApiError;
 use crate::auth::{Authenticator, Principal};
+use crate::command::{
+    CommandAdmission, CommandError, CommandResult, NewCommand, admit_command, complete_command,
+};
 use crate::domain::{OperationKind, WorkshopRole, normalize_email, opaque_database_ref};
 use crate::integrations::extraction::ExtractionBrokerClient;
+use crate::invitation::InvitationVerifier;
 use crate::persistence::{NewOperation, Store};
 
+pub(crate) mod governance;
+use governance::*;
+pub(crate) mod contracts;
+use contracts::*;
+pub(crate) mod recovery;
+pub(crate) use recovery::{DuplicateBody, RecoveryPointBody, RestoreBody};
+use recovery::{confirm_slug, ensure_lifecycle_idle, lock_lifecycle, primary_database};
+pub(crate) mod internal;
+#[cfg(test)]
+use internal::valid_gtin14;
+pub(crate) mod platform;
+pub(crate) mod routes;
+pub(crate) use platform::{AdoptReleaseBody, DeleteWorkshopBody};
+pub(crate) mod workshops;
+pub(crate) use workshops::{
+    CreateWorkshop, InvitationTokenBody, InviteBody, RoleBody, TransferBody,
+};
+
 type ApiResult<T> = Result<T, ApiError>;
+
+#[derive(Default, Clone, Copy)]
+struct HttpMetric {
+    requests: u64,
+    latency_micros: u128,
+}
+
+static HTTP_METRICS: OnceLock<Mutex<std::collections::HashMap<(String, u16), HttpMetric>>> =
+    OnceLock::new();
+
+async fn record_http_metric(request: Request<Body>, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
+        .to_owned();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status_class = response.status().as_u16() / 100;
+    if let Ok(mut metrics) = HTTP_METRICS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        let metric = metrics.entry((route, status_class)).or_default();
+        metric.requests = metric.requests.saturating_add(1);
+        metric.latency_micros = metric
+            .latency_micros
+            .saturating_add(started.elapsed().as_micros());
+    }
+    response
+}
 
 fn api_timestamp(value: OffsetDateTime) -> String {
     value
@@ -41,6 +97,7 @@ pub struct AppState {
     pub store: Store,
     pub config: Config,
     pub auth: Arc<Authenticator>,
+    pub invitation_verifier: Arc<InvitationVerifier>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -51,101 +108,37 @@ pub fn app(state: AppState) -> Router {
         .trim_end_matches('/')
         .parse()
         .expect("validated CORS origin is a header value");
-    Router::new()
+    let state = Arc::new(state);
+    routes::build()
+        .0
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .route("/v1/version", get(version))
         .route("/openapi.json", get(openapi))
-        .route("/v1/me", get(me))
-        .route("/v1/platform/overview", get(platform_overview))
-        .route("/v1/platform/workshops", get(platform_workshops))
-        .route("/v1/platform/workshops/{id}", get(platform_workshop))
-        .route(
-            "/v1/platform/workshops/{id}/deletion",
-            post(platform_delete_workshop),
-        )
-        .route(
-            "/v1/platform/workshops/{id}/reconcile",
-            post(platform_reconcile_workshop),
-        )
-        .route("/v1/platform/operations", get(platform_operations))
-        .route("/v1/platform/users", get(platform_users))
-        .route("/v1/platform/status", get(platform_status))
-        .route(
-            "/v1/platform/email-deliveries",
-            get(platform_email_deliveries),
-        )
-        .route("/v1/platform/audit-events", get(platform_audit_events))
-        .route("/v1/identity/link", post(link_identity))
-        .route("/v1/workshops", get(workshops).post(create_workshop))
-        .route("/v1/workshops/{id}", get(workshop))
-        .route("/v1/workshops/{id}/members", get(members))
-        .route(
-            "/v1/workshops/{id}/invitations",
-            get(invitations).post(invite),
-        )
-        .route("/v1/invitations/{id}/resend", post(resend_invitation))
-        .route("/v1/invitations/{id}", delete(revoke_invitation))
-        .route("/v1/invitations/{token}/validate", get(validate_invitation))
-        .route("/v1/invitations/{token}/accept", post(accept_invitation))
-        .route(
-            "/v1/workshops/{id}/members/{user_id}",
-            patch(update_member).delete(remove_member),
-        )
-        .route(
-            "/v1/workshops/{id}/ownership-transfers",
-            get(ownership_transfers).post(create_ownership_transfer),
-        )
-        .route(
-            "/v1/ownership-transfers/{id}/accept",
-            post(accept_ownership_transfer),
-        )
-        .route("/v1/workshops/{id}/integrations", get(integrations))
-        .route("/v1/workshops/{id}/modules", get(modules))
-        .route(
-            "/v1/workshops/{id}/modules/{module_key}/enable",
-            post(enable_module),
-        )
-        .route("/v1/workshops/{id}/database", get(database))
-        .route(
-            "/v1/workshops/{id}/database/snapshots",
-            post(create_snapshot),
-        )
-        .route("/v1/workshops/{id}/database/backups", post(create_backup))
-        .route(
-            "/v1/workshops/{id}/database/backups/{recovery_id}/download",
-            post(download_backup),
-        )
-        .route(
-            "/v1/workshops/{id}/database/restores",
-            post(restore_database),
-        )
-        .route(
-            "/v1/workshops/{id}/database/duplicates",
-            post(duplicate_database),
-        )
-        .route("/v1/operations/{id}", get(operation))
-        .route("/v1/operations/{id}/retry", post(retry_operation))
         .route(
             "/internal/v1/paperless/{workshop_id}/events",
-            post(paperless_event),
+            post(internal::paperless_event),
         )
         .route(
             "/internal/v1/workshops/{workshop_id}/inventory-captures",
-            post(inventory_capture),
+            post(internal::inventory_capture),
         )
         .route(
             "/internal/v1/workshops/{workshop_id}/inventory-product-lookups",
-            post(inventory_product_lookup),
+            post(internal::inventory_product_lookup),
         )
         .route(
             "/internal/v1/tenants/{workshop_id}/reconcile",
-            post(reconcile_tenant),
+            post(internal::reconcile_tenant),
         )
         .route(
             "/internal/v1/entitlements/{workshop_id}/ack",
-            post(ack_entitlement),
+            post(internal::ack_entitlement),
         )
+        .route(
+            "/internal/v1/application-releases",
+            post(platform::publish_release),
+        )
+        .route("/internal/metrics", get(metrics))
         .layer(
             CorsLayer::new()
                 .allow_origin(origin)
@@ -163,12 +156,65 @@ pub fn app(state: AppState) -> Router {
             state.config.request_timeout,
         ))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            enforce_privacy_production_gate,
+        ))
+        .layer(axum::middleware::from_fn(record_http_metric))
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+            tracing::info_span!(
+                "http_request",
+                http_request_method = %request.method(),
+                http_route = request.extensions().get::<MatchedPath>().map_or("unmatched", MatchedPath::as_str)
+            )
+        }))
         .layer(SetSensitiveRequestHeadersLayer::new([
             header::AUTHORIZATION,
             header::COOKIE,
         ]))
-        .with_state(Arc::new(state))
+        .with_state(state)
+}
+
+async fn enforce_privacy_production_gate(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.config.synthetic_data_only {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    let allowed_without_approval = path.starts_with("/health/")
+        || matches!(
+            path,
+            "/openapi.json"
+                | "/v1/version"
+                | "/v1/me"
+                | "/v1/identity/link"
+                | "/internal/metrics"
+                | "/internal/v1/application-releases"
+        )
+        || path.starts_with("/v1/privacy/requests")
+        || path.starts_with("/v1/platform/privacy")
+        || path.starts_with("/v1/platform/roles")
+        || path.starts_with("/v1/platform/releases")
+        || matches!(path, "/v1/platform/status" | "/v1/platform/overview");
+    if allowed_without_approval {
+        return next.run(request).await;
+    }
+    let allowed = sqlx::query_scalar::<_, bool>(
+        "select production_personal_data_allowed from control.privacy_platform_state where singleton",
+    )
+    .fetch_one(state.store.pool())
+    .await;
+    match allowed {
+        Ok(true) => next.run(request).await,
+        Ok(false) => ApiError::PrivacyGate(
+            "personal-data processing is blocked until controller, retention, processing-register and DPIA approvals are recorded",
+        )
+        .into_response(),
+        Err(error) => ApiError::Internal(error.into()).into_response(),
+    }
 }
 
 async fn principal(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
@@ -197,8 +243,51 @@ fn idempotency(headers: &HeaderMap) -> ApiResult<&str> {
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .filter(|value| {
+            (1..=255).contains(&value.len())
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+                })
+        })
         .ok_or(ApiError::Precondition("Idempotency-Key is required"))
+}
+
+fn command_error(error: CommandError) -> ApiError {
+    match error {
+        CommandError::InvalidIdempotencyKey => {
+            ApiError::Validation("Idempotency-Key contains invalid characters")
+        }
+        CommandError::PayloadMismatch => {
+            ApiError::Conflict("Idempotency-Key was already used for another request")
+        }
+        CommandError::Database(error) => ApiError::from(error),
+    }
+}
+
+fn expected_version(headers: &HeaderMap, resource_prefix: &str) -> ApiResult<i64> {
+    let value = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::Precondition("If-Match is required"))?;
+    let prefix = format!("\"{resource_prefix}-v");
+    value
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|version| *version > 0)
+        .ok_or(ApiError::PreconditionFailed(
+            "If-Match does not match this resource",
+        ))
+}
+
+fn etag(resource_prefix: &str, version: i64) -> ApiResult<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{resource_prefix}-v{version}\""))
+            .map_err(|error| ApiError::Internal(error.into()))?,
+    );
+    Ok(headers)
 }
 
 fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -207,6 +296,17 @@ fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     if supplied != Some(state.config.internal_token.as_str()) {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(())
+}
+
+fn release_publisher(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if supplied != Some(state.config.release_publish_token.as_str()) {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())
@@ -265,955 +365,391 @@ async fn openapi() -> impl IntoResponse {
     Json(crate::openapi::document())
 }
 
-async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    Ok(Json(
-        json!({"id": who.user_id, "email": who.email, "subject": who.subject,"is_operator":is_operator(&state,&who)}),
-    ))
+async fn metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<(HeaderMap, String)> {
+    internal(&state, &headers)?;
+    let queues=sqlx::query_as::<_,(String,i64,i64,f64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='dead_letter'),coalesce(extract(epoch from now()-min(o.next_attempt_at) filter(where o.state in ('pending','awaiting_reconciliation') and o.next_attempt_at<=now())),0)::float8 from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue")
+        .fetch_all(state.store.pool()).await?;
+    let workers=sqlx::query_as::<_,(String,i64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(h.worker_id) filter(where h.shutdown_at is null and h.last_heartbeat_at>now()-interval '30 seconds') from known left join control.worker_heartbeats h on h.queue=known.queue group by known.queue order by known.queue")
+        .fetch_all(state.store.pool()).await?;
+    let adoptions = sqlx::query_as::<_, (String, i64)>(
+        "select state,count(*) from control.tenant_release_adoptions group by state order by state",
+    )
+    .fetch_all(state.store.pool())
+    .await?;
+    let integrations = sqlx::query_as::<_, (String, String, i64)>(
+        "select service,health,count(*) from control.service_instances group by service,health order by service,health",
+    )
+    .fetch_all(state.store.pool())
+    .await?;
+    let identity_available = state.auth.ready().await;
+    let backup_age=sqlx::query_scalar::<_,Option<f64>>("select extract(epoch from now()-max(ready_at))::float8 from control.workshop_recovery_points where kind='backup' and state='ready' and verification_state='verified'")
+        .fetch_one(state.store.pool()).await?;
+    let rehearsal_age=sqlx::query_scalar::<_,Option<f64>>("select extract(epoch from now()-max(finished_at))::float8 from control.workshop_recovery_rehearsals where state='succeeded'")
+        .fetch_one(state.store.pool()).await?;
+    let abandoned=sqlx::query_scalar::<_,i64>("select count(*) from control.operations where state='in_flight' and lease_expires_at<now()")
+        .fetch_one(state.store.pool()).await?;
+    let mut body = String::from(
+        "# HELP makersbrain_queue_depth Due or queued durable operations.\n# TYPE makersbrain_queue_depth gauge\n",
+    );
+    for (queue, depth, dead, age) in queues {
+        body.push_str(&format!("makersbrain_queue_depth{{queue=\"{queue}\"}} {depth}\nmakersbrain_queue_dead_letters{{queue=\"{queue}\"}} {dead}\nmakersbrain_queue_oldest_due_age_seconds{{queue=\"{queue}\"}} {age}\n"));
+    }
+    body.push_str("# HELP makersbrain_worker_fresh Fresh worker heartbeats by queue.\n# TYPE makersbrain_worker_fresh gauge\n");
+    for (queue, count) in workers {
+        body.push_str(&format!(
+            "makersbrain_worker_fresh{{queue=\"{queue}\"}} {count}\n"
+        ));
+    }
+    for (adoption_state, count) in adoptions {
+        body.push_str(&format!(
+            "makersbrain_release_adoptions{{state=\"{adoption_state}\"}} {count}\n"
+        ));
+    }
+    body.push_str("# HELP makersbrain_integration_instances Connected integration instances by bounded integration and health.\n# TYPE makersbrain_integration_instances gauge\n");
+    for (integration, health, count) in integrations {
+        body.push_str(&format!(
+            "makersbrain_integration_instances{{integration=\"{integration}\",health=\"{health}\"}} {count}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "makersbrain_integration_instances{{integration=\"rauthy\",health=\"{}\"}} 1\n",
+        if identity_available {
+            "ready"
+        } else {
+            "failed"
+        }
+    ));
+    body.push_str(&format!("makersbrain_abandoned_operation_leases {abandoned}\nmakersbrain_backup_freshness_seconds {}\nmakersbrain_restore_rehearsal_age_seconds {}\n",backup_age.unwrap_or(-1.0),rehearsal_age.unwrap_or(-1.0)));
+    body.push_str("# HELP makersbrain_http_requests_total HTTP requests by templated route and status class.\n# TYPE makersbrain_http_requests_total counter\n# HELP makersbrain_http_latency_seconds_sum Accumulated HTTP latency by templated route and status class.\n# TYPE makersbrain_http_latency_seconds_sum counter\n");
+    if let Ok(metrics) = HTTP_METRICS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        let mut rows = metrics.iter().collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(right.0));
+        for ((route, status_class), metric) in rows {
+            body.push_str(&format!("makersbrain_http_requests_total{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\nmakersbrain_http_latency_seconds_sum{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\n",metric.requests,metric.latency_micros as f64/1_000_000.0));
+        }
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((response_headers, body))
 }
 
-fn is_operator(state: &AppState, who: &Principal) -> bool {
-    state.config.operator_emails.contains(&who.email)
+async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
+    let who = principal(&state, &headers).await?;
+    let roles = platform_roles(&state, &who).await?;
+    Ok(Json(MeResponse {
+        id: who.user_id,
+        email: who.email,
+        subject: who.subject,
+        is_operator: !roles.is_empty(),
+        platform_roles: roles,
+        recent_strong_authentication: who.recent_strong_authentication,
+    }))
+}
+
+async fn platform_roles(state: &AppState, who: &Principal) -> ApiResult<Vec<String>> {
+    let roles = sqlx::query_scalar::<_, String>(
+        "select role from control.platform_role_assignments where user_id=$1 and revoked_at is null order by role",
+    )
+    .bind(who.user_id)
+    .fetch_all(state.store.pool())
+    .await?;
+    if !roles.is_empty() || !state.config.operator_emails.contains(&who.email) {
+        return Ok(roles);
+    }
+
+    // CONTROL_OPERATOR_EMAILS is only a one-time bootstrap input. Once the
+    // initial technical administrator is recorded, authorization is entirely
+    // database-backed and changing the environment cannot grant authority.
+    let mut tx = state.store.begin().await?;
+    let bootstrapped = sqlx::query_scalar::<_, bool>(
+        "select initial_admin_bootstrapped from control.platform_authority_state where singleton for update",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !bootstrapped {
+        sqlx::query("insert into control.platform_role_assignments(id,user_id,role,granted_by,grant_reason_code) values($1,$2,'technical_admin',$2,'initial_project_owner')")
+            .bind(Uuid::new_v4())
+            .bind(who.user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("update control.platform_authority_state set initial_admin_bootstrapped=true,bootstrapped_at=now() where singleton")
+            .execute(&mut *tx)
+            .await?;
+        audit(
+            &mut tx,
+            Some(who.user_id),
+            None,
+            "platform.authority.bootstrap",
+            "user",
+            who.user_id.to_string(),
+            Uuid::new_v4(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    sqlx::query_scalar::<_, String>(
+        "select role from control.platform_role_assignments where user_id=$1 and revoked_at is null order by role",
+    )
+    .bind(who.user_id)
+    .fetch_all(state.store.pool())
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn is_operator(state: &AppState, who: &Principal) -> ApiResult<bool> {
+    Ok(!platform_roles(state, who).await?.is_empty())
 }
 
 async fn operator(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
     let who = principal(state, headers).await?;
-    if !is_operator(state, &who) {
+    if !is_operator(state, &who).await? {
         return Err(ApiError::Forbidden);
     }
     Ok(who)
 }
 
-async fn platform_overview(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let workshops = sqlx::query_as::<_, (i64, i64, i64)>(
-        "select count(*),count(*) filter(where status in ('active','trial')),count(*) filter(where status in ('past_due','restricted','suspended','deleting')) from control.workshops where status<>'deleted'",
-    )
-    .fetch_one(state.store.pool())
-    .await?;
-    let users = sqlx::query_as::<_, (i64, i64)>(
-        "select count(*),count(*) filter(where disabled_at is not null) from control.users",
-    )
-    .fetch_one(state.store.pool())
-    .await?;
-    let operations = sqlx::query_as::<_, (i64, i64, i64)>(
-        "select count(*) filter(where state in ('pending','awaiting_reconciliation')),count(*) filter(where state='in_flight'),count(*) filter(where state='dead_letter') from control.operations",
-    )
-    .fetch_one(state.store.pool())
-    .await?;
-    let degraded_services = sqlx::query_scalar::<_, i64>(
-        "select count(*) from control.service_instances where health in ('degraded','failed')",
-    )
-    .fetch_one(state.store.pool())
-    .await?;
-    let attention = sqlx::query_as::<_, (Uuid,String,String,Option<String>,Option<Uuid>,Option<String>,OffsetDateTime,i16)>(
-        "select o.id,o.kind,o.state,o.failure_class,o.workshop_id,w.display_name,o.created_at,o.progress_percent from control.operations o left join control.workshops w on w.id=o.workshop_id where o.state in ('dead_letter','in_flight','awaiting_reconciliation') order by case when o.state='dead_letter' then 0 else 1 end,o.created_at limit 12",
-    )
-    .fetch_all(state.store.pool())
-    .await?;
-    Ok(Json(json!({
-        "workshops":{"total":workshops.0,"healthy":workshops.1,"attention":workshops.2},
-        "users":{"total":users.0,"disabled":users.1},
-        "operations":{"queued":operations.0,"running":operations.1,"failed":operations.2},
-        "degraded_services":degraded_services,
-        "attention":attention.into_iter().map(|row|json!({"id":row.0,"kind":row.1,"state":row.2,"failure_class":row.3,"workshop_id":row.4,"workshop_name":row.5,"created_at":api_timestamp(row.6),"progress_percent":row.7})).collect::<Vec<_>>()
-    })))
-}
-
-async fn platform_workshops(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (Uuid,String,String,String,String,OffsetDateTime,i64,i64)>(
-        "select w.id,w.slug,w.display_name,w.status,w.plan,w.created_at,count(distinct m.user_id) filter(where m.status='active'),count(distinct s.id) filter(where s.health in ('degraded','failed')) from control.workshops w left join control.memberships m on m.workshop_id=w.id left join control.service_instances s on s.workshop_id=w.id where w.status<>'deleted' group by w.id order by w.created_at desc,w.id",
-    )
-    .fetch_all(state.store.pool())
-    .await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"slug":row.1,"display_name":row.2,"status":row.3,"plan":row.4,"created_at":api_timestamp(row.5),"member_count":row.6,"degraded_service_count":row.7})).collect())))
-}
-
-async fn platform_workshop(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let workshop = sqlx::query_as::<_, (String,String,String,String,Option<String>,Option<String>,OffsetDateTime)>(
-        "select slug,display_name,status,plan,legal_name,country_code,created_at from control.workshops where id=$1",
-    ).bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    let members = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String)>(
-        "select u.id,u.email,u.display_name,m.role,m.status from control.memberships m join control.users u on u.id=m.user_id where m.workshop_id=$1 order by u.email",
-    ).bind(id).fetch_all(state.store.pool()).await?;
-    let services = sqlx::query_as::<_, (String,String,String,Option<String>,Option<String>,i32,i32)>(
-        "select service,base_url,health,release_id,safe_error_class,desired_epoch,applied_epoch from control.service_instances where workshop_id=$1 order by service",
-    ).bind(id).fetch_all(state.store.pool()).await?;
-    let entitlement = sqlx::query_as::<_, (i64,String,String,Value,Option<OffsetDateTime>,OffsetDateTime)>(
-        "select version,plan,status,limits,expires_at,updated_at from control.entitlements where workshop_id=$1",
-    ).bind(id).fetch_optional(state.store.pool()).await?;
-    let usage = sqlx::query_as::<_, (String,i64,OffsetDateTime)>(
-        "select metric,quantity,updated_at from control.usage_counters where workshop_id=$1 and period=date_trunc('month',current_date)::date order by metric",
-    ).bind(id).fetch_all(state.store.pool()).await?;
-    let primary_hostname = sqlx::query_scalar::<_, String>(
-        "select public_hostname from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null and public_hostname is not null",
-    ).bind(id).fetch_optional(state.store.pool()).await?;
-    let operations = platform_operation_rows(&state, Some(id), None, 30).await?;
-    let deletion = sqlx::query_as::<_, (String,Uuid,Uuid,OffsetDateTime,Option<OffsetDateTime>,OffsetDateTime,Option<String>)>(
-        "select state,operation_id,final_recovery_point_id,requested_at,quarantined_at,purge_after,failure_class from control.workshop_deletions where workshop_id=$1",
-    ).bind(id).fetch_optional(state.store.pool()).await?;
-    Ok(Json(json!({
-        "id":id,"slug":workshop.0,"display_name":workshop.1,"status":workshop.2,"plan":workshop.3,"legal_name":workshop.4,"country_code":workshop.5,"created_at":api_timestamp(workshop.6),
-        "members":members.into_iter().map(|row|json!({"id":row.0,"email":row.1,"display_name":row.2,"role":row.3,"status":row.4})).collect::<Vec<_>>(),
-        "services":services.into_iter().map(|row|json!({"service":row.0,"url":row.1,"health":row.2,"release_id":row.3,"error":row.4,"desired_epoch":row.5,"applied_epoch":row.6})).collect::<Vec<_>>(),
-        "entitlement":entitlement.map(|row|json!({"version":row.0,"plan":row.1,"status":row.2,"limits":row.3,"expires_at":row.4.map(api_timestamp),"updated_at":api_timestamp(row.5)})),
-        "usage":usage.into_iter().map(|row|json!({"metric":row.0,"quantity":row.1,"updated_at":api_timestamp(row.2)})).collect::<Vec<_>>(),
-        "primary_hostname":primary_hostname,
-        "operations":operations,
-        "deletion":deletion.map(|row|json!({"state":row.0,"operation_id":row.1,"final_recovery_point_id":row.2,"requested_at":api_timestamp(row.3),"quarantined_at":row.4.map(api_timestamp),"purge_after":api_timestamp(row.5),"failure_class":row.6}))
-    })))
-}
-
-#[derive(Deserialize)]
-struct DeleteWorkshopBody {
-    confirmation: String,
-}
-
-async fn platform_delete_workshop(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<DeleteWorkshopBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = operator(&state, &headers).await?;
-    confirm_slug(&state, id, &body.confirmation).await?;
-    let client_key = idempotency(&headers)?;
-    let stored_key = format!("platform:{id}:delete:{client_key}");
-    if let Some(existing) = existing_lifecycle_operation(&state, who.user_id, &stored_key).await? {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"operation_id":existing,"replayed":true})),
-        ));
-    }
-    let recovery_id = Uuid::new_v4();
-    let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    lock_lifecycle(&mut tx, id).await?;
-    let (slug, previous_status) = sqlx::query_as::<_, (String, String)>(
-        "select slug,status from control.workshops where id=$1 for update",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    if slug != body.confirmation {
-        return Err(ApiError::Validation(
-            "confirmation must exactly match the workshop slug",
-        ));
-    }
-    if matches!(previous_status.as_str(), "deleting" | "deleted")
-        || sqlx::query_scalar::<_, bool>(
-            "select exists(select 1 from control.workshop_deletions where workshop_id=$1)",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?
-    {
-        return Err(ApiError::Conflict("workshop deletion is already scheduled"));
-    }
-    let database_id = primary_database(&mut tx, id).await?;
-    ensure_lifecycle_idle(&mut tx, id).await?;
-    let documents_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
-    ).bind(id).fetch_one(&mut *tx).await?;
-    let component_scope = if documents_enabled {
-        vec!["odoo", "paperless"]
-    } else {
-        vec!["odoo"]
-    };
-    let payload =
-        json!({"action":"delete","database_id":database_id,"recovery_point_id":recovery_id});
-    let operation_id = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::TenantLifecycle,
-            workshop_id: Some(id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by: Some(who.user_id),
-            correlation_id: correlation,
-            idempotency_key: &stored_key,
-        },
-    )
-    .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Final pre-deletion backup',$5,$6,'makersbrain-workshop-recovery-v2')")
-        .bind(recovery_id).bind(id).bind(database_id).bind(operation_id).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
-    sqlx::query("insert into control.workshop_deletions(workshop_id,previous_status,requested_by,operation_id,final_recovery_point_id,purge_after) values($1,$2,$3,$4,$5,now()+interval '30 days')")
-        .bind(id).bind(&previous_status).bind(who.user_id).bind(operation_id).bind(recovery_id).execute(&mut *tx).await?;
-    sqlx::query("update control.workshops set status='restricted',version=version+1 where id=$1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(id),
-        "workshop.delete.schedule",
-        "workshop",
-        id.to_string(),
-        correlation,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(
-            json!({"operation_id":operation_id,"recovery_point_id":recovery_id,"retention_days":30}),
-        ),
-    ))
-}
-
-async fn platform_reconcile_workshop(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = operator(&state, &headers).await?;
-    let key = idempotency(&headers)?;
-    queue_tenant_reconciliation(&state, id, Some(who.user_id), &format!("operator:{key}")).await
-}
-
-#[derive(Deserialize)]
-struct PlatformOperationQuery {
-    state: Option<String>,
-    workshop_id: Option<Uuid>,
-    limit: Option<i64>,
-}
-
-async fn platform_operations(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<PlatformOperationQuery>,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    if query.state.as_deref().is_some_and(|value| {
-        !matches!(
-            value,
-            "pending" | "in_flight" | "awaiting_reconciliation" | "succeeded" | "dead_letter"
-        )
-    }) {
-        return Err(ApiError::Validation("invalid operation state"));
-    }
-    Ok(Json(Value::Array(
-        platform_operation_rows(
-            &state,
-            query.workshop_id,
-            query.state.as_deref(),
-            query.limit.unwrap_or(100).clamp(1, 200),
-        )
-        .await?,
-    )))
-}
-
-async fn platform_operation_rows(
+async fn platform_role(
     state: &AppState,
-    workshop: Option<Uuid>,
-    operation_state: Option<&str>,
-    limit: i64,
-) -> ApiResult<Vec<Value>> {
-    let rows = sqlx::query_as::<_, (Uuid,String,String,Option<String>,Option<Uuid>,Option<String>,i32,i32,OffsetDateTime,Option<OffsetDateTime>,i16,Option<String>,Option<String>)>(
-        "select o.id,o.kind,o.state,o.failure_class,o.workshop_id,w.display_name,o.attempt,o.max_attempts,o.created_at,o.finished_at,o.progress_percent,o.progress_phase,o.progress_message from control.operations o left join control.workshops w on w.id=o.workshop_id where ($1::uuid is null or o.workshop_id=$1) and ($2::text is null or o.state=$2) order by o.created_at desc,o.id desc limit $3",
-    ).bind(workshop).bind(operation_state).bind(limit).fetch_all(state.store.pool()).await?;
-    Ok(rows.into_iter().map(|row|json!({"id":row.0,"kind":row.1,"state":row.2,"failure_class":row.3,"workshop_id":row.4,"workshop_name":row.5,"attempt":row.6,"max_attempts":row.7,"created_at":api_timestamp(row.8),"finished_at":row.9.map(api_timestamp),"progress_percent":row.10,"progress_phase":row.11,"progress_message":row.12})).collect())
+    headers: &HeaderMap,
+    allowed: &[&str],
+) -> ApiResult<Principal> {
+    let who = principal(state, headers).await?;
+    let roles = platform_roles(state, &who).await?;
+    if !roles
+        .iter()
+        .any(|role| allowed.iter().any(|allowed| role == allowed))
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(who)
 }
 
-async fn platform_users(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,OffsetDateTime,Option<OffsetDateTime>,bool,i64)>(
-        "select u.id,u.email,u.display_name,u.locale,u.created_at,u.disabled_at,exists(select 1 from control.external_identities i where i.user_id=u.id and i.disabled_at is null),count(m.workshop_id) filter(where m.status='active') from control.users u left join control.memberships m on m.user_id=u.id group by u.id order by u.created_at desc,u.id",
-    ).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"email":row.1,"display_name":row.2,"locale":row.3,"created_at":api_timestamp(row.4),"disabled_at":row.5.map(api_timestamp),"identity_linked":row.6,"workshop_count":row.7})).collect())))
-}
-
-async fn platform_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let queues = sqlx::query_as::<_, (String,i64,i64,i64,Option<OffsetDateTime>,Option<OffsetDateTime>)>(
-        "with known(queue) as (values ('identity-operations'),('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),min(o.created_at) filter(where o.state in ('pending','in_flight','awaiting_reconciliation')),max(o.finished_at) from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue",
-    ).fetch_all(state.store.pool()).await?;
-    let services = sqlx::query_as::<_, (String,String,i64)>(
-        "select service,health,count(*) from control.service_instances group by service,health order by service,health",
-    ).fetch_all(state.store.pool()).await?;
-    let newest_backup = sqlx::query_as::<_, (Uuid,Uuid,String,OffsetDateTime,Option<String>)>(
-        "select r.id,r.workshop_id,w.display_name,r.ready_at,r.source_release from control.workshop_recovery_points r join control.workshops w on w.id=r.workshop_id where r.kind='backup' and r.state='ready' and r.verification_state='verified' order by r.ready_at desc nulls last limit 1",
-    ).fetch_optional(state.store.pool()).await?;
-    let rehearsal = sqlx::query_as::<_, (Uuid,Uuid,String,Option<String>,OffsetDateTime,Option<OffsetDateTime>)>(
-        "select h.id,h.workshop_id,h.state,h.safe_error,h.started_at,h.finished_at from control.workshop_recovery_rehearsals h order by h.started_at desc limit 1",
-    ).fetch_optional(state.store.pool()).await?;
-    Ok(Json(json!({
-        "release":{"api":env!("CARGO_PKG_VERSION"),"schema":crate::persistence::EMBEDDED_SCHEMA_RELEASE},
-        "queues":queues.into_iter().map(|row|json!({"queue":row.0,"queued":row.1,"running":row.2,"failed":row.3,"oldest_active_at":row.4.map(api_timestamp),"last_finished_at":row.5.map(api_timestamp)})).collect::<Vec<_>>(),
-        "services":services.into_iter().map(|row|json!({"service":row.0,"health":row.1,"count":row.2})).collect::<Vec<_>>(),
-        "newest_verified_backup":newest_backup.map(|row|json!({"id":row.0,"workshop_id":row.1,"workshop_name":row.2,"ready_at":api_timestamp(row.3),"source_release":row.4})),
-        "latest_rehearsal":rehearsal.map(|row|json!({"id":row.0,"workshop_id":row.1,"state":row.2,"safe_error":row.3,"started_at":api_timestamp(row.4),"finished_at":row.5.map(api_timestamp)}))
-    })))
-}
-
-async fn platform_email_deliveries(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (Uuid,String,String,String,i32,OffsetDateTime,OffsetDateTime,Option<OffsetDateTime>)>(
-        "select id,recipient,template,state,attempts,next_attempt_at,created_at,sent_at from control.outbox order by created_at desc,id desc limit 200",
-    ).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"recipient":row.1,"template":row.2,"state":row.3,"attempts":row.4,"next_attempt_at":api_timestamp(row.5),"created_at":api_timestamp(row.6),"sent_at":row.7.map(api_timestamp)})).collect())))
-}
-
-#[derive(Deserialize)]
-struct PlatformAuditQuery {
-    limit: Option<i64>,
-}
-
-async fn platform_audit_events(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<PlatformAuditQuery>,
-) -> ApiResult<Json<Value>> {
-    operator(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (Uuid,Option<String>,Option<Uuid>,Option<String>,String,Option<String>,Option<String>,Uuid,String,Value,OffsetDateTime)>(
-        "select a.id,u.email,a.workshop_id,w.display_name,a.action,a.target_type,a.target_id,a.correlation_id,a.outcome,a.detail,a.created_at from control.audit_events a left join control.users u on u.id=a.actor_user_id left join control.workshops w on w.id=a.workshop_id order by a.created_at desc,a.id desc limit $1",
-    ).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row|json!({"id":row.0,"actor_email":row.1,"workshop_id":row.2,"workshop_name":row.3,"action":row.4,"target_type":row.5,"target_id":row.6,"correlation_id":row.7,"outcome":row.8,"detail":row.9,"created_at":api_timestamp(row.10)})).collect())))
+fn require_step_up(who: &Principal) -> ApiResult<()> {
+    if !who.recent_strong_authentication {
+        return Err(ApiError::Precondition(
+            "recent multi-factor or phishing-resistant authentication is required",
+        ));
+    }
+    Ok(())
 }
 
 async fn link_identity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    let client_key = if headers.contains_key("idempotency-key") {
+        idempotency(&headers)?.to_owned()
+    } else {
+        "identity-link".to_owned()
+    };
     let verified = state.auth.verify_headers(&headers).await?;
     let mut tx = state.store.begin().await?;
-    if let Some(user_id) = sqlx::query_scalar::<_, Uuid>(
+    let existing_user_id = sqlx::query_scalar::<_, Uuid>(
         "select user_id from control.external_identities where issuer=$1 and subject=$2 and disabled_at is null",
     )
     .bind(&verified.issuer)
     .bind(&verified.subject)
     .fetch_optional(&mut *tx)
     .await?
-    {
-        tx.commit().await?;
-        return Ok((StatusCode::OK, Json(json!({"user_id":user_id,"linked":false}))));
-    }
-    let user_id = match sqlx::query_scalar::<_, Uuid>(
-        "select u.id from control.users u where u.email=$1 and u.disabled_at is null and not exists(select 1 from control.external_identities i where i.user_id=u.id)",
-    )
-    .bind(&verified.email)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        Some(user_id) => user_id,
-        None if state.config.allow_self_signup => {
-            let user_id = Uuid::new_v4();
-            sqlx::query("insert into control.users(id,email) values($1,$2)")
-                .bind(user_id).bind(&verified.email).execute(&mut *tx).await?;
-            user_id
+    ;
+    let user_id = if let Some(user_id) = existing_user_id {
+        user_id
+    } else {
+        match sqlx::query_scalar::<_, Uuid>(
+            "select u.id from control.users u where u.email=$1 and u.disabled_at is null and not exists(select 1 from control.external_identities i where i.user_id=u.id)",
+        )
+        .bind(&verified.email)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            Some(user_id) => user_id,
+            None if state.config.allow_self_signup => {
+                let user_id = Uuid::new_v4();
+                sqlx::query("insert into control.users(id,email) values($1,$2)")
+                    .bind(user_id)
+                    .bind(&verified.email)
+                    .execute(&mut *tx)
+                    .await?;
+                user_id
+            }
+            None => return Err(ApiError::Unauthenticated),
         }
-        None => return Err(ApiError::Unauthenticated),
     };
-    sqlx::query("insert into control.external_identities(id,user_id,issuer,subject,email_at_link) values($1,$2,$3,$4,$5)")
-        .bind(Uuid::new_v4()).bind(user_id).bind(&verified.issuer).bind(&verified.subject).bind(&verified.email).execute(&mut *tx).await?;
-    let correlation = Uuid::new_v4();
-    audit(
+    let semantic = json!({
+        "issuer": verified.issuer,
+        "subject": verified.subject,
+        "email": verified.email,
+    });
+    let scope = format!("user:{user_id}");
+    let command_id = match admit_command(
         &mut tx,
-        Some(user_id),
-        None,
+        NewCommand {
+            actor_user_id: user_id,
+            scope: &scope,
+            command_kind: "identity.link",
+            idempotency_key: &client_key,
+            semantic_request: &semantic,
+            expected_version: None,
+        },
+    )
+    .await
+    .map_err(command_error)?
+    {
+        CommandAdmission::New { command_id } => command_id,
+        CommandAdmission::Replay {
+            response_status,
+            response_body,
+            ..
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK),
+                Json(response_body.unwrap_or_else(|| json!({"replayed":true}))),
+            ));
+        }
+        CommandAdmission::InProgress {
+            command_id,
+            operation_id,
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "command_id": command_id,
+                    "operation_id": operation_id,
+                    "in_progress": true
+                })),
+            ));
+        }
+    };
+    let linked = existing_user_id.is_none();
+    if linked {
+        sqlx::query("insert into control.external_identities(id,user_id,issuer,subject,email_at_link) values($1,$2,$3,$4,$5)")
+            .bind(Uuid::new_v4()).bind(user_id).bind(&verified.issuer).bind(&verified.subject).bind(&verified.email).execute(&mut *tx).await?;
+    }
+    let correlation = Uuid::new_v4();
+    audit_command(
+        &mut tx,
+        (Some(user_id), None),
         "identity.link",
         "user",
         user_id.to_string(),
         correlation,
+        command_id,
     )
     .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({"user_id":user_id,"linked":true})),
-    ))
-}
-
-async fn workshops(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (Uuid, String, String, String, String, i64, String, i32)>(
-        "select w.id,w.slug,w.display_name,w.status,w.plan,w.version,m.role,m.authority_epoch
-         from control.workshops w join control.memberships m on m.workshop_id=w.id
-         where m.user_id=$1 and m.status='active' and w.status<>'deleted' order by w.display_name,w.id",
-    ).bind(who.user_id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r| json!({
-        "id":r.0,"slug":r.1,"display_name":r.2,"status":r.3,"plan":r.4,"version":r.5,"role":r.6,"authority_epoch":r.7
-    })).collect())))
-}
-
-#[derive(Deserialize)]
-struct CreateWorkshop {
-    slug: String,
-    display_name: String,
-    country_code: Option<String>,
-    time_zone: String,
-}
-
-async fn create_workshop(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<CreateWorkshop>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let key = idempotency(&headers)?.to_owned();
-    if body.display_name.trim().is_empty() {
-        return Err(ApiError::Validation("display_name is required"));
-    }
-    let workshop_id = Uuid::new_v4();
-    let database_id = Uuid::new_v4();
-    let database_ref = opaque_database_ref(database_id);
-    let public_hostname = format!("{}.{}", body.slug, state.config.tenant_domain);
-    let paperless_hostname = format!("docs-{}.{}", body.slug, state.config.tenant_domain);
-    let operation_id = Uuid::new_v4();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let inserted = sqlx::query_scalar::<_, Uuid>(
-        "insert into control.workshops(id,slug,display_name,country_code,time_zone)
-         values($1,$2,$3,$4,$5) on conflict(slug) do nothing returning id",
-    )
-    .bind(workshop_id)
-    .bind(&body.slug)
-    .bind(body.display_name.trim())
-    .bind(&body.country_code)
-    .bind(&body.time_zone)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if inserted.is_none() {
-        return Err(ApiError::Conflict("workshop slug already exists"));
-    }
-    sqlx::query("insert into control.memberships(workshop_id,user_id,role) values($1,$2,'owner')")
-        .bind(workshop_id)
-        .bind(who.user_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,routable) values($1,$2,'primary',$3,$4,'Primary database',true)")
-        .bind(database_id).bind(workshop_id).bind(&database_ref).bind(&public_hostname).execute(&mut *tx).await?;
-    sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key)
-                 values($1,'tenant.provision','tenant-provisioning',$2,$3,1,$4,$3,$5,$6)")
-        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname,"paperless_enabled":false})).bind(correlation_id).bind(&key).execute(&mut *tx).await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(workshop_id),
-        "workshop.create",
-        "workshop",
-        workshop_id.to_string(),
-        correlation_id,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"id":workshop_id,"operation_id":operation_id})),
-    ))
-}
-
-async fn workshop(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    let (role, epoch) = authority(&state, who.user_id, id).await?;
-    let row = sqlx::query_as::<_, (String, String, String, String, i64)>(
-        "select slug,display_name,status,plan,version from control.workshops where id=$1",
-    )
-    .bind(id)
-    .fetch_one(state.store.pool())
-    .await?;
-    Ok(Json(
-        json!({"id":id,"slug":row.0,"display_name":row.1,"status":row.2,"plan":row.3,"version":row.4,"role":role,"authority_epoch":epoch}),
-    ))
-}
-
-async fn members(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
-    let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String,i32,Value,Option<Uuid>,Option<String>)>(
-        "select u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,
-           coalesce(jsonb_object_agg(t.target,jsonb_build_object('state',t.state,'desired_epoch',t.desired_epoch,'applied_epoch',t.applied_epoch,'error',t.safe_error_class,'observed_at',t.observed_at)) filter(where t.target is not null),'{}'),
-           latest.id,latest.state
-         from control.memberships m join control.users u on u.id=m.user_id
-         left join control.membership_targets t on t.workshop_id=m.workshop_id and t.user_id=m.user_id
-         left join lateral (select id,state from control.operations where workshop_id=m.workshop_id and target_user_id=m.user_id and kind='membership.reconcile' order by created_at desc,id desc limit 1) latest on true
-         where m.workshop_id=$1 group by u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,latest.id,latest.state order by u.email",
-    ).bind(id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r| json!({"id":r.0,"email":r.1,"display_name":r.2,"role":r.3,"status":r.4,"authority_epoch":r.5,"targets":r.6,"operation_id":r.7,"operation_state":r.8})).collect())))
-}
-
-#[derive(Deserialize)]
-struct InviteBody {
-    email: String,
-    role: WorkshopRole,
-    #[serde(default = "default_locale")]
-    locale: String,
-}
-fn default_locale() -> String {
-    "en".into()
-}
-
-fn new_token() -> (String, Vec<u8>) {
-    let mut bytes = [0_u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    let digest = Sha256::digest(token.as_bytes()).to_vec();
-    (token, digest)
-}
-
-async fn invitations(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, id)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    let rows = sqlx::query_as::<_, (Uuid, String, String, String, OffsetDateTime, i32, OffsetDateTime)>(
-        "select id,email,role,locale,expires_at,sent_count,last_sent_at from control.invitations where workshop_id=$1 and accepted_at is null and revoked_at is null order by created_at desc",
-    ).bind(id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r|json!({"id":r.0,"email":r.1,"role":r.2,"locale":r.3,"expires_at":r.4,"sent_count":r.5,"last_sent_at":r.6})).collect())))
-}
-
-async fn invite(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<InviteBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
-    if !role.can_manage_members() || !body.role.can_invite() {
-        return Err(ApiError::Forbidden);
-    }
-    if !matches!(body.locale.as_str(), "en" | "fr") {
-        return Err(ApiError::Validation("locale must be en or fr"));
-    }
-    let key = idempotency(&headers)?.to_owned();
-    let email = normalize_email(&body.email).map_err(ApiError::Validation)?;
-    let (token, digest) = new_token();
-    let invitation_id = Uuid::new_v4();
-    let outbox_id = Uuid::new_v4();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    if let Some((existing_id, existing_email, existing_role)) = sqlx::query_as::<
-        _,
-        (Uuid, String, String),
-    >(
-        "select id,email,role from control.invitations where invited_by=$1 and idempotency_key=$2",
-    )
-    .bind(who.user_id)
-    .bind(&key)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        tx.commit().await?;
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(
-                json!({"id":existing_id,"email":existing_email,"role":existing_role,"replayed":true}),
-            ),
-        ));
-    }
-    let existing = sqlx::query_scalar::<_, Uuid>("select id from control.invitations where workshop_id=$1 and email=$2 and accepted_at is null and revoked_at is null")
-        .bind(id).bind(&email).fetch_optional(&mut *tx).await?;
-    if existing.is_some() {
-        return Err(ApiError::Conflict("a pending invitation already exists"));
-    }
-    sqlx::query("insert into control.invitations(id,workshop_id,email,role,token_hash,locale,invited_by,idempotency_key,expires_at) values($1,$2,$3,$4,$5,$6,$7,$8,now()+interval '7 days')")
-        .bind(invitation_id).bind(id).bind(&email).bind(body.role.as_str()).bind(digest).bind(&body.locale).bind(who.user_id).bind(&key).execute(&mut *tx).await?;
-    let link = state
-        .config
-        .public_origin
-        .join(&format!("invitations/{token}"))
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .to_string();
-    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload) values($1,'invitation',$2,'workshop-invitation',$3)")
-        .bind(outbox_id).bind(&email).bind(json!({"invitation_id":invitation_id,"workshop_id":id,"role":body.role,"locale":body.locale,"accept_url":link,"idempotency_key":key})).execute(&mut *tx).await?;
-    Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::EmailDelivery,
-            workshop_id: Some(id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &json!({"outbox_id":outbox_id}),
-            requested_by: Some(who.user_id),
-            correlation_id,
-            idempotency_key: &key,
-        },
-    )
-    .await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(id),
-        "invitation.create",
-        "invitation",
-        invitation_id.to_string(),
-        correlation_id,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(
-            json!({"id":invitation_id,"email":email,"role":body.role,"expires_in_seconds":604800}),
-        ),
-    ))
-}
-
-async fn resend_invitation(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let key = idempotency(&headers)?.to_owned();
-    let row=sqlx::query_as::<_,(Uuid,String,String,String)>("select workshop_id,email,role,locale from control.invitations where id=$1 and accepted_at is null and revoked_at is null and expires_at>now()")
-        .bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    if !authority(&state, who.user_id, row.0)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    let (token, digest) = new_token();
-    let outbox_id = Uuid::new_v4();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    sqlx::query("update control.invitations set token_hash=$2,sent_count=sent_count+1,last_sent_at=now(),expires_at=now()+interval '7 days' where id=$1")
-        .bind(id).bind(digest).execute(&mut *tx).await?;
-    let link = state
-        .config
-        .public_origin
-        .join(&format!("invitations/{token}"))
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .to_string();
-    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload) values($1,'invitation',$2,'workshop-invitation',$3)")
-        .bind(outbox_id).bind(&row.1).bind(json!({"invitation_id":id,"workshop_id":row.0,"role":row.2,"locale":row.3,"accept_url":link})).execute(&mut *tx).await?;
-    Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::EmailDelivery,
-            workshop_id: Some(row.0),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &json!({"outbox_id":outbox_id}),
-            requested_by: Some(who.user_id),
-            correlation_id,
-            idempotency_key: &key,
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({"id":id,"resent":true}))))
-}
-
-async fn revoke_invitation(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<StatusCode> {
-    let who = principal(&state, &headers).await?;
-    let workshop=sqlx::query_scalar::<_,Uuid>("select workshop_id from control.invitations where id=$1 and accepted_at is null and revoked_at is null").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    if !authority(&state, who.user_id, workshop)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    sqlx::query("update control.invitations set revoked_at=now() where id=$1")
-        .bind(id)
-        .execute(state.store.pool())
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn token_digest(token: &str) -> Vec<u8> {
-    Sha256::digest(token.as_bytes()).to_vec()
-}
-
-async fn validate_invitation(
-    State(state): State<Arc<AppState>>,
-    Path(token): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let row=sqlx::query_as::<_,(String,String,String,String)>("select i.email,i.role,i.locale,w.display_name from control.invitations i join control.workshops w on w.id=i.workshop_id where i.token_hash=$1 and i.accepted_at is null and i.revoked_at is null and i.expires_at>now()")
-        .bind(token_digest(&token)).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(
-        json!({"email":row.0,"role":row.1,"locale":row.2,"workshop_name":row.3}),
-    ))
-}
-
-async fn accept_invitation(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(token): Path<String>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let verified = state.auth.verify_headers(&headers).await?;
-    let digest = token_digest(&token);
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let invitation=sqlx::query_as::<_,(Uuid,Uuid,String,String)>("select id,workshop_id,email,role from control.invitations where token_hash=$1 and accepted_at is null and revoked_at is null and expires_at>now() for update")
-        .bind(digest).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
-    if invitation.2 != verified.email {
-        return Err(ApiError::Forbidden);
-    }
-    let linked=sqlx::query_scalar::<_,Uuid>("select user_id from control.external_identities where issuer=$1 and subject=$2 and disabled_at is null").bind(&verified.issuer).bind(&verified.subject).fetch_optional(&mut *tx).await?;
-    let user_id = if let Some(id) = linked {
-        id
+    let response = json!({"user_id":user_id,"linked":linked});
+    let status = if linked {
+        StatusCode::CREATED
     } else {
-        let id=sqlx::query_scalar::<_,Uuid>("insert into control.users(id,email) values($1,$2) on conflict(email) do update set email=excluded.email returning id").bind(Uuid::new_v4()).bind(&verified.email).fetch_one(&mut *tx).await?;
-        sqlx::query("insert into control.external_identities(id,user_id,issuer,subject,email_at_link) values($1,$2,$3,$4,$5)").bind(Uuid::new_v4()).bind(id).bind(&verified.issuer).bind(&verified.subject).bind(&verified.email).execute(&mut *tx).await?;
-        id
+        StatusCode::OK
     };
-    sqlx::query("insert into control.memberships(workshop_id,user_id,role) values($1,$2,$3) on conflict(workshop_id,user_id) do update set role=excluded.role,status='active',revoked_at=null,authority_epoch=control.memberships.authority_epoch+1")
-        .bind(invitation.1).bind(user_id).bind(&invitation.3).execute(&mut *tx).await?;
-    let epoch = sqlx::query_scalar::<_, i32>(
-        "select authority_epoch from control.memberships where workshop_id=$1 and user_id=$2",
-    )
-    .bind(invitation.1)
-    .bind(user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query("update control.invitations set accepted_at=now(),accepted_user_id=$2 where id=$1")
-        .bind(invitation.0)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    seed_targets(&mut tx, invitation.1, user_id, epoch).await?;
-    let operation_id = Store::enqueue(
+    complete_command(
         &mut tx,
-        NewOperation {
-            kind: OperationKind::MembershipReconcile,
-            workshop_id: Some(invitation.1),
-            target_user_id: Some(user_id),
-            desired_epoch: Some(epoch),
-            payload: &json!({"active":true}),
-            requested_by: Some(user_id),
-            correlation_id,
-            idempotency_key: &format!("accept:{}", invitation.0),
+        command_id,
+        CommandResult {
+            operation_id: None,
+            response_status: status.as_u16(),
+            response_body: Some(&response),
+            result_ref: None,
         },
     )
-    .await?;
+    .await
+    .map_err(command_error)?;
     tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"workshop_id":invitation.1,"user_id":user_id,"operation_id":operation_id})),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RoleBody {
-    role: WorkshopRole,
-}
-async fn update_member(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<RoleBody>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    let role = authority(&state, who.user_id, id).await?.0;
-    if !role.can_manage_members() || matches!(body.role, WorkshopRole::Owner) {
-        return Err(ApiError::Forbidden);
-    }
-    let key = idempotency(&headers)?.to_owned();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let epoch=sqlx::query_scalar::<_,i32>("update control.memberships set role=$3,authority_epoch=authority_epoch+1 where workshop_id=$1 and user_id=$2 and status='active' and role<>'owner' returning authority_epoch")
-        .bind(id).bind(user_id).bind(body.role.as_str()).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
-    seed_targets(&mut tx, id, user_id, epoch).await?;
-    let op = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::MembershipReconcile,
-            workshop_id: Some(id),
-            target_user_id: Some(user_id),
-            desired_epoch: Some(epoch),
-            payload: &json!({"active":true,"role":body.role}),
-            requested_by: Some(who.user_id),
-            correlation_id,
-            idempotency_key: &key,
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Json(
-        json!({"user_id":user_id,"role":body.role,"authority_epoch":epoch,"operation_id":op}),
-    ))
-}
-
-async fn remove_member(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, id)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    let key = idempotency(&headers)?.to_owned();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let epoch=sqlx::query_scalar::<_,i32>("update control.memberships set status='revoked',revoked_at=now(),authority_epoch=authority_epoch+1 where workshop_id=$1 and user_id=$2 and status='active' and role<>'owner' returning authority_epoch")
-        .bind(id).bind(user_id).fetch_optional(&mut *tx).await?.ok_or(ApiError::Conflict("owner must be transferred before removal"))?;
-    seed_targets(&mut tx, id, user_id, epoch).await?;
-    let op = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::MembershipReconcile,
-            workshop_id: Some(id),
-            target_user_id: Some(user_id),
-            desired_epoch: Some(epoch),
-            payload: &json!({"active":false}),
-            requested_by: Some(who.user_id),
-            correlation_id,
-            idempotency_key: &key,
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({"operation_id":op}))))
-}
-
-#[derive(Deserialize)]
-struct TransferBody {
-    to_user_id: Uuid,
-}
-async fn ownership_transfers(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
-    let rows=sqlx::query_as::<_,(Uuid,Uuid,Uuid,OffsetDateTime)>("select id,from_user_id,to_user_id,expires_at from control.ownership_transfers where workshop_id=$1 and accepted_at is null and revoked_at is null and expires_at>now() and (from_user_id=$2 or to_user_id=$2) order by created_at desc").bind(id).bind(who.user_id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r|json!({"id":r.0,"from_user_id":r.1,"to_user_id":r.2,"expires_at":r.3,"can_accept":r.2==who.user_id})).collect())))
-}
-
-async fn create_ownership_transfer(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<TransferBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if authority(&state, who.user_id, id).await?.0 != WorkshopRole::Owner {
-        return Err(ApiError::Forbidden);
-    }
-    let key = idempotency(&headers)?.to_owned();
-    authority(&state, body.to_user_id, id).await?;
-    let transfer = Uuid::new_v4();
-    let transfer = sqlx::query_scalar::<_,Uuid>("insert into control.ownership_transfers(id,workshop_id,from_user_id,to_user_id,idempotency_key,expires_at) values($1,$2,$3,$4,$5,now()+interval '48 hours') on conflict(from_user_id,idempotency_key) do update set idempotency_key=excluded.idempotency_key returning id").bind(transfer).bind(id).bind(who.user_id).bind(body.to_user_id).bind(key).fetch_one(state.store.pool()).await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"id":transfer,"expires_in_seconds":172800})),
-    ))
-}
-
-async fn accept_ownership_transfer(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    let key = idempotency(&headers)?.to_owned();
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let row=sqlx::query_as::<_,(Uuid,Uuid,Uuid)>("select workshop_id,from_user_id,to_user_id from control.ownership_transfers where id=$1 and accepted_at is null and revoked_at is null and expires_at>now() for update").bind(id).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
-    if row.2 != who.user_id {
-        return Err(ApiError::Forbidden);
-    }
-    sqlx::query("update control.memberships set role=case when user_id=$2 then 'studio_manager' else 'owner' end,authority_epoch=authority_epoch+1 where workshop_id=$1 and user_id in($2,$3) and status='active'").bind(row.0).bind(row.1).bind(row.2).execute(&mut *tx).await?;
-    sqlx::query("update control.ownership_transfers set accepted_at=now() where id=$1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    for user in [row.1, row.2] {
-        let epoch = sqlx::query_scalar::<_, i32>(
-            "select authority_epoch from control.memberships where workshop_id=$1 and user_id=$2",
-        )
-        .bind(row.0)
-        .bind(user)
-        .fetch_one(&mut *tx)
-        .await?;
-        seed_targets(&mut tx, row.0, user, epoch).await?;
-        Store::enqueue(
-            &mut tx,
-            NewOperation {
-                kind: OperationKind::MembershipReconcile,
-                workshop_id: Some(row.0),
-                target_user_id: Some(user),
-                desired_epoch: Some(epoch),
-                payload: &json!({"active":true}),
-                requested_by: Some(who.user_id),
-                correlation_id,
-                idempotency_key: &format!("{key}:{user}"),
-            },
-        )
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(Json(json!({"id":id,"accepted":true})))
+    Ok((status, Json(response)))
 }
 
 async fn integrations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<IntegrationResponse>>> {
     let who = principal(&state, &headers).await?;
     authority(&state, who.user_id, id).await?;
     let rows=sqlx::query_as::<_,(String,String,String,i32,i32,Option<String>)>("select service,base_url,health,desired_epoch,applied_epoch,safe_error_class from control.service_instances where workshop_id=$1 order by service").bind(id).fetch_all(state.store.pool()).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r|json!({"service":r.0,"url":r.1,"health":r.2,"desired_epoch":r.3,"applied_epoch":r.4,"error":r.5})).collect())))
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| IntegrationResponse {
+                service: row.0,
+                url: row.1,
+                health: row.2,
+                desired_epoch: row.3,
+                applied_epoch: row.4,
+                error: row.5,
+            })
+            .collect(),
+    ))
 }
 
 async fn modules(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<ModuleResponse>>> {
     let who = principal(&state, &headers).await?;
     let (role, _) = authority(&state, who.user_id, id).await?;
-    let rows = sqlx::query_as::<_, (String, String, Option<Uuid>, Option<String>, Option<String>)>(
-        "select wm.module_key,wm.state,wm.operation_id,o.state,o.failure_class
+    let entitlement_limits = sqlx::query_scalar::<_, Value>(
+        "select limits from control.entitlements
+         where workshop_id=$1 and status='active'
+           and (expires_at is null or expires_at>now())",
+    )
+    .bind(id)
+    .fetch_optional(state.store.pool())
+    .await?;
+    let entitled = entitlement_limits
+        .as_ref()
+        .and_then(|limits| limits.get("capabilities"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let active_release = sqlx::query_as::<_, (String, i32)>(
+        "select release_id,registry_version from control.tenant_release_adoptions
+         where workshop_id=$1 and state='active' order by activated_at desc,id limit 1",
+    )
+    .bind(id)
+    .fetch_optional(state.store.pool())
+    .await?;
+    let release_capabilities = if let Some((_, registry_version)) = &active_release {
+        sqlx::query_scalar::<_, String>(
+            "select capability_key from control.capability_registry_entries
+             where registry_version=$1",
+        )
+        .bind(registry_version)
+        .fetch_all(state.store.pool())
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ),
+    >(
+        "select wm.module_key,wm.state,wm.operation_id,o.state,o.failure_class,wm.version
          from control.workshop_modules wm
          left join control.operations o on o.id=wm.operation_id
          where wm.workshop_id=$1",
@@ -1223,44 +759,101 @@ async fn modules(
     .await?;
     let states = rows
         .into_iter()
-        .map(|row| (row.0, (row.1, row.2, row.3, row.4)))
+        .map(|row| (row.0, (row.1, row.2, row.3, row.4, row.5)))
         .collect::<std::collections::HashMap<_, _>>();
-    Ok(Json(Value::Array(
+    Ok(Json(
         crate::modules::CATALOG
             .iter()
             .map(|bundle| {
                 let state = states.get(bundle.key);
                 let operation_state = state.and_then(|value| value.2.as_deref());
+                let version = state.map_or(1, |value| value.4);
+                let is_entitled = entitled.contains("*") || entitled.contains(bundle.key);
+                let release_available = release_capabilities.contains(bundle.key);
                 let visible_state = match operation_state {
                     Some("dead_letter") => "failed",
+                    _ if !release_available && state.is_none() => "unavailable",
+                    _ if state.is_some_and(|value| value.0 == "enabled") && !is_entitled => {
+                        "restricted"
+                    }
                     _ => state.map_or("available", |value| value.0.as_str()),
                 };
-                json!({
-                    "key":bundle.key,
-                    "name":bundle.name,
-                    "description":bundle.description,
-                    "state":visible_state,
-                    "operation_id":state.and_then(|value|value.1),
-                    "error":state.and_then(|value|value.3.as_deref()),
-                    "can_manage":role.can_manage_modules(),
-                    "dependencies":bundle.dependencies,
-                })
+                ModuleResponse {
+                    key: bundle.key.to_owned(),
+                    name: bundle.name.to_owned(),
+                    description: bundle.description.to_owned(),
+                    state: visible_state.to_owned(),
+                    operation_id: state.and_then(|value| value.1),
+                    error: state.and_then(|value| value.3.clone()),
+                    version,
+                    etag: format!("\"capability-{id}-{}-v{version}\"", bundle.key),
+                    can_manage: role.can_manage_modules() && is_entitled && release_available,
+                    entitled: is_entitled,
+                    release_available,
+                    application_release_id: active_release.as_ref().map(|value| value.0.clone()),
+                    registry_version: active_release
+                        .as_ref()
+                        .and_then(|value| u32::try_from(value.1).ok())
+                        .unwrap_or(crate::modules::REGISTRY_VERSION),
+                    minimum_release: bundle.minimum_release.to_owned(),
+                    dependencies: bundle
+                        .dependencies
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                }
             })
             .collect(),
-    )))
+    ))
 }
 
 async fn enable_module(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((id, module_key)): Path<(Uuid, String)>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
     let who = principal(&state, &headers).await?;
     let (role, _) = authority(&state, who.user_id, id).await?;
     if !role.can_manage_modules() {
         return Err(ApiError::Forbidden);
     }
+    let client_key = idempotency(&headers)?.to_owned();
+    let resource = format!("capability-{id}-{module_key}");
+    let expected = expected_version(&headers, &resource)?;
     let bundle = crate::modules::bundle(&module_key).ok_or(ApiError::NotFound)?;
+    let activation = sqlx::query_as::<
+        _,
+        (i64, String, i32, Vec<String>, Vec<String>, Option<String>),
+    >(
+        "select e.version,a.release_id,a.registry_version,c.dependencies,c.odoo_modules,c.service
+         from control.entitlements e
+         join lateral (
+           select release_id,registry_version from control.tenant_release_adoptions
+           where workshop_id=e.workshop_id and state='active'
+           order by activated_at desc,id limit 1
+         ) a on true
+         join control.capability_registry_entries c
+           on c.registry_version=a.registry_version and c.capability_key=$2
+         where e.workshop_id=$1 and e.status='active'
+           and (e.expires_at is null or e.expires_at>now())
+           and (coalesce(e.limits->'capabilities','[]'::jsonb) ? $2
+                or coalesce(e.limits->'capabilities','[]'::jsonb) ? '*')",
+    )
+    .bind(id)
+    .bind(&module_key)
+    .fetch_optional(state.store.pool())
+    .await?;
+    let Some(activation) = activation else {
+        return Err(ApiError::Forbidden);
+    };
+    if activation.3 != bundle.dependencies
+        || activation.4 != bundle.odoo_modules
+        || activation.5.as_deref() != bundle.service
+    {
+        return Err(ApiError::Conflict(
+            "active release capability registry does not match this control release",
+        ));
+    }
     if !bundle.dependencies.is_empty() {
         let enabled = sqlx::query_scalar::<_, String>(
             "select module_key from control.workshop_modules
@@ -1284,54 +877,92 @@ async fn enable_module(
             }));
         }
     }
-    let client_key = idempotency(&headers)?;
-    let stored_key = format!("module:{id}:{module_key}:{client_key}");
-    if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
-        "select id from control.operations
-         where kind='module.enable' and requested_by=$1 and idempotency_key=$2",
+    let correlation = Uuid::new_v4();
+    let payload = json!({
+        "module_key":module_key,
+        "registry_version":activation.2,
+        "application_release_id":activation.1,
+        "entitlement_version":activation.0,
+        "resolved_implementation":{
+            "odoo_modules":activation.4,
+            "service":activation.5
+        }
+    });
+    let mut tx = state.store.begin().await?;
+    let scope = format!("workshop:{id}:capability:{module_key}");
+    let command_id = match admit_command(
+        &mut tx,
+        NewCommand {
+            actor_user_id: who.user_id,
+            scope: &scope,
+            command_kind: "capability.enable",
+            idempotency_key: &client_key,
+            semantic_request: &payload,
+            expected_version: Some(expected),
+        },
     )
-    .bind(who.user_id)
-    .bind(&stored_key)
-    .fetch_optional(state.store.pool())
-    .await?
+    .await
+    .map_err(command_error)?
     {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"operation_id":existing,"replayed":true})),
-        ));
-    }
-    if let Some((module_state, operation_id)) = sqlx::query_as::<_, (String, Option<Uuid>)>(
-        "select state,operation_id from control.workshop_modules
-         where workshop_id=$1 and module_key=$2",
+        CommandAdmission::New { command_id } => command_id,
+        CommandAdmission::Replay {
+            response_status,
+            response_body,
+            ..
+        } => {
+            let response = response_body.unwrap_or_else(|| json!({"replayed":true}));
+            let version = response["version"].as_i64().unwrap_or(expected);
+            tx.commit().await?;
+            return Ok((
+                StatusCode::from_u16(response_status).unwrap_or(StatusCode::ACCEPTED),
+                etag(&resource, version)?,
+                Json(response),
+            ));
+        }
+        CommandAdmission::InProgress {
+            command_id,
+            operation_id,
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                etag(&resource, expected)?,
+                Json(
+                    json!({"command_id":command_id,"operation_id":operation_id,"in_progress":true}),
+                ),
+            ));
+        }
+    };
+    lock_lifecycle(&mut tx, id).await?;
+    ensure_lifecycle_idle(&mut tx, id).await?;
+    let current = sqlx::query_as::<_, (String, Option<Uuid>, i64)>(
+        "select state,operation_id,version from control.workshop_modules
+         where workshop_id=$1 and module_key=$2 for update",
     )
     .bind(id)
     .bind(&module_key)
-    .fetch_optional(state.store.pool())
-    .await?
-    {
-        if module_state == "enabled" {
-            return Ok((StatusCode::OK, Json(json!({"state":"enabled"}))));
-        }
-        if let Some(operation_id) = operation_id {
-            let active = sqlx::query_scalar::<_, bool>(
-                "select state in ('pending','in_flight','awaiting_reconciliation')
-                 from control.operations where id=$1",
-            )
-            .bind(operation_id)
-            .fetch_optional(state.store.pool())
-            .await?
-            .unwrap_or(false);
-            if active {
-                return Ok((
-                    StatusCode::ACCEPTED,
-                    Json(json!({"operation_id":operation_id,"replayed":true})),
-                ));
-            }
-        }
+    .fetch_optional(&mut *tx)
+    .await?;
+    if current.as_ref().map_or(1, |row| row.2) != expected {
+        return Err(ApiError::PreconditionFailed("If-Match is stale"));
     }
-    let correlation = Uuid::new_v4();
-    let payload = json!({"module_key":module_key});
-    let mut tx = state.store.begin().await?;
+    if current.as_ref().is_some_and(|row| row.0 == "enabled") {
+        let response = json!({"state":"enabled","version":expected});
+        complete_command(
+            &mut tx,
+            command_id,
+            CommandResult {
+                operation_id: None,
+                response_status: StatusCode::OK.as_u16(),
+                response_body: Some(&response),
+                result_ref: None,
+            },
+        )
+        .await
+        .map_err(command_error)?;
+        tx.commit().await?;
+        return Ok((StatusCode::OK, etag(&resource, expected)?, Json(response)));
+    }
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -1342,496 +973,76 @@ async fn enable_module(
             payload: &payload,
             requested_by: Some(who.user_id),
             correlation_id: correlation,
-            idempotency_key: &stored_key,
+            idempotency_key: &format!("command:{command_id}"),
         },
     )
     .await?;
-    sqlx::query(
-        "insert into control.workshop_modules(workshop_id,module_key,state,operation_id,requested_by)
-         values($1,$2,'requested',$3,$4)
+    let changed = sqlx::query(
+        "insert into control.workshop_modules(workshop_id,module_key,state,operation_id,requested_by,version,registry_version,application_release_id,entitlement_version,resolved_implementation)
+         values($1,$2,'requested',$3,$4,2,$6,$7,$8,$9)
          on conflict(workshop_id,module_key) do update set
            state='requested',operation_id=excluded.operation_id,requested_by=excluded.requested_by,
-           requested_at=now(),enabled_at=null",
+           requested_at=now(),enabled_at=null,version=control.workshop_modules.version+1,
+           registry_version=excluded.registry_version,application_release_id=excluded.application_release_id,
+           entitlement_version=excluded.entitlement_version,resolved_implementation=excluded.resolved_implementation
+         where control.workshop_modules.version=$5",
     )
     .bind(id)
     .bind(&module_key)
     .bind(operation_id)
     .bind(who.user_id)
+    .bind(expected)
+    .bind(activation.2)
+    .bind(&activation.1)
+    .bind(activation.0)
+    .bind(&payload["resolved_implementation"])
     .execute(&mut *tx)
-    .await?;
-    audit(
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(ApiError::PreconditionFailed("If-Match is stale"));
+    }
+    let version = expected + 1;
+    audit_command(
         &mut tx,
-        Some(who.user_id),
-        Some(id),
+        (Some(who.user_id), Some(id)),
         "module.enable",
         "workshop_module",
-        module_key,
+        module_key.clone(),
         correlation,
+        command_id,
     )
     .await?;
+    let response = json!({"operation_id":operation_id,"version":version,"state":"requested"});
+    complete_command(
+        &mut tx,
+        command_id,
+        CommandResult {
+            operation_id: Some(operation_id),
+            response_status: StatusCode::ACCEPTED.as_u16(),
+            response_body: Some(&response),
+            result_ref: None,
+        },
+    )
+    .await
+    .map_err(command_error)?;
     tx.commit().await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({"operation_id":operation_id})),
+        etag(&resource, version)?,
+        Json(response),
     ))
-}
-
-async fn database(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
-    let primary =
-        sqlx::query_as::<_, (Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>)>(
-            "select id,public_hostname,state,created_at,last_restored_at
-         from control.odoo_databases
-         where workshop_id=$1 and kind='primary' and deleted_at is null",
-        )
-        .bind(id)
-        .fetch_optional(state.store.pool())
-        .await?;
-    let duplicates = sqlx::query_as::<_, (Uuid, String, String, OffsetDateTime)>(
-        "select id,label,state,created_at from control.odoo_databases
-         where workshop_id=$1 and kind='duplicate' and deleted_at is null
-         order by created_at desc",
-    )
-    .bind(id)
-    .fetch_all(state.store.pool())
-    .await?;
-    let recovery = sqlx::query_as::<_, RecoveryPointRow>(
-        "select r.id,r.kind,r.label,r.state,r.size_bytes,r.created_at,r.ready_at,
-                r.operation_id,o.state as operation_state,r.component_scope,r.format_version,
-                r.storage_location,r.verified_at,r.expires_at,
-                coalesce(o.progress_percent,0::smallint) as progress_percent,
-                o.progress_phase,o.progress_message,
-                o.progress_updated_at,r.archive_size_bytes
-         from control.workshop_recovery_points r
-         left join control.operations o on o.id=r.operation_id
-         where r.workshop_id=$1 and r.state<>'deleted'
-         order by r.created_at desc",
-    )
-    .bind(id)
-    .fetch_all(state.store.pool())
-    .await?;
-    Ok(Json(json!({
-        "can_manage": role.can_manage_database(),
-        "primary": primary.map(|row| json!({"id":row.0,"public_hostname":row.1,"state":row.2,"created_at":api_timestamp(row.3),"last_restored_at":row.4.map(api_timestamp)})),
-        "duplicates": duplicates.into_iter().map(|row| json!({"id":row.0,"label":row.1,"state":row.2,"routable":false,"created_at":api_timestamp(row.3)})).collect::<Vec<_>>(),
-        "recovery_points": recovery.into_iter().map(|row| {
-            let downloadable = row.kind == "backup" && row.state == "ready" && row.verified_at.is_some() && row.archive_size_bytes.is_some();
-            json!({"id":row.id,"kind":row.kind,"label":row.label,"state":row.state,"size_bytes":row.size_bytes,"created_at":api_timestamp(row.created_at),"ready_at":row.ready_at.map(api_timestamp),"operation_id":row.operation_id,"operation_state":row.operation_state,"component_scope":row.component_scope,"format_version":row.format_version,"storage_location":row.storage_location,"verified_at":row.verified_at.map(api_timestamp),"expires_at":row.expires_at.map(api_timestamp),"progress_percent":row.progress_percent,"progress_phase":row.progress_phase,"progress_message":row.progress_message,"progress_updated_at":row.progress_updated_at.map(api_timestamp),"archive_size_bytes":row.archive_size_bytes,"downloadable":downloadable})
-        }).collect::<Vec<_>>()
-    })))
-}
-
-#[derive(sqlx::FromRow)]
-struct RecoveryPointRow {
-    id: Uuid,
-    kind: String,
-    label: String,
-    state: String,
-    size_bytes: Option<i64>,
-    created_at: OffsetDateTime,
-    ready_at: Option<OffsetDateTime>,
-    operation_id: Option<Uuid>,
-    operation_state: Option<String>,
-    component_scope: Vec<String>,
-    format_version: String,
-    storage_location: String,
-    verified_at: Option<OffsetDateTime>,
-    expires_at: Option<OffsetDateTime>,
-    progress_percent: i16,
-    progress_phase: Option<String>,
-    progress_message: Option<String>,
-    progress_updated_at: Option<OffsetDateTime>,
-    archive_size_bytes: Option<i64>,
-}
-
-async fn download_backup(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((workshop, recovery)): Path<(Uuid, Uuid)>,
-) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, workshop).await?;
-    let downloadable = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_recovery_points
-         where id=$1 and workshop_id=$2 and kind='backup' and state='ready'
-           and verification_state='verified' and archive_object_key is not null)",
-    )
-    .bind(recovery)
-    .bind(workshop)
-    .fetch_one(state.store.pool())
-    .await?;
-    if !downloadable {
-        return Err(ApiError::Conflict(
-            "backup archive is not ready for download",
-        ));
-    }
-    let response = reqwest::Client::builder()
-        .timeout(state.config.request_timeout)
-        .build()
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .post(format!(
-            "{}v1/tenants/{workshop}/download",
-            state.config.deployment_driver_url.as_str()
-        ))
-        .bearer_auth(&state.config.deployment_driver_token)
-        .header("idempotency-key", Uuid::new_v4().to_string())
-        .json(&json!({"recovery_point_id": recovery}))
-        .send()
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let status = response.status();
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    if !status.is_success() {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "deployment driver refused backup download"
-        )));
-    }
-    Ok(Json(value))
-}
-
-#[derive(Deserialize)]
-struct RecoveryPointBody {
-    label: Option<String>,
-}
-
-async fn create_snapshot(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<RecoveryPointBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    create_recovery_point(&state, &headers, id, body.label, "snapshot").await
-}
-
-async fn create_backup(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<RecoveryPointBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    create_recovery_point(&state, &headers, id, body.label, "backup").await
-}
-
-async fn create_recovery_point(
-    state: &AppState,
-    headers: &HeaderMap,
-    workshop: Uuid,
-    label: Option<String>,
-    kind: &'static str,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(state, headers).await?;
-    require_database_owner(state, who.user_id, workshop).await?;
-    let client_key = idempotency(headers)?;
-    let stored_key = format!("database:{workshop}:{kind}:{client_key}");
-    if let Some(existing) = existing_lifecycle_operation(state, who.user_id, &stored_key).await? {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"operation_id":existing,"replayed":true})),
-        ));
-    }
-    let label = lifecycle_label(
-        label,
-        if kind == "snapshot" {
-            "Manual snapshot"
-        } else {
-            "Portable backup"
-        },
-    )?;
-    let recovery_id = Uuid::new_v4();
-    let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    lock_lifecycle(&mut tx, workshop).await?;
-    let database_id = primary_database(&mut tx, workshop).await?;
-    ensure_lifecycle_idle(&mut tx, workshop).await?;
-    let documents_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
-    )
-    .bind(workshop)
-    .fetch_one(&mut *tx)
-    .await?;
-    let component_scope = if documents_enabled {
-        vec!["odoo", "paperless"]
-    } else {
-        vec!["odoo"]
-    };
-    let payload = json!({"action":kind,"database_id":database_id,"recovery_point_id":recovery_id});
-    let operation_id = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::TenantLifecycle,
-            workshop_id: Some(workshop),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by: Some(who.user_id),
-            correlation_id: correlation,
-            idempotency_key: &stored_key,
-        },
-    )
-    .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,$5,$6,$7,$8,'makersbrain-workshop-recovery-v2')")
-        .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(workshop),
-        &format!("database.{kind}"),
-        "workshop_recovery_point",
-        recovery_id.to_string(),
-        correlation,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"id":recovery_id,"operation_id":operation_id})),
-    ))
-}
-
-async fn restore_database(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<RestoreBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, id).await?;
-    confirm_slug(&state, id, &body.confirmation).await?;
-    let client_key = idempotency(&headers)?;
-    let stored_key = format!("database:{id}:restore:{client_key}");
-    if let Some(existing) = existing_lifecycle_operation(&state, who.user_id, &stored_key).await? {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"operation_id":existing,"replayed":true})),
-        ));
-    }
-    let correlation = Uuid::new_v4();
-    let safety_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    lock_lifecycle(&mut tx, id).await?;
-    let database_id = primary_database(&mut tx, id).await?;
-    ensure_lifecycle_idle(&mut tx, id).await?;
-    let recovery_scope = sqlx::query_scalar::<_, Vec<String>>("select component_scope from control.workshop_recovery_points where id=$1 and workshop_id=$2 and database_id=$3 and state='ready' and verification_state='verified' and storage_ref is not null and (expires_at is null or expires_at > now())")
-        .bind(body.recovery_point_id).bind(id).bind(database_id).fetch_optional(&mut *tx).await?.ok_or(ApiError::Validation("recovery point is not ready and verified"))?;
-    let documents_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if recovery_scope.iter().any(|item| item == "paperless") != documents_enabled {
-        return Err(ApiError::Validation(
-            "recovery point module scope does not match the workshop",
-        ));
-    }
-    let safety_scope = if documents_enabled {
-        vec!["odoo", "paperless"]
-    } else {
-        vec!["odoo"]
-    };
-    let payload = json!({"action":"restore","database_id":database_id,"recovery_point_id":body.recovery_point_id,"safety_recovery_point_id":safety_id});
-    let operation_id = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::TenantLifecycle,
-            workshop_id: Some(id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by: Some(who.user_id),
-            correlation_id: correlation,
-            idempotency_key: &stored_key,
-        },
-    )
-    .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'backup','Automatic pre-restore safety backup',$4,$5,'makersbrain-workshop-recovery-v2')")
-        .bind(safety_id).bind(id).bind(database_id).bind(who.user_id).bind(&safety_scope).execute(&mut *tx).await?;
-    sqlx::query("update control.odoo_databases set state='restoring' where id=$1")
-        .bind(database_id)
-        .execute(&mut *tx)
-        .await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(id),
-        "database.restore",
-        "workshop_recovery_point",
-        body.recovery_point_id.to_string(),
-        correlation,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"operation_id":operation_id,"safety_recovery_point_id":safety_id})),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RestoreBody {
-    recovery_point_id: Uuid,
-    confirmation: String,
-}
-
-#[derive(Deserialize)]
-struct DuplicateBody {
-    label: String,
-    confirmation: String,
-}
-
-async fn duplicate_database(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<DuplicateBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, id).await?;
-    confirm_slug(&state, id, &body.confirmation).await?;
-    let label = lifecycle_label(Some(body.label), "Database duplicate")?;
-    let client_key = idempotency(&headers)?;
-    let stored_key = format!("database:{id}:duplicate:{client_key}");
-    if let Some(existing) = existing_lifecycle_operation(&state, who.user_id, &stored_key).await? {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"operation_id":existing,"replayed":true})),
-        ));
-    }
-    let duplicate_id = Uuid::new_v4();
-    let duplicate_ref = opaque_database_ref(duplicate_id);
-    let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    lock_lifecycle(&mut tx, id).await?;
-    let source_id = primary_database(&mut tx, id).await?;
-    ensure_lifecycle_idle(&mut tx, id).await?;
-    sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,label,state,source_database_id,routable) values($1,$2,'duplicate',$3,$4,'duplicating',$5,false)")
-        .bind(duplicate_id).bind(id).bind(&duplicate_ref).bind(label).bind(source_id).execute(&mut *tx).await?;
-    let payload = json!({"action":"duplicate","database_id":source_id,"target_database_id":duplicate_id,"target_database_ref":duplicate_ref,"routable":false});
-    let operation_id = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::TenantLifecycle,
-            workshop_id: Some(id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by: Some(who.user_id),
-            correlation_id: correlation,
-            idempotency_key: &stored_key,
-        },
-    )
-    .await?;
-    audit(
-        &mut tx,
-        Some(who.user_id),
-        Some(id),
-        "database.duplicate",
-        "odoo_database",
-        duplicate_id.to_string(),
-        correlation,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"id":duplicate_id,"operation_id":operation_id,"routable":false})),
-    ))
-}
-
-async fn require_database_owner(state: &AppState, user: Uuid, workshop: Uuid) -> ApiResult<()> {
-    if !authority(state, user, workshop)
-        .await?
-        .0
-        .can_manage_database()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
-}
-
-async fn confirm_slug(state: &AppState, workshop: Uuid, confirmation: &str) -> ApiResult<()> {
-    let slug = sqlx::query_scalar::<_, String>("select slug from control.workshops where id=$1")
-        .bind(workshop)
-        .fetch_one(state.store.pool())
-        .await?;
-    if confirmation != slug {
-        return Err(ApiError::Validation(
-            "confirmation must exactly match the workshop slug",
-        ));
-    }
-    Ok(())
-}
-
-fn lifecycle_label(value: Option<String>, fallback: &str) -> ApiResult<String> {
-    let value = value.unwrap_or_else(|| fallback.to_owned());
-    let value = value.trim();
-    if value.is_empty() || value.len() > 120 {
-        return Err(ApiError::Validation(
-            "label must contain 1 to 120 characters",
-        ));
-    }
-    Ok(value.to_owned())
-}
-
-async fn existing_lifecycle_operation(
-    state: &AppState,
-    user: Uuid,
-    key: &str,
-) -> ApiResult<Option<Uuid>> {
-    Ok(sqlx::query_scalar::<_, Uuid>("select id from control.operations where kind='tenant.lifecycle' and requested_by=$1 and idempotency_key=$2")
-        .bind(user).bind(key).fetch_optional(state.store.pool()).await?)
-}
-
-async fn lock_lifecycle(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workshop: Uuid,
-) -> ApiResult<()> {
-    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(workshop.to_string())
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-async fn primary_database(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workshop: Uuid,
-) -> ApiResult<Uuid> {
-    sqlx::query_scalar::<_, Uuid>("select id from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null")
-        .bind(workshop).fetch_optional(&mut **tx).await?.ok_or(ApiError::Conflict("Odoo database is not provisioned"))
-}
-
-async fn ensure_lifecycle_idle(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workshop: Uuid,
-) -> ApiResult<()> {
-    let active = sqlx::query_scalar::<_, bool>("select exists(select 1 from control.operations where workshop_id=$1 and kind='tenant.lifecycle' and state in ('pending','in_flight','awaiting_reconciliation'))")
-        .bind(workshop).fetch_one(&mut **tx).await?;
-    if active {
-        return Err(ApiError::Conflict(
-            "another database operation is already running",
-        ));
-    }
-    Ok(())
 }
 
 async fn operation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OperationResponse>> {
     let who = principal(&state, &headers).await?;
     let row=sqlx::query_as::<_,(String,String,Option<Uuid>,i32,i32,Option<String>,OffsetDateTime,Option<OffsetDateTime>,i16,Option<String>,Option<String>,Option<OffsetDateTime>)>("select kind,state,workshop_id,attempt,max_attempts,failure_class,created_at,finished_at,progress_percent,progress_phase,progress_message,progress_updated_at from control.operations where id=$1").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
     if let Some(workshop) = row.2 {
-        if !is_operator(&state, &who) {
+        if !is_operator(&state, &who).await? {
             authority(&state, who.user_id, workshop).await?;
         }
     } else if who.user_id
@@ -1842,9 +1053,21 @@ async fn operation(
     {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(
-        json!({"id":id,"kind":row.0,"state":row.1,"workshop_id":row.2,"attempt":row.3,"max_attempts":row.4,"failure_class":row.5,"created_at":api_timestamp(row.6),"finished_at":row.7.map(api_timestamp),"progress_percent":row.8,"progress_phase":row.9,"progress_message":row.10,"progress_updated_at":row.11.map(api_timestamp)}),
-    ))
+    Ok(Json(OperationResponse {
+        id,
+        kind: row.0,
+        state: row.1,
+        workshop_id: row.2,
+        attempt: row.3,
+        max_attempts: row.4,
+        failure_class: row.5,
+        created_at: api_timestamp(row.6),
+        finished_at: row.7.map(api_timestamp),
+        progress_percent: row.8,
+        progress_phase: row.9,
+        progress_message: row.10,
+        progress_updated_at: row.11.map(api_timestamp),
+    }))
 }
 
 async fn retry_operation(
@@ -1853,6 +1076,7 @@ async fn retry_operation(
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let who = principal(&state, &headers).await?;
+    let key = idempotency(&headers)?.to_owned();
     let row = sqlx::query_as::<_, (Option<Uuid>, String)>(
         "select workshop_id,kind from control.operations where id=$1",
     )
@@ -1861,7 +1085,7 @@ async fn retry_operation(
     .await?
     .ok_or(ApiError::NotFound)?;
     if let Some(workshop) = row.0
-        && !is_operator(&state, &who)
+        && !is_operator(&state, &who).await?
     {
         let role = authority(&state, who.user_id, workshop).await?.0;
         if (row.1 == "tenant.lifecycle" && !role.can_manage_database())
@@ -1870,461 +1094,79 @@ async fn retry_operation(
             return Err(ApiError::Forbidden);
         }
     }
+    let semantic = json!({"operation_id":id});
+    let correlation = Uuid::new_v4();
+    let command_scope = row.0.map_or_else(
+        || "platform:operations".to_owned(),
+        |workshop| format!("workshop:{workshop}:operations"),
+    );
     let mut tx = state.store.begin().await?;
+    let command_id = match admit_command(
+        &mut tx,
+        NewCommand {
+            actor_user_id: who.user_id,
+            scope: &command_scope,
+            command_kind: "operation.retry",
+            idempotency_key: &key,
+            semantic_request: &semantic,
+            expected_version: None,
+        },
+    )
+    .await
+    .map_err(command_error)?
+    {
+        CommandAdmission::New { command_id } => command_id,
+        CommandAdmission::Replay {
+            response_status,
+            response_body,
+            ..
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::from_u16(response_status).unwrap_or(StatusCode::ACCEPTED),
+                Json(response_body.unwrap_or_else(|| json!({"replayed":true}))),
+            ));
+        }
+        CommandAdmission::InProgress { command_id, .. } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({"command_id":command_id,"in_progress":true})),
+            ));
+        }
+    };
     let changed=sqlx::query("update control.operations set state='pending',attempt=0,next_attempt_at=now(),failure_class=null,finished_at=null where id=$1 and state='dead_letter'").bind(id).execute(&mut *tx).await?;
     if changed.rows_affected() != 1 {
         return Err(ApiError::Conflict(
             "only dead-letter operations can be retried",
         ));
     }
-    audit(
+    audit_command(
         &mut tx,
-        Some(who.user_id),
-        row.0,
+        (Some(who.user_id), row.0),
         "operation.retry",
         "operation",
         id.to_string(),
-        Uuid::new_v4(),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"id":id,"state":"pending"})),
-    ))
-}
-
-async fn paperless_event(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop_id): Path<Uuid>,
-    Json(payload): Json<Value>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    internal(&state, &headers)?;
-    let document_id = payload
-        .get("document_id")
-        .and_then(Value::as_i64)
-        .filter(|id| *id > 0)
-        .ok_or(ApiError::Validation("document_id is required"))?;
-    let capture_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules
-         where workshop_id=$1 and module_key='invoice-capture' and state='enabled')",
-    )
-    .bind(workshop_id)
-    .fetch_one(state.store.pool())
-    .await?;
-    if !capture_enabled {
-        return Ok((StatusCode::OK, Json(json!({"ignored":true}))));
-    }
-    let mut tx = state.store.begin().await?;
-    let correlation = Uuid::new_v4();
-    let key = format!(
-        "paperless:{workshop_id}:{document_id}:{}",
-        payload
-            .get("revision")
-            .and_then(Value::as_str)
-            .unwrap_or("current")
-    );
-    let operation = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::InvoiceCapture,
-            workshop_id: Some(workshop_id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &json!({"document_id":document_id}),
-            requested_by: None,
-            correlation_id: correlation,
-            idempotency_key: &key,
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"operation_id":operation})),
-    ))
-}
-
-async fn inventory_capture(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop_id): Path<Uuid>,
-    Json(payload): Json<Value>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    tenant_bridge(&state, &headers, workshop_id).await?;
-    let object = payload
-        .as_object()
-        .filter(|value| {
-            value.len() == 4
-                && value
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "capture_id" | "assets" | "task" | "hints"))
-        })
-        .ok_or(ApiError::Validation("inventory capture payload is invalid"))?;
-    let _hints = object
-        .get("hints")
-        .and_then(Value::as_object)
-        .filter(|value| {
-            value.len() <= 4
-                && value.keys().all(|key| {
-                    matches!(
-                        key.as_str(),
-                        "brand" | "languages" | "allow_ai" | "provider_order"
-                    )
-                })
-                && value.get("brand").is_none_or(|brand| {
-                    brand
-                        .as_str()
-                        .is_some_and(|text| !text.is_empty() && text.len() <= 100)
-                })
-                && value.get("languages").is_none_or(|languages| {
-                    languages.as_array().is_some_and(|items| {
-                        items.len() <= 5
-                            && items.iter().all(|item| {
-                                item.as_str()
-                                    .is_some_and(|text| !text.is_empty() && text.len() <= 16)
-                            })
-                    })
-                })
-                && value.get("allow_ai").is_none_or(Value::is_boolean)
-                && value.get("provider_order").is_none_or(|providers| {
-                    providers.as_array().is_some_and(|items| {
-                        items.len() <= 2
-                            && items.iter().all(|item| {
-                                item.as_str().is_some_and(|name| {
-                                    matches!(name, "azure" | "gemini" | "openai" | "claude")
-                                })
-                            })
-                            && (items.len() < 2 || items[0] != items[1])
-                    })
-                })
-        })
-        .ok_or(ApiError::Validation("inventory capture hints are invalid"))?;
-    let capture_id = payload
-        .get("capture_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or(ApiError::Validation("capture_id must be a UUID"))?;
-    if payload.get("task").and_then(Value::as_str) != Some("inventory_label") {
-        return Err(ApiError::Validation("task must be inventory_label"));
-    }
-    let assets = payload
-        .get("assets")
-        .and_then(Value::as_array)
-        .filter(|assets| !assets.is_empty() && assets.len() <= 2)
-        .ok_or(ApiError::Validation("one or two assets are required"))?;
-    for asset in assets {
-        let valid_id = asset
-            .get("asset_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| Uuid::parse_str(value).is_ok());
-        let valid_role = matches!(
-            asset.get("role").and_then(Value::as_str),
-            Some("front" | "lot_detail" | "crop" | "ocr_variant")
-        );
-        let valid_digest = asset
-            .get("content_sha256")
-            .and_then(Value::as_str)
-            .is_some_and(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-        if !valid_id
-            || !valid_role
-            || !valid_digest
-            || asset.as_object().is_none_or(|v| v.len() != 3)
-        {
-            return Err(ApiError::Validation("asset descriptor is invalid"));
-        }
-    }
-    let enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules
-         where workshop_id=$1 and module_key='inventory-capture' and state='enabled')",
-    )
-    .bind(workshop_id)
-    .fetch_one(state.store.pool())
-    .await?;
-    if !enabled {
-        return Err(ApiError::Forbidden);
-    }
-    let key = idempotency(&headers)?;
-    let mut tx = state.store.begin().await?;
-    let operation = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::InventoryCaptureExtract,
-            workshop_id: Some(workshop_id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by: None,
-            correlation_id: Uuid::new_v4(),
-            idempotency_key: key,
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"operation_id": operation, "capture_id": capture_id})),
-    ))
-}
-
-const PRODUCT_LOOKUP_SCHEMA_VERSION: i32 = 1;
-
-async fn inventory_product_lookup(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop_id): Path<Uuid>,
-    Json(payload): Json<Value>,
-) -> ApiResult<Json<Value>> {
-    tenant_bridge(&state, &headers, workshop_id).await?;
-    let object = payload
-        .as_object()
-        .filter(|value| value.len() == 1 && value.contains_key("gtin14"))
-        .ok_or(ApiError::Validation("product lookup payload is invalid"))?;
-    let gtin14 = object
-        .get("gtin14")
-        .and_then(Value::as_str)
-        .filter(|value| valid_gtin14(value))
-        .ok_or(ApiError::Validation("gtin14 must be checksum-valid"))?;
-    let enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules
-         where workshop_id=$1 and module_key='inventory-capture' and state='enabled')",
-    )
-    .bind(workshop_id)
-    .fetch_one(state.store.pool())
-    .await?;
-    if !enabled {
-        return Err(ApiError::Forbidden);
-    }
-    sqlx::query(
-        "delete from control.product_lookup_cache where ctid in (
-            select ctid from control.product_lookup_cache
-            where expires_at < now() - interval '7 days' limit 100
-        )",
-    )
-    .execute(state.store.pool())
-    .await?;
-    let provider = "upcitemdb";
-    if let Some(candidates) = cached_product_lookup(
-        state.store.pool(),
-        provider,
-        PRODUCT_LOOKUP_SCHEMA_VERSION,
-        gtin14,
-    )
-    .await?
-    {
-        return Ok(Json(json!({
-            "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
-            "gtin14":gtin14,"cache":"hit","candidates":candidates
-        })));
-    }
-
-    let mut tx = state.store.begin().await?;
-    let cache_key = format!("{provider}:{PRODUCT_LOOKUP_SCHEMA_VERSION}:{gtin14}");
-    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(&cache_key)
-        .execute(&mut *tx)
-        .await?;
-    if let Some(candidates) = sqlx::query_scalar::<_, Value>(
-        "select candidates from control.product_lookup_cache
-         where provider=$1 and schema_version=$2 and gtin14=$3 and expires_at>now()",
-    )
-    .bind(provider)
-    .bind(PRODUCT_LOOKUP_SCHEMA_VERSION)
-    .bind(gtin14)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        tx.commit().await?;
-        return Ok(Json(json!({
-            "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
-            "gtin14":gtin14,"cache":"coalesced_hit","candidates":candidates
-        })));
-    }
-
-    let broker_url = std::env::var("CONTROL_EXTRACTION_BROKER_URL")
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let broker_token = std::env::var("CONTROL_EXTRACTION_BROKER_TOKEN")
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let broker = ExtractionBrokerClient::new(&broker_url, &broker_token, Duration::from_secs(12))
-        .map_err(ApiError::Internal)?;
-    let response = broker
-        .product_lookup(provider, gtin14)
-        .await
-        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
-    let candidates = response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .filter(|items| items.len() <= 5 && items.iter().all(Value::is_object))
-        .cloned()
-        .ok_or(ApiError::Internal(anyhow::anyhow!(
-            "product lookup contract drift"
-        )))?;
-    if response.get("provider").and_then(Value::as_str) != Some(provider)
-        || response.get("schema_version").and_then(Value::as_i64)
-            != Some(i64::from(PRODUCT_LOOKUP_SCHEMA_VERSION))
-        || response.get("gtin14").and_then(Value::as_str) != Some(gtin14)
-    {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "product lookup contract drift"
-        )));
-    }
-    let outcome = if candidates.is_empty() {
-        "negative"
-    } else {
-        "positive"
-    };
-    let ttl_seconds = if candidates.is_empty() {
-        24 * 60 * 60
-    } else {
-        30 * 24 * 60 * 60
-    };
-    let candidates = Value::Array(candidates);
-    sqlx::query(
-        "insert into control.product_lookup_cache
-            (provider,schema_version,gtin14,outcome,candidates,retrieved_at,expires_at)
-         values ($1,$2,$3,$4,$5,now(),now()+($6::bigint * interval '1 second'))
-         on conflict (provider,schema_version,gtin14) do update set
-            outcome=excluded.outcome,candidates=excluded.candidates,
-            retrieved_at=excluded.retrieved_at,expires_at=excluded.expires_at",
-    )
-    .bind(provider)
-    .bind(PRODUCT_LOOKUP_SCHEMA_VERSION)
-    .bind(gtin14)
-    .bind(outcome)
-    .bind(&candidates)
-    .bind(ttl_seconds)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Json(json!({
-        "provider":provider,"schema_version":PRODUCT_LOOKUP_SCHEMA_VERSION,
-        "gtin14":gtin14,"cache":"miss","candidates":candidates
-    })))
-}
-
-async fn cached_product_lookup(
-    pool: &sqlx::PgPool,
-    provider: &str,
-    schema_version: i32,
-    gtin14: &str,
-) -> ApiResult<Option<Value>> {
-    Ok(sqlx::query_scalar(
-        "select candidates from control.product_lookup_cache
-         where provider=$1 and schema_version=$2 and gtin14=$3 and expires_at>now()",
-    )
-    .bind(provider)
-    .bind(schema_version)
-    .bind(gtin14)
-    .fetch_optional(pool)
-    .await?)
-}
-
-fn valid_gtin14(value: &str) -> bool {
-    if value.len() != 14 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    let digits = value.bytes().map(|byte| byte - b'0').collect::<Vec<_>>();
-    let sum = digits[..13]
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(index, digit)| u32::from(*digit) * if index % 2 == 0 { 3 } else { 1 })
-        .sum::<u32>();
-    ((10 - sum % 10) % 10) as u8 == digits[13]
-}
-
-async fn reconcile_tenant(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop_id): Path<Uuid>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    internal(&state, &headers)?;
-    let correlation = Uuid::new_v4();
-    queue_tenant_reconciliation(&state, workshop_id, None, &format!("manual:{correlation}")).await
-}
-
-async fn queue_tenant_reconciliation(
-    state: &AppState,
-    workshop_id: Uuid,
-    requested_by: Option<Uuid>,
-    key: &str,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let tenant = sqlx::query_as::<_, (Uuid, String, String, String)>(
-        "select d.id,w.slug,d.database_ref,d.public_hostname
-         from control.workshops w
-         join control.odoo_databases d on d.workshop_id=w.id
-         where w.id=$1 and w.status<>'deleted' and d.kind='primary'
-           and d.deleted_at is null and d.public_hostname is not null",
-    )
-    .bind(workshop_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    let paperless_hostname = format!("docs-{}.{}", tenant.1, state.config.tenant_domain);
-    let paperless_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules
-         where workshop_id=$1 and module_key='documents' and state='enabled')",
-    )
-    .bind(workshop_id)
-    .fetch_one(state.store.pool())
-    .await?;
-    let payload = json!({
-        "database_id": tenant.0,
-        "database_ref": tenant.2,
-        "public_hostname": tenant.3,
-        "paperless_hostname": paperless_hostname,
-        "paperless_enabled": paperless_enabled,
-    });
-    let mut tx = state.store.begin().await?;
-    let correlation = Uuid::new_v4();
-    let op = Store::enqueue(
-        &mut tx,
-        NewOperation {
-            kind: OperationKind::TenantReconcile,
-            workshop_id: Some(workshop_id),
-            target_user_id: None,
-            desired_epoch: None,
-            payload: &payload,
-            requested_by,
-            correlation_id: correlation,
-            idempotency_key: key,
-        },
-    )
-    .await?;
-    audit(
-        &mut tx,
-        requested_by,
-        Some(workshop_id),
-        "tenant.reconcile",
-        "workshop",
-        workshop_id.to_string(),
         correlation,
+        command_id,
     )
     .await?;
+    let response = json!({"id":id,"state":"pending"});
+    let result_ref = id.to_string();
+    complete_command(
+        &mut tx,
+        command_id,
+        CommandResult {
+            operation_id: Some(id),
+            response_status: StatusCode::ACCEPTED.as_u16(),
+            response_body: Some(&response),
+            result_ref: Some(&result_ref),
+        },
+    )
+    .await
+    .map_err(command_error)?;
     tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({"operation_id":op}))))
-}
-
-#[derive(Deserialize)]
-struct EntitlementAck {
-    version: i64,
-    service: String,
-}
-async fn ack_entitlement(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop_id): Path<Uuid>,
-    Json(body): Json<EntitlementAck>,
-) -> ApiResult<StatusCode> {
-    internal(&state, &headers)?;
-    if body.service != "odoo" && body.service != "paperless" {
-        return Err(ApiError::Validation("unknown service"));
-    }
-    sqlx::query("update control.service_instances set applied_epoch=greatest(applied_epoch,$3::integer),last_observed_at=now() where workshop_id=$1 and service=$2").bind(workshop_id).bind(body.service).bind(i32::try_from(body.version).map_err(|_|ApiError::Validation("version out of range"))?).execute(state.store.pool()).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn seed_targets(
@@ -2354,14 +1196,52 @@ async fn audit(
     target_id: String,
     correlation: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("insert into control.audit_events(id,actor_user_id,workshop_id,action,target_type,target_id,correlation_id,outcome) values($1,$2,$3,$4,$5,$6,$7,'accepted')")
+    sqlx::query("insert into control.audit_events(id,actor_audit_subject_id,workshop_id,action,target_type,target_id,correlation_id,outcome) values($1,(select audit_subject_id from control.users where id=$2),$3,$4,$5,$6,$7,'accepted')")
         .bind(Uuid::new_v4()).bind(actor).bind(workshop).bind(action).bind(target_type).bind(target_id).bind(correlation).execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn audit_command(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authority: (Option<Uuid>, Option<Uuid>),
+    action: &str,
+    target_type: &str,
+    target_id: String,
+    correlation: Uuid,
+    command_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let (actor, workshop) = authority;
+    sqlx::query(
+        "insert into control.audit_events(
+           id,actor_audit_subject_id,workshop_id,action,target_type,target_id,
+           correlation_id,outcome,detail
+         )
+         select $1,(select audit_subject_id from control.users where id=$2),$3,$4,$5,$6,$7,
+                'accepted',jsonb_build_object(
+                    'command_id',$8,
+                    'request_digest',encode(c.request_digest,'hex'),
+                    'result_class','accepted'
+                )
+         from control.commands c where c.id=$8",
+    )
+    .bind(Uuid::new_v4())
+    .bind(actor)
+    .bind(workshop)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(correlation)
+    .bind(command_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{api_timestamp, valid_gtin14};
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{ApiError, api_timestamp, etag, expected_version, valid_gtin14};
 
     #[test]
     fn api_timestamps_are_rfc3339_for_browser_parsers() {
@@ -2376,5 +1256,31 @@ mod tests {
         assert!(valid_gtin14("00097539118054"));
         assert!(!valid_gtin14("00097539118055"));
         assert!(!valid_gtin14("097539118054"));
+    }
+
+    #[test]
+    fn version_preconditions_require_an_exact_strong_etag() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            expected_version(&headers, "member-a-b"),
+            Err(ApiError::Precondition(_))
+        ));
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("W/\"member-a-b-v3\""),
+        );
+        assert!(matches!(
+            expected_version(&headers, "member-a-b"),
+            Err(ApiError::PreconditionFailed(_))
+        ));
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("\"member-a-b-v3\""),
+        );
+        assert_eq!(expected_version(&headers, "member-a-b").unwrap(), 3);
+        assert_eq!(
+            etag("member-a-b", 4).unwrap().get(header::ETAG).unwrap(),
+            "\"member-a-b-v4\""
+        );
     }
 }

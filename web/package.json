@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "generate:api": "cargo run --quiet --manifest-path ../Cargo.toml --bin control-openapi -- --typescript src/lib/generated/control-api.ts",
     "dev": "vite dev --port 4175",
     "build": "vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"

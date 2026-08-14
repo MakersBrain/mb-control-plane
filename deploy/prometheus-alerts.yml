@@ -1,0 +1,73 @@
+groups:
+  - name: makersbrain-control-plane
+    rules:
+      - alert: MakersBrainRequiredWorkerAbsent
+        expr: makersbrain_worker_fresh < 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Required control-plane queue has no fresh worker"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainQueueDueTooLong
+        expr: makersbrain_queue_oldest_due_age_seconds > 300
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "A durable-operation queue is not converging"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainDeadLettersPresent
+        expr: makersbrain_queue_dead_letters > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A queue contains dead-lettered operations"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainAbandonedOperationLease
+        expr: makersbrain_abandoned_operation_leases > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "An in-flight operation lease has expired"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainVerifiedBackupStale
+        expr: makersbrain_backup_freshness_seconds < 0 or makersbrain_backup_freshness_seconds > 93600
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: "No sufficiently recent verified workshop backup exists"
+          runbook_url: "docs/runbooks/failed-restore.md"
+      - alert: MakersBrainRestoreRehearsalStale
+        expr: makersbrain_restore_rehearsal_age_seconds < 0 or makersbrain_restore_rehearsal_age_seconds > 2678400
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Isolated restore evidence is missing or older than 31 days"
+          runbook_url: "docs/runbooks/failed-restore.md"
+      - alert: MakersBrainReleaseTenantFailed
+        expr: makersbrain_release_adoptions{state="failed"} > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "At least one tenant release adoption failed"
+          runbook_url: "docs/runbooks/failed-release-adoption.md"
+      - alert: MakersBrainApiServerErrors
+        expr: sum(rate(makersbrain_http_requests_total{status_class="5xx"}[5m])) by (route) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Sustained control API server errors"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainProviderFailures
+        expr: sum(rate(makersbrain_provider_requests_total{outcome="failure"}[10m])) by (provider, operation) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "A document or product provider has a sustained failure rate"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainIntegrationUnavailable
+        expr: sum(makersbrain_integration_instances{health=~"degraded|failed"}) by (integration) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Odoo, Paperless, or Rauthy integration availability is degraded"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"

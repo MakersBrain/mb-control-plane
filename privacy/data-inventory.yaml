@@ -1,0 +1,235 @@
+schema_version: 1
+status: controller-approval-required
+last_reviewed: 2026-08-14
+production_personal_data_allowed: false
+controller: null
+dpo: null
+
+datasets:
+  - id: user-directory
+    fields: [control.users.id, control.users.email, control.users.display_name, control.users.locale, control.users.disabled_at]
+    subjects: [platform users]
+    purpose: account identity, communication, locale and access lifecycle
+    lawful_basis: pending-controller-approval
+    source: verified user and OIDC claims
+    owner: control-api
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [control API, membership worker, authorized platform operator]
+    recipients: [Rauthy, tenant Odoo and Paperless when membership is applied]
+    retention_policy: user-directory
+    subject_lookup: internal user UUID and normalized verified email
+    transfer: EEA-only
+
+  - id: external-identity
+    fields: [control.external_identities.issuer, control.external_identities.subject, control.external_identities.email_at_link, control.external_identities.disabled_at]
+    subjects: [platform users]
+    purpose: bind an authenticated OIDC principal to one internal user
+    lawful_basis: pending-controller-approval
+    source: Rauthy verified token
+    owner: control-api
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [control API, membership worker]
+    recipients: []
+    retention_policy: external-identity
+    subject_lookup: issuer plus subject, mapped to internal user UUID
+    transfer: EEA-only
+
+  - id: workshop-authority
+    fields: [control.memberships.user_id, control.memberships.role, control.memberships.status, control.memberships.created_at, control.memberships.revoked_at, control.ownership_transfers.from_user_id, control.ownership_transfers.to_user_id]
+    subjects: [platform users]
+    purpose: workshop authorization, ownership safety and access evidence
+    lawful_basis: pending-controller-approval
+    source: workshop owner or authorized manager commands
+    owner: control-api
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [control API, membership worker, authorized workshop managers, authorized platform operator]
+    recipients: [Rauthy, tenant Odoo, tenant Paperless]
+    retention_policy: workshop-authority
+    subject_lookup: internal user UUID
+    transfer: EEA-only
+
+  - id: invitations
+    fields: [control.invitations.email, control.invitations.invited_by, control.invitations.accepted_user_id, control.invitations.created_at, control.invitations.expires_at, control.invitations.accepted_at, control.invitations.revoked_at]
+    subjects: [invitees, inviters]
+    purpose: deliver, validate and evidence workshop invitations
+    lawful_basis: pending-controller-approval
+    source: authorized workshop manager
+    owner: control-api and email worker
+    locations: [control PostgreSQL, mail provider, encrypted backups]
+    authorized_roles: [control API, email worker, authorized workshop managers]
+    recipients: [configured mail processor]
+    retention_policy: invitations
+    subject_lookup: invitation UUID, normalized email and internal user UUID
+    transfer: EEA-only
+    protection: compact capability is signed only in email-worker memory and is never persisted
+
+  - id: mail-delivery
+    fields: [control.outbox.recipient, control.outbox.template, control.outbox.payload, control.outbox.created_at, control.outbox.sent_at]
+    subjects: [message recipients]
+    purpose: reliable transactional email delivery and delivery evidence
+    lawful_basis: pending-controller-approval
+    source: control API commands
+    owner: email worker
+    locations: [control PostgreSQL, mail provider, encrypted backups]
+    authorized_roles: [email worker, narrowly redacted platform operator view]
+    recipients: [configured mail processor]
+    retention_policy: mail-delivery
+    subject_lookup: outbox UUID, recipient email and related internal user/invitation UUID
+    transfer: EEA-only
+
+  - id: operations-and-audit
+    fields:
+      - control.commands.actor_user_id
+      - control.commands.scope
+      - control.commands.command_kind
+      - control.commands.idempotency_key
+      - control.commands.request_digest
+      - control.commands.operation_id
+      - control.commands.response_body
+      - control.commands.result_ref
+      - control.commands.created_at
+      - control.commands.completed_at
+      - control.operations.requested_by
+      - control.operations.target_user_id
+      - control.operations.workshop_id
+      - control.operations.payload
+      - control.operations.checkpoint
+      - control.operations.correlation_id
+      - control.operations.created_at
+      - control.users.audit_subject_id
+      - control.audit_events.actor_audit_subject_id
+      - control.audit_events.action
+      - control.audit_events.target_type
+      - control.audit_events.target_id
+      - control.audit_events.correlation_id
+      - control.audit_events.created_at
+    subjects: [platform users and operators]
+    purpose: command execution, security evidence, incident response and accountability
+    lawful_basis: pending-controller-approval
+    source: authenticated commands and system actions
+    owner: control API and queue workers
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [owning worker, control API, authorized platform security operator]
+    recipients: []
+    retention_policy: operations-and-audit
+    subject_lookup: internal user UUID for live commands/operations; random audit subject UUID mapped through the access-controlled users table for retained audit
+    minimization: command request bodies are represented only by an RFC 8785 SHA-256 digest; stored responses and operation payload/checkpoints are allowlisted to stable identifiers, bounded state and safe evidence and must not contain provider bodies, credentials, email addresses or OIDC subjects
+    transfer: EEA-only
+
+  - id: usage-and-entitlement
+    fields: [control.entitlements.workshop_id, control.usage_counters.workshop_id, control.usage_reservations.workshop_id]
+    subjects: [workshop owners where a workshop is a sole trader]
+    purpose: feature authorization, plan enforcement and usage accounting
+    lawful_basis: pending-controller-approval
+    source: commercial entitlement and admitted operations
+    owner: control API and extraction workers
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [control API, owning workers, authorized workshop owner, authorized platform operator]
+    recipients: []
+    retention_policy: usage-and-entitlement
+    subject_lookup: workshop UUID then controller-approved user mapping
+    transfer: EEA-only
+
+  - id: recovery-and-deletion-evidence
+    fields: [control.workshop_recovery_points.workshop_id, control.workshop_recovery_rehearsals.workshop_id, control.workshop_deletions.workshop_id]
+    subjects: [workshop owners and users represented in tenant data]
+    purpose: continuity, verified recovery, deletion safety and erasure replay
+    lawful_basis: pending-controller-approval
+    source: lifecycle operations
+    owner: lifecycle worker and backup scheduler
+    locations: [control PostgreSQL, encrypted object storage, infrastructure driver]
+    authorized_roles: [lifecycle worker, backup scheduler metadata role, explicitly authorized restore operator]
+    recipients: [approved EEA backup processor]
+    retention_policy: recovery
+    subject_lookup: workshop UUID plus post-restore erasure tombstone ledger
+    transfer: EEA-only
+
+  - id: application-telemetry
+    fields: [request correlation UUID, route class, status class, safe failure class, worker UUID, operation UUID]
+    excluded_fields: [email, OIDC subject, invitation token, authorization header, document body, provider payload, IP address, user agent]
+    subjects: [platform users only through separately retained pseudonymous correlation]
+    purpose: availability, security monitoring and incident response
+    lawful_basis: pending-controller-approval
+    source: API, workers, drivers and gateway
+    owner: platform operations
+    locations: [approved EEA telemetry backend]
+    authorized_roles: [authorized platform operations and security roles]
+    recipients: [approved EEA telemetry processor]
+    retention_policy: telemetry
+    subject_lookup: controlled incident-only correlation map
+    transfer: EEA-only
+
+  - id: tenant-business-data
+    fields: [Odoo business records, Paperless documents and metadata]
+    subjects: [workshop users, customers, suppliers and document subjects]
+    purpose: workshop business operations
+    lawful_basis: determined by each controller and processing purpose
+    source: workshop users, customers, suppliers and integrations
+    owner: tenant Odoo and Paperless, not control PostgreSQL
+    locations: [tenant PostgreSQL databases, filestore/document volumes, encrypted recovery sets]
+    authorized_roles: [tenant-authorized users and narrowly scoped integration workers]
+    recipients: [controller-approved processors and providers]
+    retention_policy: tenant-controller-policy
+    subject_lookup: tenant-owned identifiers; control plane coordinates but does not centralize contents
+    transfer: EEA-only-by-default
+
+  - id: platform-authority
+    fields: [control.platform_role_assignments.user_id, control.platform_role_assignments.granted_by, control.platform_role_assignments.revoked_by, control.platform_role_assignments.granted_at, control.platform_role_assignments.revoked_at]
+    subjects: [platform operators and role grantors]
+    purpose: least-privilege platform authorization and access-review evidence
+    lawful_basis: pending-controller-approval
+    source: initial project-owner bootstrap and step-up-authorized technical administrators
+    owner: control-api
+    locations: [control PostgreSQL, encrypted backups]
+    authorized_roles: [technical administrator, auditor]
+    recipients: []
+    retention_policy: workshop-authority
+    subject_lookup: internal user UUID
+    transfer: EEA-only
+
+  - id: privacy-rights-and-incidents
+    fields: [control.data_subject_requests.subject_user_id, control.data_subject_requests.requested_at, control.data_subject_requests.decision_code, control.processing_holds.subject_user_id, control.data_subject_processor_tasks.acknowledgement_ref, control.data_subject_exports.encryption_key_ref, control.data_subject_exports.nonce, control.data_subject_exports.storage_ref, control.data_subject_exports.manifest_digest, control.data_subject_exports.expires_at, AEAD-encrypted Odoo and Paperless subject export artifact, control.erasure_tombstones.subject_user_id, control.erasure_subject_lookups.key_id, control.erasure_subject_lookups.nonce, control.erasure_subject_lookups.ciphertext, control.erasure_restore_replays.completed_locations, control.privacy_incidents.created_by, control.privacy_incidents.affected_workshop_ids]
+    subjects: [rights requesters, affected persons and incident responders]
+    purpose: exercise data-subject rights, enforce restriction and coordinate breach response
+    lawful_basis: GDPR legal-obligation and controller assessment pending formal controller designation
+    source: verified data subject, privacy reviewer and security responder actions
+    owner: control-api and privacy worker
+    locations: [control PostgreSQL with AEAD-protected processor lookup and export metadata only, dedicated 0700 shared export volume containing 0600 AES-256-GCM artifacts, encrypted backups]
+    authorized_roles: [privacy reviewer, security responder, requesting data subject for own request]
+    recipients: [applicable approved processors, controller, DPO and supervisory authority when required]
+    retention_policy: rights-export-artifact for encrypted content; tenant-controller-policy for request evidence
+    backup_behavior: transient export artifacts are excluded from backups; metadata follows encrypted control-database backup policy
+    key_management: new artifacts use only the active export key; an API-only decryption ring may retain at most 16 previous keys solely until their live artifacts are consumed or reach the seven-day maximum; compromised keys are never retained and affected exports are reissued
+    subject_lookup: internal user UUID, pseudonymous audit-subject UUID and AES-256-GCM processor lookup bound to its tombstone UUID
+    transfer: EEA-only
+
+  - id: worker-runtime-evidence
+    fields: [control.worker_heartbeats.worker_id, control.worker_heartbeats.active_operation_id, control.worker_heartbeats.started_at, control.worker_heartbeats.last_heartbeat_at, control.worker_heartbeats.shutdown_at, control.operations.trace_parent, control.operations.trace_state]
+    subjects: [platform operators only if a worker identifier is correlated through deployment records]
+    purpose: service availability, queue ownership and incident diagnosis
+    lawful_basis: pending-controller-approval
+    source: worker process lifecycle
+    owner: queue workers
+    locations: [control PostgreSQL, encrypted backups, privacy-safe metrics, optional EEA OTLP traces]
+    authorized_roles: [owning worker, platform operations and security roles]
+    recipients: [approved EEA telemetry processor]
+    retention_policy: telemetry
+    subject_lookup: random worker UUID; no email or OIDC subject
+    transfer: EEA-only
+
+  - id: tenant-integration-credential-verifiers
+    fields: [Odoo res.company.mb_control_bridge_token_hash]
+    subjects: []
+    personal_data: false
+    security_classification: credential-verifier
+    purpose: authenticate a control-plane bridge request only to the exact selected workshop database
+    lawful_basis: not-applicable-no-personal-data
+    source: SHA-256 of a driver-generated 64-character random tenant token
+    owner: deployment driver and tenant Odoo bridge
+    locations: [tenant Odoo database, encrypted recovery sets]
+    plaintext_locations: [worker-facing tenant secret volume only]
+    authorized_roles: [Odoo runtime verifier; owning integration workers receive plaintext by file reference]
+    recipients: []
+    retention_policy: tenant-integration-credentials
+    subject_lookup: none
+    transfer: EEA-only

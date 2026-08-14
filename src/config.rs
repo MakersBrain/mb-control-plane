@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -24,16 +25,24 @@ pub struct Config {
     pub oidc_discovery_url: Url,
     pub tenant_domain: String,
     pub internal_token: String,
+    pub release_publish_token: String,
+    pub invitation_verification_keys_file: PathBuf,
+    pub invitation_signing_key_id: String,
     pub deployment_driver_url: Url,
     pub deployment_driver_token: String,
     pub allow_self_signup: bool,
     pub operator_emails: HashSet<String>,
     pub request_timeout: Duration,
+    pub synthetic_data_only: bool,
 }
 
 impl Config {
     pub fn database_url() -> Result<String, ConfigError> {
         required("CONTROL_DATABASE_URL")
+    }
+
+    pub fn synthetic_data_only() -> Result<bool, ConfigError> {
+        data_mode(&required("CONTROL_DATA_MODE")?)
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -52,6 +61,11 @@ impl Config {
             oidc_discovery_url: absolute_url("CONTROL_OIDC_DISCOVERY_URL")?,
             tenant_domain: tenant_domain()?,
             internal_token: required("CONTROL_INTERNAL_TOKEN")?,
+            release_publish_token: required("CONTROL_RELEASE_PUBLISH_TOKEN")?,
+            invitation_verification_keys_file: PathBuf::from(required(
+                "CONTROL_INVITATION_VERIFICATION_KEYS_FILE",
+            )?),
+            invitation_signing_key_id: required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
             deployment_driver_url: absolute_url("CONTROL_DEPLOYMENT_DRIVER_URL")?,
             deployment_driver_token: required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
             allow_self_signup: std::env::var("CONTROL_ALLOW_SELF_SIGNUP")
@@ -63,8 +77,71 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .collect(),
             request_timeout: Duration::from_secs(20),
+            synthetic_data_only: Self::synthetic_data_only()?,
         })
     }
+}
+
+fn data_mode(value: &str) -> Result<bool, ConfigError> {
+    data_mode_with(value, &|name| std::env::var(name).ok())
+}
+
+fn data_mode_with(
+    value: &str,
+    lookup: &dyn Fn(&'static str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    match value {
+        "synthetic" => Ok(true),
+        "personal" => {
+            validate_personal_data_governance(lookup)?;
+            Ok(false)
+        }
+        _ => Err(ConfigError::Invalid {
+            name: "CONTROL_DATA_MODE",
+            reason: "must be synthetic or personal".into(),
+        }),
+    }
+}
+
+fn validate_personal_data_governance(
+    lookup: &dyn Fn(&'static str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    for name in [
+        "CONTROL_PRIVACY_CONTROLLER_REF",
+        "CONTROL_PRIVACY_PROCESSING_RECORD_REF",
+        "CONTROL_PRIVACY_RETENTION_APPROVAL_REF",
+        "CONTROL_PRIVACY_PROCESSOR_REGISTER_REF",
+        "CONTROL_PRIVACY_DPIA_APPROVAL_REF",
+    ] {
+        let value = lookup(name).ok_or(ConfigError::Missing(name))?;
+        let value = value.trim();
+        let lower = value.to_ascii_lowercase();
+        if !(8..=500).contains(&value.len())
+            || value.chars().any(char::is_whitespace)
+            || lower.contains("pending")
+            || lower.contains("replace")
+            || lower.contains("example")
+            || lower.contains("todo")
+        {
+            return Err(ConfigError::Invalid {
+                name,
+                reason: "must be a bounded opaque reference to approved governance evidence".into(),
+            });
+        }
+    }
+
+    let region_name = "CONTROL_PRIVACY_PROCESSING_REGION";
+    let region = lookup(region_name).ok_or(ConfigError::Missing(region_name))?;
+    if !matches!(
+        region.as_str(),
+        "paris" | "azure-france-central" | "azure-west-europe"
+    ) {
+        return Err(ConfigError::Invalid {
+            name: region_name,
+            reason: "must be paris, azure-france-central, or azure-west-europe".into(),
+        });
+    }
+    Ok(())
 }
 
 fn tenant_domain() -> Result<String, ConfigError> {
@@ -88,10 +165,13 @@ fn tenant_domain() -> Result<String, ConfigError> {
 }
 
 fn required(name: &'static str) -> Result<String, ConfigError> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(ConfigError::Missing(name))
+    crate::runtime_secret::required(name).map_err(|reason| {
+        if reason == format!("{name} is required") {
+            ConfigError::Missing(name)
+        } else {
+            ConfigError::Invalid { name, reason }
+        }
+    })
 }
 
 fn absolute_url(name: &'static str) -> Result<Url, ConfigError> {
@@ -126,4 +206,55 @@ fn trusted_origin(name: &'static str) -> Result<Url, ConfigError> {
         });
     }
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_mode_is_explicit_and_fail_closed() {
+        let absent = |_| None;
+        assert!(data_mode_with("synthetic", &absent).unwrap());
+        assert!(data_mode_with("personal", &absent).is_err());
+        assert!(data_mode_with("", &absent).is_err());
+        assert!(data_mode_with("production", &absent).is_err());
+    }
+
+    #[test]
+    fn personal_data_requires_approved_governance_and_an_allowed_eea_region() {
+        let approved = |name| {
+            Some(
+                match name {
+                    "CONTROL_PRIVACY_PROCESSING_REGION" => "paris",
+                    _ => "evidence://approved/2026-08-14",
+                }
+                .into(),
+            )
+        };
+        assert!(!data_mode_with("personal", &approved).unwrap());
+
+        let pending = |name| {
+            Some(
+                match name {
+                    "CONTROL_PRIVACY_PROCESSING_REGION" => "paris",
+                    "CONTROL_PRIVACY_DPIA_APPROVAL_REF" => "pending-controller-review",
+                    _ => "evidence://approved/2026-08-14",
+                }
+                .into(),
+            )
+        };
+        assert!(data_mode_with("personal", &pending).is_err());
+
+        let non_eea = |name| {
+            Some(
+                match name {
+                    "CONTROL_PRIVACY_PROCESSING_REGION" => "us-east",
+                    _ => "evidence://approved/2026-08-14",
+                }
+                .into(),
+            )
+        };
+        assert!(data_mode_with("personal", &non_eea).is_err());
+    }
 }

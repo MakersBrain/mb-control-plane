@@ -1,0 +1,26 @@
+schema_version: 1
+status: controller-approval-required
+production_enforced: false
+principles:
+  - each duration starts from a named event and has a documented lawful basis
+  - legal holds are scoped, approved, time-bounded and explicitly released
+  - immutable backups receive erasure tombstones before restored data is routable
+  - append-only audit facts are minimized and de-linked through the audit-subject mapping
+
+synthetic_development:
+  maximum_age_days: 30
+  action: delete environment and all associated volumes/backups
+
+policies:
+  user-directory: {trigger: account closure or controller instruction, duration: pending, action: erase-or-retain-minimum-required}
+  external-identity: {trigger: identity unlink or account closure, duration: pending, action: erase-and-revoke-sessions}
+  workshop-authority: {trigger: membership revocation or workshop closure, duration: pending, action: anonymize-or-retain-minimum-security-evidence}
+  invitations: {trigger: expiry, acceptance or revocation, duration: pending, action: erase-recipient-and-delivery-detail}
+  mail-delivery: {trigger: final delivery state, duration: pending, action: erase-recipient-and-payload}
+  operations-and-audit: {trigger: command or operation completion or audit-event creation, duration: pending, action: delete command responses and operation detail then delink any controller-approved retained audit minimum}
+  usage-and-entitlement: {trigger: accounting-period close or contract end, duration: pending, action: aggregate-or-delete-subject-linkage}
+  recovery: {trigger: successful creation, supersession or workshop closure, duration: pending, action: expire-object-and-preserve-erasure-tombstone}
+  telemetry: {trigger: event ingestion, duration: pending, action: delete}
+  rights-export-artifact: {trigger: export ready, duration: maximum 7 days or first consumption whichever occurs first, action: delete AEAD artifact and retain only tombstoned request evidence, rationale: technical data-minimization safety ceiling that the controller may shorten}
+  tenant-integration-credentials: {trigger: credential rotation or workshop deletion, duration: immediate replacement or deletion, action: remove the obsolete verifier and plaintext credential file}
+  tenant-controller-policy: {trigger: controller-defined, duration: controller-defined, action: controller-defined}

@@ -1,13 +1,25 @@
-.PHONY: check test build configure configure-tunnel compose-config compose-tunnel-config up up-tunnel down down-tunnel
+.PHONY: check test build topology-secret-check topology-odoo-isolation-check configure configure-tunnel compose-config compose-tunnel-config up up-tunnel down down-tunnel
 export CARGO_TARGET_DIR ?= /tmp/makersbrain-control-target
 
 check:
 	cargo fmt --check
+	python3 tools/validate_contract.py
+	python3 tools/test_compose_secret_canary.py
+	python3 tools/test_local_secret_bootstrap.py
+	python3 tools/test_dynamic_secret_boundary.py
+	python3 tools/test_privacy_deployment_gate.py
+	python3 tools/test_topology_odoo_isolation.py --self-test
 	cargo clippy --locked --all-targets -- -D warnings
 	npm --prefix web run check
 
 test:
 	cargo test --locked
+
+topology-secret-check:
+	./tools/test_docker_secret_subpath.sh
+
+topology-odoo-isolation-check:
+	python3 tools/test_topology_odoo_isolation.py
 
 build:
 	cargo build --locked --release

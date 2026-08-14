@@ -85,3 +85,90 @@ impl RauthyClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn user_observation_classifies_provider_failures_without_leaking_the_key() {
+        for (status, expected) in [
+            (401, IntegrationError::Unauthorized),
+            (
+                429,
+                IntegrationError::RateLimited {
+                    retry_after_seconds: None,
+                },
+            ),
+            (503, IntegrationError::Unavailable),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/auth/v1/users/subject-1"))
+                .and(header("authorization", "API-Key fixture-key"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = RauthyClient::new(
+                &format!("{}/auth/v1", server.uri()),
+                "fixture-key",
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .observe_user("subject-1", "artisan@example.test")
+                    .await,
+                Err(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_observation_rejects_identity_contract_drift() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/v1/users/subject-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"another-subject","email":"artisan@example.test"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RauthyClient::new(
+            &format!("{}/auth/v1", server.uri()),
+            "fixture-key",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .observe_user("subject-1", "artisan@example.test")
+                .await,
+            Err(IntegrationError::ContractDrift)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_revocation_treats_absence_as_idempotent_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v1/users/subject-1/logout"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        RauthyClient::new(
+            &format!("{}/auth/v1", server.uri()),
+            "fixture-key",
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .revoke_sessions("subject-1")
+        .await
+        .unwrap();
+    }
+}

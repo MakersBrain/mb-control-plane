@@ -34,7 +34,7 @@
 		<header class="topbar">
 			<div class="topbar-inner">
 				<a class="brand" href="/" aria-label="MakersBrain home"><BrandMark /><span>MakersBrain</span></a>
-				<nav class="global-nav" aria-label="Main navigation"><a href="/" class:active={page.url.pathname === '/'}>Workshops</a>{#if session.me.is_operator}<a href="/platform" class:active={page.url.pathname.startsWith('/platform')}>Platform</a>{/if}</nav>
+				<nav class="global-nav" aria-label="Main navigation"><a href="/" class:active={page.url.pathname === '/'}>Workshops</a><a href="/privacy" class:active={page.url.pathname.startsWith('/privacy')}>Your privacy</a>{#if session.me.is_operator}<a href="/platform" class:active={page.url.pathname.startsWith('/platform')}>Platform</a>{/if}</nav>
 				<div class="account-menu">
 					<a class="account-link" href={ACCOUNT_URL} target="_blank" rel="noreferrer">Account & security</a>
 					<span class="account-email">{session.me.email}</span>

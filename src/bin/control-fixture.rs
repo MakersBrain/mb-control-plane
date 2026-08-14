@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn authorized(headers: &HeaderMap) -> bool {
-    let expected = std::env::var("FIXTURE_TOKEN").unwrap_or_default();
+    let expected = makersbrain_control_plane::runtime_secret::environment("FIXTURE_TOKEN")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     headers.get("authorization").and_then(|v| v.to_str().ok())
         == Some(&format!("Bearer {expected}"))
 }
@@ -68,10 +71,6 @@ async fn mail(
         return Err(StatusCode::UNAUTHORIZED);
     }
     tracing::info!(
-        recipient = body
-            .get("to")
-            .and_then(|value| value.as_str())
-            .unwrap_or("invalid"),
         template = body
             .get("template")
             .and_then(|value| value.as_str())
@@ -83,7 +82,7 @@ async fn mail(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().json().init();
+    let _telemetry = makersbrain_control_plane::telemetry::init("makersbrain-control-fixture")?;
     let app = Router::new()
         .route("/health/live", get(|| async { "live" }))
         .route("/v1/tenants/{workshop}/{action}", post(tenant))

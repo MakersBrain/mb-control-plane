@@ -5,10 +5,11 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { formatInstant, sentence } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	let operations = $state<any[]>([]); let stateFilter = $state(''); let error = $state(''); let loading = $state(true);
+	import type { PlatformOperationResponse } from '$lib/generated/control-api';
+	let operations = $state<PlatformOperationResponse[]>([]); let stateFilter = $state(''); let error = $state(''); let loading = $state(true);
 	const workshopId = $derived(page.url.searchParams.get('workshop_id') ?? '');
 	$effect(() => { stateFilter; void load(); const timer = window.setInterval(() => void load(false), 5000); return () => window.clearInterval(timer); });
-	async function load(showError = true) { try { operations = await request<any[]>(`/v1/platform/operations?limit=200${stateFilter ? `&state=${stateFilter}` : ''}${workshopId ? `&workshop_id=${encodeURIComponent(workshopId)}` : ''}`); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
+	async function load(showError = true) { try { operations = await request<PlatformOperationResponse[]>(`/v1/platform/operations?limit=200${stateFilter ? `&state=${stateFilter}` : ''}${workshopId ? `&workshop_id=${encodeURIComponent(workshopId)}` : ''}`); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
 </script>
 
 <svelte:head><title>Platform operations · MakersBrain</title></svelte:head>

@@ -1,9 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 1,
+  "application_release_schema": "application-release.schema.json",
+  "public_openapi_baseline": "openapi-v1-baseline.json",
+  "capability_registry": {"path":"capability-registry-v1.json","version":1,"sha256":"528d089a90c5f869566eef1451bc4dea5aa1271190501d47996b06a36d091f01"},
   "release": "0.1.0",
-  "schema_release": "0014_operation_checkpoints",
-  "schema_compatibility": ">=0014_operation_checkpoints,<0015",
+  "schema_release": "0031_periodic_reconciliation_fleet_fence",
+  "schema_compatibility": ">=0024_worker_heartbeats,<0025",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "web": {"build_context": "control-plane/web", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
@@ -14,34 +17,85 @@
   "processes": {
     "migration": {"command": ["/usr/local/bin/control-migrate"], "run_before": ["api", "workers"]},
     "api": {"command": ["/usr/local/bin/control-api"], "port": 8080, "live": "/health/live", "ready": "/health/ready", "openapi": "/openapi.json"},
-    "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["identity-operations", "tenant-provisioning", "membership-provisioning", "invoice-capture", "inventory-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle"]},
+    "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["tenant-provisioning", "membership-provisioning", "invoice-capture", "inventory-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle", "release-adoption", "privacy-operations"]},
     "web": {"port": 8080, "live": "/health/live"},
     "docker_driver": {"command": ["/usr/local/bin/control-docker-driver"], "port": 8080, "live": "/health/live", "private": true},
     "backup_scheduler": {"command": ["/usr/local/bin/control-backup-scheduler"], "private": true, "cadence": "one due backup per workshop per 24 hours and one isolated recovery rehearsal per 30 days"}
     ,"document_extraction_broker": {"command": ["/usr/local/bin/document-extraction-broker"], "port": 8080, "live": "/health/live", "private": true, "allowed_models": ["prebuilt-invoice", "prebuilt-read"]}
   },
+  "secret_delivery": {
+    "local_transport": "Compose secret files mounted by exact process ownership",
+    "runtime_reference_prefix": "@/run/secrets/",
+    "rendered_configuration_gate": "tools/test_compose_secret_canary.py",
+    "production_transport": "approved secret-manager references resolved by the infrastructure driver",
+    "plaintext_in_rendered_configuration": false
+  },
+  "observability": {
+    "metrics_path": "/internal/metrics",
+    "authentication": "CONTROL_INTERNAL_TOKEN",
+    "traces": {
+      "protocol": "OTLP/HTTP protobuf",
+      "enabled_when": "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT is non-empty",
+      "privacy_safe_span_attributes": ["service.name", "http_request_method", "http_route", "operation_id", "operation_kind", "attempt", "reconciling"],
+      "durable_propagation_fields": ["control.operations.trace_parent", "control.operations.trace_state"],
+      "events_exported": false,
+      "required_region": "EEA"
+    },
+    "privacy_safe_labels": ["templated_route", "status_class", "queue", "release_adoption_state", "provider", "provider_operation", "provider_outcome", "integration", "integration_health"],
+    "forbidden_labels": ["email", "subject", "workshop_id", "operation_id", "token", "provider_payload"],
+    "prometheus_rules": "prometheus-alerts.yml",
+    "runbooks": [
+      "../docs/runbooks/queue-and-worker-failure.md",
+      "../docs/runbooks/failed-release-adoption.md",
+      "../docs/runbooks/failed-restore.md",
+      "../docs/runbooks/credential-rotation.md"
+    ]
+  },
   "required_environment": {
-    "migration": ["CONTROL_DATABASE_URL"],
-    "api": ["CONTROL_LISTEN", "CONTROL_DATABASE_URL", "CONTROL_PUBLIC_ORIGIN", "CONTROL_CORS_ORIGIN", "CONTROL_OIDC_ISSUER", "CONTROL_OIDC_AUDIENCE", "CONTROL_OIDC_DISCOVERY_URL", "CONTROL_TENANT_DOMAIN", "CONTROL_INTERNAL_TOKEN", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
-    "membership_worker": ["CONTROL_DATABASE_URL", "CONTROL_RAUTHY_ADMIN_URL", "CONTROL_RAUTHY_ADMIN_KEY", "CONTROL_SECRET_ROOT"],
-    "invoice_worker": ["CONTROL_DATABASE_URL", "CONTROL_TENANT_DOMAIN", "CONTROL_SECRET_ROOT", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
-    "inventory_worker": ["CONTROL_DATABASE_URL", "CONTROL_SECRET_ROOT", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
-    "document_extraction_broker": ["BROKER_LISTEN", "BROKER_TOKEN", "BROKER_AZURE_ENDPOINT", "BROKER_AZURE_KEY"],
-    "provisioning_worker": ["CONTROL_DATABASE_URL", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_SECRET_ROOT"],
-    "docker_driver": ["DRIVER_LISTEN", "DRIVER_TOKEN", "DRIVER_DOCKER_SOCKET", "DRIVER_DATABASE_URL", "DRIVER_POSTGRES_ADMIN_URL", "DRIVER_POSTGRES_HOST", "DRIVER_POSTGRES_PORT", "DRIVER_ODOO_POSTGRES_PASSWORD", "DRIVER_ODOO_BRIDGE_TOKEN", "DRIVER_ODOO_IMAGE", "DRIVER_POSTGRES_IMAGE", "DRIVER_DOCKER_NETWORK", "DRIVER_ODOO_VOLUME", "DRIVER_ODOO_UID", "DRIVER_ODOO_GID", "DRIVER_BACKUP_VOLUME", "DRIVER_ODOO_DATA_ROOT", "DRIVER_BACKUP_ROOT", "DRIVER_REDIS_ADDRESS", "DRIVER_SECRET_ROOT", "DRIVER_SECRET_VOLUME", "DRIVER_BACKUP_SECRET_VOLUME", "DRIVER_ROUTE_ROOT", "DRIVER_GATEWAY_CONTAINER", "DRIVER_ODOO_BASE_URL", "DRIVER_CONTROL_INTERNAL_URL", "DRIVER_CONTROL_INTERNAL_TOKEN", "DRIVER_RAUTHY_ADMIN_URL", "DRIVER_RAUTHY_ADMIN_KEY", "DRIVER_OIDC_ISSUER", "DRIVER_PUBLIC_SCHEME"],
+    "migration": ["CONTROL_DATABASE_URL", "CONTROL_DATA_MODE"],
+    "api": ["CONTROL_LISTEN", "CONTROL_DATABASE_URL", "CONTROL_DATA_MODE", "CONTROL_PUBLIC_ORIGIN", "CONTROL_CORS_ORIGIN", "CONTROL_OIDC_ISSUER", "CONTROL_OIDC_AUDIENCE", "CONTROL_OIDC_DISCOVERY_URL", "CONTROL_TENANT_DOMAIN", "CONTROL_INTERNAL_TOKEN", "CONTROL_RELEASE_PUBLISH_TOKEN", "CONTROL_INVITATION_SIGNING_KEY_ID", "CONTROL_INVITATION_VERIFICATION_KEYS_FILE", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN", "CONTROL_PRIVACY_EXPORT_KEY_ID", "CONTROL_PRIVACY_EXPORT_KEY", "CONTROL_PRIVACY_EXPORT_ROOT", "CONTROL_SECRET_ROOT"],
+    "membership_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_RAUTHY_ADMIN_URL", "CONTROL_RAUTHY_ADMIN_KEY", "CONTROL_SECRET_ROOT", "CONTROL_PAPERLESS_SECRET_ROOT"],
+    "invoice_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_SECRET_ROOT", "CONTROL_PAPERLESS_SECRET_ROOT", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
+    "inventory_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_SECRET_ROOT", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
+    "document_extraction_broker": ["BROKER_LISTEN", "BROKER_TOKEN"],
+    "provisioning_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN"],
+    "docker_driver": ["DRIVER_ENVIRONMENT", "DRIVER_LISTEN", "DRIVER_TOKEN", "DRIVER_PRIVACY_TOKEN", "DRIVER_DOCKER_SOCKET", "DRIVER_DATABASE_URL", "DRIVER_POSTGRES_ADMIN_URL", "DRIVER_POSTGRES_HOST", "DRIVER_POSTGRES_PORT", "DRIVER_ODOO_POSTGRES_PASSWORD", "DRIVER_ODOO_BRIDGE_TOKEN", "DRIVER_ODOO_IMAGE", "DRIVER_POSTGRES_IMAGE", "DRIVER_DOCKER_NETWORK", "DRIVER_ODOO_VOLUME", "DRIVER_ODOO_UID", "DRIVER_ODOO_GID", "DRIVER_BACKUP_VOLUME", "DRIVER_ODOO_DATA_ROOT", "DRIVER_BACKUP_ROOT", "DRIVER_REDIS_ADDRESS", "DRIVER_SECRET_ROOT", "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT", "DRIVER_BACKUP_SECRET_VOLUME", "DRIVER_JOB_SECRET_ROOT", "DRIVER_ROUTE_ROOT", "DRIVER_GATEWAY_CONTAINER", "DRIVER_ODOO_BASE_URL", "DRIVER_CONTROL_INTERNAL_URL", "DRIVER_RAUTHY_ADMIN_URL", "DRIVER_RAUTHY_ADMIN_KEY", "DRIVER_OIDC_ISSUER", "DRIVER_PUBLIC_SCHEME"],
     "backup_scheduler": ["CONTROL_DATABASE_URL", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN"],
-    "email_worker": ["CONTROL_DATABASE_URL", "CONTROL_MAIL_WEBHOOK_URL", "CONTROL_MAIL_WEBHOOK_TOKEN"]
+    "email_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_MAIL_WEBHOOK_URL", "CONTROL_MAIL_WEBHOOK_TOKEN", "CONTROL_PUBLIC_ORIGIN", "CONTROL_INVITATION_SIGNING_KEY_ID", "CONTROL_INVITATION_SIGNING_KEYS_FILE"]
+    ,"reconciliation_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_SECRET_ROOT"]
+    ,"lifecycle_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_PRIVACY_LOOKUP_KEY_ID", "CONTROL_PRIVACY_LOOKUP_KEY"]
+    ,"release_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_RELEASE_COSIGN_EXECUTABLE", "CONTROL_RELEASE_COSIGN_KEY_FILE", "CONTROL_RELEASE_SLSA_BUILDER_ID"]
+    ,"privacy_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_PRIVACY_LOOKUP_KEY_ID", "CONTROL_PRIVACY_LOOKUP_KEY", "CONTROL_PRIVACY_EXPORT_KEY_ID", "CONTROL_PRIVACY_EXPORT_KEY", "CONTROL_PRIVACY_EXPORT_ROOT", "CONTROL_PRIVACY_DRIVER_URL", "CONTROL_PRIVACY_DRIVER_TOKEN"]
   },
   "optional_environment": {
+    "personal_data_governance": ["CONTROL_PRIVACY_CONTROLLER_REF", "CONTROL_PRIVACY_PROCESSING_RECORD_REF", "CONTROL_PRIVACY_RETENTION_APPROVAL_REF", "CONTROL_PRIVACY_PROCESSOR_REGISTER_REF", "CONTROL_PRIVACY_DPIA_APPROVAL_REF", "CONTROL_PRIVACY_PROCESSING_REGION"],
+    "privacy_export_rotation": ["CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE"],
     "platform_operators": ["CONTROL_OPERATOR_EMAILS"],
-    "azure_document_extraction": ["BROKER_AZURE_API_VERSION", "BROKER_AZURE_POLL_INTERVAL_MS", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS"],
+    "azure_document_extraction": ["BROKER_AZURE_ENDPOINT", "BROKER_AZURE_KEY", "BROKER_AZURE_API_VERSION", "BROKER_AZURE_POLL_INTERVAL_MS", "CONTROL_AZURE_MONTHLY_PAGE_LIMIT", "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT", "CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS"],
     "inventory_vision_fallback": ["BROKER_VISION_PRIMARY", "BROKER_VISION_SECONDARY", "BROKER_OPENAI_ENDPOINT", "BROKER_OPENAI_KEY", "BROKER_OPENAI_MODEL", "BROKER_AZURE_MULTIMODAL_ENDPOINT", "BROKER_AZURE_MULTIMODAL_KEY", "BROKER_AZURE_MULTIMODAL_MODEL", "BROKER_GEMINI_ENDPOINT", "BROKER_GEMINI_KEY", "BROKER_GEMINI_MODEL", "BROKER_CLAUDE_ENDPOINT", "BROKER_CLAUDE_KEY", "BROKER_CLAUDE_MODEL", "BROKER_VISION_ENDPOINT", "BROKER_VISION_KEY", "BROKER_VISION_MODEL", "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT"],
     "inventory_product_lookup": ["BROKER_UPCITEMDB_ENDPOINT", "BROKER_UPCITEMDB_KEY"],
     "paperless": ["DRIVER_PAPERLESS_IMAGE"],
-    "portable_backups": ["DRIVER_BACKUP_AGENT_IMAGE", "BACKUP_S3_BUCKET", "BACKUP_S3_ENDPOINT", "BACKUP_S3_REGION", "BACKUP_S3_ACCESS_KEY_ID", "BACKUP_S3_SECRET_ACCESS_KEY", "RESTORE_S3_ACCESS_KEY_ID", "RESTORE_S3_SECRET_ACCESS_KEY", "BACKUP_AGE_RECIPIENT", "BACKUP_AGE_IDENTITY_FILE", "BACKUP_ENCRYPTION_KEY_ID", "BACKUP_RETENTION_DAYS", "CONTROL_BACKUP_SCHEDULER_ENABLED", "CONTROL_BACKUP_INTERVAL_SECONDS"]
+    "portable_backups": ["DRIVER_BACKUP_AGENT_IMAGE", "BACKUP_S3_BUCKET", "BACKUP_S3_ENDPOINT", "BACKUP_S3_REGION", "BACKUP_S3_ACCESS_KEY_ID", "BACKUP_S3_SECRET_ACCESS_KEY", "RESTORE_S3_ACCESS_KEY_ID", "RESTORE_S3_SECRET_ACCESS_KEY", "BACKUP_AGE_RECIPIENT", "BACKUP_AGE_IDENTITY_FILE", "BACKUP_ENCRYPTION_KEY_ID", "BACKUP_RETENTION_DAYS", "CONTROL_BACKUP_SCHEDULER_ENABLED", "CONTROL_BACKUP_INTERVAL_SECONDS"],
+    "opentelemetry": ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS", "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"]
+  },
+  "database_roles": {
+    "migration": "control",
+    "api": "control_api",
+    "membership_worker": "control_membership_worker",
+    "provisioning_worker": "control_provisioning_worker",
+    "invoice_worker": "control_invoice_worker",
+    "inventory_worker": "control_inventory_worker",
+    "email_worker": "control_email_worker",
+    "reconciliation_worker": "control_reconciliation_worker",
+    "lifecycle_worker": "control_lifecycle_worker",
+    "backup_scheduler": "control_backup_scheduler",
+    "release_worker": "control_release_worker",
+    "privacy_worker": "control_privacy_worker",
+    "docker_driver": "control_driver_ledger"
   },
   "volumes": {
     "control": ["postgresql_database"],
+    "privacy_exports": ["shared_api_privacy_worker_aead_artifacts", "seven_day_maximum", "single_use_cleanup"],
     "odoo_shared": ["postgresql_cluster", "filestore"],
     "paperless_tenant": ["postgresql_database", "data", "media", "consume"],
     "redis_shared": ["append_only_data"]
@@ -51,7 +105,7 @@
   "paperless": {"optional_module": "documents", "tested_version": "2.20.15", "deployment": "one container and PostgreSQL database per enabled workshop", "redis": "one shared Redis with a unique ACL user and key/channel prefix per workshop", "api_prefix": "/api", "oidc_provider": "openid_connect", "document_event": "/internal/v1/paperless/{workshop_id}/events"},
   "invoice_capture": {"optional_module": "invoice-capture", "depends_on": ["documents"], "azure_module": "azure-invoice-extraction", "azure_optional": true},
   "inventory_capture": {"optional_module": "inventory-capture", "azure_module": "azure-label-extraction", "azure_optional": true, "source_images_in_queue": false},
-  "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge", "mb_brand", "mb_workshop_pos"], "optional_modules": ["mb_ai_bridge", "mb_invoice_capture", "mb_inventory_capture", "mb_inventory_capture_catalogue"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another"},
+  "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge", "mb_brand", "mb_workshop_pos"], "optional_modules": ["mb_ai_bridge", "mb_invoice_capture", "mb_inventory_capture", "mb_inventory_capture_catalogue"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another; normal bridge requests require the distinct credential verifier stored in that selected tenant database"},
   "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
-  "rollback": {"application": "requires an application release compatible with 0014_operation_checkpoints", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
+  "rollback": {"application": "requires an application release compatible with 0024_worker_heartbeats", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
 }

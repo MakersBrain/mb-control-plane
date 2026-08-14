@@ -5,14 +5,14 @@
 	import WorkshopNav from '$lib/components/WorkshopNav.svelte';
 	import { formatInstant, isPending, roleLabel, sentence } from '$lib/format';
 	import { request, session } from '$lib/session.svelte';
-	import type { Integration, Member, WorkshopRole, WorkshopSummary } from '$lib/types';
+	import type { Integration, Invitation, Member, OwnershipTransfer, WorkshopRole, WorkshopSummary } from '$lib/types';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
 	let members = $state<Member[]>([]);
 	let integrations = $state<Integration[]>([]);
-	let invitations = $state<any[]>([]);
-	let transfers = $state<any[]>([]);
+	let invitations = $state<Invitation[]>([]);
+	let transfers = $state<OwnershipTransfer[]>([]);
 	let error = $state('');
 	let notice = $state('');
 	let busy = $state('');
@@ -37,9 +37,9 @@
 				request<Member[]>(`/v1/workshops/${id}/members`),
 				request<Integration[]>(`/v1/workshops/${id}/integrations`)
 			]);
-			if (workshop.role === 'owner' || workshop.role === 'studio_manager') invitations = await request<any[]>(`/v1/workshops/${id}/invitations`);
+			if (workshop.role === 'owner' || workshop.role === 'studio_manager') invitations = await request<Invitation[]>(`/v1/workshops/${id}/invitations`);
 			else invitations = [];
-			transfers = await request<any[]>(`/v1/workshops/${id}/ownership-transfers`);
+			transfers = await request<OwnershipTransfer[]>(`/v1/workshops/${id}/ownership-transfers`);
 			if (showError) error = '';
 		} catch (cause) {
 			if (showError) error = cause instanceof Error ? cause.message : String(cause);
@@ -58,11 +58,11 @@
 		if (!error) { invite.email = ''; inviteKey = crypto.randomUUID(); }
 	}
 	const resend = (invitationId: string) => act(`invite-${invitationId}`, () => request(`/v1/invitations/${invitationId}/resend`, { method: 'POST', headers: { 'idempotency-key': key() } }), 'A new single-use invitation link was sent.');
-	async function revoke(invitationId: string) { if (confirm('Revoke this invitation? Its link will stop working immediately.')) await act(`invite-${invitationId}`, () => request(`/v1/invitations/${invitationId}`, { method: 'DELETE' }), 'Invitation revoked.'); }
-	const changeRole = (user: string, role: string) => act(`member-${user}`, () => request(`/v1/workshops/${id}/members/${user}`, { method: 'PATCH', headers: { 'idempotency-key': key() }, body: JSON.stringify({ role }) }), 'Role update queued for reconciliation.');
-	async function remove(user: string) { if (confirm('Remove this person? Control-plane access is revoked immediately and connected services will converge in the background.')) await act(`member-${user}`, () => request(`/v1/workshops/${id}/members/${user}`, { method: 'DELETE', headers: { 'idempotency-key': key() } }), 'Member removed; downstream access revocation is in progress.'); }
-	async function transfer(user: string) { if (confirm('Ask this person to become the owner? You will become a studio manager only after they accept.')) await act(`member-${user}`, () => request(`/v1/workshops/${id}/ownership-transfers`, { method: 'POST', headers: { 'idempotency-key': key() }, body: JSON.stringify({ to_user_id: user }) }), 'Ownership transfer requested.'); }
-	const acceptTransfer = (transferId: string) => act(`transfer-${transferId}`, () => request(`/v1/ownership-transfers/${transferId}/accept`, { method: 'POST', headers: { 'idempotency-key': key() } }), 'Ownership transferred. Both accounts are being reconciled.');
+	async function revoke(invitationId: string) { if (confirm('Revoke this invitation? Its link will stop working immediately.')) await act(`invite-${invitationId}`, () => request(`/v1/invitations/${invitationId}`, { method: 'DELETE', headers: { 'idempotency-key': key() } }), 'Invitation revoked.'); }
+	const changeRole = (member: Member, role: string) => act(`member-${member.id}`, () => request(`/v1/workshops/${id}/members/${member.id}`, { method: 'PATCH', headers: { 'idempotency-key': key(), 'if-match': member.etag }, body: JSON.stringify({ role }) }), 'Role update queued for reconciliation.');
+	async function remove(member: Member) { if (confirm('Remove this person? Control-plane access is revoked immediately and connected services will converge in the background.')) await act(`member-${member.id}`, () => request(`/v1/workshops/${id}/members/${member.id}`, { method: 'DELETE', headers: { 'idempotency-key': key(), 'if-match': member.etag } }), 'Member removed; downstream access revocation is in progress.'); }
+	async function transfer(user: string) { if (confirm('Ask this person to become the owner? You will become a studio manager only after they accept.') && workshop) await act(`member-${user}`, () => request(`/v1/workshops/${id}/ownership-transfers`, { method: 'POST', headers: { 'idempotency-key': key(), 'if-match': `"workshop-${id}-v${workshop?.version}"` }, body: JSON.stringify({ to_user_id: user }) }), 'Ownership transfer requested.'); }
+	const acceptTransfer = (transfer: OwnershipTransfer) => act(`transfer-${transfer.id}`, () => request(`/v1/ownership-transfers/${transfer.id}/accept`, { method: 'POST', headers: { 'idempotency-key': key(), 'if-match': transfer.etag } }), 'Ownership transferred. Both accounts are being reconciled.');
 	const integrationReady = (integration: Integration) => integration.health === 'ready' && integration.applied_epoch >= integration.desired_epoch;
 	function lastReconciliation(member: Member): string {
 		const observed = Object.values(member.targets).map((target) => target.observed_at).filter((value): value is string => !!value).sort();
@@ -82,7 +82,7 @@
 
 {#each transfers as transfer (transfer.id)}
 	{#if transfer.can_accept}
-		<aside class="card row transfer"><div><strong>Ownership transfer waiting for you</strong><div class="muted">Accept before {formatInstant(transfer.expires_at)}. The current owner keeps ownership until you do.</div></div><button disabled={busy === `transfer-${transfer.id}`} onclick={() => acceptTransfer(transfer.id)}>{busy === `transfer-${transfer.id}` ? 'Accepting…' : 'Accept ownership'}</button></aside>
+		<aside class="card row transfer"><div><strong>Ownership transfer waiting for you</strong><div class="muted">Accept before {formatInstant(transfer.expires_at)}. The current owner keeps ownership until you do.</div></div><button disabled={busy === `transfer-${transfer.id}`} onclick={() => acceptTransfer(transfer)}>{busy === `transfer-${transfer.id}` ? 'Accepting…' : 'Accept ownership'}</button></aside>
 	{/if}
 {/each}
 
@@ -98,10 +98,10 @@
 						{/each}
 					</div>
 				</div>
-				<label><span class="visually-hidden">Role for {member.email}</span><select value={member.role} disabled={!canManage || member.role === 'owner' || busy === `member-${member.id}`} onchange={(event) => changeRole(member.id, event.currentTarget.value)}><option value="viewer">Viewer</option><option value="artisan">Artisan</option><option value="accountant">Accountant</option><option value="studio_manager">Studio manager</option>{#if member.role === 'owner'}<option value="owner">Owner</option>{/if}</select></label>
+				<label><span class="visually-hidden">Role for {member.email}</span><select value={member.role} disabled={!canManage || member.role === 'owner' || busy === `member-${member.id}`} onchange={(event) => changeRole(member, event.currentTarget.value)}><option value="viewer">Viewer</option><option value="artisan">Artisan</option><option value="accountant">Accountant</option><option value="studio_manager">Studio manager</option>{#if member.role === 'owner'}<option value="owner">Owner</option>{/if}</select></label>
 				<div class="actions">
 					{#if canTransfer && member.id !== session.me?.id && member.role !== 'owner'}<button class="secondary" disabled={busy === `member-${member.id}`} onclick={() => transfer(member.id)}>Transfer ownership</button>{/if}
-					{#if canManage && member.id !== session.me?.id && member.role !== 'owner'}<button class="danger" disabled={busy === `member-${member.id}`} onclick={() => remove(member.id)}>Remove</button>{/if}
+					{#if canManage && member.id !== session.me?.id && member.role !== 'owner'}<button class="danger" disabled={busy === `member-${member.id}`} onclick={() => remove(member)}>Remove</button>{/if}
 				</div>
 				{#if member.operation_id && (isPending(member.operation_state) || member.operation_state === 'dead_letter')}<div class="member-operation"><OperationCard id={member.operation_id} compact onsettled={load} /></div>{/if}
 			</article>

@@ -6,6 +6,9 @@
 		{ href: '/platform/users', label: 'Accounts' },
 		{ href: '/platform/operations', label: 'Operations' },
 		{ href: '/platform/status', label: 'Health' },
+		{ href: '/platform/releases', label: 'Releases' },
+		{ href: '/platform/privacy', label: 'Privacy' },
+		{ href: '/platform/roles', label: 'Roles' },
 		{ href: '/platform/email', label: 'Email' },
 		{ href: '/platform/audit', label: 'Audit journal' }
 	];

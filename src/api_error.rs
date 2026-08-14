@@ -11,6 +11,9 @@ pub enum ApiError {
     Conflict(&'static str),
     Validation(&'static str),
     Precondition(&'static str),
+    PreconditionFailed(&'static str),
+    PrivacyGate(&'static str),
+    Gone(&'static str),
     Internal(anyhow::Error),
 }
 
@@ -36,6 +39,17 @@ impl IntoResponse for ApiError {
                 "precondition_required",
                 Some(*message),
             ),
+            Self::PreconditionFailed(message) => (
+                StatusCode::PRECONDITION_FAILED,
+                "precondition_failed",
+                Some(*message),
+            ),
+            Self::PrivacyGate(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "privacy_production_gate",
+                Some(*message),
+            ),
+            Self::Gone(message) => (StatusCode::GONE, "gone", Some(*message)),
             Self::Internal(error) => {
                 tracing::error!(error = %format_args!("{error:#}"), "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
@@ -55,6 +69,14 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static("Bearer"),
             );
         }
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response.headers_mut().insert(
+            header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("no-referrer"),
+        );
         response
     }
 }

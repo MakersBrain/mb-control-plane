@@ -1,21 +1,21 @@
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
 use crate::integrations::extraction::ExtractionBrokerClient;
 use crate::integrations::odoo::{
-    EntitlementCommand, MembershipCommand, ModuleEnableCommand, OdooClient, TenantBootstrapCommand,
+    EntitlementCommand, MembershipCommand, ModuleEnableCommand, ModuleRestrictCommand, OdooClient,
 };
 use crate::integrations::paperless::PaperlessClient;
 use crate::integrations::rauthy::RauthyClient;
 use crate::persistence::{LeasedOperation, OperationOutcome, Store};
+use crate::privacy_crypto;
 
-const QUEUES: [&str; 8] = [
-    "identity-operations",
+const QUEUES: [&str; 9] = [
     "tenant-provisioning",
     "membership-provisioning",
     "invoice-capture",
@@ -23,18 +23,66 @@ const QUEUES: [&str; 8] = [
     "email-delivery",
     "tenant-reconciliation",
     "tenant-lifecycle",
+    "release-adoption",
+    "privacy-operations",
 ];
+const TENANT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
     if !QUEUES.contains(&queue) {
         anyhow::bail!("unknown worker queue {queue}")
     }
+    if queue == "release-adoption" {
+        crate::workers::release::validate_configuration()?;
+    }
+    if matches!(queue, "tenant-lifecycle" | "privacy-operations") {
+        privacy_crypto::validate_configuration()
+            .map_err(|_| anyhow::anyhow!("privacy lookup encryption is not configured"))?;
+    }
+    if queue == "privacy-operations" {
+        privacy_crypto::validate_export_configuration()
+            .map_err(|_| anyhow::anyhow!("privacy export encryption is not configured"))?;
+    }
     let worker_id = format!("{queue}-{}", Uuid::new_v4());
+    let release_id = std::env::var("CONTROL_RELEASE_ID")
+        .ok()
+        .filter(|value| {
+            (1..=200).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("CONTROL_RELEASE_ID must name the immutable control image release")
+        })?;
+    store.start_worker(&worker_id, queue, &release_id).await?;
     tracing::info!(queue,worker=%worker_id,"worker started");
+    let mut next_privacy_export_cleanup = Instant::now();
+    let mut next_tenant_reconciliation = Instant::now();
     loop {
         tokio::select! {
             _=tokio::time::sleep(Duration::from_secs(2))=>{
+                if !store.heartbeat_worker(&worker_id,None).await? {
+                    anyhow::bail!("worker heartbeat registration disappeared")
+                }
+                if queue == "tenant-reconciliation" {
+                    admit_capability_restriction(&store).await?;
+                    if Instant::now() >= next_tenant_reconciliation {
+                        let admitted = admit_periodic_tenant_reconciliation(&store).await?;
+                        tracing::info!(admitted,"admitted periodic tenant reconciliation operations");
+                        next_tenant_reconciliation = Instant::now() + TENANT_RECONCILIATION_INTERVAL;
+                    }
+                }
+                if queue == "privacy-operations" && Instant::now() >= next_privacy_export_cleanup {
+                    let deleted = crate::workers::privacy::cleanup_export_artifacts(&store)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("privacy export artifact cleanup failed"))?;
+                    if deleted > 0 {
+                        tracing::info!(deleted,"purged expired or consumed privacy export artifacts");
+                    }
+                    next_privacy_export_cleanup = Instant::now() + Duration::from_secs(60);
+                }
                 if let Some(operation)=store.lease(queue,&worker_id).await?{
+                    if !store.heartbeat_worker(&worker_id,Some(operation.id)).await? {
+                        anyhow::bail!("worker heartbeat registration disappeared")
+                    }
                     let heartbeat_store = store.clone();
                     let heartbeat_operation_id = operation.id;
                     let heartbeat_worker = operation.leased_by.clone();
@@ -43,17 +91,59 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
                         loop {
                             tokio::time::sleep(Duration::from_secs(20)).await;
                             match heartbeat_store.renew_lease(heartbeat_operation_id, &heartbeat_worker, heartbeat_attempt).await {
-                                Ok(true) => {}
+                                Ok(true) => {
+                                    if let Err(error)=heartbeat_store.heartbeat_worker(&heartbeat_worker,Some(heartbeat_operation_id)).await {
+                                        tracing::warn!(operation=%heartbeat_operation_id,error=%error,"worker heartbeat failed");
+                                    }
+                                }
                                 Ok(false) => break,
                                 Err(error) => tracing::warn!(operation=%heartbeat_operation_id,error=%error,"operation lease heartbeat failed"),
                             }
                         }
                     });
-                    let result = handle(&store,&operation).await;
+                    let span = tracing::info_span!(
+                        "durable_operation",
+                        operation_id = %operation.id,
+                        operation_kind = %operation.kind,
+                        attempt = operation.attempt,
+                        reconciling = operation.reconciling
+                    );
+                    if let Some(trace_parent) = operation.trace_parent.as_deref() {
+                        let mut carrier = std::collections::HashMap::from([(
+                            "traceparent".to_owned(),
+                            trace_parent.to_owned(),
+                        )]);
+                        if let Some(trace_state) = operation.trace_state.as_deref() {
+                            carrier.insert("tracestate".to_owned(), trace_state.to_owned());
+                        }
+                        let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&carrier)
+                        });
+                        if span.set_parent(parent).is_err() {
+                            tracing::warn!(
+                                error_class = "trace_parent_rejected",
+                                "durable operation trace context was not attached"
+                            );
+                        }
+                    }
+                    let result = handle(&store,&operation).instrument(span).await;
                     if operation.kind == "tenant.lifecycle"
                         && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
                     {
-                        lifecycle_failed(&store, &operation).await;
+                        crate::workers::lifecycle::failed(&store, &operation).await;
+                    }
+                    if operation.kind == "odoo.release.adopt"
+                        && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
+                    {
+                        crate::workers::release::failed(&store, &operation).await;
+                    }
+                    if operation.kind == "module.enable"
+                        && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
+                        && let (Some(workshop),Some(module_key))=(operation.workshop_id,operation.payload.get("module_key").and_then(Value::as_str))
+                        && let Err(error)=sqlx::query("update control.workshop_modules set state='failed',version=version+1 where workshop_id=$1 and module_key=$2 and operation_id=$3 and state in ('requested','installing')")
+                            .bind(workshop).bind(module_key).bind(operation.id).execute(store.pool()).await
+                    {
+                        tracing::error!(operation=%operation.id,error=%error,"could not mark capability activation failed");
                     }
                     let outcome=match result{
                         Ok(())=>OperationOutcome::Succeeded,
@@ -63,12 +153,80 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
                     };
                     heartbeat.abort();
                     store.finish(&operation,outcome).await?;
+                    store.heartbeat_worker(&worker_id,None).await?;
                 }
             }
-            _=crate::shutdown_signal()=>break,
+            _=crate::shutdown_signal()=>{
+                store.shutdown_worker(&worker_id).await?;
+                break
+            },
         }
     }
     Ok(())
+}
+
+async fn admit_periodic_tenant_reconciliation(store: &Store) -> anyhow::Result<usize> {
+    let domain = std::env::var("CONTROL_TENANT_DOMAIN")
+        .map_err(|_| anyhow::anyhow!("CONTROL_TENANT_DOMAIN is required for reconciliation"))?;
+    let tenants = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
+        "select w.id,d.id,w.slug,d.database_ref,d.public_hostname,
+                exists(select 1 from control.workshop_modules m
+                       where m.workshop_id=w.id and m.module_key='documents'
+                         and m.state='enabled')
+           from control.workshops w
+           join control.odoo_databases d on d.workshop_id=w.id
+          where w.status in ('trial','active','past_due','restricted','suspended')
+            and d.kind='primary' and d.deleted_at is null
+            and d.public_hostname is not null
+            and not exists(
+                select 1 from control.release_fleet_runs f
+                 where f.state in ('preflighting','preparing','paused','activating')
+            )
+            and not exists(
+                select 1 from control.operations o
+                 where o.workshop_id=w.id
+                   and o.state in ('pending','in_flight','awaiting_reconciliation')
+                   and o.kind in ('tenant.provision','tenant.reconcile',
+                                  'tenant.lifecycle','odoo.release.adopt')
+            )
+          order by w.id",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    let bucket = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / TENANT_RECONCILIATION_INTERVAL.as_secs();
+    let mut admitted = 0;
+    for (workshop, database_id, slug, database_ref, public_hostname, paperless_enabled) in tenants {
+        let payload = json!({
+            "database_id":database_id,
+            "database_ref":database_ref,
+            "public_hostname":public_hostname,
+            "paperless_hostname":format!("docs-{slug}.{domain}"),
+            "paperless_enabled":paperless_enabled,
+            "reason":"periodic_drift_reconciliation",
+        });
+        let mut tx = store.begin().await?;
+        Store::enqueue(
+            &mut tx,
+            crate::persistence::NewOperation {
+                kind: crate::domain::OperationKind::TenantReconcile,
+                workshop_id: Some(workshop),
+                target_user_id: None,
+                desired_epoch: None,
+                payload: &payload,
+                requested_by: None,
+                correlation_id: Uuid::new_v4(),
+                idempotency_key: &format!("periodic-reconcile:{workshop}:{bucket}"),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        admitted += 1;
+    }
+    Ok(admitted)
 }
 
 async fn handle(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
@@ -76,13 +234,21 @@ async fn handle(store: &Store, operation: &LeasedOperation) -> Result<(), Integr
     match operation.kind.as_str() {
         "membership.reconcile" => membership(store, operation).await,
         "entitlement.apply" => entitlement(store, operation).await,
-        "invoice.capture" => invoice(store, operation).await,
-        "inventory.capture.extract" => inventory_capture(store, operation).await,
+        "invoice.capture" => crate::workers::extraction::invoice(store, operation).await,
+        "inventory.capture.extract" => {
+            crate::workers::extraction::inventory_capture(store, operation).await
+        }
         "tenant.provision" => driver(store, operation, "provision").await.map(|_| ()),
         "tenant.reconcile" => driver(store, operation, "reconcile").await.map(|_| ()),
-        "tenant.lifecycle" => lifecycle(store, operation).await,
-        "email.delivery" => deliver_mail(store, operation).await,
+        "tenant.lifecycle" => crate::workers::lifecycle::run(store, operation).await,
+        "email.delivery" => crate::workers::email::deliver(store, operation).await,
         "module.enable" => enable_module(store, operation).await,
+        "module.restrict" => restrict_module(store, operation).await,
+        "odoo.release.adopt" => crate::workers::release::adopt(store, operation).await,
+        "privacy.retention" => crate::workers::privacy::retention(store, operation).await,
+        "privacy.data_subject_request" => {
+            crate::workers::privacy::data_subject_request(store, operation).await
+        }
         _ => Err(IntegrationError::ContractDrift),
     }
 }
@@ -97,6 +263,104 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
         .and_then(Value::as_str)
         .ok_or(IntegrationError::ContractDrift)?;
     let bundle = crate::modules::bundle(module_key).ok_or(IntegrationError::ContractDrift)?;
+    let registry_version = operation
+        .payload
+        .get("registry_version")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(IntegrationError::ContractDrift)?;
+    let release_id = operation
+        .payload
+        .get("application_release_id")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let entitlement_version = operation
+        .payload
+        .get("entitlement_version")
+        .and_then(Value::as_i64)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let resolved = operation
+        .payload
+        .get("resolved_implementation")
+        .ok_or(IntegrationError::ContractDrift)?;
+    let resolved_modules = resolved
+        .get("odoo_modules")
+        .and_then(Value::as_array)
+        .ok_or(IntegrationError::ContractDrift)?;
+    if resolved_modules.len() != bundle.odoo_modules.len()
+        || resolved_modules
+            .iter()
+            .zip(bundle.odoo_modules)
+            .any(|(actual, expected)| actual.as_str() != Some(expected))
+        || resolved.get("service").and_then(Value::as_str) != bundle.service
+    {
+        return Err(IntegrationError::ContractDrift);
+    }
+    let pinned = sqlx::query_as::<
+        _,
+        (
+            i32,
+            Option<String>,
+            Option<i64>,
+            Value,
+            String,
+            Option<Uuid>,
+        ),
+    >(
+        "select registry_version,application_release_id,entitlement_version,
+                resolved_implementation,state,operation_id
+         from control.workshop_modules where workshop_id=$1 and module_key=$2",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::NotFound)?;
+    if pinned.0 != registry_version
+        || pinned.1.as_deref() != Some(release_id)
+        || pinned.2 != Some(entitlement_version)
+        || pinned.3 != *resolved
+        || pinned.5 != Some(operation.id)
+    {
+        return Err(IntegrationError::ContractDrift);
+    }
+    let entitled = sqlx::query_scalar::<_, bool>(
+        "select exists(
+           select 1 from control.entitlements e
+           join control.tenant_release_adoptions a on a.workshop_id=e.workshop_id
+           where e.workshop_id=$1 and e.version=$3 and e.status='active'
+             and (e.expires_at is null or e.expires_at>now())
+             and (coalesce(e.limits->'capabilities','[]'::jsonb) ? $2
+                  or coalesce(e.limits->'capabilities','[]'::jsonb) ? '*')
+             and a.release_id=$4 and a.registry_version=$5 and a.state='active'
+         )",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .bind(entitlement_version)
+    .bind(release_id)
+    .bind(registry_version)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if !entitled {
+        return Err(IntegrationError::Rejected);
+    }
+    if pinned.4 == "requested" {
+        sqlx::query(
+            "update control.workshop_modules set state='installing',version=version+1
+             where workshop_id=$1 and module_key=$2 and operation_id=$3 and state='requested'",
+        )
+        .bind(workshop)
+        .bind(module_key)
+        .bind(operation.id)
+        .execute(store.pool())
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    } else if pinned.4 != "installing" {
+        return Err(IntegrationError::ContractDrift);
+    }
     if bundle.service == Some("paperless") {
         enable_paperless(store, operation, workshop).await?;
     } else if matches!(
@@ -130,7 +394,7 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
         .await?;
     }
     sqlx::query(
-        "update control.workshop_modules set state='enabled',enabled_at=now()
+        "update control.workshop_modules set state='enabled',enabled_at=now(),version=version+1
          where workshop_id=$1 and module_key=$2 and operation_id=$3",
     )
     .bind(workshop)
@@ -139,6 +403,248 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
     .execute(store.pool())
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
+    Ok(())
+}
+
+async fn admit_capability_restriction(store: &Store) -> anyhow::Result<()> {
+    let mut tx = store.begin().await?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            i64,
+            Uuid,
+            i32,
+            Option<String>,
+            Option<i64>,
+            Value,
+            String,
+        ),
+    >(
+        "select wm.workshop_id,wm.module_key,wm.version,wm.requested_by,
+                wm.registry_version,wm.application_release_id,wm.entitlement_version,
+                wm.resolved_implementation,
+                case when not exists(
+                    select 1 from control.tenant_release_adoptions a
+                     where a.workshop_id=wm.workshop_id and a.state='active'
+                       and a.release_id=wm.application_release_id
+                       and a.registry_version=wm.registry_version
+                ) then 'release_drift' else 'entitlement_inactive' end
+           from control.workshop_modules wm
+          where wm.state='enabled' and (
+            not exists(
+              select 1 from control.tenant_release_adoptions a
+               where a.workshop_id=wm.workshop_id and a.state='active'
+                 and a.release_id=wm.application_release_id
+                 and a.registry_version=wm.registry_version
+            ) or not exists(
+              select 1 from control.entitlements e
+               where e.workshop_id=wm.workshop_id and e.version=wm.entitlement_version
+                 and e.status='active' and (e.expires_at is null or e.expires_at>now())
+                 and (coalesce(e.limits->'capabilities','[]'::jsonb) ? wm.module_key
+                      or coalesce(e.limits->'capabilities','[]'::jsonb) ? '*')
+            )
+          ) order by wm.workshop_id,wm.module_key for update of wm skip locked limit 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((
+        workshop,
+        module_key,
+        version,
+        requested_by,
+        registry_version,
+        release_id,
+        entitlement_version,
+        resolved,
+        reason,
+    )) = row
+    else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    let payload = json!({
+        "module_key":module_key,"reason":reason,"registry_version":registry_version,
+        "application_release_id":release_id,"entitlement_version":entitlement_version,
+        "resolved_implementation":resolved
+    });
+    let idempotency_key = format!("module-restrict:{workshop}:{module_key}:{version}:{reason}");
+    let operation_id = Store::enqueue(
+        &mut tx,
+        crate::persistence::NewOperation {
+            kind: crate::domain::OperationKind::ModuleRestrict,
+            workshop_id: Some(workshop),
+            target_user_id: None,
+            desired_epoch: None,
+            payload: &payload,
+            requested_by: Some(requested_by),
+            correlation_id: Uuid::new_v4(),
+            idempotency_key: &idempotency_key,
+        },
+    )
+    .await?;
+    let changed = sqlx::query(
+        "update control.workshop_modules set state='restricting',operation_id=$4,
+                restriction_reason=$3,restriction_evidence=null,restricted_at=null,version=version+1
+          where workshop_id=$1 and module_key=$2 and state='enabled' and version=$5",
+    )
+    .bind(workshop)
+    .bind(&module_key)
+    .bind(&reason)
+    .bind(operation_id)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        anyhow::bail!("capability restriction admission lost its row lock");
+    }
+    tx.commit().await?;
+    tracing::info!(operation=%operation_id,reason,"capability restriction admitted");
+    Ok(())
+}
+
+async fn restrict_module(
+    store: &Store,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
+    let workshop = operation
+        .workshop_id
+        .ok_or(IntegrationError::ContractDrift)?;
+    let module_key = operation
+        .payload
+        .get("module_key")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let reason = operation
+        .payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let bundle = crate::modules::bundle(module_key).ok_or(IntegrationError::ContractDrift)?;
+    let pinned = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<Uuid>,
+            i32,
+            Option<String>,
+            Option<i64>,
+            Value,
+            Option<String>,
+            Option<Value>,
+        ),
+    >(
+        "select state,operation_id,registry_version,application_release_id,
+                entitlement_version,resolved_implementation,restriction_reason,
+                restriction_evidence
+           from control.workshop_modules where workshop_id=$1 and module_key=$2",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::NotFound)?;
+    if pinned.1 != Some(operation.id)
+        || operation
+            .payload
+            .get("registry_version")
+            .and_then(Value::as_i64)
+            != Some(i64::from(pinned.2))
+        || operation
+            .payload
+            .get("application_release_id")
+            .and_then(Value::as_str)
+            != pinned.3.as_deref()
+        || operation
+            .payload
+            .get("entitlement_version")
+            .and_then(Value::as_i64)
+            != pinned.4
+        || operation.payload.get("resolved_implementation") != Some(&pinned.5)
+    {
+        return Err(IntegrationError::ContractDrift);
+    }
+    if pinned.0 == "restricted" {
+        if pinned.6.as_deref() == Some(reason)
+            && pinned.7.as_ref().is_some_and(|value| value != &json!({}))
+        {
+            return Ok(());
+        }
+        return Err(IntegrationError::ContractDrift);
+    }
+    if pinned.0 != "restricting" {
+        return Err(IntegrationError::ContractDrift);
+    }
+    let evidence =
+        if bundle.service == Some("paperless") {
+            let tenant = sqlx::query_as::<_, (String, String, String)>(
+                "select d.database_ref,d.public_hostname,w.slug from control.odoo_databases d
+              join control.workshops w on w.id=d.workshop_id
+              where d.workshop_id=$1 and d.kind='primary' and d.deleted_at is null
+                and d.public_hostname is not null",
+            )
+            .bind(workshop)
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?
+            .ok_or(IntegrationError::NotFound)?;
+            driver_request(store, operation.id, workshop, "restrict", &json!({
+            "capability":module_key,"database_ref":tenant.0,"public_hostname":tenant.1,
+            "paperless_hostname":format!("docs-{}.{}", tenant.2, env("CONTROL_TENANT_DOMAIN")?)
+        })).await?
+        } else if !bundle.odoo_modules.is_empty() {
+            let (url, secret_ref, database_ref) = service(store, workshop, "odoo").await?;
+            OdooClient::new(
+                &url,
+                &secret(&secret_ref)?,
+                database_ref.as_deref(),
+                Duration::from_secs(120),
+            )
+            .map_err(|_| IntegrationError::ContractDrift)?
+            .restrict_modules(&ModuleRestrictCommand {
+                operation_key: format!("module-restrict:{workshop}:{module_key}:{}", operation.id),
+                workshop_id: workshop,
+                module_key: module_key.into(),
+                modules: bundle
+                    .odoo_modules
+                    .iter()
+                    .map(|item| (*item).into())
+                    .collect(),
+                reason: reason.into(),
+            })
+            .await?
+        } else {
+            json!({"adapter":"control_api_gate","write_blocked":true,
+               "historical_read_retained":true})
+        };
+    if evidence.get("write_blocked").and_then(Value::as_bool) != Some(true)
+        || evidence
+            .get("historical_read_retained")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(IntegrationError::ContractDrift);
+    }
+    let changed = sqlx::query(
+        "update control.workshop_modules set state='restricted',restriction_evidence=$4,
+                restricted_at=now(),version=version+1
+          where workshop_id=$1 and module_key=$2 and operation_id=$3 and state='restricting'",
+    )
+    .bind(workshop)
+    .bind(module_key)
+    .bind(operation.id)
+    .bind(evidence)
+    .execute(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(IntegrationError::ContractDrift);
+    }
     Ok(())
 }
 
@@ -231,14 +737,16 @@ async fn enable_paperless(
     Ok(())
 }
 
-fn env(name: &str) -> Result<String, IntegrationError> {
-    std::env::var(name)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+pub(crate) fn env(name: &str) -> Result<String, IntegrationError> {
+    crate::runtime_secret::environment(name)
+        .map_err(|_| IntegrationError::Unauthorized)?
+        .filter(|value| !value.trim().is_empty())
         .ok_or(IntegrationError::Unauthorized)
 }
 
-fn extraction_broker(timeout: Duration) -> Result<ExtractionBrokerClient, IntegrationError> {
+pub(crate) fn extraction_broker(
+    timeout: Duration,
+) -> Result<ExtractionBrokerClient, IntegrationError> {
     ExtractionBrokerClient::new(
         &env("CONTROL_EXTRACTION_BROKER_URL")?,
         &env("CONTROL_EXTRACTION_BROKER_TOKEN")?,
@@ -260,7 +768,8 @@ pub(crate) fn secret(reference: &str) -> Result<String, IntegrationError> {
     if !valid_reference {
         return Err(IntegrationError::ContractDrift);
     }
-    if let Ok(root) = std::env::var("CONTROL_SECRET_ROOT") {
+    let root_variable = secret_root_variable(reference);
+    if let Ok(root) = std::env::var(root_variable) {
         let root = std::fs::canonicalize(root).map_err(|_| IntegrationError::Unauthorized)?;
         let candidate = root.join(reference);
         let resolved =
@@ -291,7 +800,15 @@ pub(crate) fn secret(reference: &str) -> Result<String, IntegrationError> {
     env(&name)
 }
 
-async fn service(
+fn secret_root_variable(reference: &str) -> &'static str {
+    if reference.ends_with("/paperless") {
+        "CONTROL_PAPERLESS_SECRET_ROOT"
+    } else {
+        "CONTROL_SECRET_ROOT"
+    }
+}
+
+pub(crate) async fn service(
     store: &Store,
     workshop: Uuid,
     name: &str,
@@ -387,11 +904,19 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
     )
     .await?;
     let has_paperless_target = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.membership_targets
-         where workshop_id=$1 and user_id=$2 and target='paperless')",
+        "select exists(
+            select 1 from control.membership_targets t
+            where t.workshop_id=$1 and t.user_id=$2 and t.target='paperless'
+              and (not $3 or exists(
+                select 1 from control.workshop_modules m
+                 where m.workshop_id=t.workshop_id and m.module_key='documents'
+                   and m.state='enabled'
+              ))
+         )",
     )
     .bind(workshop)
     .bind(user)
+    .bind(active)
     .fetch_one(store.pool())
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
@@ -484,541 +1009,7 @@ async fn entitlement(store: &Store, operation: &LeasedOperation) -> Result<(), I
     Ok(())
 }
 
-async fn invoice(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
-    let workshop = operation
-        .workshop_id
-        .ok_or(IntegrationError::ContractDrift)?;
-    let database_ready = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.odoo_databases where workshop_id=$1 and kind='primary' and state='ready' and deleted_at is null)",
-    )
-    .bind(workshop)
-    .fetch_one(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    if !database_ready {
-        return Err(IntegrationError::Unavailable);
-    }
-    let document_id = operation
-        .payload
-        .get("document_id")
-        .and_then(Value::as_i64)
-        .ok_or(IntegrationError::ContractDrift)?;
-    let (paperless_url, paperless_ref, _) = service(store, workshop, "paperless").await?;
-    let paperless = PaperlessClient::new(
-        &paperless_url,
-        &secret(&paperless_ref)?,
-        Duration::from_secs(30),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
-    let metadata = paperless.document(document_id).await?;
-    let (mimetype, source) = paperless.original(document_id).await?;
-    let slug = sqlx::query_scalar::<_, String>("select slug from control.workshops where id=$1")
-        .bind(workshop)
-        .fetch_optional(store.pool())
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?
-        .ok_or(IntegrationError::NotFound)?;
-    let paperless_public_url = format!(
-        "https://docs-{slug}.{}/documents/{document_id}/details",
-        env("CONTROL_TENANT_DOMAIN")?
-    );
-    let digest = format!("{:x}", Sha256::digest(&source));
-    let (provider, invoice, confidence, pages) = if let Some(invoice) =
-        crate::invoice::structured(&source)
-    {
-        ("structured", invoice, json!({}), 1_i64)
-    } else {
-        if !module_enabled(store, workshop, "azure-invoice-extraction").await? {
-            tracing::info!(
-                workshop = %workshop,
-                document_id,
-                "unstructured invoice retained in Paperless because Azure extraction is disabled"
-            );
-            return Ok(());
-        }
-        reserve_azure(
-            store,
-            operation.id,
-            workshop,
-            estimated_pages(&source, &mimetype),
-        )
-        .await?;
-        throttle_azure_submission(store).await?;
-        let result = extraction_broker(Duration::from_secs(120))?
-            .invoice(&source, &mimetype)
-            .await?;
-        let invoice = result
-            .get("invoice")
-            .cloned()
-            .ok_or(IntegrationError::ContractDrift)?;
-        let confidence = result
-            .get("confidence")
-            .cloned()
-            .ok_or(IntegrationError::ContractDrift)?;
-        let pages = result
-            .get("pages")
-            .and_then(Value::as_i64)
-            .ok_or(IntegrationError::ContractDrift)?;
-        ("azure", invoice, confidence, pages)
-    };
-    let requires_review = crate::invoice::requires_review(&invoice, &confidence);
-    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
-    let odoo = OdooClient::new(
-        &odoo_url,
-        &secret(&odoo_ref)?,
-        database_ref.as_deref(),
-        Duration::from_secs(45),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
-    odoo.capture_invoice(&json!({"operation_key":format!("invoice:{workshop}:{document_id}:{digest}"),"workshop_id":workshop,"external_document_id":format!("paperless:{document_id}"),"source_document_url":paperless_public_url,"content_digest":digest,"source_filename":metadata.filename,"source_mimetype":mimetype,"source_base64":base64::engine::general_purpose::STANDARD.encode(&source),"provider":provider,"model":if provider=="azure"{"prebuilt-invoice"}else{"structured"},"page_count":pages,"requires_review":requires_review,"field_confidence":confidence,"invoice":invoice})).await?;
-    if let Ok(tags) = std::env::var("CONTROL_PAPERLESS_CAPTURED_TAG_IDS") {
-        let mut ids = tags
-            .split(',')
-            .filter_map(|v| v.trim().parse().ok())
-            .collect::<Vec<_>>();
-        ids.extend(metadata.tags.iter().copied());
-        ids.sort_unstable();
-        ids.dedup();
-        if !ids.is_empty() {
-            paperless.mark_capture(document_id, &ids).await?
-        }
-    }
-    Ok(())
-}
-
-async fn inventory_capture(
-    store: &Store,
-    operation: &LeasedOperation,
-) -> Result<(), IntegrationError> {
-    let workshop = operation
-        .workshop_id
-        .ok_or(IntegrationError::ContractDrift)?;
-    let capture_id = operation
-        .payload
-        .get("capture_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or(IntegrationError::ContractDrift)?;
-    let descriptors = operation
-        .payload
-        .get("assets")
-        .and_then(Value::as_array)
-        .filter(|assets| !assets.is_empty() && assets.len() <= 2)
-        .ok_or(IntegrationError::ContractDrift)?;
-    let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
-    let odoo = OdooClient::new(
-        &odoo_url,
-        &secret(&odoo_ref)?,
-        database_ref.as_deref(),
-        Duration::from_secs(45),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
-    if let Some(checkpoint) = store
-        .operation_checkpoint(operation.id)
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?
-    {
-        return deliver_inventory_checkpoint(&odoo, &checkpoint).await;
-    }
-    let mut assets = Vec::with_capacity(descriptors.len());
-    let mut input_digests = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
-        let asset_id = descriptor
-            .get("asset_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .ok_or(IntegrationError::ContractDrift)?;
-        let expected = descriptor
-            .get("content_sha256")
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)?
-            .to_ascii_lowercase();
-        let asset = odoo.inventory_asset(capture_id, asset_id).await?;
-        let actual = format!("{:x}", Sha256::digest(&asset.content));
-        if asset.sha256 != expected || actual != expected {
-            return Err(IntegrationError::ContractDrift);
-        }
-        input_digests.push(expected);
-        assets.push((asset_id, asset));
-    }
-    let attempt_id = Uuid::new_v4();
-    let operation_key = format!("inventory:{capture_id}:{}", operation.id);
-    if !module_enabled(store, workshop, "azure-label-extraction").await? {
-        let checkpoint = json!({"callbacks": [json!({
-            "operation_key": operation_key,
-            "capture_id": capture_id,
-            "attempt_id": attempt_id,
-            "kind": "ocr",
-            "provider": "manual-only",
-            "model": "none",
-            "version": env!("CARGO_PKG_VERSION"),
-            "state": "failed",
-            "input_digests": input_digests,
-            "normalized_response": {"candidates": [], "warnings": ["label extraction is not enabled"]},
-            "raw_response": {},
-            "usage": {"images": 0},
-            "failure_code": "provider_disabled"
-        })]});
-        store
-            .save_operation_checkpoint(operation, &checkpoint)
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
-        return deliver_inventory_checkpoint(&odoo, &checkpoint).await;
-    }
-    reserve_azure_inventory(store, operation.id, workshop, assets.len() as i64).await?;
-    let broker = extraction_broker(Duration::from_secs(120))?;
-    let mut tokens = Vec::new();
-    let mut codes = Vec::new();
-    let mut candidates = Vec::new();
-    for (asset_id, asset) in &assets {
-        throttle_azure_submission(store).await?;
-        let result = broker
-            .inventory_label(&asset.content, &asset.mimetype, &asset_id.to_string())
-            .await?;
-        let normalized = result
-            .get("normalized")
-            .cloned()
-            .ok_or(IntegrationError::ContractDrift)?;
-        tokens.extend(
-            normalized["ocr_tokens"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-        codes.extend(normalized["codes"].as_array().cloned().unwrap_or_default());
-        candidates.extend(
-            normalized["candidates"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-    }
-    let lot_focused = descriptors.iter().all(|descriptor| {
-        matches!(
-            descriptor.get("role").and_then(Value::as_str),
-            Some("lot_detail" | "crop" | "ocr_variant")
-        )
-    });
-    let needs_vision =
-        inventory_needs_vision(lot_focused, !codes.is_empty(), !candidates.is_empty());
-    let ocr_tokens = Value::Array(tokens.clone());
-    let ocr_callback = json!({
-        "operation_key": operation_key,
-        "capture_id": capture_id,
-        "attempt_id": attempt_id,
-        "kind": "ocr",
-        "provider": "azure-document-intelligence",
-        "model": "prebuilt-read",
-        "version": "broker-v1",
-        "state": "succeeded",
-        "input_digests": input_digests,
-        "normalized_response": {"ocr_tokens": tokens, "codes": codes, "candidates": candidates},
-        "raw_response": {"retained": false},
-        "usage": {"images": assets.len()}
-    });
-    let mut callbacks = vec![ocr_callback];
-    let tenant_allows_ai = operation
-        .payload
-        .pointer("/hints/allow_ai")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if needs_vision
-        && tenant_allows_ai
-        && module_enabled(store, workshop, "inventory-ai-fallback").await?
-    {
-        let vision_inputs = assets
-            .iter()
-            .zip(descriptors.iter())
-            .filter(|(_, descriptor)| {
-                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
-            })
-            .collect::<Vec<_>>();
-        reserve_inventory_ai(store, operation.id, workshop, vision_inputs.len() as i64).await?;
-        let vision_assets = assets
-            .iter()
-            .zip(descriptors.iter())
-            .filter(|(_, descriptor)| {
-                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
-            })
-            .map(|((asset_id, asset), _)| {
-                (
-                    asset_id.to_string(),
-                    asset.mimetype.clone(),
-                    asset.content.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let vision_digests = assets
-            .iter()
-            .zip(descriptors.iter())
-            .filter(|(_, descriptor)| {
-                descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
-            })
-            .map(|((_, asset), _)| asset.sha256.clone())
-            .collect::<Vec<_>>();
-        let provider_order = operation
-            .payload
-            .pointer("/hints/provider_order")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let vision = broker
-            .inventory_vision(&vision_assets, &ocr_tokens, &provider_order)
-            .await?;
-        let normalized = vision
-            .get("normalized")
-            .cloned()
-            .ok_or(IntegrationError::ContractDrift)?;
-        callbacks.push(json!({
-            "operation_key": format!("inventory:{capture_id}:{}:vision", operation.id),
-            "capture_id": capture_id,
-            "attempt_id": Uuid::new_v4(),
-            "parent_attempt_id": attempt_id,
-            "kind": "multimodal",
-            "provider": vision.get("provider").and_then(Value::as_str).unwrap_or("multimodal-vision"),
-            "model": vision.get("model").and_then(Value::as_str).unwrap_or("configured"),
-            "version": vision.get("version").and_then(Value::as_str).unwrap_or("broker-v1"),
-            "request_id": vision.get("request_id").and_then(Value::as_str).unwrap_or(""),
-            "state": "succeeded",
-            "input_digests": vision_digests,
-            "normalized_response": normalized,
-            "raw_response": {"retained": false},
-            "usage": vision.get("usage").cloned().unwrap_or_else(|| json!({"images":vision_assets.len()})),
-            "latency_ms": vision.get("latency_ms").and_then(Value::as_u64)
-        }));
-    }
-    let checkpoint = json!({"callbacks": callbacks});
-    store
-        .save_operation_checkpoint(operation, &checkpoint)
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    deliver_inventory_checkpoint(&odoo, &checkpoint).await
-}
-
-async fn deliver_inventory_checkpoint(
-    odoo: &OdooClient,
-    checkpoint: &Value,
-) -> Result<(), IntegrationError> {
-    let callbacks = checkpoint
-        .get("callbacks")
-        .and_then(Value::as_array)
-        .filter(|items| !items.is_empty() && items.len() <= 2)
-        .ok_or(IntegrationError::ContractDrift)?;
-    for callback in callbacks {
-        odoo.capture_inventory_result(callback).await?;
-    }
-    Ok(())
-}
-
-fn inventory_needs_vision(lot_focused: bool, has_codes: bool, has_lot_candidates: bool) -> bool {
-    !has_lot_candidates || (!lot_focused && !has_codes)
-}
-
-async fn reserve_azure_inventory(
-    store: &Store,
-    operation: Uuid,
-    workshop: Uuid,
-    images: i64,
-) -> Result<(), IntegrationError> {
-    reserve_inventory_usage(
-        store,
-        operation,
-        workshop,
-        images,
-        "azure_inventory_images",
-        "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT",
-    )
-    .await
-}
-
-async fn reserve_inventory_ai(
-    store: &Store,
-    operation: Uuid,
-    workshop: Uuid,
-    images: i64,
-) -> Result<(), IntegrationError> {
-    reserve_inventory_usage(
-        store,
-        operation,
-        workshop,
-        images,
-        "inventory_ai_images",
-        "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT",
-    )
-    .await
-}
-
-async fn reserve_inventory_usage(
-    store: &Store,
-    operation: Uuid,
-    workshop: Uuid,
-    images: i64,
-    metric: &str,
-    limit_variable: &str,
-) -> Result<(), IntegrationError> {
-    let limit = std::env::var(limit_variable)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(500);
-    let mut transaction = store
-        .begin()
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    let reserved = sqlx::query_scalar::<_, i64>(
-        "insert into control.usage_reservations(operation_id,workshop_id,metric,quantity)
-         values($1,$2,$3,$4)
-         on conflict(operation_id,metric) do nothing returning quantity",
-    )
-    .bind(operation)
-    .bind(workshop)
-    .bind(metric)
-    .bind(images)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    if reserved.is_none() {
-        transaction
-            .rollback()
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
-        return Ok(());
-    }
-    let quantity = sqlx::query_scalar::<_, i64>(
-        "insert into control.usage_counters(workshop_id,period,metric,quantity)
-         select $1,date_trunc('month',current_date)::date,$2,$3 where $3<=$4
-         on conflict(workshop_id,period,metric) do update set
-         quantity=control.usage_counters.quantity+excluded.quantity,updated_at=now()
-         where control.usage_counters.quantity+excluded.quantity<=$4 returning quantity",
-    )
-    .bind(workshop)
-    .bind(metric)
-    .bind(images)
-    .bind(limit)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    if quantity.is_none() {
-        transaction
-            .rollback()
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
-        return Err(IntegrationError::Rejected);
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    Ok(())
-}
-
-async fn module_enabled(
-    store: &Store,
-    workshop: Uuid,
-    module_key: &str,
-) -> Result<bool, IntegrationError> {
-    sqlx::query_scalar(
-        "select exists(select 1 from control.workshop_modules
-         where workshop_id=$1 and module_key=$2 and state='enabled')",
-    )
-    .bind(workshop)
-    .bind(module_key)
-    .fetch_one(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)
-}
-
-fn estimated_pages(source: &[u8], mimetype: &str) -> i64 {
-    if mimetype == "application/pdf" {
-        source
-            .windows(11)
-            .filter(|window| *window == b"/Type /Page")
-            .count()
-            .max(1) as i64
-    } else {
-        1
-    }
-}
-async fn reserve_azure(
-    store: &Store,
-    operation: Uuid,
-    workshop: Uuid,
-    pages: i64,
-) -> Result<(), IntegrationError> {
-    let limit = std::env::var("CONTROL_AZURE_MONTHLY_PAGE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1000);
-    let mut transaction = store
-        .begin()
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    let reserved = sqlx::query_scalar::<_, i64>(
-        "insert into control.usage_reservations(operation_id,workshop_id,metric,quantity)
-         values($1,$2,'azure_invoice_pages',$3)
-         on conflict(operation_id,metric) do nothing returning quantity",
-    )
-    .bind(operation)
-    .bind(workshop)
-    .bind(pages)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    if reserved.is_none() {
-        transaction
-            .rollback()
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
-        return Ok(());
-    }
-    let quantity=sqlx::query_scalar::<_,i64>("insert into control.usage_counters(workshop_id,period,metric,quantity) select $1,date_trunc('month',current_date)::date,'azure_invoice_pages',$2 where $2<=$3 on conflict(workshop_id,period,metric) do update set quantity=control.usage_counters.quantity+excluded.quantity,updated_at=now() where control.usage_counters.quantity+excluded.quantity<=$3 returning quantity")
-        .bind(workshop).bind(pages).bind(limit).fetch_optional(&mut *transaction).await.map_err(|_|IntegrationError::Unavailable)?;
-    if quantity.is_none() {
-        transaction
-            .rollback()
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
-        return Err(IntegrationError::Rejected);
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    Ok(())
-}
-
-async fn throttle_azure_submission(store: &Store) -> Result<(), IntegrationError> {
-    let interval_ms = std::env::var("CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_100)
-        .clamp(100, 60_000);
-    let interval_seconds = interval_ms as f64 / 1_000.0;
-    let delay_seconds = sqlx::query_scalar::<_, f64>(
-        "insert into control.provider_rate_limits(provider,next_allowed_at)
-         values('azure_document_analyze',now()+make_interval(secs=>$1))
-         on conflict(provider) do update set
-           next_allowed_at=greatest(control.provider_rate_limits.next_allowed_at,now())+make_interval(secs=>$1),
-           updated_at=now()
-         returning greatest(0,extract(epoch from
-           (next_allowed_at-make_interval(secs=>$1)-now())))::float8",
-    )
-    .bind(interval_seconds)
-    .fetch_one(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    if delay_seconds > 0.0 {
-        tokio::time::sleep(Duration::from_secs_f64(delay_seconds)).await;
-    }
-    Ok(())
-}
-
-async fn driver(
+pub(crate) async fn driver(
     store: &Store,
     operation: &LeasedOperation,
     action: &str,
@@ -1065,32 +1056,25 @@ async fn driver(
         if changed.rows_affected() != 1 {
             return Err(IntegrationError::ContractDrift);
         }
-        let odoo_config = value
-            .get("odoo_oidc")
-            .ok_or(IntegrationError::ContractDrift)?;
-        let oidc_client_id = odoo_config
-            .get("client_id")
+        let release_id = value
+            .get("release_id")
             .and_then(Value::as_str)
             .ok_or(IntegrationError::ContractDrift)?;
-        let oidc_issuer = odoo_config
-            .get("issuer")
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)?;
-        let (odoo_url, odoo_ref, database_ref) = service(store, workshop, "odoo").await?;
-        let odoo = OdooClient::new(
-            &odoo_url,
-            &secret(&odoo_ref)?,
-            database_ref.as_deref(),
-            Duration::from_secs(30),
+        let database_id = sqlx::query_scalar::<_, Uuid>(
+            "select id from control.odoo_databases where workshop_id=$1 and kind='primary' and database_ref=$2",
         )
-        .map_err(|_| IntegrationError::ContractDrift)?;
-        odoo.bootstrap_tenant(&TenantBootstrapCommand {
-            operation_key: format!("tenant-bootstrap:{workshop}"),
-            workshop_id: workshop,
-            oidc_client_id: oidc_client_id.into(),
-            oidc_issuer: oidc_issuer.into(),
-        })
-        .await?;
+        .bind(workshop)
+        .bind(expected_ref)
+        .fetch_one(store.pool())
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+        sqlx::query("insert into control.tenant_release_adoptions(id,workshop_id,database_id,release_id,registry_version,state,operation_id,target_schema_epoch,started_at,verified_at,activated_at,evidence) select $1,$2,$3,r.id,1,'active',$4,r.schema_epoch,now(),now(),now(),jsonb_build_object('source','tenant_provisioning','release_id',r.id) from control.application_releases r where r.id=$5 and r.status='active' on conflict(workshop_id,database_id,release_id) do nothing")
+            .bind(Uuid::new_v4()).bind(workshop).bind(database_id).bind(operation.id).bind(release_id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        let adoption_recorded=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.tenant_release_adoptions where workshop_id=$1 and database_id=$2 and release_id=$3 and state='active')")
+            .bind(workshop).bind(database_id).bind(release_id).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        if !adoption_recorded {
+            return Err(IntegrationError::ContractDrift);
+        }
         sqlx::query("update control.workshops set status='trial',version=version+1 where id=$1 and status='provisioning'").bind(workshop).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
         let owner = sqlx::query_as::<_, (Uuid, i32)>(
             "select user_id,authority_epoch from control.memberships where workshop_id=$1 and role='owner' and status='active'",
@@ -1136,6 +1120,23 @@ async fn driver_request(
     action: &str,
     payload: &Value,
 ) -> Result<Value, IntegrationError> {
+    driver_request_with_key(
+        operation_id,
+        workshop,
+        action,
+        &operation_id.to_string(),
+        payload,
+    )
+    .await
+}
+
+pub(crate) async fn driver_request_with_key(
+    _operation_id: Uuid,
+    workshop: Uuid,
+    action: &str,
+    idempotency_key: &str,
+    payload: &Value,
+) -> Result<Value, IntegrationError> {
     let url = env("CONTROL_DEPLOYMENT_DRIVER_URL")?;
     let token = env("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
     // First-time Odoo and Paperless initialization can legitimately take several
@@ -1147,7 +1148,7 @@ async fn driver_request(
             "{}/v1/tenants/{workshop}/{action}",
             url.trim_end_matches('/')
         ))
-        .header("idempotency-key", operation_id.to_string())
+        .header("idempotency-key", idempotency_key)
         .json(payload)
         .send()
         .await
@@ -1189,261 +1190,7 @@ async fn upsert_service(
     Ok(())
 }
 
-async fn lifecycle(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
-    let action = operation
-        .payload
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or(IntegrationError::ContractDrift)?;
-    sqlx::query(
-        "update control.operations set progress_percent=2,progress_phase='preparing',
-                progress_message='Preparing workshop recovery operation',progress_updated_at=now()
-         where id=$1 and state='in_flight'",
-    )
-    .bind(operation.id)
-    .execute(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    match action {
-        "snapshot" | "backup" | "delete" => {
-            let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
-            let database = payload_uuid(&operation.payload, "database_id")?;
-            sqlx::query("update control.odoo_databases set state='snapshotting' where id=$1 and state='ready'")
-                .bind(database).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-            sqlx::query("update control.workshop_recovery_points set state='creating',verification_state='pending' where id=$1 and state in ('queued','failed')")
-                .bind(recovery).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-            if action == "delete" {
-                let workshop = operation
-                    .workshop_id
-                    .ok_or(IntegrationError::ContractDrift)?;
-                sqlx::query("update control.workshop_deletions set state='quarantining',failure_class=null where workshop_id=$1")
-                    .bind(workshop).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-                sqlx::query("update control.workshops set status='deleting' where id=$1")
-                    .bind(workshop)
-                    .execute(store.pool())
-                    .await
-                    .map_err(|_| IntegrationError::Unavailable)?;
-            }
-        }
-        "restore" => {
-            let database = payload_uuid(&operation.payload, "database_id")?;
-            let safety = payload_uuid(&operation.payload, "safety_recovery_point_id")?;
-            sqlx::query("update control.odoo_databases set state='restoring' where id=$1")
-                .bind(database)
-                .execute(store.pool())
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-            sqlx::query("update control.workshop_recovery_points set state='creating',verification_state='pending' where id=$1 and state in ('queued','failed')")
-                .bind(safety).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-        }
-        "duplicate" => {
-            let target = payload_uuid(&operation.payload, "target_database_id")?;
-            sqlx::query("update control.odoo_databases set state='duplicating' where id=$1")
-                .bind(target)
-                .execute(store.pool())
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-        }
-        _ => return Err(IntegrationError::ContractDrift),
-    }
-    let value = driver(store, operation, "lifecycle").await?;
-    match action {
-        "snapshot" | "backup" | "delete" => {
-            let recovery = payload_uuid(&operation.payload, "recovery_point_id")?;
-            let result = value
-                .get("recovery_point")
-                .ok_or(IntegrationError::ContractDrift)?;
-            record_recovery_ready(store, recovery, result).await?;
-            let database = payload_uuid(&operation.payload, "database_id")?;
-            sqlx::query(if action == "delete" { "update control.odoo_databases set state='suspended' where id=$1 and state='snapshotting'" } else { "update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'" })
-                .bind(database)
-                .execute(store.pool())
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-            if action == "delete" {
-                let workshop = operation
-                    .workshop_id
-                    .ok_or(IntegrationError::ContractDrift)?;
-                let mut tx = store
-                    .begin()
-                    .await
-                    .map_err(|_| IntegrationError::Unavailable)?;
-                sqlx::query("update control.workshop_deletions set state='retained',quarantined_at=now(),failure_class=null where workshop_id=$1")
-                    .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-                sqlx::query(
-                    "update control.workshops set status='deleted',version=version+1 where id=$1",
-                )
-                .bind(workshop)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-                sqlx::query("update control.service_instances set health='suspended',safe_error_class=null,last_observed_at=now() where workshop_id=$1")
-                    .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-                tx.commit()
-                    .await
-                    .map_err(|_| IntegrationError::Unavailable)?;
-            }
-        }
-        "restore" => {
-            let database = payload_uuid(&operation.payload, "database_id")?;
-            let safety = payload_uuid(&operation.payload, "safety_recovery_point_id")?;
-            let result = value
-                .get("safety_recovery_point")
-                .ok_or(IntegrationError::ContractDrift)?;
-            record_recovery_ready(store, safety, result).await?;
-            if value.get("restore_status").and_then(Value::as_str) == Some("rolled_back") {
-                return Err(IntegrationError::Rejected);
-            }
-            let mut tx = store
-                .begin()
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-            sqlx::query("update control.odoo_databases set state='ready',last_restored_at=now() where id=$1")
-                .bind(database).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-            tx.commit()
-                .await
-                .map_err(|_| IntegrationError::Unavailable)?;
-        }
-        "duplicate" => {
-            let target = payload_uuid(&operation.payload, "target_database_id")?;
-            sqlx::query("update control.odoo_databases set state='ready' where id=$1 and kind='duplicate' and routable=false")
-                .bind(target).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-        }
-        _ => return Err(IntegrationError::ContractDrift),
-    }
-    Ok(())
-}
-
-async fn record_recovery_ready(
-    store: &Store,
-    recovery: Uuid,
-    result: &Value,
-) -> Result<(), IntegrationError> {
-    let string = |key| {
-        result
-            .get(key)
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)
-    };
-    let storage_ref = string("storage_ref")?;
-    let size_bytes = result
-        .get("size_bytes")
-        .and_then(Value::as_i64)
-        .ok_or(IntegrationError::ContractDrift)?;
-    let manifest_digest = string("manifest_digest")?;
-    let format_version = string("format_version")?;
-    let storage_location = string("storage_location")?;
-    let source_release = string("source_release")?;
-    let paperless_version = result.get("paperless_version").and_then(Value::as_str);
-    let encryption_key_id = result.get("encryption_key_id").and_then(Value::as_str);
-    let object_prefix = result.get("object_prefix").and_then(Value::as_str);
-    let archive_object_key = result.get("archive_object_key").and_then(Value::as_str);
-    let archive_size_bytes = result.get("archive_size_bytes").and_then(Value::as_i64);
-    let archive_digest = result.get("archive_digest").and_then(Value::as_str);
-    let retention_days = result
-        .get("retention_days")
-        .and_then(Value::as_i64)
-        .unwrap_or(35);
-    let components = result
-        .get("components")
-        .and_then(Value::as_array)
-        .ok_or(IntegrationError::ContractDrift)?;
-    let mut tx = store
-        .begin()
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$4,format_version=$5,storage_location=$6,source_release=$7,paperless_version=$8,encryption_key_id=$9,object_prefix=$10,expires_at=case when kind='backup' then now()+make_interval(days=>$11) else expires_at end,archive_object_key=$12,archive_size_bytes=$13,archive_digest=$14 where id=$1")
-        .bind(recovery).bind(storage_ref).bind(size_bytes).bind(manifest_digest).bind(format_version).bind(storage_location).bind(source_release).bind(paperless_version).bind(encryption_key_id).bind(object_prefix).bind(i32::try_from(retention_days).map_err(|_|IntegrationError::ContractDrift)?).bind(archive_object_key).bind(archive_size_bytes).bind(archive_digest).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-    sqlx::query("delete from control.workshop_recovery_components where recovery_point_id=$1")
-        .bind(recovery)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    for component in components {
-        let name = component
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)?;
-        let path = component
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)?;
-        let bytes = component
-            .get("size_bytes")
-            .and_then(Value::as_i64)
-            .ok_or(IntegrationError::ContractDrift)?;
-        let digest = component
-            .get("sha256")
-            .and_then(Value::as_str)
-            .ok_or(IntegrationError::ContractDrift)?;
-        let plaintext_digest = component.get("plaintext_sha256").and_then(Value::as_str);
-        sqlx::query("insert into control.workshop_recovery_components(recovery_point_id,component,object_key,size_bytes,digest,plaintext_digest,state,verified_at) values($1,$2,$3,$4,$5,$6,'verified',now())")
-            .bind(recovery).bind(name).bind(path).bind(bytes).bind(digest).bind(plaintext_digest).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-    }
-    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
-}
-
-async fn lifecycle_failed(store: &Store, operation: &LeasedOperation) {
-    let action = operation.payload.get("action").and_then(Value::as_str);
-    if matches!(action, Some("snapshot" | "backup" | "delete"))
-        && let Ok(database) = payload_uuid(&operation.payload, "database_id")
-        && let Err(error) = sqlx::query(
-            "update control.odoo_databases set state='ready' where id=$1 and state='snapshotting'",
-        )
-        .bind(database)
-        .execute(store.pool())
-        .await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not release snapshotting database state");
-    }
-    if action == Some("restore")
-        && let Ok(safety) = payload_uuid(&operation.payload, "safety_recovery_point_id")
-        && let Err(error) =
-            sqlx::query("update control.workshop_recovery_points set state='failed',verification_state='failed' where id=$1 and state='creating'")
-                .bind(safety)
-                .execute(store.pool())
-                .await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not mark restore safety snapshot failed");
-    }
-    let result = match action {
-        Some("snapshot" | "backup" | "delete") => {
-            payload_uuid(&operation.payload, "recovery_point_id").map(|id| {
-                (
-                    "update control.workshop_recovery_points set state='failed',verification_state='failed' where id=$1",
-                    id,
-                )
-            })
-        }
-        Some("restore") => payload_uuid(&operation.payload, "database_id").map(|id| {
-            (
-                "update control.odoo_databases set state='failed' where id=$1 and state='restoring'",
-                id,
-            )
-        }),
-        Some("duplicate") => payload_uuid(&operation.payload, "target_database_id").map(|id| {
-            (
-                "update control.odoo_databases set state='failed' where id=$1",
-                id,
-            )
-        }),
-        _ => Err(IntegrationError::ContractDrift),
-    };
-    if let Ok((query, id)) = result
-        && let Err(error) = sqlx::query(query).bind(id).execute(store.pool()).await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not mark lifecycle resource failed");
-    }
-    if action == Some("delete")
-        && let Some(workshop) = operation.workshop_id
-        && let Err(error) = sqlx::query("with failed as (update control.workshop_deletions set state='failed',failure_class='lifecycle_failed' where workshop_id=$1 returning previous_status) update control.workshops set status=failed.previous_status from failed where id=$1")
-            .bind(workshop).execute(store.pool()).await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not release failed workshop deletion");
-    }
-}
-
-fn payload_uuid(payload: &Value, key: &str) -> Result<Uuid, IntegrationError> {
+pub(crate) fn payload_uuid(payload: &Value, key: &str) -> Result<Uuid, IntegrationError> {
     payload
         .get(key)
         .and_then(Value::as_str)
@@ -1466,39 +1213,6 @@ async fn seed_membership_targets(
         )
         on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
         .bind(workshop).bind(user).bind(epoch).execute(&mut **tx).await.map_err(|_| IntegrationError::Unavailable)?;
-    Ok(())
-}
-
-async fn deliver_mail(store: &Store, operation: &LeasedOperation) -> Result<(), IntegrationError> {
-    let outbox = operation
-        .payload
-        .get("outbox_id")
-        .and_then(Value::as_str)
-        .and_then(|v| Uuid::parse_str(v).ok())
-        .ok_or(IntegrationError::ContractDrift)?;
-    let row=sqlx::query_as::<_,(String,String,Value)>("update control.outbox set state='sending',attempts=attempts+1 where id=$1 and state in('queued','deferred') returning recipient,template,payload").bind(outbox).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
-    let client = http_client(&env("CONTROL_MAIL_WEBHOOK_TOKEN")?, Duration::from_secs(30))?;
-    let response = client
-        .post(env("CONTROL_MAIL_WEBHOOK_URL")?)
-        .json(&json!({"to":row.0,"template":row.1,"data":row.2}))
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
-    if !response.status().is_success() {
-        sqlx::query("update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1").bind(outbox).execute(store.pool()).await.ok();
-        return Err(super_classify(response.status()));
-    }
-    sqlx::query("update control.outbox set state='sent',sent_at=now() where id=$1")
-        .bind(outbox)
-        .execute(store.pool())
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
 }
 
@@ -1531,6 +1245,37 @@ fn super_classify(status: reqwest::StatusCode) -> IntegrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workers::release::slsa_statement_matches;
+    use std::collections::BTreeMap;
+
+    fn release_manifest() -> crate::release::ApplicationReleaseManifest {
+        crate::release::ApplicationReleaseManifest {
+            schema_version: 1,
+            release_id: "odoo-2026.08.14-2cbc37c".into(),
+            source_commit: "2cbc37c000000000000000000000000000000000".into(),
+            odoo_version: "19.0".into(),
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            built_at: "2026-08-14T10:00:00Z".into(),
+            addons: BTreeMap::new(),
+            oca: BTreeMap::new(),
+            upgradeable_from: Vec::new(),
+            database_runtime_compatibility: BTreeMap::new(),
+            bridge_contract: ">=3.2.0,<4.0.0".into(),
+            schema_epoch: 42,
+            change_class: crate::release::ChangeClass::A,
+            required_postconditions: vec![
+                crate::release::Postcondition::RegistryLoad,
+                crate::release::Postcondition::Health,
+            ],
+            capability_registry_version: 1,
+            provenance: crate::release::ReleaseProvenance {
+                oci_ref: format!("registry.example/odoo@sha256:{}", "a".repeat(64)),
+                cosign_bundle_ref: "oci://signature".into(),
+                slsa_provenance_ref: "oci://provenance".into(),
+                sbom_ref: "oci://sbom".into(),
+            },
+        }
+    }
     #[test]
     fn secret_names_cannot_escape_environment_namespace() {
         assert_eq!(
@@ -1549,14 +1294,74 @@ mod tests {
         );
     }
     #[test]
+    fn paperless_credentials_use_the_dedicated_client_root() {
+        assert_eq!(
+            secret_root_variable("docker/00000000-0000-0000-0000-000000000000/paperless"),
+            "CONTROL_PAPERLESS_SECRET_ROOT"
+        );
+        assert_eq!(
+            secret_root_variable("docker/00000000-0000-0000-0000-000000000000/odoo"),
+            "CONTROL_SECRET_ROOT"
+        );
+    }
+    #[test]
     fn pdf_page_estimate_is_bounded_below() {
-        assert_eq!(estimated_pages(b"not a pdf", "application/pdf"), 1);
+        assert_eq!(
+            crate::workers::extraction::estimated_pages(b"not a pdf", "application/pdf"),
+            1
+        );
     }
     #[test]
     fn resolved_lot_crop_does_not_spend_a_multimodal_call() {
-        assert!(!inventory_needs_vision(true, false, true));
-        assert!(inventory_needs_vision(true, false, false));
-        assert!(inventory_needs_vision(false, false, true));
-        assert!(!inventory_needs_vision(false, true, true));
+        assert!(!crate::workers::extraction::inventory_needs_vision(
+            true, false, true
+        ));
+        assert!(crate::workers::extraction::inventory_needs_vision(
+            true, false, false
+        ));
+        assert!(crate::workers::extraction::inventory_needs_vision(
+            false, false, true
+        ));
+        assert!(!crate::workers::extraction::inventory_needs_vision(
+            false, true, true
+        ));
+    }
+
+    #[test]
+    fn slsa_provenance_binds_builder_source_and_image() {
+        let manifest = release_manifest();
+        let manifest_digest = format!("sha256:{}", "b".repeat(64));
+        let statement = json!({
+            "subject":[
+                {"name":"odoo","digest":{"sha256":"a".repeat(64)}},
+                {"name":"application-release.json","digest":{"sha256":"b".repeat(64)}}
+            ],
+            "predicate":{
+                "runDetails":{"builder":{"id":"https://ci.example/builders/odoo"}},
+                "buildDefinition":{"resolvedDependencies":[{
+                    "uri":"git+https://example.test/makersbrain",
+                    "digest":{"gitCommit":manifest.source_commit}
+                }]}
+            }
+        });
+        assert!(slsa_statement_matches(
+            &statement,
+            &manifest,
+            &manifest_digest,
+            "https://ci.example/builders/odoo"
+        ));
+        assert!(!slsa_statement_matches(
+            &statement,
+            &manifest,
+            &manifest_digest,
+            "https://ci.example/builders/other"
+        ));
+        let image_only = json!({"subject":[{"digest":{"sha256":"a".repeat(64)}}],"predicate":{"runDetails":{"builder":{"id":"https://ci.example/builders/odoo"}},"buildDefinition":{"resolvedDependencies":[{"digest":{"gitCommit":manifest.source_commit}}]}}});
+        assert!(!slsa_statement_matches(
+            &image_only,
+            &manifest,
+            &manifest_digest,
+            "https://ci.example/builders/odoo"
+        ));
     }
 }

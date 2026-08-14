@@ -4,10 +4,11 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { formatInstant } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	let workshops = $state<any[]>([]); let query = $state(''); let status = $state(''); let error = $state(''); let loading = $state(true);
+	import type { PlatformWorkshopResponse } from '$lib/generated/control-api';
+	let workshops = $state<PlatformWorkshopResponse[]>([]); let query = $state(''); let status = $state(''); let error = $state(''); let loading = $state(true);
 	const filtered = $derived(workshops.filter((item) => (!status || item.status === status) && (!query.trim() || `${item.display_name} ${item.slug}`.toLowerCase().includes(query.trim().toLowerCase()))));
 	$effect(() => { void load(); });
-	async function load() { try { workshops = await request<any[]>('/v1/platform/workshops'); error = ''; } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
+	async function load() { try { workshops = await request<PlatformWorkshopResponse[]>('/v1/platform/workshops'); error = ''; } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
 </script>
 
 <svelte:head><title>Platform workshops · MakersBrain</title></svelte:head>

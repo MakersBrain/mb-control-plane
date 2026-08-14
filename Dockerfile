@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
+FROM ghcr.io/sigstore/cosign/cosign@sha256:b29487e48205d875c324c79583e2806d9d269c0fa299e0861bbec023d8430c8b AS cosign
+
 FROM rust:1.96-bookworm AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
@@ -35,6 +37,7 @@ COPY --from=builder /out/control-fixture /usr/local/bin/control-fixture
 COPY --from=builder /out/control-docker-driver /usr/local/bin/control-docker-driver
 COPY --from=builder /out/control-backup-scheduler /usr/local/bin/control-backup-scheduler
 COPY --from=builder /out/document-extraction-broker /usr/local/bin/document-extraction-broker
+COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign
 USER 10001:10001
 EXPOSE 8080
 CMD ["/usr/local/bin/control-api"]

@@ -8,10 +8,8 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    makersbrain_control_plane::startup_config::validate_process("backup_scheduler")?;
+    let _telemetry = makersbrain_control_plane::telemetry::init("makersbrain-backup-scheduler")?;
     let store = Store::connect(&makersbrain_control_plane::Config::database_url()?).await?;
     let interval = std::env::var("CONTROL_BACKUP_INTERVAL_SECONDS")
         .ok()
@@ -21,7 +19,9 @@ async fn main() -> anyhow::Result<()> {
     let enabled = std::env::var("CONTROL_BACKUP_SCHEDULER_ENABLED")
         .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
     let driver_url = std::env::var("CONTROL_DEPLOYMENT_DRIVER_URL")?;
-    let driver_token = std::env::var("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
+    let driver_token =
+        makersbrain_control_plane::runtime_secret::required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
+            .map_err(anyhow::Error::msg)?;
     let client = reqwest::Client::new();
     if !enabled {
         tracing::info!("nightly workshop backup scheduling is disabled");

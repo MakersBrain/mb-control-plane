@@ -4,10 +4,11 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { formatInstant, sentence } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	let events = $state<any[]>([]); let query = $state(''); let error = $state(''); let loading = $state(true);
+	import type { AuditEventResponse } from '$lib/generated/control-api';
+	let events = $state<AuditEventResponse[]>([]); let query = $state(''); let error = $state(''); let loading = $state(true);
 	const filtered = $derived(events.filter((item) => !query.trim() || JSON.stringify(item).toLowerCase().includes(query.trim().toLowerCase())));
 	$effect(() => { void load(); });
-	async function load() { try { events = await request<any[]>('/v1/platform/audit-events?limit=200'); error = ''; } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
+	async function load() { try { events = await request<AuditEventResponse[]>('/v1/platform/audit-events?limit=200'); error = ''; } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
 	const detail = (value: Record<string, unknown>) => Object.entries(value || {}).map(([key, item]) => `${sentence(key)}: ${String(item)}`).join(' · ');
 </script>
 

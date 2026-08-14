@@ -11,6 +11,7 @@ use super::{bounded_body, classify_status};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 15 * 1024 * 1024;
+const MAX_PRIVACY_EXPORT_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct OdooClient {
@@ -49,6 +50,7 @@ pub struct TenantBootstrapCommand {
     pub workshop_id: Uuid,
     pub oidc_client_id: String,
     pub oidc_issuer: String,
+    pub bridge_token: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +59,29 @@ pub struct ModuleEnableCommand {
     pub workshop_id: Uuid,
     pub module_key: String,
     pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleRestrictCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+    pub module_key: String,
+    pub modules: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErasureReplayCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+    pub user_id: Uuid,
+    pub subject_key: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrivacyExportCommand {
+    pub workshop_id: Uuid,
+    pub user_id: Uuid,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -124,6 +149,15 @@ impl OdooClient {
         path: &str,
         body: &T,
     ) -> Result<R, IntegrationError> {
+        self.post_bounded(path, body, MAX_RESPONSE_BYTES).await
+    }
+
+    async fn post_bounded<T: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &T,
+        maximum: usize,
+    ) -> Result<R, IntegrationError> {
         let url = self
             .base_url
             .join(path)
@@ -142,11 +176,33 @@ impl OdooClient {
                 }
             })?;
         let status = response.status();
-        let bytes = bounded_body(response, MAX_RESPONSE_BYTES).await?;
+        let bytes = bounded_body(response, maximum).await?;
         if !status.is_success() {
             return Err(classify_status(status));
         }
         serde_json::from_slice(&bytes).map_err(|_| IntegrationError::ContractDrift)
+    }
+
+    pub async fn replay_erasure(
+        &self,
+        command: &ErasureReplayCommand,
+    ) -> Result<(), IntegrationError> {
+        let _: Value = self
+            .post("/mb_control/v1/privacy/erasure-replay", command)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn export_personal_data(
+        &self,
+        command: &PrivacyExportCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post_bounded(
+            "/mb_control/v1/privacy/export",
+            command,
+            MAX_PRIVACY_EXPORT_BYTES,
+        )
+        .await
     }
 
     pub async fn reconcile_membership(
@@ -244,13 +300,57 @@ impl OdooClient {
     ) -> Result<Value, IntegrationError> {
         self.post("/mb_control/v1/modules/enable", command).await
     }
+
+    pub async fn restrict_modules(
+        &self,
+        command: &ModuleRestrictCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/modules/restrict", command).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn provisioning_bootstrap_uses_the_idempotent_tenant_endpoint() {
+        let server = MockServer::start().await;
+        let command = TenantBootstrapCommand {
+            operation_key: "tenant-bootstrap:fixture".into(),
+            workshop_id: Uuid::new_v4(),
+            oidc_client_id: "makersbrain-odoo-fixture".into(),
+            oidc_issuer: "https://identity.example.test".into(),
+            bridge_token: "a".repeat(64),
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/tenant/bootstrap"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(header(
+                "x-odoo-dbfilter",
+                r"^mb_00000000000000000000000000000001\Z",
+            ))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "applied": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        OdooClient::new(
+            &server.uri(),
+            "fixture-token",
+            Some("mb_00000000000000000000000000000001"),
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .bootstrap_tenant(&command)
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn membership_uses_the_narrow_tenant_endpoint() {
@@ -290,5 +390,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.epoch, Some(3));
+    }
+
+    #[tokio::test]
+    async fn erasure_replay_uses_the_tenant_bridge_and_stable_identifiers() {
+        let server = MockServer::start().await;
+        let workshop = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let subject_key = Uuid::new_v4();
+        let command = ErasureReplayCommand {
+            operation_key: "erasure-replay:tombstone".into(),
+            workshop_id: workshop,
+            user_id: user,
+            subject_key,
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/privacy/erasure-replay"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "applied":true,"already_erased":false,"subject_key":subject_key
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        OdooClient::new(&server.uri(), "fixture-token", None, Duration::from_secs(2))
+            .unwrap()
+            .replay_erasure(&command)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restriction_uses_the_narrow_idempotent_tenant_endpoint() {
+        let server = MockServer::start().await;
+        let command = ModuleRestrictCommand {
+            operation_key: "module-restrict:fixture".into(),
+            workshop_id: Uuid::new_v4(),
+            module_key: "firings".into(),
+            modules: vec!["mb_ceramics_firing".into()],
+            reason: "entitlement_inactive".into(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/modules/restrict"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "applied":true,"adapter":"odoo_write_rules","rule_ids":[42],
+                "write_blocked":true,"historical_read_retained":true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = OdooClient::new(&server.uri(), "fixture-token", None, Duration::from_secs(2))
+            .unwrap()
+            .restrict_modules(&command)
+            .await
+            .unwrap();
+        assert_eq!(result["write_blocked"], true);
+    }
+
+    #[tokio::test]
+    async fn privacy_export_uses_the_authenticated_tenant_endpoint() {
+        let server = MockServer::start().await;
+        let command = PrivacyExportCommand {
+            workshop_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/privacy/export"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "format":"makersbrain-odoo-subject-export-v1",
+                "found":true,"datasets":{},"attachments":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let value = OdooClient::new(&server.uri(), "fixture-token", None, Duration::from_secs(2))
+            .unwrap()
+            .export_personal_data(&command)
+            .await
+            .unwrap();
+        assert_eq!(value["found"], true);
     }
 }

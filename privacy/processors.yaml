@@ -1,0 +1,25 @@
+schema_version: 1
+status: approval-required
+controller: null
+dpo: null
+initial_technical_administrator: project-owner
+region_policy:
+  preferred: Paris
+  fallback: Azure West Europe
+  default_boundary: EEA
+  non_eea_transfer_allowed: false
+
+processors:
+  hosting: {provider: pending, region: pending-paris-or-west-europe, article_28_terms: pending, transfer_assessment: pending}
+  object_storage: {provider: pending, region: pending-eea, article_28_terms: pending, transfer_assessment: pending}
+  transactional_mail: {provider: pending, region: pending-eea, article_28_terms: pending, transfer_assessment: pending}
+  telemetry: {provider: pending, region: pending-eea, article_28_terms: pending, transfer_assessment: pending}
+  identity: {provider: self-hosted-rauthy, region: follows-hosting, article_28_terms: not-applicable-if-self-hosted, transfer_assessment: pending-hosting}
+  document_extraction: {provider: pending, region: pending-eea, article_28_terms: pending, transfer_assessment: pending}
+
+production_gate:
+  allowed: false
+  reasons:
+    - legal data controller is not designated
+    - lawful bases and retention periods are not approved
+    - Article 28 processor terms and exact regions are not approved

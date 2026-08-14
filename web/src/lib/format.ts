@@ -26,7 +26,7 @@ export function sentence(value: string): string {
 	return text ? text[0].toUpperCase() + text.slice(1) : 'Unknown';
 }
 
-export function formatInstant(value?: string): string {
+export function formatInstant(value?: string | null): string {
 	if (!value) return '—';
 	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) return '—';
@@ -48,8 +48,8 @@ export function formatBytes(value?: number): string {
 	return `${size < 10 && unit > 0 ? size.toFixed(1) : Math.round(size)} ${units[unit]}`;
 }
 
-export function isPending(state?: string): boolean {
-	return !!state && ['pending', 'in_flight', 'awaiting_reconciliation', 'requested', 'provisioning'].includes(state);
+export function isPending(state?: string | null): boolean {
+	return !!state && ['pending', 'in_flight', 'awaiting_reconciliation', 'requested', 'installing', 'restricting', 'provisioning'].includes(state);
 }
 
 export function tone(state?: string): 'good' | 'warn' | 'bad' | 'neutral' {

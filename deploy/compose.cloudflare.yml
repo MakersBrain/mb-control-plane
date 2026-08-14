@@ -61,6 +61,5 @@ services:
     user: "0:0"
     command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/run/secrets/cloudflare_tunnel_token"]
     network_mode: host
-    volumes:
-      - ./secrets/cloudflare-tunnel-token:/run/secrets/cloudflare_tunnel_token:ro
+    secrets: [cloudflare_tunnel_token]
     restart: unless-stopped

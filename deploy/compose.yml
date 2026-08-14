@@ -1,21 +1,17 @@
 name: makersbrain-control
 
-x-control-env: &control-env
-  CONTROL_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
-  CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
-x-worker-env: &worker-env
-  <<: *control-env
-  CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
-  CONTROL_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_ADMIN_KEY}
-  CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
-  CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
-  CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT: "100"
-  CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
-  CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
-  CONTROL_MAIL_WEBHOOK_TOKEN: ${MAIL_WEBHOOK_TOKEN}
-  CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
-  CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
-  CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+x-migration-env: &migration-env
+  CONTROL_DATABASE_URL: "@/run/secrets/control_database_url"
+  CONTROL_DATA_MODE: ${CONTROL_DATA_MODE:?CONTROL_DATA_MODE is required}
+  CONTROL_PRIVACY_CONTROLLER_REF: ${CONTROL_PRIVACY_CONTROLLER_REF:-}
+  CONTROL_PRIVACY_PROCESSING_RECORD_REF: ${CONTROL_PRIVACY_PROCESSING_RECORD_REF:-}
+  CONTROL_PRIVACY_RETENTION_APPROVAL_REF: ${CONTROL_PRIVACY_RETENTION_APPROVAL_REF:-}
+  CONTROL_PRIVACY_PROCESSOR_REGISTER_REF: ${CONTROL_PRIVACY_PROCESSOR_REGISTER_REF:-}
+  CONTROL_PRIVACY_DPIA_APPROVAL_REF: ${CONTROL_PRIVACY_DPIA_APPROVAL_REF:-}
+  CONTROL_PRIVACY_PROCESSING_REGION: ${CONTROL_PRIVACY_PROCESSING_REGION:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
 x-worker: &worker
   image: makersbrain-control:local
   build: {context: ..}
@@ -26,20 +22,11 @@ x-worker: &worker
   depends_on:
     postgres: {condition: service_healthy}
     control-migrate: {condition: service_completed_successfully}
-  environment:
-    <<: *worker-env
-  volumes:
-    - tenant-secrets:/run/makersbrain-secrets:ro
-x-extraction-worker: &extraction-worker
-  <<: *worker
-  depends_on:
-    postgres: {condition: service_healthy}
-    control-migrate: {condition: service_completed_successfully}
-    document-extraction: {condition: service_healthy}
-  environment:
-    <<: *worker-env
-    CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
-    CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
+x-worker-env: &worker-env
+  CONTROL_RELEASE_ID: ${CONTROL_RELEASE_ID:?CONTROL_RELEASE_ID is required}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
 
 services:
   document-extraction:
@@ -48,31 +35,45 @@ services:
     command: ["/usr/local/bin/document-extraction-broker"]
     environment:
       BROKER_LISTEN: 0.0.0.0:8080
-      BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+      BROKER_TOKEN: "@/run/secrets/document_extraction_token"
       BROKER_AZURE_ENDPOINT: ${AZURE_DOCUMENT_ENDPOINT:-}
-      BROKER_AZURE_KEY: ${AZURE_DOCUMENT_KEY:-}
+      BROKER_AZURE_KEY: "@/run/secrets/azure_document_key"
       BROKER_AZURE_API_VERSION: ${AZURE_DOCUMENT_API_VERSION:-2024-11-30}
       BROKER_AZURE_POLL_INTERVAL_MS: "2000"
       BROKER_VISION_PRIMARY: ${INVENTORY_VISION_PRIMARY:-}
       BROKER_VISION_SECONDARY: ${INVENTORY_VISION_SECONDARY:-}
       BROKER_OPENAI_ENDPOINT: ${INVENTORY_OPENAI_ENDPOINT:-}
-      BROKER_OPENAI_KEY: ${INVENTORY_OPENAI_KEY:-}
+      BROKER_OPENAI_KEY: "@/run/secrets/inventory_openai_key"
       BROKER_OPENAI_MODEL: ${INVENTORY_OPENAI_MODEL:-}
       BROKER_AZURE_MULTIMODAL_ENDPOINT: ${INVENTORY_AZURE_MULTIMODAL_ENDPOINT:-}
-      BROKER_AZURE_MULTIMODAL_KEY: ${INVENTORY_AZURE_MULTIMODAL_KEY:-}
+      BROKER_AZURE_MULTIMODAL_KEY: "@/run/secrets/inventory_azure_multimodal_key"
       BROKER_AZURE_MULTIMODAL_MODEL: ${INVENTORY_AZURE_MULTIMODAL_MODEL:-}
       BROKER_GEMINI_ENDPOINT: ${INVENTORY_GEMINI_ENDPOINT:-}
-      BROKER_GEMINI_KEY: ${INVENTORY_GEMINI_KEY:-}
+      BROKER_GEMINI_KEY: "@/run/secrets/inventory_gemini_key"
       BROKER_GEMINI_MODEL: ${INVENTORY_GEMINI_MODEL:-}
       BROKER_CLAUDE_ENDPOINT: ${INVENTORY_CLAUDE_ENDPOINT:-}
-      BROKER_CLAUDE_KEY: ${INVENTORY_CLAUDE_KEY:-}
+      BROKER_CLAUDE_KEY: "@/run/secrets/inventory_claude_key"
       BROKER_CLAUDE_MODEL: ${INVENTORY_CLAUDE_MODEL:-}
       # Deprecated compatibility path for an OpenAI Chat Completions-compatible API.
       BROKER_VISION_ENDPOINT: ${INVENTORY_VISION_ENDPOINT:-}
-      BROKER_VISION_KEY: ${INVENTORY_VISION_KEY:-}
+      BROKER_VISION_KEY: "@/run/secrets/inventory_vision_key"
       BROKER_VISION_MODEL: ${INVENTORY_VISION_MODEL:-}
       BROKER_UPCITEMDB_ENDPOINT: ${INVENTORY_UPCITEMDB_ENDPOINT:-}
-      BROKER_UPCITEMDB_KEY: ${INVENTORY_UPCITEMDB_KEY:-}
+      BROKER_UPCITEMDB_KEY: "@/run/secrets/inventory_upcitemdb_key"
+    secrets:
+      - document_extraction_token
+      - azure_document_key
+      - inventory_openai_key
+      - inventory_azure_multimodal_key
+      - inventory_gemini_key
+      - inventory_claude_key
+      - inventory_vision_key
+      - inventory_upcitemdb_key
+    depends_on:
+      control-migrate: {condition: service_completed_successfully}
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
@@ -80,10 +81,39 @@ services:
     image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-local-superuser-not-published}
-      CONTROL_POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD}
-      RAUTHY_POSTGRES_PASSWORD: ${RAUTHY_POSTGRES_PASSWORD}
-      ODOO_POSTGRES_PASSWORD: ${ODOO_POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_superuser_password
+      CONTROL_POSTGRES_PASSWORD: "@/run/secrets/control_postgres_password"
+      CONTROL_API_POSTGRES_PASSWORD: "@/run/secrets/control_api_postgres_password"
+      CONTROL_MEMBERSHIP_POSTGRES_PASSWORD: "@/run/secrets/control_membership_postgres_password"
+      CONTROL_PROVISIONING_POSTGRES_PASSWORD: "@/run/secrets/control_provisioning_postgres_password"
+      CONTROL_INVOICE_POSTGRES_PASSWORD: "@/run/secrets/control_invoice_postgres_password"
+      CONTROL_INVENTORY_POSTGRES_PASSWORD: "@/run/secrets/control_inventory_postgres_password"
+      CONTROL_EMAIL_POSTGRES_PASSWORD: "@/run/secrets/control_email_postgres_password"
+      CONTROL_RECONCILIATION_POSTGRES_PASSWORD: "@/run/secrets/control_reconciliation_postgres_password"
+      CONTROL_LIFECYCLE_POSTGRES_PASSWORD: "@/run/secrets/control_lifecycle_postgres_password"
+      CONTROL_BACKUP_POSTGRES_PASSWORD: "@/run/secrets/control_backup_postgres_password"
+      CONTROL_DRIVER_POSTGRES_PASSWORD: "@/run/secrets/control_driver_postgres_password"
+      CONTROL_RELEASE_POSTGRES_PASSWORD: "@/run/secrets/control_release_postgres_password"
+      CONTROL_PRIVACY_POSTGRES_PASSWORD: "@/run/secrets/control_privacy_postgres_password"
+      RAUTHY_POSTGRES_PASSWORD: "@/run/secrets/rauthy_postgres_password"
+      ODOO_POSTGRES_PASSWORD: "@/run/secrets/odoo_postgres_password"
+    secrets:
+      - postgres_superuser_password
+      - control_postgres_password
+      - control_api_postgres_password
+      - control_membership_postgres_password
+      - control_provisioning_postgres_password
+      - control_invoice_postgres_password
+      - control_inventory_postgres_password
+      - control_email_postgres_password
+      - control_reconciliation_postgres_password
+      - control_lifecycle_postgres_password
+      - control_backup_postgres_password
+      - control_driver_postgres_password
+      - control_release_postgres_password
+      - control_privacy_postgres_password
+      - rauthy_postgres_password
+      - odoo_postgres_password
     volumes:
       - control-postgres:/var/lib/postgresql/data
       - ./init-databases.sh:/docker-entrypoint-initdb.d/01-databases.sh:ro
@@ -108,6 +138,8 @@ services:
       - ./secrets/rauthy:/source:ro
       - ./rauthy:/public:ro
       - rauthy-bootstrap:/bootstrap
+    depends_on:
+      control-migrate: {condition: service_completed_successfully}
     restart: "no"
 
   rauthy:
@@ -118,12 +150,9 @@ services:
       PG_PORT: "5432"
       PG_USER: rauthy
       PG_DB_NAME: rauthy
-      PG_PASSWORD: ${RAUTHY_POSTGRES_PASSWORD}
       PG_TLS: disable
       HQL_NODE_ID: "1"
       HQL_NODES: "1 localhost:8100 localhost:8200"
-      HQL_SECRET_RAFT: ${RAUTHY_HQL_SECRET_RAFT}
-      HQL_SECRET_API: ${RAUTHY_HQL_SECRET_API}
       LISTEN_ADDRESS: 0.0.0.0
       LISTEN_PORT_HTTP: "8092"
       LISTEN_SCHEME: http
@@ -131,8 +160,6 @@ services:
       PROXY_MODE: "false"
       BOOTSTRAP_DIR: /bootstrap
       BOOTSTRAP_ADMIN_EMAIL: ${RAUTHY_BOOTSTRAP_ADMIN_EMAIL}
-      BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${RAUTHY_BOOTSTRAP_ADMIN_PASSWORD}
-      ENC_KEYS: ${RAUTHY_ENC_KEYS}
       ENC_KEY_ACTIVE: ${RAUTHY_ENC_KEY_ACTIVE}
       RP_ID: rauthy.localhost
       RP_ORIGIN: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}
@@ -140,10 +167,14 @@ services:
       SWAGGER_UI_ENABLE: "false"
     volumes:
       - rauthy-bootstrap:/bootstrap:ro
+    secrets:
+      - source: rauthy_config
+        target: /app/config.toml
     ports: ["127.0.0.1:${RAUTHY_HTTP_PORT:-8092}:8092"]
     depends_on:
       postgres: {condition: service_healthy}
       rauthy-bootstrap: {condition: service_completed_successfully}
+      control-migrate: {condition: service_completed_successfully}
     networks:
       default:
         aliases: [rauthy.localhost]
@@ -154,7 +185,8 @@ services:
     build: {context: ..}
     command: ["/usr/local/bin/control-migrate"]
     environment:
-      <<: *control-env
+      <<: *migration-env
+    secrets: [control_database_url]
     depends_on: {postgres: {condition: service_healthy}}
     restart: "no"
 
@@ -162,7 +194,14 @@ services:
     image: makersbrain-control:local
     build: {context: ..}
     environment:
-      <<: *control-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_api_database_url"
+      CONTROL_DATA_MODE: ${CONTROL_DATA_MODE:?CONTROL_DATA_MODE is required}
+      CONTROL_PRIVACY_CONTROLLER_REF: ${CONTROL_PRIVACY_CONTROLLER_REF:-}
+      CONTROL_PRIVACY_PROCESSING_RECORD_REF: ${CONTROL_PRIVACY_PROCESSING_RECORD_REF:-}
+      CONTROL_PRIVACY_RETENTION_APPROVAL_REF: ${CONTROL_PRIVACY_RETENTION_APPROVAL_REF:-}
+      CONTROL_PRIVACY_PROCESSOR_REGISTER_REF: ${CONTROL_PRIVACY_PROCESSOR_REGISTER_REF:-}
+      CONTROL_PRIVACY_DPIA_APPROVAL_REF: ${CONTROL_PRIVACY_DPIA_APPROVAL_REF:-}
+      CONTROL_PRIVACY_PROCESSING_REGION: ${CONTROL_PRIVACY_PROCESSING_REGION:-}
       CONTROL_LISTEN: 0.0.0.0:8080
       CONTROL_PUBLIC_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
       CONTROL_CORS_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
@@ -170,14 +209,35 @@ services:
       CONTROL_OIDC_AUDIENCE: makersbrain-members
       CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: localhost
-      CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
+      CONTROL_INTERNAL_TOKEN: "@/run/secrets/control_internal_token"
+      CONTROL_RELEASE_PUBLISH_TOKEN: "@/run/secrets/control_release_publish_token"
+      CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
+      CONTROL_INVITATION_VERIFICATION_KEYS_FILE: /run/makersbrain-invitation/public-keys.json
       CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
-      CONTROL_EXTRACTION_BROKER_TOKEN: ${DOCUMENT_EXTRACTION_TOKEN}
+      CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
-      CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+      CONTROL_PRIVACY_EXPORT_KEY_ID: ${CONTROL_PRIVACY_EXPORT_KEY_ID:?CONTROL_PRIVACY_EXPORT_KEY_ID is required}
+      CONTROL_PRIVACY_EXPORT_KEY: "@/run/secrets/control_privacy_export_key"
+      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/makersbrain/privacy-exports
+      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
       CONTROL_ALLOW_SELF_SIGNUP: "true"
       CONTROL_OPERATOR_EMAILS: ${CONTROL_OPERATOR_EMAILS:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
     ports: ["127.0.0.1:${CONTROL_API_PORT:-8080}:8080"]
+    volumes:
+      - ./secrets/invitation/public-keys.json:/run/makersbrain-invitation/public-keys.json:ro
+      - privacy-exports:/var/lib/makersbrain/privacy-exports
+      - tenant-secrets:/run/makersbrain-secrets:ro
+    secrets:
+      - control_api_database_url
+      - control_internal_token
+      - control_release_publish_token
+      - document_extraction_token
+      - deployment_driver_token
+      - control_privacy_export_key
     depends_on:
       postgres: {condition: service_healthy}
       control-migrate: {condition: service_completed_successfully}
@@ -201,7 +261,12 @@ services:
     image: makersbrain-control:local
     build: {context: ..}
     command: ["/usr/local/bin/control-fixture"]
-    environment: {FIXTURE_TOKEN: "${DEPLOYMENT_DRIVER_TOKEN}"}
+    environment:
+      FIXTURE_TOKEN: "@/run/secrets/deployment_driver_token"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+    secrets: [deployment_driver_token]
     restart: unless-stopped
 
   paperless-image:
@@ -227,14 +292,18 @@ services:
     command: ["/usr/local/bin/control-docker-driver"]
     environment:
       DRIVER_LISTEN: 0.0.0.0:8080
-      DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+      DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+      DRIVER_PRIVACY_TOKEN: "@/run/secrets/privacy_driver_token"
       DRIVER_DOCKER_SOCKET: /var/run/docker.sock
-      DRIVER_DATABASE_URL: postgresql://control:${CONTROL_POSTGRES_PASSWORD}@postgres:5432/makersbrain_control
-      DRIVER_POSTGRES_ADMIN_URL: postgresql://postgres:${POSTGRES_SUPERUSER_PASSWORD:-local-superuser-not-published}@postgres:5432/postgres
+      DRIVER_DATABASE_URL: "@/run/secrets/control_driver_database_url"
+      DRIVER_POSTGRES_ADMIN_URL: "@/run/secrets/postgres_admin_database_url"
       DRIVER_POSTGRES_HOST: postgres
       DRIVER_POSTGRES_PORT: "5432"
-      DRIVER_ODOO_POSTGRES_PASSWORD: ${ODOO_POSTGRES_PASSWORD}
-      DRIVER_ODOO_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
+      DRIVER_ODOO_POSTGRES_PASSWORD: "@/run/secrets/odoo_postgres_password"
+      DRIVER_ODOO_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       DRIVER_ODOO_IMAGE: makersbrain-control-odoo:local
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
       DRIVER_PAPERLESS_IMAGE: makersbrain-control-paperless:local
@@ -249,35 +318,50 @@ services:
       BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
       BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
       BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
-      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
-      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
-      RESTORE_S3_ACCESS_KEY_ID: ${RESTORE_S3_ACCESS_KEY_ID:-}
-      RESTORE_S3_SECRET_ACCESS_KEY: ${RESTORE_S3_SECRET_ACCESS_KEY:-}
-      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+      BACKUP_S3_ACCESS_KEY_ID: "@/run/secrets/backup_s3_access_key_id"
+      BACKUP_S3_SECRET_ACCESS_KEY: "@/run/secrets/backup_s3_secret_access_key"
+      RESTORE_S3_ACCESS_KEY_ID: "@/run/secrets/restore_s3_access_key_id"
+      RESTORE_S3_SECRET_ACCESS_KEY: "@/run/secrets/restore_s3_secret_access_key"
+      BACKUP_AGE_RECIPIENT: "@/run/secrets/backup_age_recipient"
       BACKUP_AGE_IDENTITY_FILE: ${BACKUP_AGE_IDENTITY_FILE:-}
       BACKUP_ENCRYPTION_KEY_ID: ${BACKUP_ENCRYPTION_KEY_ID:-}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
       DRIVER_REDIS_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/makersbrain-secrets
-      DRIVER_SECRET_VOLUME: makersbrain-control-tenant-secrets
+      DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
       DRIVER_BACKUP_SECRET_VOLUME: makersbrain-control-backup-secrets
+      DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes
       DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
       DRIVER_ODOO_BASE_URL: http://odoo:8069
       DRIVER_CONTROL_INTERNAL_URL: http://control-api:8080
-      DRIVER_CONTROL_INTERNAL_TOKEN: ${CONTROL_INTERNAL_TOKEN}
       DRIVER_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1
-      DRIVER_RAUTHY_ADMIN_KEY: ${CONTROL_RAUTHY_DEPLOYMENT_KEY}
+      DRIVER_RAUTHY_ADMIN_KEY: "@/run/secrets/control_rauthy_deployment_key"
       DRIVER_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
       DRIVER_PUBLIC_SCHEME: http
+      DRIVER_ENVIRONMENT: development
       DRIVER_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - tenant-secrets:/run/makersbrain-secrets
-      - backup-secrets:/run/makersbrain-backup-secrets:ro
+      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets
+      - backup-secrets:/run/makersbrain-backup-secrets
       - tenant-routes:/routes
       - odoo-data:/odoo-data
       - backup-data:/backups
+    secrets:
+      - deployment_driver_token
+      - privacy_driver_token
+      - control_driver_database_url
+      - postgres_admin_database_url
+      - odoo_postgres_password
+      - odoo_bridge_token
+      - backup_s3_access_key_id
+      - backup_s3_secret_access_key
+      - restore_s3_access_key_id
+      - restore_s3_secret_access_key
+      - backup_age_recipient
+      - control_rauthy_deployment_key
     depends_on:
       postgres: {condition: service_healthy}
       control-migrate: {condition: service_completed_successfully}
@@ -289,38 +373,171 @@ services:
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
-  worker-membership: {<<: *worker, command: ["/usr/local/bin/control-worker", "membership-provisioning"]}
-  worker-invoice: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "invoice-capture"]}
-  worker-inventory: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "inventory-capture"]}
-  worker-provisioning: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-provisioning"]}
-  worker-email: {<<: *worker, command: ["/usr/local/bin/control-worker", "email-delivery"]}
-  worker-reconciliation: {<<: *extraction-worker, command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]}
-  worker-lifecycle: {<<: *worker, command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]}
+  worker-membership:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "membership-provisioning"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_membership_database_url"
+      CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
+      CONTROL_RAUTHY_ADMIN_KEY: "@/run/secrets/control_rauthy_admin_key"
+      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_PAPERLESS_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
+    volumes:
+      - tenant-secrets:/run/makersbrain-secrets:ro
+      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets:ro
+    secrets: [control_membership_database_url, control_rauthy_admin_key]
+  worker-invoice:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "invoice-capture"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_invoice_database_url"
+      CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_PAPERLESS_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
+      CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
+      CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
+      CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
+      CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
+    volumes:
+      - tenant-secrets:/run/makersbrain-secrets:ro
+      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets:ro
+    secrets: [control_invoice_database_url, document_extraction_token]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
+      document-extraction: {condition: service_healthy}
+  worker-inventory:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "inventory-capture"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_inventory_database_url"
+      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
+      CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
+      CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
+      CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT: "100"
+      CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
+    volumes: ["tenant-secrets:/run/makersbrain-secrets:ro"]
+    secrets: [control_inventory_database_url, document_extraction_token]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
+      document-extraction: {condition: service_healthy}
+  worker-provisioning:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "tenant-provisioning"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_provisioning_database_url"
+      CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+      CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+    secrets: [control_provisioning_database_url, deployment_driver_token]
+  worker-email:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "email-delivery"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_email_database_url"
+      CONTROL_PUBLIC_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
+      CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
+      CONTROL_MAIL_WEBHOOK_TOKEN: "@/run/secrets/mail_webhook_token"
+      CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
+      CONTROL_INVITATION_SIGNING_KEYS_FILE: /run/makersbrain-invitation/private-keys.json
+    volumes:
+      - ./secrets/invitation/private-keys.json:/run/makersbrain-invitation/private-keys.json:ro
+    secrets: [control_email_database_url, mail_webhook_token]
+  worker-reconciliation:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "tenant-reconciliation"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_reconciliation_database_url"
+      CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+      CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+    volumes: ["tenant-secrets:/run/makersbrain-secrets:ro"]
+    secrets: [control_reconciliation_database_url, deployment_driver_token]
+  worker-lifecycle:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_lifecycle_database_url"
+      CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+      CONTROL_PRIVACY_LOOKUP_KEY_ID: ${CONTROL_PRIVACY_LOOKUP_KEY_ID:?CONTROL_PRIVACY_LOOKUP_KEY_ID is required}
+      CONTROL_PRIVACY_LOOKUP_KEY: "@/run/secrets/control_privacy_lookup_key"
+    secrets: [control_lifecycle_database_url, deployment_driver_token, control_privacy_lookup_key]
+
+  worker-release:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "release-adoption"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_release_database_url"
+      CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
+      CONTROL_RELEASE_COSIGN_EXECUTABLE: /usr/local/bin/cosign
+      CONTROL_RELEASE_COSIGN_KEY_FILE: /run/makersbrain-release/cosign.pub
+      CONTROL_RELEASE_SLSA_BUILDER_ID: ${RELEASE_SLSA_BUILDER_ID}
+    volumes:
+      - ./secrets/release/cosign.pub:/run/makersbrain-release/cosign.pub:ro
+    secrets: [control_release_database_url, deployment_driver_token]
+
+  worker-privacy:
+    <<: *worker
+    command: ["/usr/local/bin/control-worker", "privacy-operations"]
+    environment:
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_privacy_database_url"
+      CONTROL_PRIVACY_LOOKUP_KEY_ID: ${CONTROL_PRIVACY_LOOKUP_KEY_ID:?CONTROL_PRIVACY_LOOKUP_KEY_ID is required}
+      CONTROL_PRIVACY_LOOKUP_KEY: "@/run/secrets/control_privacy_lookup_key"
+      CONTROL_PRIVACY_EXPORT_KEY_ID: ${CONTROL_PRIVACY_EXPORT_KEY_ID:?CONTROL_PRIVACY_EXPORT_KEY_ID is required}
+      CONTROL_PRIVACY_EXPORT_KEY: "@/run/secrets/control_privacy_export_key"
+      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/makersbrain/privacy-exports
+      CONTROL_PRIVACY_DRIVER_URL: http://control-docker-driver:8080
+      CONTROL_PRIVACY_DRIVER_TOKEN: "@/run/secrets/privacy_driver_token"
+    volumes:
+      - privacy-exports:/var/lib/makersbrain/privacy-exports
+    secrets: [control_privacy_database_url, control_privacy_lookup_key, control_privacy_export_key, privacy_driver_token]
 
   backup-scheduler:
     <<: *worker
     command: ["/usr/local/bin/control-backup-scheduler"]
     environment:
-      <<: *control-env
+      <<: *worker-env
+      CONTROL_DATABASE_URL: "@/run/secrets/control_backup_database_url"
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
-      CONTROL_DEPLOYMENT_DRIVER_TOKEN: ${DEPLOYMENT_DRIVER_TOKEN}
+      CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       CONTROL_BACKUP_INTERVAL_SECONDS: ${CONTROL_BACKUP_INTERVAL_SECONDS:-3600}
       CONTROL_BACKUP_SCHEDULER_ENABLED: ${CONTROL_BACKUP_SCHEDULER_ENABLED:-false}
+    secrets: [control_backup_database_url, deployment_driver_token]
 
   odoo:
     image: makersbrain-control-odoo:local
     container_name: makersbrain-shared-odoo
     build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
+    entrypoint: ["/bin/sh", "/run/makersbrain/resolve-secret-env.sh", "/entrypoint.sh"]
     environment:
       HOST: postgres
       PORT: "5432"
       USER: odoo
-      PASSWORD: ${ODOO_POSTGRES_PASSWORD}
-      MB_CONTROL_BRIDGE_TOKEN: ${ODOO_BRIDGE_TOKEN}
+      PASSWORD: "@/run/secrets/odoo_postgres_password"
+      MB_CONTROL_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       MB_CONTROL_API_URL: http://control-api:8080
-    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--db_password=${ODOO_POSTGRES_PASSWORD}", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
-    volumes: ["odoo-data:/var/lib/odoo"]
-    depends_on: {postgres: {condition: service_healthy}}
+    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
+    volumes:
+      - odoo-data:/var/lib/odoo
+      - ./resolve-secret-env.sh:/run/makersbrain/resolve-secret-env.sh:ro
+    secrets: [odoo_postgres_password, odoo_bridge_token]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
     restart: unless-stopped
 
   redis:
@@ -337,8 +554,71 @@ services:
       - ./gateway.conf:/etc/nginx/nginx.conf:ro
       - tenant-routes:/etc/nginx/tenants:ro
     ports: ["127.0.0.1:${ODOO_HTTP_PORT:-8169}:8080"]
-    depends_on: {odoo: {condition: service_started}}
+    depends_on:
+      odoo: {condition: service_started}
+      control-migrate: {condition: service_completed_successfully}
     restart: unless-stopped
+
+secrets:
+  cloudflare_tunnel_token: {file: ./secrets/runtime/cloudflare_tunnel_token}
+  postgres_superuser_password: {file: ./secrets/runtime/postgres_superuser_password}
+  control_postgres_password: {file: ./secrets/runtime/control_postgres_password}
+  control_api_postgres_password: {file: ./secrets/runtime/control_api_postgres_password}
+  control_membership_postgres_password: {file: ./secrets/runtime/control_membership_postgres_password}
+  control_provisioning_postgres_password: {file: ./secrets/runtime/control_provisioning_postgres_password}
+  control_invoice_postgres_password: {file: ./secrets/runtime/control_invoice_postgres_password}
+  control_inventory_postgres_password: {file: ./secrets/runtime/control_inventory_postgres_password}
+  control_email_postgres_password: {file: ./secrets/runtime/control_email_postgres_password}
+  control_reconciliation_postgres_password: {file: ./secrets/runtime/control_reconciliation_postgres_password}
+  control_lifecycle_postgres_password: {file: ./secrets/runtime/control_lifecycle_postgres_password}
+  control_backup_postgres_password: {file: ./secrets/runtime/control_backup_postgres_password}
+  control_driver_postgres_password: {file: ./secrets/runtime/control_driver_postgres_password}
+  control_release_postgres_password: {file: ./secrets/runtime/control_release_postgres_password}
+  control_privacy_postgres_password: {file: ./secrets/runtime/control_privacy_postgres_password}
+  rauthy_postgres_password: {file: ./secrets/runtime/rauthy_postgres_password}
+  odoo_postgres_password: {file: ./secrets/runtime/odoo_postgres_password}
+  rauthy_enc_keys: {file: ./secrets/runtime/rauthy_enc_keys}
+  rauthy_bootstrap_admin_password: {file: ./secrets/runtime/rauthy_bootstrap_admin_password}
+  rauthy_hql_secret_raft: {file: ./secrets/runtime/rauthy_hql_secret_raft}
+  rauthy_hql_secret_api: {file: ./secrets/runtime/rauthy_hql_secret_api}
+  rauthy_config: {file: ./secrets/runtime/rauthy_config.toml}
+  control_internal_token: {file: ./secrets/runtime/control_internal_token}
+  control_release_publish_token: {file: ./secrets/runtime/control_release_publish_token}
+  odoo_bridge_token: {file: ./secrets/runtime/odoo_bridge_token}
+  document_extraction_token: {file: ./secrets/runtime/document_extraction_token}
+  control_rauthy_admin_key: {file: ./secrets/runtime/control_rauthy_admin_key}
+  control_rauthy_deployment_key: {file: ./secrets/runtime/control_rauthy_deployment_key}
+  azure_document_key: {file: ./secrets/runtime/azure_document_key}
+  inventory_openai_key: {file: ./secrets/runtime/inventory_openai_key}
+  inventory_azure_multimodal_key: {file: ./secrets/runtime/inventory_azure_multimodal_key}
+  inventory_gemini_key: {file: ./secrets/runtime/inventory_gemini_key}
+  inventory_claude_key: {file: ./secrets/runtime/inventory_claude_key}
+  inventory_vision_key: {file: ./secrets/runtime/inventory_vision_key}
+  inventory_upcitemdb_key: {file: ./secrets/runtime/inventory_upcitemdb_key}
+  mail_webhook_token: {file: ./secrets/runtime/mail_webhook_token}
+  deployment_driver_token: {file: ./secrets/runtime/deployment_driver_token}
+  privacy_driver_token: {file: ./secrets/runtime/privacy_driver_token}
+  control_privacy_lookup_key: {file: ./secrets/runtime/control_privacy_lookup_key}
+  control_privacy_export_key: {file: ./secrets/runtime/control_privacy_export_key}
+  backup_s3_access_key_id: {file: ./secrets/runtime/backup_s3_access_key_id}
+  backup_s3_secret_access_key: {file: ./secrets/runtime/backup_s3_secret_access_key}
+  restore_s3_access_key_id: {file: ./secrets/runtime/restore_s3_access_key_id}
+  restore_s3_secret_access_key: {file: ./secrets/runtime/restore_s3_secret_access_key}
+  backup_age_recipient: {file: ./secrets/runtime/backup_age_recipient}
+  control_database_url: {file: ./secrets/runtime/control_database_url}
+  control_api_database_url: {file: ./secrets/runtime/control_api_database_url}
+  control_membership_database_url: {file: ./secrets/runtime/control_membership_database_url}
+  control_provisioning_database_url: {file: ./secrets/runtime/control_provisioning_database_url}
+  control_invoice_database_url: {file: ./secrets/runtime/control_invoice_database_url}
+  control_inventory_database_url: {file: ./secrets/runtime/control_inventory_database_url}
+  control_email_database_url: {file: ./secrets/runtime/control_email_database_url}
+  control_reconciliation_database_url: {file: ./secrets/runtime/control_reconciliation_database_url}
+  control_lifecycle_database_url: {file: ./secrets/runtime/control_lifecycle_database_url}
+  control_backup_database_url: {file: ./secrets/runtime/control_backup_database_url}
+  control_driver_database_url: {file: ./secrets/runtime/control_driver_database_url}
+  control_release_database_url: {file: ./secrets/runtime/control_release_database_url}
+  control_privacy_database_url: {file: ./secrets/runtime/control_privacy_database_url}
+  postgres_admin_database_url: {file: ./secrets/runtime/postgres_admin_database_url}
 
 networks:
   default:
@@ -355,7 +635,11 @@ volumes:
     name: makersbrain-control-tenant-routes
   tenant-secrets:
     name: makersbrain-control-tenant-secrets
+  paperless-client-secrets:
+    name: makersbrain-control-paperless-client-secrets
   backup-data:
     name: makersbrain-control-backups
   backup-secrets:
     name: makersbrain-control-backup-secrets
+  privacy-exports:
+    name: makersbrain-control-privacy-exports

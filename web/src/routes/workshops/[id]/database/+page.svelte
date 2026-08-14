@@ -5,11 +5,11 @@
 	import WorkshopNav from '$lib/components/WorkshopNav.svelte';
 	import { formatBytes, formatInstant, isPending } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	import type { WorkshopSummary } from '$lib/types';
+	import type { Database, RecoveryPoint, WorkshopSummary } from '$lib/types';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
-	let database = $state<any>();
+	let database = $state<Database>();
 	let error = $state('');
 	let notice = $state('');
 	let busy = $state(false);
@@ -28,8 +28,8 @@
 	async function load(showError = true) {
 		try {
 			[workshop, database] = await Promise.all([
-				request<any>(`/v1/workshops/${id}`),
-				request<any>(`/v1/workshops/${id}/database`)
+				request<WorkshopSummary>(`/v1/workshops/${id}`),
+				request<Database>(`/v1/workshops/${id}/database`)
 			]);
 			if (showError) error = '';
 		} catch (e) {
@@ -52,7 +52,7 @@
 	}
 
 	const makeRecovery = (kind: 'snapshots' | 'backups') => start(kind, { label: recoveryLabel || undefined }, kind === 'snapshots' ? 'Snapshot queued.' : 'Portable backup queued.');
-	async function restore(point: any) {
+	async function restore(point: RecoveryPoint) {
 		await start('restores', { recovery_point_id: point.id, confirmation: restoreConfirmation }, 'Restore queued. A verified S3 safety backup will be created first.');
 		restoreConfirmation = '';
 	}
@@ -60,7 +60,7 @@
 		await start('duplicates', { label: duplicateLabel, confirmation: duplicateConfirmation }, 'Non-routable duplicate queued.');
 		duplicateConfirmation = '';
 	}
-	async function download(point: any) {
+	async function download(point: RecoveryPoint) {
 		busy = true; error = ''; notice = '';
 		try {
 			const result = await request<{ url: string; filename: string }>(`/v1/workshops/${id}/database/backups/${point.id}/download`, { method: 'POST' });
@@ -110,10 +110,10 @@
 <section class="stack"><h2>Recovery points</h2>
 	{#if !database?.recovery_points?.length}<p class="card muted">No snapshots or backups yet.</p>{/if}
 	{#each database?.recovery_points || [] as point}
-		<article class="card recovery-row"><div><strong>{point.label}</strong><div class="muted">{point.kind} · {(point.component_scope || ['odoo']).join(' + ')} · {point.storage_location} · {formatInstant(point.created_at)} · {formatBytes(point.archive_size_bytes ?? point.size_bytes)}</div>{#if point.expires_at}<div class="muted">Retained until {formatInstant(point.expires_at)}</div>{/if}</div><StatusBadge state={point.operation_state || point.state} label={point.verified_at ? `${point.operation_state || point.state} · verified` : undefined} />
+		<article class="card recovery-row"><div><strong>{point.label}</strong><div class="muted">{point.kind} · {(point.component_scope || ['odoo']).join(' + ')} · {point.storage_location} · {formatInstant(point.created_at)} · {formatBytes(point.archive_size_bytes ?? point.size_bytes ?? undefined)}</div>{#if point.expires_at}<div class="muted">Retained until {formatInstant(point.expires_at)}</div>{/if}</div><StatusBadge state={point.operation_state || point.state} label={point.verified_at ? `${point.operation_state || point.state} · verified` : undefined} />
 			{#if point.operation_id && (isPending(point.operation_state) || point.operation_state === 'dead_letter')}<div class="recovery-operation"><OperationCard id={point.operation_id} compact onsettled={load} /></div>{/if}
 			{#if point.downloadable}<div class="actions"><button class="secondary" disabled={busy} onclick={() => void download(point)}>Download encrypted archive</button></div>{/if}
-			{#if database.can_manage && workshop && point.state === 'ready' && point.verified_at}<div class="restore"><label>Type <code>{workshop.slug}</code> to restore<input bind:value={restoreConfirmation} /></label><button class="danger" disabled={busy || restoreConfirmation !== workshop.slug} onclick={() => void restore(point)}>Restore complete workshop</button></div>{/if}
+			{#if database?.can_manage && workshop && point.state === 'ready' && point.verified_at}<div class="restore"><label>Type <code>{workshop.slug}</code> to restore<input bind:value={restoreConfirmation} /></label><button class="danger" disabled={busy || restoreConfirmation !== workshop.slug} onclick={() => void restore(point)}>Restore complete workshop</button></div>{/if}
 		</article>
 	{/each}
 </section>

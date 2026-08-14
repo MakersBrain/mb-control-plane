@@ -1,3 +1,6 @@
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleBundle {
     pub key: &'static str,
@@ -6,9 +9,49 @@ pub struct ModuleBundle {
     pub odoo_modules: &'static [&'static str],
     pub dependencies: &'static [&'static str],
     pub service: Option<&'static str>,
+    pub minimum_release: &'static str,
+}
+
+pub const REGISTRY_VERSION: u32 = 1;
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbeddedCapabilityRegistry {
+    pub version: u32,
+    pub minimum_application_release: String,
+    pub capabilities: Vec<EmbeddedCapability>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbeddedCapability {
+    pub key: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub odoo_modules: Vec<String>,
+    pub service: Option<String>,
+}
+
+const EMBEDDED_REGISTRY: &[u8] = include_bytes!("../deploy/capability-registry-v1.json");
+
+pub(crate) fn embedded_registry() -> anyhow::Result<EmbeddedCapabilityRegistry> {
+    serde_json::from_slice(EMBEDDED_REGISTRY)
+        .map_err(|error| anyhow::anyhow!("embedded capability registry is invalid: {error}"))
+}
+
+pub(crate) fn embedded_registry_digest() -> String {
+    format!("sha256:{:x}", Sha256::digest(EMBEDDED_REGISTRY))
 }
 
 pub const CATALOG: &[ModuleBundle] = &[
+    ModuleBundle {
+        key: "ceramics-production",
+        name: "Ceramics production",
+        description: "Run throwing, finishing, bisque, glazing and quality workflows with lot traceability.",
+        odoo_modules: &["mb_ceramics_workflow"],
+        dependencies: &["firings"],
+        service: None,
+        minimum_release: "0.1.0",
+    },
     ModuleBundle {
         key: "catalogue",
         name: "Ceramics catalogue",
@@ -16,6 +59,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_catalogue_sync"],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "firings",
@@ -24,14 +68,16 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_ceramics_firing"],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "kiln-connectivity",
         name: "Kiln connectivity",
         description: "Connect supported kiln controllers and synchronize firing data.",
         odoo_modules: &["mb_kiln_bridge"],
-        dependencies: &[],
+        dependencies: &["firings"],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "labels",
@@ -40,6 +86,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_label", "mb_label_pos"],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "depot",
@@ -48,6 +95,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_depot"],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "sumup",
@@ -60,6 +108,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         ],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "inventory-capture",
@@ -68,6 +117,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_inventory_capture"],
         dependencies: &[],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "azure-label-extraction",
@@ -76,6 +126,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &[],
         dependencies: &["inventory-capture"],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "inventory-ai-fallback",
@@ -84,6 +135,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &[],
         dependencies: &["inventory-capture"],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "documents",
@@ -92,6 +144,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &[],
         dependencies: &[],
         service: Some("paperless"),
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "invoice-capture",
@@ -100,6 +153,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &["mb_invoice_capture"],
         dependencies: &["documents"],
         service: None,
+        minimum_release: "0.1.0",
     },
     ModuleBundle {
         key: "azure-invoice-extraction",
@@ -108,6 +162,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         odoo_modules: &[],
         dependencies: &["invoice-capture"],
         service: None,
+        minimum_release: "0.1.0",
     },
 ];
 
@@ -135,5 +190,17 @@ mod tests {
         for bundle in CATALOG {
             assert!(bundle.dependencies.iter().all(|key| keys.contains(key)));
         }
+        assert_eq!(REGISTRY_VERSION, 1);
+        let embedded = embedded_registry().unwrap();
+        assert_eq!(embedded.version, REGISTRY_VERSION);
+        assert_eq!(embedded.capabilities.len(), CATALOG.len());
+        assert_eq!(
+            bundle("ceramics-production").unwrap().odoo_modules,
+            &["mb_ceramics_workflow"]
+        );
+        assert_eq!(
+            bundle("kiln-connectivity").unwrap().dependencies,
+            &["firings"]
+        );
     }
 }
