@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0031_periodic_reconciliation_fleet_fence";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0032_provisioning_worker_heartbeat_grant";
 
 #[derive(Clone)]
 pub struct Store {

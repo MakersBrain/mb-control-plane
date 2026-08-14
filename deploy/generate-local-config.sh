@@ -8,6 +8,10 @@ if [ ! -d deploy/secrets/runtime ]; then
   echo "deploy/secrets/runtime is missing; run deploy/migrate-local-env-secrets.sh --apply for a legacy .env" >&2
   exit 1
 fi
+if [ ! -f deploy/secrets/release/cosign.pub ]; then
+  echo "deploy/secrets/release/cosign.pub is missing; install the trusted release-signing public key" >&2
+  exit 1
+fi
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 set -a
 . deploy/.env

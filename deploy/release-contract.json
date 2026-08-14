@@ -5,7 +5,7 @@
   "public_openapi_baseline": "openapi-v1-baseline.json",
   "capability_registry": {"path":"capability-registry-v1.json","version":1,"sha256":"528d089a90c5f869566eef1451bc4dea5aa1271190501d47996b06a36d091f01"},
   "release": "0.1.0",
-  "schema_release": "0031_periodic_reconciliation_fleet_fence",
+  "schema_release": "0032_provisioning_worker_heartbeat_grant",
   "schema_compatibility": ">=0024_worker_heartbeats,<0025",
   "images": {
     "control": {"build_context": "control-plane", "dockerfile": "Dockerfile", "required_artifacts": ["oci_digest", "spdx_sbom"]},
@@ -17,6 +17,7 @@
   "processes": {
     "migration": {"command": ["/usr/local/bin/control-migrate"], "run_before": ["api", "workers"]},
     "database_identity_reconciliation": {"command": ["/bin/sh", "/run/makersbrain/reconcile-database-identities.sh"], "run_before": ["migration"], "idempotent": true},
+    "privacy_export_volume_initialization": {"command": ["/bin/sh", "-ec", "chown 10001:10001 /exports && chmod 0700 /exports"], "run_before": ["api", "privacy_worker"], "idempotent": true},
     "api": {"command": ["/usr/local/bin/control-api"], "port": 8080, "live": "/health/live", "ready": "/health/ready", "openapi": "/openapi.json"},
     "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["tenant-provisioning", "membership-provisioning", "invoice-capture", "inventory-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle", "release-adoption", "privacy-operations"]},
     "web": {"port": 8080, "live": "/health/live"},

@@ -229,6 +229,14 @@ services:
     depends_on: {postgres: {condition: service_healthy}}
     restart: "no"
 
+  privacy-export-init:
+    image: alpine:3.22
+    user: "0:0"
+    command: ["/bin/sh", "-ec", "chown 10001:10001 /exports && chmod 0700 /exports"]
+    volumes:
+      - privacy-exports:/exports
+    restart: "no"
+
   control-api:
     image: makersbrain-control:local
     build: {context: ..}
@@ -281,6 +289,7 @@ services:
       postgres: {condition: service_healthy}
       control-migrate: {condition: service_completed_successfully}
       document-extraction: {condition: service_healthy}
+      privacy-export-init: {condition: service_completed_successfully}
     healthcheck: {test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/ready"], interval: 10s, timeout: 3s, retries: 10}
     restart: unless-stopped
 
@@ -525,7 +534,12 @@ services:
       CONTROL_RELEASE_COSIGN_KEY_FILE: /run/makersbrain-release/cosign.pub
       CONTROL_RELEASE_SLSA_BUILDER_ID: ${RELEASE_SLSA_BUILDER_ID}
     volumes:
-      - ./secrets/release/cosign.pub:/run/makersbrain-release/cosign.pub:ro
+      - type: bind
+        source: ./secrets/release/cosign.pub
+        target: /run/makersbrain-release/cosign.pub
+        read_only: true
+        bind:
+          create_host_path: false
     secrets: [control_release_database_url, deployment_driver_token]
 
   worker-privacy:
@@ -544,6 +558,10 @@ services:
     volumes:
       - privacy-exports:/var/lib/makersbrain/privacy-exports
     secrets: [control_privacy_database_url, control_privacy_lookup_key, control_privacy_export_key, privacy_driver_token]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-migrate: {condition: service_completed_successfully}
+      privacy-export-init: {condition: service_completed_successfully}
 
   backup-scheduler:
     <<: *worker
