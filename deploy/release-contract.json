@@ -16,6 +16,7 @@
   },
   "processes": {
     "migration": {"command": ["/usr/local/bin/control-migrate"], "run_before": ["api", "workers"]},
+    "database_identity_reconciliation": {"command": ["/bin/sh", "/run/makersbrain/reconcile-database-identities.sh"], "run_before": ["migration"], "idempotent": true},
     "api": {"command": ["/usr/local/bin/control-api"], "port": 8080, "live": "/health/live", "ready": "/health/ready", "openapi": "/openapi.json"},
     "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["tenant-provisioning", "membership-provisioning", "invoice-capture", "inventory-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle", "release-adoption", "privacy-operations"]},
     "web": {"port": 8080, "live": "/health/live"},

@@ -10,6 +10,7 @@ target=${2:-deploy/.env}
 target_dir=$(dirname "$target")
 runtime_dir="$target_dir/secrets/runtime"
 [ ! -e "$runtime_dir" ] || { echo "$runtime_dir already exists; refusing partial migration" >&2; exit 1; }
+command -v openssl >/dev/null 2>&1 || { echo "openssl is required" >&2; exit 1; }
 
 set -a
 . "$target"
@@ -17,12 +18,46 @@ set +a
 umask 077
 runtime_temporary="${runtime_dir}.tmp.$$"
 environment_temporary="${target}.tmp.$$"
+invitation_temporary=
 cleanup() {
   rm -f "$environment_temporary"
   rm -rf "$runtime_temporary"
+  [ -z "$invitation_temporary" ] || rm -rf "$invitation_temporary"
 }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$runtime_temporary"
+
+random_hex() { openssl rand -hex 32; }
+random_base64() { openssl rand -base64 32 | tr -d '\n'; }
+generate_if_missing() {
+  name=$1
+  kind=$2
+  eval "value=\${$name-}"
+  [ -n "$value" ] && return
+  case "$kind" in
+    hex) value=$(random_hex) ;;
+    base64) value=$(random_base64) ;;
+    *) echo "unsupported generated secret kind for $name" >&2; exit 1 ;;
+  esac
+  export "$name=$value"
+}
+
+# These identities and capabilities did not exist in the original local
+# topology. Generate only the missing values; all legacy credentials below are
+# preserved byte-for-byte.
+for name in \
+  CONTROL_API_POSTGRES_PASSWORD CONTROL_MEMBERSHIP_POSTGRES_PASSWORD \
+  CONTROL_PROVISIONING_POSTGRES_PASSWORD CONTROL_INVOICE_POSTGRES_PASSWORD \
+  CONTROL_INVENTORY_POSTGRES_PASSWORD CONTROL_EMAIL_POSTGRES_PASSWORD \
+  CONTROL_RECONCILIATION_POSTGRES_PASSWORD CONTROL_LIFECYCLE_POSTGRES_PASSWORD \
+  CONTROL_BACKUP_POSTGRES_PASSWORD CONTROL_DRIVER_POSTGRES_PASSWORD \
+  CONTROL_RELEASE_POSTGRES_PASSWORD CONTROL_PRIVACY_POSTGRES_PASSWORD \
+  CONTROL_RELEASE_PUBLISH_TOKEN DOCUMENT_EXTRACTION_TOKEN PRIVACY_DRIVER_TOKEN
+do
+  generate_if_missing "$name" hex
+done
+generate_if_missing CONTROL_PRIVACY_LOOKUP_KEY base64
+generate_if_missing CONTROL_PRIVACY_EXPORT_KEY base64
 
 read_value() {
   name=$1
@@ -119,9 +154,43 @@ while IFS= read -r line || [ -n "$line" ]; do
     *) printf '%s\n' "$line" ;;
   esac
 done < "$target" > "$environment_temporary"
+for name in $all_secret_names; do
+  if ! grep -q "^${name}=" "$target"; then
+    file=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+    printf '%s=@/run/secrets/%s\n' "$name" "$file" >> "$environment_temporary"
+  fi
+done
+
+today=$(date -u +%Y-%m-%d)
+source_commit=$(git rev-parse --verify HEAD 2>/dev/null || printf 'unreleased')
+invitation_dir="$target_dir/secrets/invitation"
+invitation_temporary="${invitation_dir}.tmp.$$"
+[ ! -e "$invitation_dir" ] || { echo "$invitation_dir already exists; refusing partial invitation-key migration" >&2; exit 1; }
+mkdir -p "$invitation_temporary"
+openssl genpkey -algorithm ED25519 -out "$invitation_temporary/private.pem"
+public_der=$(openssl pkey -in "$invitation_temporary/private.pem" -pubout -outform DER | openssl base64 -A)
+private_der=$(openssl pkey -in "$invitation_temporary/private.pem" -outform DER | openssl base64 -A)
+invitation_key_id="local-$today"
+printf '{"keys":{"%s":"%s"}}\n' "$invitation_key_id" "$private_der" > "$invitation_temporary/private-keys.json"
+printf '{"keys":{"%s":"%s"}}\n' "$invitation_key_id" "$public_der" > "$invitation_temporary/public-keys.json"
+chmod 0600 "$invitation_temporary/private.pem" "$invitation_temporary/private-keys.json"
+chmod 0644 "$invitation_temporary/public-keys.json"
+
+append_setting() {
+  name=$1
+  value=$2
+  grep -q "^${name}=" "$target" || printf '%s=%s\n' "$name" "$value" >> "$environment_temporary"
+}
+append_setting CONTROL_DATA_MODE synthetic
+append_setting CONTROL_PRIVACY_LOOKUP_KEY_ID "local-privacy-$today"
+append_setting CONTROL_PRIVACY_EXPORT_KEY_ID "local-export-$today"
+append_setting CONTROL_RELEASE_ID "control-local-$source_commit"
+append_setting INVITATION_SIGNING_KEY_ID "$invitation_key_id"
+append_setting RELEASE_SLSA_BUILDER_ID local-synthetic-builder
 chmod 0600 "$environment_temporary"
 mkdir -p "$(dirname "$runtime_dir")"
 mv "$runtime_temporary" "$runtime_dir"
+mv "$invitation_temporary" "$invitation_dir"
 mv "$environment_temporary" "$target"
 trap - EXIT HUP INT TERM
 echo "migrated $target to mounted secret-file references"

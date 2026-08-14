@@ -187,6 +187,45 @@ services:
     environment:
       <<: *migration-env
     secrets: [control_database_url]
+    depends_on:
+      postgres: {condition: service_healthy}
+      control-database-identities: {condition: service_completed_successfully}
+    restart: "no"
+
+  control-database-identities:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    entrypoint: ["/bin/sh", "/run/makersbrain/reconcile-database-identities.sh"]
+    environment:
+      PGHOST: postgres
+      POSTGRES_SUPERUSER_PASSWORD: "@/run/secrets/postgres_superuser_password"
+      CONTROL_API_POSTGRES_PASSWORD: "@/run/secrets/control_api_postgres_password"
+      CONTROL_MEMBERSHIP_POSTGRES_PASSWORD: "@/run/secrets/control_membership_postgres_password"
+      CONTROL_PROVISIONING_POSTGRES_PASSWORD: "@/run/secrets/control_provisioning_postgres_password"
+      CONTROL_INVOICE_POSTGRES_PASSWORD: "@/run/secrets/control_invoice_postgres_password"
+      CONTROL_INVENTORY_POSTGRES_PASSWORD: "@/run/secrets/control_inventory_postgres_password"
+      CONTROL_EMAIL_POSTGRES_PASSWORD: "@/run/secrets/control_email_postgres_password"
+      CONTROL_RECONCILIATION_POSTGRES_PASSWORD: "@/run/secrets/control_reconciliation_postgres_password"
+      CONTROL_LIFECYCLE_POSTGRES_PASSWORD: "@/run/secrets/control_lifecycle_postgres_password"
+      CONTROL_BACKUP_POSTGRES_PASSWORD: "@/run/secrets/control_backup_postgres_password"
+      CONTROL_DRIVER_POSTGRES_PASSWORD: "@/run/secrets/control_driver_postgres_password"
+      CONTROL_RELEASE_POSTGRES_PASSWORD: "@/run/secrets/control_release_postgres_password"
+      CONTROL_PRIVACY_POSTGRES_PASSWORD: "@/run/secrets/control_privacy_postgres_password"
+    volumes:
+      - ./reconcile-database-identities.sh:/run/makersbrain/reconcile-database-identities.sh:ro
+    secrets:
+      - postgres_superuser_password
+      - control_api_postgres_password
+      - control_membership_postgres_password
+      - control_provisioning_postgres_password
+      - control_invoice_postgres_password
+      - control_inventory_postgres_password
+      - control_email_postgres_password
+      - control_reconciliation_postgres_password
+      - control_lifecycle_postgres_password
+      - control_backup_postgres_password
+      - control_driver_postgres_password
+      - control_release_postgres_password
+      - control_privacy_postgres_password
     depends_on: {postgres: {condition: service_healthy}}
     restart: "no"
 

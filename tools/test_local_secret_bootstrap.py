@@ -87,16 +87,48 @@ def main() -> int:
             capture_output=True,
             text=True,
         )
+        generated_during_legacy_upgrade = {
+            "CONTROL_API_POSTGRES_PASSWORD",
+            "CONTROL_MEMBERSHIP_POSTGRES_PASSWORD",
+            "CONTROL_PROVISIONING_POSTGRES_PASSWORD",
+            "CONTROL_INVOICE_POSTGRES_PASSWORD",
+            "CONTROL_INVENTORY_POSTGRES_PASSWORD",
+            "CONTROL_EMAIL_POSTGRES_PASSWORD",
+            "CONTROL_RECONCILIATION_POSTGRES_PASSWORD",
+            "CONTROL_LIFECYCLE_POSTGRES_PASSWORD",
+            "CONTROL_BACKUP_POSTGRES_PASSWORD",
+            "CONTROL_DRIVER_POSTGRES_PASSWORD",
+            "CONTROL_RELEASE_POSTGRES_PASSWORD",
+            "CONTROL_PRIVACY_POSTGRES_PASSWORD",
+            "CONTROL_RELEASE_PUBLISH_TOKEN",
+            "DOCUMENT_EXTRACTION_TOKEN",
+            "PRIVACY_DRIVER_TOKEN",
+            "CONTROL_PRIVACY_LOOKUP_KEY",
+            "CONTROL_PRIVACY_EXPORT_KEY",
+            "CONTROL_PRIVACY_LOOKUP_KEY_ID",
+            "CONTROL_PRIVACY_EXPORT_KEY_ID",
+            "CONTROL_DATA_MODE",
+            "CONTROL_RELEASE_ID",
+            "INVITATION_SIGNING_KEY_ID",
+            "RELEASE_SLSA_BUILDER_ID",
+        }
         legacy_lines: list[str] = []
+        preserved_internal_token = ""
         for line in environment.splitlines():
             match = re.match(r"^([A-Z][A-Z0-9_]*)=@/run/secrets/([a-z0-9_.-]+)$", line)
             if match:
                 value = (runtime / match.group(2)).read_text()
+                if match.group(1) == "CONTROL_INTERNAL_TOKEN":
+                    preserved_internal_token = value
                 line = f"{match.group(1)}='{value}'"
+            name = line.split("=", 1)[0]
+            if name in generated_during_legacy_upgrade:
+                continue
             legacy_lines.append(line)
         target.write_text("\n".join(legacy_lines) + "\n")
         target.chmod(0o600)
         shutil.rmtree(runtime)
+        shutil.rmtree(Path(directory) / "secrets/invitation")
         subprocess.run(
             [
                 str(DEPLOY / "migrate-local-env-secrets.sh"),
@@ -117,6 +149,10 @@ def main() -> int:
         migrated_files = {path.name for path in runtime.iterdir() if path.is_file()}
         if migrated_files != expected_files:
             raise SystemExit("legacy migration did not reconstruct the Compose secret set")
+        if (runtime / "control_internal_token").read_text() != preserved_internal_token:
+            raise SystemExit("legacy migration rotated an existing credential")
+        if not (Path(directory) / "secrets/invitation/public-keys.json").is_file():
+            raise SystemExit("legacy migration did not generate invitation signing keys")
         repeated = subprocess.run(
             [str(DEPLOY / "bootstrap-local-env.sh"), str(target)],
             cwd=CONTROL.parent,
