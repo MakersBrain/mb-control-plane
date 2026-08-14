@@ -579,7 +579,7 @@ async fn ensure_release_runtime(
         Sha256::digest(
             format!(
                 "{image}\0{runtime_role}\0{runtime_password}\0{}\0driver-secret-runtime-v2",
-                state.config.backup_secret_volume
+                state.config.runtime_secret_source
             )
             .as_bytes()
         )
@@ -621,13 +621,11 @@ async fn ensure_release_runtime(
                     "NetworkMode":state.config.docker_network,
                     "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)],
                     "GroupAdd":["0"],
-                    "Mounts":[{
-                        "Type":"volume",
-                        "Source":state.config.backup_secret_volume,
-                        "Target":"/run/makersbrain-release-secrets",
-                        "ReadOnly":true,
-                        "VolumeOptions":{"Subpath":"runtime/releases"}
-                    }]
+                    "Mounts":[runtime_secret_mount(
+                        state,
+                        Path::new("releases"),
+                        "/run/makersbrain-release-secrets",
+                    )?]
                 }
             }),
         )
@@ -732,21 +730,7 @@ async fn activate_release_routes(
         }
         return Err(error);
     }
-    let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{}/kill?signal=HUP",
-            state.config.gateway_container
-        ))
-        .send()
-        .await
-        .map_err(DriverError::internal)?;
-    if !response.status().is_success() {
-        return Err(DriverError::internal(format!(
-            "gateway release activation returned {}",
-            response.status()
-        )));
-    }
+    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
     for (workshop, _, _) in &replacements {
         let backup = state
             .config

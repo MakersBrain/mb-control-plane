@@ -476,7 +476,7 @@ def validate() -> list[str]:
     startup_entrypoints = {
         "src/bin/control-api.rs": ["api"],
         "src/bin/control-migrate.rs": ["migration"],
-        "src/bin/control-docker-driver.rs": ["docker_driver"],
+        "src/bin/control-container-driver.rs": ["docker_driver"],
         "src/bin/control-backup-scheduler.rs": ["backup_scheduler"],
         "src/bin/document-extraction-broker.rs": ["document_extraction_broker"],
         "src/bin/control-worker.rs": [

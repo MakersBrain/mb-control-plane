@@ -1,0 +1,9 @@
+[Unit]
+Description=MakersBrain private rootless application network
+
+[Network]
+NetworkName=@@RUNTIME_NETWORK@@
+DisableDNS=false
+Internal=false
+Subnet=10.89.0.0/24
+Gateway=10.89.0.1

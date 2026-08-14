@@ -1,0 +1,24 @@
+[Unit]
+Description=MakersBrain encrypted backup scheduler
+Requires=control-migrate.container control-container-driver.container
+After=control-migrate.container control-container-driver.container
+
+[Container]
+Image=@@CONTROL_IMAGE@@
+Pull=never
+ContainerName=control-backup-scheduler
+Network=makersbrain.network
+EnvironmentFile=/etc/makersbrain/control-backup-scheduler.env
+Volume=/etc/makersbrain/secrets/control-backup-scheduler:/run/secrets:ro
+Exec=/usr/local/bin/control-backup-scheduler
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

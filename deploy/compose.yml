@@ -337,7 +337,7 @@ services:
     image: makersbrain-control:local
     build: {context: ..}
     user: "0:0"
-    command: ["/usr/local/bin/control-docker-driver"]
+    command: ["/usr/local/bin/control-container-driver"]
     environment:
       DRIVER_LISTEN: 0.0.0.0:8080
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -345,7 +345,8 @@ services:
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
       DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       DRIVER_PRIVACY_TOKEN: "@/run/secrets/privacy_driver_token"
-      DRIVER_DOCKER_SOCKET: /var/run/docker.sock
+      DRIVER_CONTAINER_RUNTIME: docker
+      DRIVER_RUNTIME_SOCKET: /var/run/docker.sock
       DRIVER_DATABASE_URL: "@/run/secrets/control_driver_database_url"
       DRIVER_POSTGRES_ADMIN_URL: "@/run/secrets/postgres_admin_database_url"
       DRIVER_POSTGRES_HOST: postgres
@@ -355,7 +356,7 @@ services:
       DRIVER_ODOO_IMAGE: makersbrain-control-odoo:local
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
       DRIVER_PAPERLESS_IMAGE: makersbrain-control-paperless:local
-      DRIVER_DOCKER_NETWORK: makersbrain-control-runtime
+      DRIVER_RUNTIME_NETWORK: makersbrain-control-runtime
       DRIVER_ODOO_VOLUME: makersbrain-control-odoo-data
       DRIVER_ODOO_UID: ${ODOO_RUNTIME_UID:-100}
       DRIVER_ODOO_GID: ${ODOO_RUNTIME_GID:-101}
@@ -377,7 +378,7 @@ services:
       DRIVER_REDIS_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/makersbrain-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
-      DRIVER_BACKUP_SECRET_VOLUME: makersbrain-control-backup-secrets
+      DRIVER_RUNTIME_SECRET_SOURCE: makersbrain-control-backup-secrets
       DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes
       DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
@@ -553,7 +554,7 @@ services:
       CONTROL_PRIVACY_EXPORT_KEY_ID: ${CONTROL_PRIVACY_EXPORT_KEY_ID:?CONTROL_PRIVACY_EXPORT_KEY_ID is required}
       CONTROL_PRIVACY_EXPORT_KEY: "@/run/secrets/control_privacy_export_key"
       CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/makersbrain/privacy-exports
-      CONTROL_PRIVACY_DRIVER_URL: http://control-docker-driver:8080
+      CONTROL_PRIVACY_DRIVER_URL: http://docker-driver:8080
       CONTROL_PRIVACY_DRIVER_TOKEN: "@/run/secrets/privacy_driver_token"
     volumes:
       - privacy-exports:/var/lib/makersbrain/privacy-exports

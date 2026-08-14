@@ -1,0 +1,22 @@
+{
+  "environment": "staging",
+  "data_mode": "synthetic",
+  "production_personal_data_allowed": false,
+  "privacy_activation_record": "",
+  "images": {
+    "control": "registry.example.test/makersbrain/control@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "web": "registry.example.test/makersbrain/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "odoo": "registry.example.test/makersbrain/odoo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "rauthy": "registry.example.test/makersbrain/rauthy@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "redis": "registry.example.test/makersbrain/redis@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "nginx": "registry.example.test/makersbrain/nginx@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "alpine": "registry.example.test/makersbrain/alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "postgres": "registry.example.test/makersbrain/postgres@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "paperless": "registry.example.test/makersbrain/paperless@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "backup": "registry.example.test/makersbrain/backup@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "runtime_network": "makersbrain",
+  "runtime_secret_source": "/var/lib/makersbrain/tenant-runtime-secrets",
+  "postgres_host": "postgres.internal.example.test",
+  "public_bind_ip": "127.0.0.1"
+}

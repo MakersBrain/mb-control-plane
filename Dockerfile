@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
-FROM ghcr.io/sigstore/cosign/cosign@sha256:b29487e48205d875c324c79583e2806d9d269c0fa299e0861bbec023d8430c8b AS cosign
+FROM ghcr.io/sigstore/cosign/cosign:v2.5.0@sha256:e82eb6d42ccb6bc048d8d9e5e598e4d5178e1af6c00e54e02c9b0569c5f3ec11 AS cosign
 
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -21,10 +21,11 @@ RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registr
        target/release/control-worker \
        target/release/control-fixture \
        target/release/control-docker-driver \
+       target/release/control-container-driver \
        target/release/control-backup-scheduler \
        target/release/document-extraction-broker /out/
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 RUN --mount=type=cache,id=control-apt-lists,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,id=control-apt-cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
@@ -36,6 +37,7 @@ COPY --from=builder /out/control-migrate /usr/local/bin/control-migrate
 COPY --from=builder /out/control-worker /usr/local/bin/control-worker
 COPY --from=builder /out/control-fixture /usr/local/bin/control-fixture
 COPY --from=builder /out/control-docker-driver /usr/local/bin/control-docker-driver
+COPY --from=builder /out/control-container-driver /usr/local/bin/control-container-driver
 COPY --from=builder /out/control-backup-scheduler /usr/local/bin/control-backup-scheduler
 COPY --from=builder /out/document-extraction-broker /usr/local/bin/document-extraction-broker
 COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign

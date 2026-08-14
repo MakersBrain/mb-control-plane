@@ -27,6 +27,10 @@ name = "control-docker-driver"
 path = "src/bin/control-docker-driver.rs"
 
 [[bin]]
+name = "control-container-driver"
+path = "src/bin/control-container-driver.rs"
+
+[[bin]]
 name = "control-backup-scheduler"
 path = "src/bin/control-backup-scheduler.rs"
 

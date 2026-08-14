@@ -1,0 +1,25 @@
+[Unit]
+Description=MakersBrain members web application
+Requires=control-api.container rauthy.container
+After=control-api.container rauthy.container
+
+[Container]
+Image=@@WEB_IMAGE@@
+Pull=never
+ContainerName=control-web
+Network=makersbrain.network
+PublishPort=@@PUBLIC_BIND_IP@@:8080:8080
+HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8080/health/live
+HealthInterval=15s
+HealthRetries=12
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

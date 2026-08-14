@@ -33,8 +33,8 @@ required = (
     "PAPERLESS_ADMIN_PASSWORD_FILE=",
     "PAPERLESS_SOCIALACCOUNT_PROVIDERS_FILE=",
     "PAPERLESS_WEBHOOK_SECRET_FILE=",
-    '"Source":state.config.backup_secret_volume',
-    'VolumeOptions":{"Subpath":format!("runtime/paperless/{workshop}")}',
+    "runtime_secret_mount(",
+    'PathBuf::from("paperless").join(workshop.to_string())',
 )
 for marker in required:
     if marker not in SERVICES:
@@ -60,6 +60,8 @@ for marker in (
     "run_docker_job_with_secrets(",
     '"PGPASSFILE=/run/makersbrain-job-secrets/pgpass"',
     "aws_secret_prelude()",
+    'ContainerRuntimeKind::Podman => json!({',
+    '"Type":"bind"',
 ):
     if marker not in DRIVER_TREE:
         raise SystemExit(f"dynamic job secret boundary is missing: {marker}")

@@ -1,0 +1,27 @@
+[Unit]
+Description=MakersBrain Rauthy identity service
+Requires=control-migrate.container rauthy-bootstrap.container
+After=control-migrate.container rauthy-bootstrap.container
+
+[Container]
+Image=@@RAUTHY_IMAGE@@
+Pull=never
+ContainerName=rauthy
+Network=makersbrain.network
+EnvironmentFile=/etc/makersbrain/rauthy.env
+Volume=/etc/makersbrain/secrets/rauthy:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/rauthy-bootstrap:/app/bootstrap:ro
+HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8092/auth/v1/health
+HealthInterval=15s
+HealthRetries=20
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

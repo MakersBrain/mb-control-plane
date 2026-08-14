@@ -1,0 +1,26 @@
+[Unit]
+Description=MakersBrain control worker for %i
+Requires=control-migrate.container privacy-export-init.container
+After=control-migrate.container privacy-export-init.container
+
+[Container]
+Image=@@CONTROL_IMAGE@@
+Pull=never
+ContainerName=control-worker-%i
+GroupAdd=0
+Network=makersbrain.network
+Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
+EnvironmentFile=/etc/makersbrain/control-worker-%i.env
+Volume=/etc/makersbrain/secrets/control-worker-%i:/run/secrets:ro
+Exec=/usr/local/bin/control-worker %i
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,12 +38,56 @@ use postgres::*;
 use recovery::*;
 use services::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerRuntimeKind {
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntimeKind {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "docker" => Ok(Self::Docker),
+            "podman" => Ok(Self::Podman),
+            _ => anyhow::bail!("DRIVER_CONTAINER_RUNTIME must be docker or podman"),
+        }
+    }
+
+    fn api_version(self) -> &'static str {
+        match self {
+            Self::Docker => "v1.47",
+            // Podman's compatibility API currently targets Docker API v1.40.
+            Self::Podman => "v1.40",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker",
+            Self::Podman => "Podman",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ContainerRuntime {
+    kind: ContainerRuntimeKind,
+    client: reqwest::Client,
+}
+
+impl ContainerRuntime {
+    fn endpoint(&self, path: &str) -> String {
+        format!("http://localhost/{}{path}", self.kind.api_version())
+    }
+}
+
 #[derive(Clone)]
 pub struct DockerDriverConfig {
     pub listen: SocketAddr,
     token: String,
     privacy_token: String,
-    docker_socket: PathBuf,
+    container_runtime: ContainerRuntimeKind,
+    runtime_socket: PathBuf,
     database_url: String,
     postgres_admin_url: String,
     postgres_admin_user: String,
@@ -67,7 +111,7 @@ pub struct DockerDriverConfig {
     redis_address: String,
     secret_root: PathBuf,
     paperless_client_secret_root: PathBuf,
-    backup_secret_volume: String,
+    runtime_secret_source: String,
     job_secret_root: PathBuf,
     route_root: PathBuf,
     gateway_container: String,
@@ -97,10 +141,23 @@ struct S3BackupConfig {
 
 impl DockerDriverConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        if required("DRIVER_ENVIRONMENT")? != "development" {
+        let environment = required("DRIVER_ENVIRONMENT")?;
+        let container_runtime =
+            ContainerRuntimeKind::parse(&required("DRIVER_CONTAINER_RUNTIME")?)?;
+        if container_runtime == ContainerRuntimeKind::Docker && environment != "development" {
             anyhow::bail!(
                 "the Docker socket driver is development-only; staging and production must use the infrastructure driver"
             );
+        }
+        if !matches!(
+            environment.as_str(),
+            "development" | "staging" | "production"
+        ) {
+            anyhow::bail!("DRIVER_ENVIRONMENT must be development, staging, or production");
+        }
+        let runtime_socket = PathBuf::from(required("DRIVER_RUNTIME_SOCKET")?);
+        if !runtime_socket.is_absolute() {
+            anyhow::bail!("DRIVER_RUNTIME_SOCKET must be an absolute Unix-socket path");
         }
         let public_scheme = required("DRIVER_PUBLIC_SCHEME")?;
         if !matches!(public_scheme.as_str(), "http" | "https") {
@@ -187,11 +244,18 @@ impl DockerDriverConfig {
         if token == privacy_token {
             anyhow::bail!("DRIVER_TOKEN and DRIVER_PRIVACY_TOKEN must be distinct");
         }
+        let runtime_secret_source = required("DRIVER_RUNTIME_SECRET_SOURCE")?;
+        if container_runtime == ContainerRuntimeKind::Podman
+            && !Path::new(&runtime_secret_source).is_absolute()
+        {
+            anyhow::bail!("DRIVER_RUNTIME_SECRET_SOURCE must be an absolute host path for Podman");
+        }
         Ok(Self {
             listen: required("DRIVER_LISTEN")?.parse()?,
             token,
             privacy_token,
-            docker_socket: required("DRIVER_DOCKER_SOCKET")?.into(),
+            container_runtime,
+            runtime_socket,
             database_url: required("DRIVER_DATABASE_URL")?,
             postgres_admin_url,
             postgres_admin_user,
@@ -205,7 +269,7 @@ impl DockerDriverConfig {
             paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            docker_network: required("DRIVER_DOCKER_NETWORK")?,
+            docker_network: required("DRIVER_RUNTIME_NETWORK")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
             odoo_uid: required("DRIVER_ODOO_UID")?.parse()?,
             odoo_gid: required("DRIVER_ODOO_GID")?.parse()?,
@@ -217,7 +281,7 @@ impl DockerDriverConfig {
             redis_address: required("DRIVER_REDIS_ADDRESS")?,
             secret_root: required("DRIVER_SECRET_ROOT")?.into(),
             paperless_client_secret_root: required("DRIVER_PAPERLESS_CLIENT_SECRET_ROOT")?.into(),
-            backup_secret_volume: required("DRIVER_BACKUP_SECRET_VOLUME")?,
+            runtime_secret_source,
             job_secret_root: required("DRIVER_JOB_SECRET_ROOT")?.into(),
             route_root: required("DRIVER_ROUTE_ROOT")?.into(),
             gateway_container: required("DRIVER_GATEWAY_CONTAINER")?,
@@ -271,7 +335,7 @@ struct DriverState {
     config: DockerDriverConfig,
     ledger: PgPool,
     postgres: PgPool,
-    docker: reqwest::Client,
+    runtime: ContainerRuntime,
     rauthy: reqwest::Client,
     serial: Arc<Mutex<()>>,
 }
@@ -346,8 +410,9 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
         .max_connections(2)
         .connect(&config.postgres_admin_url)
         .await?;
-    let docker = reqwest::Client::builder()
-        .unix_socket(config.docker_socket.clone())
+    let runtime_kind = config.container_runtime;
+    let runtime_client = reqwest::Client::builder()
+        .unix_socket(config.runtime_socket.clone())
         .timeout(Duration::from_secs(180))
         .build()?;
     let mut authorization =
@@ -363,7 +428,10 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
         config,
         ledger,
         postgres,
-        docker,
+        runtime: ContainerRuntime {
+            kind: runtime_kind,
+            client: runtime_client,
+        },
         rauthy,
         serial: Arc::new(Mutex::new(())),
     });
@@ -967,6 +1035,70 @@ fn driver_runtime_secret_root(state: &DriverState) -> PathBuf {
         .join("runtime")
 }
 
+fn validated_secret_relative_path(relative: &Path) -> Result<String, DriverError> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(DriverError::internal("invalid secret mount scope"));
+    }
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| DriverError::internal("secret mount scope must be UTF-8"))
+}
+
+fn secret_mount_payload(
+    runtime: ContainerRuntimeKind,
+    source: &str,
+    relative: &Path,
+    target: &str,
+) -> Result<Value, DriverError> {
+    let relative = validated_secret_relative_path(relative)?;
+    Ok(match runtime {
+        ContainerRuntimeKind::Docker => json!({
+            "Type":"volume",
+            "Source":source,
+            "Target":target,
+            "ReadOnly":true,
+            "VolumeOptions":{"Subpath":relative}
+        }),
+        ContainerRuntimeKind::Podman => json!({
+            "Type":"bind",
+            "Source":Path::new(source).join(relative),
+            "Target":target,
+            "ReadOnly":true
+        }),
+    })
+}
+
+fn runtime_secret_mount(
+    state: &DriverState,
+    relative: &Path,
+    target: &str,
+) -> Result<Value, DriverError> {
+    secret_mount_payload(
+        state.runtime.kind,
+        &state.config.runtime_secret_source,
+        &Path::new("runtime").join(relative),
+        target,
+    )
+}
+
+fn job_secret_mount(state: &DriverState, job: &str, target: &str) -> Result<Value, DriverError> {
+    secret_mount_payload(
+        state.runtime.kind,
+        &state.config.runtime_secret_source,
+        &Path::new("jobs").join(job),
+        target,
+    )
+}
+
+fn runtime_secret_root_bind(state: &DriverState, target: &str) -> String {
+    format!("{}:{target}:ro", state.config.runtime_secret_source)
+}
+
 fn secret_value(path: &Path, length: usize) -> std::io::Result<String> {
     if path.exists() {
         return std::fs::read_to_string(path).map(|value| value.trim().to_owned());
@@ -1087,13 +1219,11 @@ async fn run_docker_job_with_secrets(
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| DriverError::internal("job Mounts must be an array"))?
-            .push(json!({
-                "Type":"volume",
-                "Source":state.config.backup_secret_volume,
-                "Target":"/run/makersbrain-job-secrets",
-                "ReadOnly":true,
-                "VolumeOptions":{"Subpath":format!("jobs/{job}")}
-            }));
+            .push(job_secret_mount(
+                state,
+                &job,
+                "/run/makersbrain-job-secrets",
+            )?);
         run_docker_job(state, container, body).await
     }
     .await;
@@ -1156,6 +1286,53 @@ fn directory_size(path: &Path) -> std::io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_secret_mount_uses_a_named_volume_subpath() {
+        let mount = secret_mount_payload(
+            ContainerRuntimeKind::Docker,
+            "control-secrets",
+            Path::new("runtime/paperless/tenant"),
+            "/run/secrets",
+        )
+        .unwrap();
+        assert_eq!(mount["Type"], "volume");
+        assert_eq!(mount["Source"], "control-secrets");
+        assert_eq!(
+            mount["VolumeOptions"]["Subpath"],
+            "runtime/paperless/tenant"
+        );
+    }
+
+    #[test]
+    fn podman_secret_mount_uses_a_protected_host_path() {
+        let mount = secret_mount_payload(
+            ContainerRuntimeKind::Podman,
+            "/var/lib/makersbrain/tenant-runtime-secrets",
+            Path::new("jobs/job-id"),
+            "/run/secrets",
+        )
+        .unwrap();
+        assert_eq!(mount["Type"], "bind");
+        assert_eq!(
+            mount["Source"],
+            "/var/lib/makersbrain/tenant-runtime-secrets/jobs/job-id"
+        );
+        assert!(mount.get("VolumeOptions").is_none());
+    }
+
+    #[test]
+    fn secret_mount_scope_cannot_escape_its_root() {
+        assert!(
+            secret_mount_payload(
+                ContainerRuntimeKind::Podman,
+                "/var/lib/makersbrain/tenant-runtime-secrets",
+                Path::new("../other-user"),
+                "/run/secrets",
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn physical_database_names_are_strictly_opaque() {

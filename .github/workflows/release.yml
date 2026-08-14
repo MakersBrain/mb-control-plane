@@ -1,0 +1,192 @@
+name: Immutable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build a staging release or sign its production promotion
+        required: true
+        type: choice
+        options: [build, promote-production]
+      staging_release_artifact:
+        description: OCI artifact reference produced by build (promotion only)
+        required: false
+        type: string
+      staging_qualification_ref:
+        description: Reviewed staging qualification record (promotion only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: immutable-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ${{ vars.OCI_REGISTRY }}
+  REPOSITORY_PREFIX: ${{ vars.OCI_REPOSITORY_PREFIX }}
+
+jobs:
+  build:
+    if: inputs.operation == 'build'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.0
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      - name: Fetch staging release secrets through Infisical OIDC
+        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
+          project-slug: makersbrain-infra
+          env-slug: staging
+          secret-path: /image
+          recursive: false
+      - name: Authenticate to the controlled registry
+        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+      - name: Validate protected release inputs
+        run: |
+          set -eu
+          test -n "$REGISTRY"
+          test -n "$REPOSITORY_PREFIX"
+          test -n "$COSIGN_PRIVATE_KEY"
+          jq -e 'length == 5 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
+      - name: Build once, mirror dependencies, scan and sign
+        run: |
+          set -euo pipefail
+          mkdir -p release/sbom release/vulnerability
+          printf '{}\n' > release/images.json
+
+          build_image() {
+            name=$1
+            context=$2
+            dockerfile=$3
+            tag="$REGISTRY/$REPOSITORY_PREFIX/$name:$GITHUB_SHA"
+            docker buildx build --platform linux/amd64 --file "$dockerfile" --tag "$tag" --push "$context"
+            digest=$(docker buildx imagetools inspect "$tag" --raw | sha256sum | cut -d' ' -f1)
+            immutable="$REGISTRY/$REPOSITORY_PREFIX/$name@sha256:$digest"
+            record_image "$name" "$immutable"
+          }
+
+          record_image() {
+            name=$1
+            immutable=$2
+            syft "$immutable" -o "spdx-json=release/sbom/$name.spdx.json"
+            trivy image --ignore-unfixed --format json --output "release/vulnerability/$name.json" "$immutable"
+            trivy image --ignore-unfixed --exit-code 1 --severity CRITICAL "$immutable"
+            cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$immutable"
+            jq --arg name "$name" --arg image "$immutable" '. + {($name): $image}' \
+              release/images.json > release/images.next.json
+            mv release/images.next.json release/images.json
+          }
+
+          build_image control control-plane control-plane/Dockerfile
+          build_image web control-plane/web control-plane/web/Dockerfile
+          build_image odoo . control-plane/deploy/Odoo.Dockerfile
+          build_image paperless control-plane/deploy control-plane/deploy/Paperless.Dockerfile
+          build_image backup control-plane/deploy control-plane/deploy/Backup.Dockerfile
+
+          jq -r 'to_entries[] | [.key, .value] | @tsv' .github/release-third-party-images.json |
+          while IFS=$'\t' read -r name source; do
+            tag="$REGISTRY/$REPOSITORY_PREFIX/$name:$GITHUB_SHA"
+            docker buildx imagetools create --tag "$tag" "$source"
+            digest=$(docker buildx imagetools inspect "$tag" --raw | sha256sum | cut -d' ' -f1)
+            record_image "$name" "$REGISTRY/$REPOSITORY_PREFIX/$name@sha256:$digest"
+          done
+
+          test "$(jq length release/images.json)" -eq 10
+          release_id="control-$(date -u +%Y.%m.%d)-${GITHUB_SHA:0:16}"
+          jq -n \
+            --arg release_id "$release_id" \
+            --arg source_commit "$GITHUB_SHA" \
+            --arg ci_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --slurpfile images release/images.json \
+            '{release_id: $release_id, source_commit: $source_commit, ci_run_url: $ci_run_url, staging_qualification_ref: "", images: $images[0]}' \
+            > release/release-record.json
+          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
+            --output-signature release/release-record.json.sig release/release-record.json
+          printf '%s\n' "$release_id" > release/release-id.txt
+          tar -C release -czf release/sbom.tar.gz sbom
+          tar -C release -czf release/vulnerability.tar.gz vulnerability
+          artifact="$REGISTRY/$REPOSITORY_PREFIX/releases:$release_id"
+          oras push "$artifact" \
+            --artifact-type application/vnd.makersbrain.release.v1+json \
+            release/release-record.json:application/json \
+            release/release-record.json.sig:application/vnd.dev.cosign.simplesigning.v1+json \
+            release/images.json:application/json \
+            release/sbom.tar.gz:application/vnd.makersbrain.sbom.layer.v1.tar+gzip \
+            release/vulnerability.tar.gz:application/vnd.makersbrain.vulnerability.layer.v1.tar+gzip
+          printf '%s\n' "$artifact" > release/artifact-reference.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: immutable-release-${{ github.sha }}
+          path: release/
+          retention-days: 30
+
+  promote-production:
+    if: inputs.operation == 'promote-production'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.0
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - name: Fetch production promotion secrets through Infisical OIDC
+        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_PRODUCTION_RELEASE_IDENTITY_ID }}
+          project-slug: makersbrain-infra
+          env-slug: prod
+          secret-path: /image
+          recursive: false
+      - name: Authenticate to the controlled registry
+        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+      - name: Verify staging record and sign production promotion
+        env:
+          STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
+          QUALIFICATION: ${{ inputs.staging_qualification_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$STAGING_ARTIFACT"
+          case "$STAGING_ARTIFACT" in
+            "$REGISTRY/$REPOSITORY_PREFIX/releases:"*) ;;
+            *) echo "staging artifact is outside the configured release repository" >&2; exit 1 ;;
+          esac
+          test "${#QUALIFICATION}" -ge 8
+          test -n "$COSIGN_PRIVATE_KEY"
+          test -n "$COSIGN_PUBLIC_KEY"
+          mkdir release
+          oras pull --output release "$STAGING_ARTIFACT"
+          printf '%s\n' "$COSIGN_PUBLIC_KEY" > release/release-cosign.pub
+          cosign verify-blob --insecure-ignore-tlog --key release/release-cosign.pub \
+            --signature release/release-record.json.sig release/release-record.json
+          jq --arg qualification "$QUALIFICATION" \
+            '.staging_qualification_ref = $qualification' \
+            release/release-record.json > release/production-release-record.json
+          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
+            --output-signature release/production-release-record.json.sig \
+            release/production-release-record.json
+          release_id=$(jq -r .release_id release/production-release-record.json)
+          artifact="$REGISTRY/$REPOSITORY_PREFIX/releases:production-$release_id"
+          oras push "$artifact" \
+            --artifact-type application/vnd.makersbrain.production-release.v1+json \
+            release/production-release-record.json:application/json \
+            release/production-release-record.json.sig:application/vnd.dev.cosign.simplesigning.v1+json
+          printf '%s\n' "$artifact"

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "contract_version": 1,
+  "contract_version": 2,
   "application_release_schema": "application-release.schema.json",
   "public_openapi_baseline": "openapi-v1-baseline.json",
   "capability_registry": {"path":"capability-registry-v1.json","version":1,"sha256":"528d089a90c5f869566eef1451bc4dea5aa1271190501d47996b06a36d091f01"},
@@ -21,7 +21,7 @@
     "api": {"command": ["/usr/local/bin/control-api"], "port": 8080, "live": "/health/live", "ready": "/health/ready", "openapi": "/openapi.json"},
     "workers": {"executable": "/usr/local/bin/control-worker", "queues": ["tenant-provisioning", "membership-provisioning", "invoice-capture", "inventory-capture", "email-delivery", "tenant-reconciliation", "tenant-lifecycle", "release-adoption", "privacy-operations"]},
     "web": {"port": 8080, "live": "/health/live"},
-    "docker_driver": {"command": ["/usr/local/bin/control-docker-driver"], "port": 8080, "live": "/health/live", "private": true},
+    "docker_driver": {"command": ["/usr/local/bin/control-container-driver"], "port": 8080, "live": "/health/live", "private": true},
     "backup_scheduler": {"command": ["/usr/local/bin/control-backup-scheduler"], "private": true, "cadence": "one due backup per workshop per 24 hours and one isolated recovery rehearsal per 30 days"}
     ,"document_extraction_broker": {"command": ["/usr/local/bin/document-extraction-broker"], "port": 8080, "live": "/health/live", "private": true, "allowed_models": ["prebuilt-invoice", "prebuilt-read"]}
   },
@@ -61,7 +61,7 @@
     "inventory_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_SECRET_ROOT", "CONTROL_EXTRACTION_BROKER_URL", "CONTROL_EXTRACTION_BROKER_TOKEN"],
     "document_extraction_broker": ["BROKER_LISTEN", "BROKER_TOKEN"],
     "provisioning_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN"],
-    "docker_driver": ["DRIVER_ENVIRONMENT", "DRIVER_LISTEN", "DRIVER_TOKEN", "DRIVER_PRIVACY_TOKEN", "DRIVER_DOCKER_SOCKET", "DRIVER_DATABASE_URL", "DRIVER_POSTGRES_ADMIN_URL", "DRIVER_POSTGRES_HOST", "DRIVER_POSTGRES_PORT", "DRIVER_ODOO_POSTGRES_PASSWORD", "DRIVER_ODOO_BRIDGE_TOKEN", "DRIVER_ODOO_IMAGE", "DRIVER_POSTGRES_IMAGE", "DRIVER_DOCKER_NETWORK", "DRIVER_ODOO_VOLUME", "DRIVER_ODOO_UID", "DRIVER_ODOO_GID", "DRIVER_BACKUP_VOLUME", "DRIVER_ODOO_DATA_ROOT", "DRIVER_BACKUP_ROOT", "DRIVER_REDIS_ADDRESS", "DRIVER_SECRET_ROOT", "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT", "DRIVER_BACKUP_SECRET_VOLUME", "DRIVER_JOB_SECRET_ROOT", "DRIVER_ROUTE_ROOT", "DRIVER_GATEWAY_CONTAINER", "DRIVER_ODOO_BASE_URL", "DRIVER_CONTROL_INTERNAL_URL", "DRIVER_RAUTHY_ADMIN_URL", "DRIVER_RAUTHY_ADMIN_KEY", "DRIVER_OIDC_ISSUER", "DRIVER_PUBLIC_SCHEME"],
+    "docker_driver": ["DRIVER_ENVIRONMENT", "DRIVER_CONTAINER_RUNTIME", "DRIVER_RUNTIME_SOCKET", "DRIVER_LISTEN", "DRIVER_TOKEN", "DRIVER_PRIVACY_TOKEN", "DRIVER_DATABASE_URL", "DRIVER_POSTGRES_ADMIN_URL", "DRIVER_POSTGRES_HOST", "DRIVER_POSTGRES_PORT", "DRIVER_ODOO_POSTGRES_PASSWORD", "DRIVER_ODOO_BRIDGE_TOKEN", "DRIVER_ODOO_IMAGE", "DRIVER_POSTGRES_IMAGE", "DRIVER_RUNTIME_NETWORK", "DRIVER_ODOO_VOLUME", "DRIVER_ODOO_UID", "DRIVER_ODOO_GID", "DRIVER_BACKUP_VOLUME", "DRIVER_ODOO_DATA_ROOT", "DRIVER_BACKUP_ROOT", "DRIVER_REDIS_ADDRESS", "DRIVER_SECRET_ROOT", "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT", "DRIVER_RUNTIME_SECRET_SOURCE", "DRIVER_JOB_SECRET_ROOT", "DRIVER_ROUTE_ROOT", "DRIVER_GATEWAY_CONTAINER", "DRIVER_ODOO_BASE_URL", "DRIVER_CONTROL_INTERNAL_URL", "DRIVER_RAUTHY_ADMIN_URL", "DRIVER_RAUTHY_ADMIN_KEY", "DRIVER_OIDC_ISSUER", "DRIVER_PUBLIC_SCHEME"],
     "backup_scheduler": ["CONTROL_DATABASE_URL", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN"],
     "email_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_MAIL_WEBHOOK_URL", "CONTROL_MAIL_WEBHOOK_TOKEN", "CONTROL_PUBLIC_ORIGIN", "CONTROL_INVITATION_SIGNING_KEY_ID", "CONTROL_INVITATION_SIGNING_KEYS_FILE"]
     ,"reconciliation_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_SECRET_ROOT"]
@@ -108,6 +108,6 @@
   "invoice_capture": {"optional_module": "invoice-capture", "depends_on": ["documents"], "azure_module": "azure-invoice-extraction", "azure_optional": true},
   "inventory_capture": {"optional_module": "inventory-capture", "azure_module": "azure-label-extraction", "azure_optional": true, "source_images_in_queue": false},
   "odoo": {"version": "19", "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop", "core_modules": ["auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4", "mb_dbfilter_gateway", "mb_control_bridge", "mb_brand", "mb_workshop_pos"], "optional_modules": ["mb_ai_bridge", "mb_invoice_capture", "mb_inventory_capture", "mb_inventory_capture_catalogue"], "bridge_prefix": "/mb_control/v1", "database_per_tenant": true, "native_database_manager": false, "tenant_hostname_pattern": "<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "paperless_hostname_pattern": "docs-<workshop-slug>.<CONTROL_TENANT_DOMAIN>", "database_identifier_pattern": "mb_<opaque-uuid>", "routing_contract": "the gateway maps each exact registered hostname to an opaque Odoo database header; hostname and database identifier are never derived from one another; normal bridge requests require the distinct credential verifier stored in that selected tenant database"},
-  "deployment_driver": {"implementation": "docker", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private Docker Unix socket", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
+  "deployment_driver": {"implementations": {"development": "docker", "staging": "podman", "production": "podman"}, "runtime_selector": "DRIVER_CONTAINER_RUNTIME", "socket_variable": "DRIVER_RUNTIME_SOCKET", "network_variable": "DRIVER_RUNTIME_NETWORK", "authentication": "bearer", "idempotency": "persistent ledger", "socket": "private rootless Unix socket owned by the selected container runtime", "dynamic_resources": ["paperless_container", "paperless_volumes", "postgresql_databases", "redis_acl", "rauthy_clients", "gateway_routes", "encrypted_s3_recovery_sets"]},
   "rollback": {"application": "requires an application release compatible with 0024_worker_heartbeats", "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"}
 }

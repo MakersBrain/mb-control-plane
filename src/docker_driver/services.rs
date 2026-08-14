@@ -238,13 +238,11 @@ pub(super) async fn ensure_odoo_break_glass(
                 "NetworkMode":state.config.docker_network,
                 "GroupAdd":["0"],
                 "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)],
-                "Mounts":[{
-                    "Type":"volume",
-                    "Source":state.config.backup_secret_volume,
-                    "Target":"/run/makersbrain-odoo-secrets",
-                    "ReadOnly":true,
-                    "VolumeOptions":{"Subpath":format!("runtime/odoo/{workshop}")}
-                }]
+                "Mounts":[runtime_secret_mount(
+                    state,
+                    &PathBuf::from("odoo").join(workshop.to_string()),
+                    "/run/makersbrain-odoo-secrets",
+                )?]
             }
         }),
         &[("postgres-password", state.config.odoo_postgres_password.as_str())],
@@ -335,7 +333,7 @@ pub(super) async fn ensure_paperless(
         Sha256::digest(
             serde_json::to_vec(&(
                 "paperless-secret-boundary-v2",
-                &state.config.backup_secret_volume,
+                &state.config.runtime_secret_source,
                 paperless_image,
                 &environment,
                 database_password,
@@ -373,13 +371,11 @@ pub(super) async fn ensure_paperless(
                 "NetworkMode":state.config.docker_network,
                 "Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")],
                 "GroupAdd":["0"],
-                "Mounts":[{
-                    "Type":"volume",
-                    "Source":state.config.backup_secret_volume,
-                    "Target":"/run/makersbrain-secrets",
-                    "ReadOnly":true,
-                    "VolumeOptions":{"Subpath":format!("runtime/paperless/{workshop}")}
-                }]
+                "Mounts":[runtime_secret_mount(
+                    state,
+                    &PathBuf::from("paperless").join(workshop.to_string()),
+                    "/run/makersbrain-secrets",
+                )?]
             }
         }),
     )

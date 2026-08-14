@@ -1,0 +1,19 @@
+[Unit]
+Description=Reconcile MakersBrain PostgreSQL process identities
+Before=control-migrate.container
+
+[Container]
+Image=@@POSTGRES_IMAGE@@
+Pull=never
+Network=makersbrain.network
+EnvironmentFile=/etc/makersbrain/control-database-identities.env
+Volume=/etc/makersbrain/assets/reconcile-database-identities.sh:/run/makersbrain/reconcile-database-identities.sh:ro
+Volume=/etc/makersbrain/secrets/database-identities:/run/secrets:ro
+Exec=/bin/sh /run/makersbrain/reconcile-database-identities.sh
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=300

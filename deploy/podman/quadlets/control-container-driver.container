@@ -1,0 +1,54 @@
+[Unit]
+Description=MakersBrain authenticated Podman deployment driver
+Requires=control-migrate.container odoo.container redis.container tenant-gateway.container podman.socket
+After=control-migrate.container odoo.container redis.container tenant-gateway.container podman.socket
+
+[Container]
+Image=@@CONTROL_IMAGE@@
+Pull=never
+ContainerName=control-container-driver
+User=0:0
+Network=makersbrain.network
+Environment=DRIVER_ENVIRONMENT=@@ENVIRONMENT@@
+Environment=DRIVER_CONTAINER_RUNTIME=podman
+Environment=DRIVER_RUNTIME_SOCKET=/run/podman/podman.sock
+Environment=DRIVER_RUNTIME_NETWORK=@@RUNTIME_NETWORK@@
+Environment=DRIVER_RUNTIME_SECRET_SOURCE=@@RUNTIME_SECRET_SOURCE@@
+Environment=DRIVER_ODOO_IMAGE=@@ODOO_IMAGE@@
+Environment=DRIVER_POSTGRES_IMAGE=@@POSTGRES_IMAGE@@
+Environment=DRIVER_PAPERLESS_IMAGE=@@PAPERLESS_IMAGE@@
+Environment=DRIVER_BACKUP_AGENT_IMAGE=@@BACKUP_IMAGE@@
+Environment=DRIVER_ODOO_VOLUME=makersbrain-odoo-data
+Environment=DRIVER_BACKUP_VOLUME=makersbrain-backup-data
+Environment=DRIVER_ODOO_DATA_ROOT=/var/lib/odoo
+Environment=DRIVER_BACKUP_ROOT=/backups
+Environment=DRIVER_SECRET_ROOT=/run/makersbrain-secrets
+Environment=DRIVER_PAPERLESS_CLIENT_SECRET_ROOT=/run/makersbrain-paperless-client-secrets
+Environment=DRIVER_ROUTE_ROOT=/run/makersbrain-routes
+Environment=DRIVER_GATEWAY_CONTAINER=tenant-gateway
+Environment=DRIVER_JOB_SECRET_ROOT=/run/makersbrain-backup-secrets/jobs
+EnvironmentFile=/etc/makersbrain/control-container-driver.env
+Volume=/etc/makersbrain/secrets/control-container-driver:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@:/run/makersbrain-backup-secrets
+Volume=odoo-data.volume:/var/lib/odoo
+Volume=backup-data.volume:/backups
+Volume=gateway-routes.volume:/run/makersbrain-routes
+Volume=tenant-secrets.volume:/run/makersbrain-secrets
+Volume=paperless-client-secrets.volume:/run/makersbrain-paperless-client-secrets
+Volume=%t/podman/podman.sock:/run/podman/podman.sock
+Exec=/usr/local/bin/control-container-driver
+HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/live
+HealthInterval=15s
+HealthRetries=12
+SecurityLabelDisable=true
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

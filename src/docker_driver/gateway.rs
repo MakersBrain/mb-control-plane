@@ -23,21 +23,7 @@ pub(super) async fn write_routes(
         }
         return Err(error);
     }
-    let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{}/kill?signal=HUP",
-            state.config.gateway_container
-        ))
-        .send()
-        .await
-        .map_err(DriverError::internal)?;
-    if !response.status().is_success() {
-        return Err(DriverError::internal(format!(
-            "gateway reload returned {}",
-            response.status()
-        )));
-    }
+    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
     Ok(())
 }
 

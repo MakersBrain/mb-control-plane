@@ -1,0 +1,28 @@
+[Unit]
+Description=MakersBrain shared Odoo runtime
+Requires=control-migrate.container
+After=control-migrate.container
+
+[Container]
+Image=@@ODOO_IMAGE@@
+Pull=never
+ContainerName=odoo
+Network=makersbrain.network
+EnvironmentFile=/etc/makersbrain/odoo.env
+Volume=/etc/makersbrain/secrets/odoo:/run/secrets:ro
+Volume=odoo-data.volume:/var/lib/odoo
+Exec=odoo --no-database-list --db_host=@@POSTGRES_HOST@@ --db_user=odoo --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode
+HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8069/web/health
+HealthInterval=15s
+HealthRetries=20
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

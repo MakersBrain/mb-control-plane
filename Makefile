@@ -7,6 +7,9 @@ check:
 	python3 tools/test_compose_secret_canary.py
 	python3 tools/test_local_secret_bootstrap.py
 	python3 tools/test_dynamic_secret_boundary.py
+	python3 -m unittest discover -s deploy/podman/tests -v
+	sh -ec 'output=$$(mktemp -d); python3 deploy/podman/render.py --values deploy/podman/values.example.json --output "$$output"; python3 deploy/podman/validate.py "$$output"'
+	sh -ec 'output=$$(mktemp -d); python3 deploy/podman/database/render.py --values deploy/podman/database/values.example.json --output "$$output"; python3 deploy/podman/database/validate.py "$$output"'
 	python3 tools/test_privacy_deployment_gate.py
 	python3 tools/test_topology_odoo_isolation.py --self-test
 	cargo clippy --locked --all-targets -- -D warnings

@@ -1,0 +1,32 @@
+[Unit]
+Description=MakersBrain control API
+Requires=control-migrate.container privacy-export-init.container
+After=control-migrate.container privacy-export-init.container
+
+[Container]
+Image=@@CONTROL_IMAGE@@
+Pull=never
+ContainerName=control-api
+GroupAdd=0
+Network=makersbrain.network
+Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
+EnvironmentFile=/etc/makersbrain/control-api.env
+Volume=/etc/makersbrain/secrets/control-api:/run/secrets:ro
+Volume=privacy-exports.volume:/var/lib/makersbrain/privacy-exports
+Volume=tenant-secrets.volume:/run/makersbrain-secrets:ro
+Exec=/usr/local/bin/control-api
+HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/ready
+HealthInterval=15s
+HealthRetries=12
+HealthStartPeriod=20s
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

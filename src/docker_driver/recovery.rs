@@ -585,21 +585,7 @@ pub(super) async fn replace_route_config(
     std::fs::write(&temporary, contents).map_err(DriverError::internal)?;
     std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
     docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await?;
-    let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{}/kill?signal=HUP",
-            state.config.gateway_container
-        ))
-        .send()
-        .await
-        .map_err(DriverError::internal)?;
-    if !response.status().is_success() {
-        return Err(DriverError::internal(format!(
-            "gateway reload returned {}",
-            response.status()
-        )));
-    }
+    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
     Ok(())
 }
 
@@ -1066,10 +1052,7 @@ async fn create_remote_recovery_set(
     let mut binds = vec![
         format!("{}:/backups", state.config.backup_volume),
         format!("{}:/odoo:ro", state.config.odoo_volume),
-        format!(
-            "{}:/run/makersbrain-backup-secrets:ro",
-            state.config.backup_secret_volume
-        ),
+        runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets"),
     ];
     if includes_paperless {
         for suffix in ["data", "media", "consume"] {
@@ -1563,7 +1546,7 @@ async fn restore_remote_recovery_inner(
             "Cmd": ["sh", "-ec", bootstrap],
             "Env": environment,
             "Labels": {"makersbrain.kind":"s3-restore-download-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), format!("{}:/run/makersbrain-backup-secrets:ro", state.config.backup_secret_volume)]}
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1682,7 +1665,7 @@ async fn restore_remote_recovery_inner(
             "Cmd": ["sh", "-ec", download],
             "Env": environment,
             "Labels": {"makersbrain.kind":"s3-restore-verify-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), format!("{}:/run/makersbrain-backup-secrets:ro", state.config.backup_secret_volume)]}
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1715,10 +1698,7 @@ async fn restore_remote_recovery_inner(
     let mut binds = vec![
         format!("{}:/backups:ro", state.config.backup_volume),
         format!("{}:/odoo", state.config.odoo_volume),
-        format!(
-            "{}:/run/makersbrain-backup-secrets:ro",
-            state.config.backup_secret_volume
-        ),
+        runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets"),
     ];
     if expected_scope.iter().any(|item| item == "paperless") {
         for suffix in ["data", "media", "consume"] {
@@ -1810,7 +1790,7 @@ async fn validate_remote_database_dumps(
                 format!("PAPERLESS_TEMPORARY={paperless_temporary}"),
             ],
             "Labels": {"makersbrain.kind":"restore-preflight-job"},
-            "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), format!("{}:/run/makersbrain-backup-secrets:ro", state.config.backup_secret_volume)]}
+            "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
         }),
         &[("pgpass", &pgpass)],
     )

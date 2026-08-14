@@ -1,0 +1,27 @@
+[Unit]
+Description=MakersBrain exact-host tenant gateway
+Requires=odoo.container
+After=odoo.container
+
+[Container]
+Image=@@NGINX_IMAGE@@
+Pull=never
+ContainerName=tenant-gateway
+Network=makersbrain.network
+PublishPort=@@PUBLIC_BIND_IP@@:8081:8080
+Volume=./gateway-podman.conf:/etc/nginx/nginx.conf:ro
+Volume=gateway-routes.volume:/etc/nginx/tenants:ro
+HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8080/__unregistered_health
+HealthInterval=15s
+HealthRetries=12
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

@@ -6,10 +6,13 @@ pub(super) async fn docker_exec(
     command: &[&str],
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{container}/exec"
-        ))
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{container}/exec")),
+        )
         .json(&json!({"AttachStdout":false,"AttachStderr":false,"Cmd":command}))
         .send()
         .await
@@ -29,8 +32,9 @@ pub(super) async fn docker_exec(
         .ok_or_else(|| DriverError::internal("Docker exec id missing"))?
         .to_owned();
     let response = state
-        .docker
-        .post(format!("http://localhost/v1.47/exec/{id}/start"))
+        .runtime
+        .client
+        .post(state.runtime.endpoint(&format!("/exec/{id}/start")))
         .json(&json!({"Detach":true,"Tty":false}))
         .send()
         .await
@@ -43,8 +47,9 @@ pub(super) async fn docker_exec(
     }
     for _ in 0..50 {
         let value = state
-            .docker
-            .get(format!("http://localhost/v1.47/exec/{id}/json"))
+            .runtime
+            .client
+            .get(state.runtime.endpoint(&format!("/exec/{id}/json")))
             .send()
             .await
             .map_err(DriverError::internal)?
@@ -70,8 +75,9 @@ pub(super) async fn docker_container_exists(
     name: &str,
 ) -> Result<bool, DriverError> {
     let response = state
-        .docker
-        .get(format!("http://localhost/v1.47/containers/{name}/json"))
+        .runtime
+        .client
+        .get(state.runtime.endpoint(&format!("/containers/{name}/json")))
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -89,8 +95,9 @@ pub(super) async fn docker_inspect_container(
     name: &str,
 ) -> Result<Value, DriverError> {
     let response = state
-        .docker
-        .get(format!("http://localhost/v1.47/containers/{name}/json"))
+        .runtime
+        .client
+        .get(state.runtime.endpoint(&format!("/containers/{name}/json")))
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -109,10 +116,13 @@ pub(super) async fn docker_create_container(
     body: Value,
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/create?name={name}"
-        ))
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/create?name={name}")),
+        )
         .json(&body)
         .send()
         .await
@@ -132,8 +142,9 @@ pub(super) async fn docker_start_container(
     name: &str,
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .post(format!("http://localhost/v1.47/containers/{name}/start"))
+        .runtime
+        .client
+        .post(state.runtime.endpoint(&format!("/containers/{name}/start")))
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -151,10 +162,13 @@ pub(super) async fn docker_stop_container(
     name: &str,
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{name}/stop?t=30"
-        ))
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{name}/stop?t=30")),
+        )
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -167,15 +181,44 @@ pub(super) async fn docker_stop_container(
     Ok(())
 }
 
+pub(super) async fn docker_signal_container(
+    state: &DriverState,
+    name: &str,
+    signal: &str,
+) -> Result<(), DriverError> {
+    let response = state
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{name}/kill?signal={signal}")),
+        )
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "{} signal returned {}",
+            state.runtime.kind.name(),
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn docker_wait_container(
     state: &DriverState,
     name: &str,
 ) -> Result<i64, DriverError> {
     let response = state
-        .docker
-        .post(format!(
-            "http://localhost/v1.47/containers/{name}/wait?condition=not-running"
-        ))
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{name}/wait?condition=not-running")),
+        )
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -191,10 +234,13 @@ pub(super) async fn docker_delete_container(
     name: &str,
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .delete(format!(
-            "http://localhost/v1.47/containers/{name}?force=true"
-        ))
+        .runtime
+        .client
+        .delete(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{name}?force=true")),
+        )
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -212,8 +258,9 @@ pub(super) async fn docker_create_volume(
     name: &str,
 ) -> Result<(), DriverError> {
     let response = state
-        .docker
-        .post("http://localhost/v1.47/volumes/create")
+        .runtime
+        .client
+        .post(state.runtime.endpoint("/volumes/create"))
         .json(&json!({"Name":name,"Labels":{"makersbrain.kind":"paperless-volume"}}))
         .send()
         .await
@@ -225,4 +272,28 @@ pub(super) async fn docker_create_volume(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_uses_the_supported_compatibility_api() {
+        assert_eq!(ContainerRuntimeKind::Docker.api_version(), "v1.47");
+        assert_eq!(ContainerRuntimeKind::Podman.api_version(), "v1.40");
+    }
+
+    #[test]
+    fn runtime_kind_is_closed() {
+        assert_eq!(
+            ContainerRuntimeKind::parse("docker").unwrap(),
+            ContainerRuntimeKind::Docker
+        );
+        assert_eq!(
+            ContainerRuntimeKind::parse("podman").unwrap(),
+            ContainerRuntimeKind::Podman
+        );
+        assert!(ContainerRuntimeKind::parse("containerd").is_err());
+    }
 }

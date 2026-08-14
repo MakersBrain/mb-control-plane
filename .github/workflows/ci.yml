@@ -21,7 +21,7 @@ concurrency:
 env:
   # Bumping this is a deliberate act: the addons declare 19.0.x versions and use
   # Odoo 19 extension points. Pin the digest too once one is chosen.
-  ODOO_IMAGE: odoo:19
+  ODOO_IMAGE: odoo:19@sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea
 
 jobs:
   control-plane:
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       db:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: control_test
           POSTGRES_USER: control
@@ -53,6 +53,15 @@ jobs:
       - run: python3 control-plane/tools/test_compose_secret_canary.py
       - run: python3 control-plane/tools/test_local_secret_bootstrap.py
       - run: python3 control-plane/tools/test_dynamic_secret_boundary.py
+      - run: python3 -m unittest discover -s control-plane/deploy/podman/tests -v
+      - name: Render and validate rootless Podman bundle
+        run: |
+          output=$(mktemp -d)
+          python3 control-plane/deploy/podman/render.py --values control-plane/deploy/podman/values.example.json --output "$output"
+          python3 control-plane/deploy/podman/validate.py "$output"
+          database_output=$(mktemp -d)
+          python3 control-plane/deploy/podman/database/render.py --values control-plane/deploy/podman/database/values.example.json --output "$database_output"
+          python3 control-plane/deploy/podman/database/validate.py "$database_output"
       - run: python3 control-plane/tools/test_topology_odoo_isolation.py --self-test
       - run: python3 control-plane/tools/test_openapi_compatibility.py
       - run: cargo clippy --locked --all-targets --manifest-path control-plane/Cargo.toml -- -D warnings
@@ -130,7 +139,7 @@ jobs:
     needs: static
     services:
       db:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: odoo
@@ -169,7 +178,7 @@ jobs:
     needs: static
     services:
       db:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: odoo
@@ -214,7 +223,7 @@ jobs:
     needs: static
     services:
       db:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: odoo
@@ -291,7 +300,7 @@ jobs:
     needs: static
     services:
       db:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: odoo

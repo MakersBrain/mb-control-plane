@@ -1,0 +1,7 @@
+{
+  "environment": "staging",
+  "postgres_image": "registry.example.test/makersbrain/postgres@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "private_bind_ip": "10.50.2.70",
+  "app_subnet_cidr": "10.50.2.0/26",
+  "data_directory": "/var/lib/makersbrain/postgresql/data"
+}

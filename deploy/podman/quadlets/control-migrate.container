@@ -1,0 +1,21 @@
+[Unit]
+Description=Apply MakersBrain control schema migrations
+Requires=control-database-identities.container
+After=control-database-identities.container
+Before=control-api.container control-workers@.container
+
+[Container]
+Image=@@CONTROL_IMAGE@@
+Pull=never
+Network=makersbrain.network
+Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
+EnvironmentFile=/etc/makersbrain/control-migrate.env
+Volume=/etc/makersbrain/secrets/control-migrate:/run/secrets:ro
+Exec=/usr/local/bin/control-migrate
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=300
