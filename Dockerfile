@@ -9,6 +9,7 @@ RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registr
     --mount=type=cache,id=control-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo fetch --locked
 COPY migrations ./migrations
+COPY deploy/capability-registry-v1.json deploy/configuration-spec.json ./deploy/
 COPY src ./src
 RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=control-cargo-git,target=/usr/local/cargo/git,sharing=locked \
