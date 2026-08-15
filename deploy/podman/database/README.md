@@ -41,7 +41,8 @@ the authoritative immutability and deletion boundary.
 The renderer accepts only the protected database data path, a private bind
 address, an explicit application subnet and a digest-pinned mirrored image.
 PostgreSQL requires TLS with SCRAM authentication and rejects every client
-outside the application subnet. OCI network policy provides a second boundary.
+outside the application subnet. The Hetzner private network and firewalls
+provide the second boundary.
 
 ```sh
 python3 render.py --values values.json --output /tmp/makersbrain-db
