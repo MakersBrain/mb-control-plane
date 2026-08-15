@@ -165,6 +165,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # -e HOST: the official Odoo entrypoint builds its own DB_ARGS from the
+      # HOST/PORT/USER/PASSWORD environment variables -- HOST defaulting to
+      # "db" -- and execs `odoo "$@" "${DB_ARGS[@]}"`. Because DB_ARGS come
+      # last, they win over the --db_host=localhost passed below, and every one
+      # of these jobs went looking for a host named "db" that does not exist on
+      # a --network host runner. The env var is the only thing the entrypoint
+      # reads, so it is the only thing that can correct it; the explicit flags
+      # stay because they document intent and because a future image that
+      # stops injecting DB_ARGS would then still work.
       - name: Install every addon on an empty database
         # `oca` is created empty and left that way on purpose: no addon here may
         # depend on an AGPL-3 module, and a green run with an empty OCA path is
@@ -173,6 +182,7 @@ jobs:
           mkdir -p oca
           MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
           docker run --rm --network host \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
             -v "$PWD/oca:/mnt/oca-addons:ro" \
             "$ODOO_IMAGE" \
@@ -217,6 +227,7 @@ jobs:
           MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
           run_odoo() {
             docker run --rm --network host \
+            -e HOST=localhost \
               -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
               -v odoo-ci-data:/var/lib/odoo \
               "$ODOO_IMAGE" \
@@ -268,6 +279,7 @@ jobs:
           mkdir -p oca
           ALL_MODULES=$(ls addons | paste -sd, -)
           docker run --rm --network host --user root \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons" \
             "$ODOO_IMAGE" \
             odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
@@ -275,6 +287,7 @@ jobs:
                  --data-dir=/tmp/odoo \
                  -d ci_i18n -i base --stop-after-init --without-demo=all --log-level=warn
           docker run --rm --network host --user root \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons" \
             "$ODOO_IMAGE" \
             odoo i18n loadlang \
@@ -282,6 +295,7 @@ jobs:
                  --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
                  --data-dir=/tmp/odoo -d ci_i18n -l fr_FR
           docker run --rm --network host --user root \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons" \
             "$ODOO_IMAGE" \
             odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
@@ -289,6 +303,7 @@ jobs:
                  --data-dir=/tmp/odoo \
                  -d ci_i18n -i "$ALL_MODULES" --stop-after-init --without-demo=all --log-level=warn
           docker run --rm --network host --user root \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons" \
             "$ODOO_IMAGE" \
             odoo i18n export \
@@ -350,6 +365,7 @@ jobs:
           MODULES=$(find addons -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)
           TEST_TAGS=$(printf '%s' "$MODULES" | sed 's#^#/#; s#,#,/#g')
           docker run --rm --network host \
+            -e HOST=localhost \
             -v "$PWD/addons:/mnt/makersbrain-addons:ro" \
             "$ODOO_IMAGE" \
             odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
