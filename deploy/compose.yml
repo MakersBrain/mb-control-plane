@@ -351,6 +351,7 @@ services:
       DRIVER_POSTGRES_ADMIN_URL: "@/run/secrets/postgres_admin_database_url"
       DRIVER_POSTGRES_HOST: postgres
       DRIVER_POSTGRES_PORT: "5432"
+      DRIVER_POSTGRES_CA_SOURCE: ${DRIVER_POSTGRES_CA_SOURCE:-}
       DRIVER_ODOO_POSTGRES_PASSWORD: "@/run/secrets/odoo_postgres_password"
       DRIVER_ODOO_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       DRIVER_ODOO_IMAGE: makersbrain-control-odoo:local

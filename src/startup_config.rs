@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
+use url::Url;
 
 #[derive(Deserialize)]
 struct ConfigurationSpecification {
@@ -23,6 +24,25 @@ fn placeholder(value: &str) -> bool {
         )
 }
 
+fn validate_postgres_tls_url(name: &str, value: &str) -> anyhow::Result<()> {
+    let url = Url::parse(value).map_err(|_| anyhow::anyhow!("{name} is not a valid URL"))?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        anyhow::bail!("{name} must use PostgreSQL");
+    }
+    let query: HashMap<_, _> = url.query_pairs().collect();
+    if query.get("sslmode").map(|value| value.as_ref()) != Some("verify-full") {
+        anyhow::bail!("{name} must use sslmode=verify-full outside development");
+    }
+    let root = query
+        .get("sslrootcert")
+        .map(|value| value.as_ref())
+        .unwrap_or_default();
+    if !root.starts_with("/run/secrets/") || root.contains("..") {
+        anyhow::bail!("{name} must use a mounted PostgreSQL CA below /run/secrets");
+    }
+    Ok(())
+}
+
 fn validate_with(process: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
     let specification = specification()?;
     let required = specification
@@ -37,6 +57,18 @@ fn validate_with(process: &str, lookup: impl Fn(&str) -> Option<String>) -> anyh
             .ok_or_else(|| anyhow::anyhow!("{name} is required for {process}"))?;
         if specification.secrets.contains(name) && placeholder(&value) {
             anyhow::bail!("{name} contains a forbidden placeholder for {process}");
+        }
+        let deployment_environment = if process == "docker_driver" {
+            lookup("DRIVER_ENVIRONMENT")
+        } else {
+            lookup("CONTROL_DEPLOYMENT_ENVIRONMENT")
+        };
+        if matches!(
+            deployment_environment.as_deref(),
+            Some("staging" | "production")
+        ) && (name.ends_with("DATABASE_URL") || name == "DRIVER_POSTGRES_ADMIN_URL")
+        {
+            validate_postgres_tls_url(name, &value)?;
         }
     }
     if process == "privacy_worker" {
@@ -119,5 +151,31 @@ mod tests {
         assert!(validate_with("privacy_worker", |name| values.get(name).cloned()).is_err());
         values.insert("CONTROL_PRIVACY_EXPORT_KEY".into(), "another-key".into());
         validate_with("privacy_worker", |name| values.get(name).cloned()).unwrap();
+    }
+
+    #[test]
+    fn production_style_database_urls_require_full_certificate_validation() {
+        let mut values = valid_api_values();
+        values.insert("CONTROL_DEPLOYMENT_ENVIRONMENT".into(), "staging".into());
+        values.insert(
+            "CONTROL_DATABASE_URL".into(),
+            "postgresql://control:secret@db.internal/control".into(),
+        );
+        assert!(validate_with("api", |name| values.get(name).cloned()).is_err());
+        values.insert(
+            "CONTROL_DATABASE_URL".into(),
+            "postgresql://control:secret@db.internal/control?sslmode=verify-full&sslrootcert=%2Frun%2Fsecrets%2Fpostgres-ca.crt".into(),
+        );
+        validate_with("api", |name| values.get(name).cloned()).unwrap();
+    }
+
+    #[test]
+    fn development_database_urls_remain_compatible_without_tls_query_parameters() {
+        let mut values = valid_api_values();
+        values.insert(
+            "CONTROL_DATABASE_URL".into(),
+            "postgresql://control:secret@postgres/control".into(),
+        );
+        validate_with("api", |name| values.get(name).cloned()).unwrap();
     }
 }

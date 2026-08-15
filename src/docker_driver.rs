@@ -94,6 +94,7 @@ pub struct DockerDriverConfig {
     postgres_admin_password: String,
     postgres_host: String,
     postgres_port: u16,
+    postgres_ca_source: Option<PathBuf>,
     odoo_postgres_password: String,
     odoo_bridge_token: String,
     odoo_image: String,
@@ -250,6 +251,15 @@ impl DockerDriverConfig {
         {
             anyhow::bail!("DRIVER_RUNTIME_SECRET_SOURCE must be an absolute host path for Podman");
         }
+        let postgres_ca_source = optional("DRIVER_POSTGRES_CA_SOURCE")?.map(PathBuf::from);
+        if environment != "development" {
+            let expected = Path::new(&runtime_secret_source).join("postgres-ca.crt");
+            if postgres_ca_source.as_deref() != Some(expected.as_path()) {
+                anyhow::bail!(
+                    "DRIVER_POSTGRES_CA_SOURCE must be the scoped runtime PostgreSQL CA outside development"
+                );
+            }
+        }
         Ok(Self {
             listen: required("DRIVER_LISTEN")?.parse()?,
             token,
@@ -262,6 +272,7 @@ impl DockerDriverConfig {
             postgres_admin_password,
             postgres_host: required("DRIVER_POSTGRES_HOST")?,
             postgres_port: required("DRIVER_POSTGRES_PORT")?.parse()?,
+            postgres_ca_source,
             odoo_postgres_password: required("DRIVER_ODOO_POSTGRES_PASSWORD")?,
             odoo_bridge_token: required("DRIVER_ODOO_BRIDGE_TOKEN")?,
             odoo_image: required("DRIVER_ODOO_IMAGE")?,
@@ -1095,6 +1106,23 @@ fn job_secret_mount(state: &DriverState, job: &str, target: &str) -> Result<Valu
     )
 }
 
+fn postgres_ca_mount(state: &DriverState) -> Result<Option<Value>, DriverError> {
+    let Some(source) = &state.config.postgres_ca_source else {
+        return Ok(None);
+    };
+    if !source.is_absolute() {
+        return Err(DriverError::internal(
+            "PostgreSQL CA source must be an absolute host path",
+        ));
+    }
+    Ok(Some(json!({
+        "Type":"bind",
+        "Source":source,
+        "Target":"/run/makersbrain-postgres-ca/postgres-ca.crt",
+        "ReadOnly":true
+    })))
+}
+
 fn runtime_secret_root_bind(state: &DriverState, target: &str) -> String {
     format!("{}:{target}:ro", state.config.runtime_secret_source)
 }
@@ -1224,6 +1252,23 @@ async fn run_docker_job_with_secrets(
                 &job,
                 "/run/makersbrain-job-secrets",
             )?);
+        if let Some(mount) = postgres_ca_mount(state)? {
+            host.get_mut("Mounts")
+                .and_then(Value::as_array_mut)
+                .expect("Mounts was validated above")
+                .push(mount);
+            let environment = body
+                .as_object_mut()
+                .expect("job body is an object")
+                .entry("Env")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| DriverError::internal("job Env must be an array"))?;
+            environment.push(json!("PGSSLMODE=verify-full"));
+            environment.push(json!(
+                "PGSSLROOTCERT=/run/makersbrain-postgres-ca/postgres-ca.crt"
+            ));
+        }
         run_docker_job(state, container, body).await
     }
     .await;

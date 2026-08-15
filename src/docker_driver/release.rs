@@ -598,6 +598,22 @@ async fn ensure_release_runtime(
         }
     }
     if !docker_container_exists(state, container).await? {
+        let mut environment = vec![
+            format!("HOST={}", state.config.postgres_host),
+            format!("PORT={}", state.config.postgres_port),
+            format!("USER={runtime_role}"),
+            format!("MB_RUNTIME_PASSWORD_FILE=/run/makersbrain-release-secrets/{runtime_role}"),
+        ];
+        let mut mounts = vec![runtime_secret_mount(
+            state,
+            Path::new("releases"),
+            "/run/makersbrain-release-secrets",
+        )?];
+        if let Some(ca_mount) = postgres_ca_mount(state)? {
+            environment.push("PGSSLMODE=verify-full".into());
+            environment.push("PGSSLROOTCERT=/run/makersbrain-postgres-ca/postgres-ca.crt".into());
+            mounts.push(ca_mount);
+        }
         docker_create_container(
             state,
             container,
@@ -607,11 +623,7 @@ async fn ensure_release_runtime(
                     "/bin/sh","-ec",
                     "password=$(cat \"$MB_RUNTIME_PASSWORD_FILE\"); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/makersbrain-release-secrets/bridge-token); exec odoo --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode"
                 ],
-                "Env":[
-                    format!("HOST={}",state.config.postgres_host),format!("PORT={}",state.config.postgres_port),
-                    format!("USER={runtime_role}"),
-                    format!("MB_RUNTIME_PASSWORD_FILE=/run/makersbrain-release-secrets/{runtime_role}")
-                ],
+                "Env":environment,
                 "Labels":{
                     "makersbrain.kind":"odoo-release-runtime",
                     "makersbrain.config-digest":config_digest,
@@ -621,11 +633,7 @@ async fn ensure_release_runtime(
                     "NetworkMode":state.config.docker_network,
                     "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)],
                     "GroupAdd":["0"],
-                    "Mounts":[runtime_secret_mount(
-                        state,
-                        Path::new("releases"),
-                        "/run/makersbrain-release-secrets",
-                    )?]
+                    "Mounts":mounts
                 }
             }),
         )

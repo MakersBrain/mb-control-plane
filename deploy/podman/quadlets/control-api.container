@@ -10,8 +10,12 @@ ContainerName=control-api
 GroupAdd=0
 Network=makersbrain.network
 Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
+Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@
+Environment=PGSSLMODE=verify-full
+Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
 EnvironmentFile=/etc/makersbrain/control-api.env
 Volume=/etc/makersbrain/secrets/control-api:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Volume=privacy-exports.volume:/var/lib/makersbrain/privacy-exports
 Volume=tenant-secrets.volume:/run/makersbrain-secrets:ro
 Exec=/usr/local/bin/control-api

@@ -10,8 +10,12 @@ ContainerName=control-worker-%i
 GroupAdd=0
 Network=makersbrain.network
 Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
+Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@
+Environment=PGSSLMODE=verify-full
+Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
 EnvironmentFile=/etc/makersbrain/control-worker-%i.env
 Volume=/etc/makersbrain/secrets/control-worker-%i:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Exec=/usr/local/bin/control-worker %i
 NoNewPrivileges=true
 DropCapability=all

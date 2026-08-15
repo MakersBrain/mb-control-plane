@@ -8,8 +8,12 @@ Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=control-backup-scheduler
 Network=makersbrain.network
+Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@
+Environment=PGSSLMODE=verify-full
+Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
 EnvironmentFile=/etc/makersbrain/control-backup-scheduler.env
 Volume=/etc/makersbrain/secrets/control-backup-scheduler:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Exec=/usr/local/bin/control-backup-scheduler
 NoNewPrivileges=true
 DropCapability=all

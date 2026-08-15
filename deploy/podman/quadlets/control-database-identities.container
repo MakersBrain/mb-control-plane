@@ -6,9 +6,12 @@ Before=control-migrate.container
 Image=@@POSTGRES_IMAGE@@
 Pull=never
 Network=makersbrain.network
+Environment=PGSSLMODE=verify-full
+Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
 EnvironmentFile=/etc/makersbrain/control-database-identities.env
 Volume=/etc/makersbrain/assets/reconcile-database-identities.sh:/run/makersbrain/reconcile-database-identities.sh:ro
 Volume=/etc/makersbrain/secrets/database-identities:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Exec=/bin/sh /run/makersbrain/reconcile-database-identities.sh
 NoNewPrivileges=true
 DropCapability=all

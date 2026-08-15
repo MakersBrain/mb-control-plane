@@ -28,6 +28,24 @@ class PodmanRendererTests(unittest.TestCase):
             driver = (output / "control-container-driver.container").read_text()
             self.assertIn("DRIVER_CONTAINER_RUNTIME=podman", driver)
             self.assertIn("%t/podman/podman.sock", driver)
+            self.assertIn(
+                "DRIVER_POSTGRES_CA_SOURCE=/var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt",
+                driver,
+            )
+            for name in (
+                "control-api.container",
+                "control-backup-scheduler.container",
+                "control-database-identities.container",
+                "control-migrate.container",
+                "control-workers@.container",
+                "odoo.container",
+            ):
+                content = (output / name).read_text()
+                self.assertIn("PGSSLMODE=verify-full", content)
+                self.assertIn("PGSSLROOTCERT=/run/secrets/postgres-ca.crt", content)
+            rauthy = (output / "rauthy.container").read_text()
+            self.assertIn("PG_TLS=require", rauthy)
+            self.assertIn("PG_TLS_NO_VERIFY=false", rauthy)
             for path in output.glob("*.container"):
                 if path.name != "control-container-driver.container":
                     self.assertNotIn("podman.sock", path.read_text())

@@ -16,6 +16,12 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
 - `tenant-runtime` has subordinate UID/GID ranges and lingering enabled.
 - `/var/lib/makersbrain/tenant-runtime-secrets` is owned by `tenant-runtime`,
   mode `0700`, and backed up only through the encrypted recovery path.
+- `postgres-ca.crt` is materialized as a regular, non-symlink file in that
+  directory before activation. All staging and production PostgreSQL clients
+  use `verify-full`; activation fails closed when the CA file is absent.
+- `/etc/makersbrain/rauthy.env` supplies Rauthy's supported
+  `PG_TLS_ROOT_CA` PEM value. The Quadlet fixes `PG_TLS=require` and
+  `PG_TLS_NO_VERIFY=false`; activation rejects an absent CA value.
 - The driver runs as container UID 0, which maps only to the unprivileged
   `tenant-runtime` host account under rootless Podman. It is not host root.
 - `/etc/makersbrain/*.env` is rendered by the approved secret manager, mode

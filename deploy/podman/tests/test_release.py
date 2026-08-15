@@ -68,6 +68,50 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "staging qualification"):
                 RELEASE.load_release(path, values)
 
+    def test_activation_requires_regular_postgres_ca(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = copy.deepcopy(VALUES)
+            values["runtime_secret_source"] = str(root / "runtime-secrets")
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "rauthy.env").write_text(
+                'PG_TLS_ROOT_CA="-----BEGIN CERTIFICATE-----fixture"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "PostgreSQL CA"):
+                RELEASE.verify_runtime_secrets(values, config_root)
+            secret_root = Path(values["runtime_secret_source"])
+            secret_root.mkdir()
+            target = root / "ca-target.crt"
+            target.write_text("certificate", encoding="utf-8")
+            (secret_root / "postgres-ca.crt").symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "non-symlink"):
+                RELEASE.verify_runtime_secrets(values, config_root)
+            (secret_root / "postgres-ca.crt").unlink()
+            (secret_root / "postgres-ca.crt").write_text(
+                "certificate", encoding="utf-8"
+            )
+            RELEASE.verify_runtime_secrets(values, config_root)
+
+    def test_activation_requires_rauthy_ca_value(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = copy.deepcopy(VALUES)
+            secret_root = root / "runtime-secrets"
+            secret_root.mkdir()
+            (secret_root / "postgres-ca.crt").write_text(
+                "certificate", encoding="utf-8"
+            )
+            values["runtime_secret_source"] = str(secret_root)
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "rauthy.env").write_text(
+                "PG_TLS_ROOT_CA=\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "PG_TLS_ROOT_CA"):
+                RELEASE.verify_runtime_secrets(values, config_root)
+
     @mock.patch.object(RELEASE, "run")
     def test_activation_uses_one_atomic_quadlet_symlink(self, run):
         with tempfile.TemporaryDirectory() as temporary:

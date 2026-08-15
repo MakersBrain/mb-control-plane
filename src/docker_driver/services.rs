@@ -301,9 +301,10 @@ pub(super) async fn ensure_paperless(
     write_secret(&tenant_secret_dir.join("providers"), &providers)
         .map_err(DriverError::internal)?;
     let public_origin = state.config.public_origin(public_hostname);
-    let environment = vec![
+    let mut environment = vec![
         "PAPERLESS_REDIS_FILE=/run/makersbrain-secrets/redis-url".into(),
         format!("PAPERLESS_REDIS_PREFIX={redis_prefix}"),
+        "PAPERLESS_DBENGINE=postgresql".into(),
         format!("PAPERLESS_DBHOST={}", state.config.postgres_host),
         format!("PAPERLESS_DBPORT={}", state.config.postgres_port),
         format!("PAPERLESS_DBNAME={database}"),
@@ -328,6 +329,18 @@ pub(super) async fn ensure_paperless(
             state.config.control_internal_url
         ),
     ];
+    let mut mounts = vec![runtime_secret_mount(
+        state,
+        &PathBuf::from("paperless").join(workshop.to_string()),
+        "/run/makersbrain-secrets",
+    )?];
+    if let Some(ca_mount) = postgres_ca_mount(state)? {
+        environment.push(
+            "PAPERLESS_DB_OPTIONS=sslmode=verify-full,sslrootcert=/run/makersbrain-postgres-ca/postgres-ca.crt"
+                .into(),
+        );
+        mounts.push(ca_mount);
+    }
     let config_digest = format!(
         "{:x}",
         Sha256::digest(
@@ -371,11 +384,7 @@ pub(super) async fn ensure_paperless(
                 "NetworkMode":state.config.docker_network,
                 "Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")],
                 "GroupAdd":["0"],
-                "Mounts":[runtime_secret_mount(
-                    state,
-                    &PathBuf::from("paperless").join(workshop.to_string()),
-                    "/run/makersbrain-secrets",
-                )?]
+                "Mounts":mounts
             }
         }),
     )

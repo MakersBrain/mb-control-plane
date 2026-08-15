@@ -49,6 +49,27 @@ def validate(root: Path) -> None:
     driver = (root / "control-container-driver.container").read_text(encoding="utf-8")
     if "%t/podman/podman.sock:/run/podman/podman.sock" not in driver:
         raise ValueError("driver does not use the private rootless Podman socket")
+    if "DRIVER_POSTGRES_CA_SOURCE=" not in driver:
+        raise ValueError("driver does not declare the PostgreSQL CA source")
+    tls_clients = {
+        "control-api.container",
+        "control-backup-scheduler.container",
+        "control-database-identities.container",
+        "control-migrate.container",
+        "control-workers@.container",
+        "odoo.container",
+    }
+    for name in tls_clients:
+        content = (root / name).read_text(encoding="utf-8")
+        if "PGSSLMODE=verify-full" not in content:
+            raise ValueError(f"PostgreSQL certificate verification is missing from {name}")
+        if "PGSSLROOTCERT=/run/secrets/postgres-ca.crt" not in content:
+            raise ValueError(f"PostgreSQL CA path is missing from {name}")
+    rauthy = (root / "rauthy.container").read_text(encoding="utf-8")
+    if "PG_TLS=require" not in rauthy or "PG_TLS_NO_VERIFY=false" not in rauthy:
+        raise ValueError("Rauthy PostgreSQL TLS verification is not mandatory")
+    if "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro" not in rauthy:
+        raise ValueError("Rauthy PostgreSQL CA mount is missing")
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")

@@ -8,8 +8,11 @@ Image=@@RAUTHY_IMAGE@@
 Pull=never
 ContainerName=rauthy
 Network=makersbrain.network
+Environment=PG_TLS=require
+Environment=PG_TLS_NO_VERIFY=false
 EnvironmentFile=/etc/makersbrain/rauthy.env
 Volume=/etc/makersbrain/secrets/rauthy:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Volume=@@RUNTIME_SECRET_SOURCE@@/rauthy-bootstrap:/app/bootstrap:ro
 HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8092/auth/v1/health
 HealthInterval=15s

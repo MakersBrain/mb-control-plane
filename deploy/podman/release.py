@@ -87,6 +87,30 @@ def verify_and_pull(images: dict[str, str], key: Path) -> None:
         run(["podman", "pull", image])
 
 
+def verify_runtime_secrets(values: dict, config_root: Path) -> None:
+    secret_root = Path(values["runtime_secret_source"])
+    postgres_ca = secret_root / "postgres-ca.crt"
+    if not postgres_ca.is_file() or postgres_ca.is_symlink():
+        raise ValueError(
+            f"PostgreSQL CA must be a regular, non-symlink file: {postgres_ca}"
+        )
+    rauthy_environment = config_root / "rauthy.env"
+    if not rauthy_environment.is_file() or rauthy_environment.is_symlink():
+        raise ValueError(
+            f"Rauthy environment must be a regular, non-symlink file: {rauthy_environment}"
+        )
+    root_ca = next(
+        (
+            line.partition("=")[2].strip().strip('"').strip("'")
+            for line in rauthy_environment.read_text(encoding="utf-8").splitlines()
+            if line.startswith("PG_TLS_ROOT_CA=")
+        ),
+        "",
+    )
+    if len(root_ca) < 30 or "BEGIN CERTIFICATE" not in root_ca:
+        raise ValueError("Rauthy PG_TLS_ROOT_CA must contain the PostgreSQL CA PEM")
+
+
 def activate(
     rendered: Path,
     release_id: str,
@@ -136,6 +160,7 @@ def main() -> None:
         type=Path,
         default=Path.home() / ".config/containers/systemd",
     )
+    parser.add_argument("--config-root", type=Path, default=Path("/etc/makersbrain"))
     parser.add_argument("--activate", action="store_true")
     args = parser.parse_args()
 
@@ -144,6 +169,8 @@ def main() -> None:
     verify_release_record(args.release_record, args.release_signature, args.cosign_key)
     values = render.load_values(args.values)
     record = load_release(args.release_record, values)
+    if args.activate:
+        verify_runtime_secrets(values, args.config_root)
     verify_and_pull(values["images"], args.cosign_key)
     with tempfile.TemporaryDirectory(prefix="makersbrain-release-") as temporary:
         rendered = Path(temporary)
