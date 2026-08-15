@@ -54,6 +54,7 @@ jobs:
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
         with:
           method: oidc
+          domain: ${{ vars.INFISICAL_DOMAIN }}
           identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
           oidc-audience: makersbrain-release
           project-slug: makersbrain-infra
@@ -164,6 +165,7 @@ jobs:
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
         with:
           method: oidc
+          domain: ${{ vars.INFISICAL_DOMAIN }}
           identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
           oidc-audience: makersbrain-release
           project-slug: makersbrain-infra
@@ -233,6 +235,7 @@ jobs:
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
         with:
           method: oidc
+          domain: ${{ vars.INFISICAL_DOMAIN }}
           identity-id: ${{ vars.INFISICAL_PRODUCTION_RELEASE_IDENTITY_ID }}
           oidc-audience: makersbrain-release
           project-slug: makersbrain-infra
