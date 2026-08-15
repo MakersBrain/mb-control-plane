@@ -19,9 +19,11 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
 - `postgres-ca.crt` is materialized as a regular, non-symlink file in that
   directory before activation. All staging and production PostgreSQL clients
   use `verify-full`; activation fails closed when the CA file is absent.
-- `/etc/makersbrain/rauthy.env` supplies Rauthy's supported
-  `PG_TLS_ROOT_CA` PEM value. The Quadlet fixes `PG_TLS=require` and
-  `PG_TLS_NO_VERIFY=false`; activation rejects an absent CA value.
+- `/etc/makersbrain/secrets/rauthy/config.toml` is mounted directly as Rauthy's
+  scoped configuration secret. It supplies `pg_password` and Rauthy's supported
+  `pg_tls_root_ca` PEM. The Quadlet fixes `PG_TLS=require` and
+  `PG_TLS_NO_VERIFY=false`; activation proves that the embedded CA exactly
+  matches the host CA file.
 - The driver runs as container UID 0, which maps only to the unprivileged
   `tenant-runtime` host account under rootless Podman. It is not host root.
 - `/etc/makersbrain/*.env` is rendered by the approved secret manager, mode
@@ -77,3 +79,36 @@ The renderer refuses mutable image tags, development environments, unresolved
 template values and production personal-data activation without an external
 privacy activation record. Formal GDPR documentation can be completed later;
 the technical activation hold remains fail-closed.
+
+## Staging qualification
+
+Each mandatory staging check writes one small JSON evidence file named after
+the check in `qualification.py`. The file contains only the check name, passed
+status, UTC start/completion times and a privacy-safe summary. Run:
+
+```sh
+python3 qualification.py create \
+  --release-record /secure/release/release-record.json \
+  --evidence-dir /secure/staging-evidence/evidence \
+  --output /secure/staging-evidence/staging-qualification.json
+```
+
+The `certify-staging` workflow independently rebuilds this record from the
+immutable evidence artifact, signs it, and publishes it with all evidence
+digests. `promote-production` accepts only that qualification artifact by OCI
+digest, verifies its signature and evidence, and proves its release/image map
+matches the staging release. A note, ticket number, mutable tag or arbitrary
+approval string cannot unlock production promotion.
+
+After authenticating `oras` to the controlled registry, the staging host
+publishes the validated evidence set without putting a registry credential or
+evidence content on the command line:
+
+```sh
+python3 publish_evidence.py \
+  --release-record /secure/release/release-record.json \
+  --evidence-dir /secure/staging-evidence/evidence \
+  --repository registry.example/makersbrain/staging-evidence
+```
+
+Pass the printed digest reference to the `certify-staging` workflow.

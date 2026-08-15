@@ -50,7 +50,7 @@ def render(values_path: Path, output: Path) -> None:
         "APP_SUBNET_CIDR": values["app_subnet_cidr"],
         "DATA_DIRECTORY": values["data_directory"],
     }
-    for source_root in (HERE / "quadlets", HERE / "assets"):
+    for source_root in (HERE / "quadlets", HERE / "assets", HERE / "systemd"):
         for source in sorted(path for path in source_root.rglob("*") if path.is_file()):
             target = output / source.relative_to(source_root)
             content = source.read_text(encoding="utf-8")
@@ -62,6 +62,8 @@ def render(values_path: Path, output: Path) -> None:
             target.chmod(0o644)
     shutil.copy2(HERE.parent.parent / "init-databases.sh", output / "init-databases.sh")
     (output / "init-databases.sh").chmod(0o555)
+    shutil.copy2(HERE / "restore.py", output / "restore.py")
+    (output / "restore.py").chmod(0o555)
     shutil.copy2(values_path, output / "rendered-values.json")
     (output / "rendered-values.json").chmod(0o600)
 

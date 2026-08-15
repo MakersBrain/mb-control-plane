@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain members web application
-Requires=control-api.container rauthy.container
-After=control-api.container rauthy.container
+Requires=control-api.container rauthy-ready.container
+After=control-api.container rauthy-ready.container
 
 [Container]
 Image=@@WEB_IMAGE@@

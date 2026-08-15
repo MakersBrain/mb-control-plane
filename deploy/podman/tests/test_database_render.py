@@ -32,6 +32,11 @@ class DatabaseRendererTests(unittest.TestCase):
             self.assertNotIn("podman.sock", unit)
             self.assertNotIn("docker.sock", unit)
             self.assertIn("hostssl all all 10.50.2.0/26 scram-sha-256", hba)
+            self.assertIn("archive-push", unit)
+            self.assertTrue((output / "postgres-recovery-init.service").is_file())
+            self.assertTrue((output / "postgres-backup.timer").is_file())
+            self.assertTrue((output / "postgres-full-backup.timer").is_file())
+            self.assertTrue((output / "restore.py").is_file())
 
     def test_mutable_image_is_rejected(self):
         values = copy.deepcopy(EXAMPLE)

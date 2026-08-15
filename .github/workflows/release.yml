@@ -4,16 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build a staging release or sign its production promotion
+        description: Build, certify staging evidence, or promote the certified release
         required: true
         type: choice
-        options: [build, promote-production]
+        options: [build, certify-staging, promote-production]
       staging_release_artifact:
         description: OCI artifact reference produced by build (promotion only)
         required: false
         type: string
-      staging_qualification_ref:
-        description: Reviewed staging qualification record (promotion only)
+      staging_evidence_artifact:
+        description: Immutable OCI evidence artifact from the staging host (certification only)
+        required: false
+        type: string
+      staging_qualification_artifact:
+        description: Immutable signed OCI qualification artifact (promotion only)
         required: false
         type: string
 
@@ -62,7 +66,7 @@ jobs:
           test -n "$REGISTRY"
           test -n "$REPOSITORY_PREFIX"
           test -n "$COSIGN_PRIVATE_KEY"
-          jq -e 'length == 6 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
+          jq -e 'length == 5 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
       - name: Build once, mirror dependencies, scan and sign
         run: |
           set -euo pipefail
@@ -97,6 +101,7 @@ jobs:
           build_image odoo . control-plane/deploy/Odoo.Dockerfile
           build_image paperless control-plane/deploy control-plane/deploy/Paperless.Dockerfile
           build_image backup control-plane/deploy control-plane/deploy/Backup.Dockerfile
+          build_image postgres control-plane/deploy control-plane/deploy/Postgres.Dockerfile
 
           jq -r 'to_entries[] | [.key, .value] | @tsv' .github/release-third-party-images.json |
           while IFS=$'\t' read -r name source; do
@@ -135,6 +140,71 @@ jobs:
           path: release/
           retention-days: 30
 
+  certify-staging:
+    if: inputs.operation == 'certify-staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.0
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - name: Fetch staging certification secrets through Infisical OIDC
+        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
+          project-slug: makersbrain-infra
+          env-slug: staging
+          secret-path: /image
+          recursive: false
+      - name: Authenticate to the controlled registry
+        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+      - name: Validate, sign and publish staging qualification
+        env:
+          STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
+          EVIDENCE_ARTIFACT: ${{ inputs.staging_evidence_artifact }}
+        run: |
+          set -euo pipefail
+          case "$STAGING_ARTIFACT" in
+            "$REGISTRY/$REPOSITORY_PREFIX/releases:"*) ;;
+            *) echo "staging release is outside the configured repository" >&2; exit 1 ;;
+          esac
+          case "$EVIDENCE_ARTIFACT" in
+            "$REGISTRY/$REPOSITORY_PREFIX/staging-evidence@sha256:"*) ;;
+            *) echo "staging evidence must be an immutable repository digest" >&2; exit 1 ;;
+          esac
+          test -n "$COSIGN_PRIVATE_KEY"
+          test -n "$COSIGN_PUBLIC_KEY"
+          mkdir release evidence-package qualification
+          oras pull --output release "$STAGING_ARTIFACT"
+          oras pull --output evidence-package "$EVIDENCE_ARTIFACT"
+          printf '%s\n' "$COSIGN_PUBLIC_KEY" > qualification/release-cosign.pub
+          cosign verify-blob --insecure-ignore-tlog --key qualification/release-cosign.pub \
+            --signature release/release-record.json.sig release/release-record.json
+          test -d evidence-package/evidence
+          python3 control-plane/deploy/podman/qualification.py create \
+            --release-record release/release-record.json \
+            --evidence-dir evidence-package/evidence \
+            --output qualification/staging-qualification.json
+          tar -C evidence-package -czf qualification/evidence.tar.gz evidence
+          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
+            --output-signature qualification/staging-qualification.json.sig \
+            qualification/staging-qualification.json
+          qualification_id=$(jq -r .qualification_id qualification/staging-qualification.json)
+          artifact="$REGISTRY/$REPOSITORY_PREFIX/qualifications:$qualification_id"
+          oras push "$artifact" \
+            --artifact-type application/vnd.makersbrain.staging-qualification.v1+json \
+            qualification/staging-qualification.json:application/json \
+            qualification/staging-qualification.json.sig:application/vnd.dev.cosign.simplesigning.v1+json \
+            qualification/evidence.tar.gz:application/vnd.makersbrain.staging-evidence.v1.tar+gzip
+          digest=$(oras resolve "$artifact")
+          printf '%s@%s\n' "$REGISTRY/$REPOSITORY_PREFIX/qualifications" "$digest"
+
   promote-production:
     if: inputs.operation == 'promote-production'
     runs-on: ubuntu-latest
@@ -147,6 +217,7 @@ jobs:
         with:
           cosign-release: v2.5.0
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Fetch production promotion secrets through Infisical OIDC
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
         with:
@@ -161,7 +232,7 @@ jobs:
       - name: Verify staging record and sign production promotion
         env:
           STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
-          QUALIFICATION: ${{ inputs.staging_qualification_ref }}
+          QUALIFICATION_ARTIFACT: ${{ inputs.staging_qualification_artifact }}
         run: |
           set -euo pipefail
           test -n "$STAGING_ARTIFACT"
@@ -169,15 +240,34 @@ jobs:
             "$REGISTRY/$REPOSITORY_PREFIX/releases:"*) ;;
             *) echo "staging artifact is outside the configured release repository" >&2; exit 1 ;;
           esac
-          test "${#QUALIFICATION}" -ge 8
+          case "$QUALIFICATION_ARTIFACT" in
+            "$REGISTRY/$REPOSITORY_PREFIX/qualifications@sha256:"*) ;;
+            *) echo "qualification must be an immutable repository digest" >&2; exit 1 ;;
+          esac
           test -n "$COSIGN_PRIVATE_KEY"
           test -n "$COSIGN_PUBLIC_KEY"
-          mkdir release
+          mkdir release qualification qualification-evidence
           oras pull --output release "$STAGING_ARTIFACT"
+          oras pull --output qualification "$QUALIFICATION_ARTIFACT"
           printf '%s\n' "$COSIGN_PUBLIC_KEY" > release/release-cosign.pub
           cosign verify-blob --insecure-ignore-tlog --key release/release-cosign.pub \
             --signature release/release-record.json.sig release/release-record.json
-          jq --arg qualification "$QUALIFICATION" \
+          cosign verify-blob --insecure-ignore-tlog --key release/release-cosign.pub \
+            --signature qualification/staging-qualification.json.sig \
+            qualification/staging-qualification.json
+          python3 control-plane/deploy/podman/qualification.py extract \
+            --archive qualification/evidence.tar.gz \
+            --output qualification-evidence
+          python3 control-plane/deploy/podman/qualification.py validate \
+            --record qualification/staging-qualification.json \
+            --release-record release/release-record.json \
+            --evidence-dir qualification-evidence/evidence
+          jq -e '.staging_qualification_ref == ""' release/release-record.json >/dev/null
+          jq -r '.images[]' release/release-record.json |
+          while IFS= read -r image; do
+            cosign verify --key release/release-cosign.pub "$image" >/dev/null
+          done
+          jq --arg qualification "$QUALIFICATION_ARTIFACT" \
             '.staging_qualification_ref = $qualification' \
             release/release-record.json > release/production-release-record.json
           cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \

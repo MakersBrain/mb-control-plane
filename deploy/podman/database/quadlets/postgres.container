@@ -44,7 +44,8 @@ Secret=rauthy_postgres_password,target=rauthy_postgres_password,uid=70,gid=70,mo
 Secret=odoo_postgres_password,target=odoo_postgres_password,uid=70,gid=70,mode=0400
 Secret=postgres_tls_certificate,target=/run/secrets/postgres.crt,uid=70,gid=70,mode=0444
 Secret=postgres_tls_private_key,target=/run/secrets/postgres.key,uid=70,gid=70,mode=0400
-Exec=postgres -c listen_addresses=* -c password_encryption=scram-sha-256 -c ssl=on -c ssl_cert_file=/run/secrets/postgres.crt -c ssl_key_file=/run/secrets/postgres.key -c hba_file=/etc/postgresql/pg_hba.conf
+Secret=pgbackrest_config,target=/etc/pgbackrest/pgbackrest.conf,uid=70,gid=70,mode=0400
+Exec=postgres -c listen_addresses=* -c password_encryption=scram-sha-256 -c ssl=on -c ssl_cert_file=/run/secrets/postgres.crt -c ssl_key_file=/run/secrets/postgres.key -c hba_file=/etc/postgresql/pg_hba.conf -c wal_level=replica -c archive_mode=on -c archive_timeout=60s -c "archive_command=pgbackrest --stanza=makersbrain archive-push %%p"
 HealthCmd=pg_isready -U postgres -h 127.0.0.1
 HealthInterval=10s
 HealthRetries=20

@@ -14,7 +14,8 @@ EnvironmentFile=/etc/makersbrain/odoo.env
 Volume=/etc/makersbrain/secrets/odoo:/run/secrets:ro
 Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Volume=odoo-data.volume:/var/lib/odoo
-Exec=odoo --no-database-list --db_host=@@POSTGRES_HOST@@ --db_user=odoo --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode
+Volume=./resolve-secret-env.sh:/run/makersbrain/resolve-secret-env.sh:ro
+Exec=/bin/sh /run/makersbrain/resolve-secret-env.sh /entrypoint.sh odoo --no-database-list --db_host=@@POSTGRES_HOST@@ --db_user=odoo --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode
 HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8069/web/health
 HealthInterval=15s
 HealthRetries=20

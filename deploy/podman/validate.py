@@ -21,6 +21,7 @@ def validate(root: Path) -> None:
         "control-migrate.container",
         "privacy-export-init.container",
         "rauthy-bootstrap.container",
+        "rauthy-ready.container",
         "control-api.container",
         "control-container-driver.container",
         "control-workers@.container",
@@ -31,6 +32,7 @@ def validate(root: Path) -> None:
         "redis.container",
         "tenant-gateway.container",
         "control-web.container",
+        "resolve-secret-env.sh",
     }
     missing = sorted(expected - {path.name for path in root.iterdir()})
     if missing:
@@ -69,8 +71,16 @@ def validate(root: Path) -> None:
     rauthy = (root / "rauthy.container").read_text(encoding="utf-8")
     if "PG_TLS=require" not in rauthy or "PG_TLS_NO_VERIFY=false" not in rauthy:
         raise ValueError("Rauthy PostgreSQL TLS verification is not mandatory")
-    if "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro" not in rauthy:
-        raise ValueError("Rauthy PostgreSQL CA mount is missing")
+    if "/secrets/rauthy/config.toml:/app/config.toml:ro" not in rauthy:
+        raise ValueError("Rauthy scoped config mount is missing")
+    rauthy_ready = (root / "rauthy-ready.container").read_text(encoding="utf-8")
+    if "http://rauthy:8092/auth/v1/health" not in rauthy_ready:
+        raise ValueError("Rauthy readiness gate is missing")
+    if "rauthy-ready.container" not in (root / "control-web.container").read_text():
+        raise ValueError("web does not wait for Rauthy readiness")
+    odoo = (root / "odoo.container").read_text(encoding="utf-8")
+    if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
+        raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")

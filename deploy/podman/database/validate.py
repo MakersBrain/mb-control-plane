@@ -13,7 +13,11 @@ IMAGE = re.compile(r"^Image=\S+@sha256:[a-f0-9]{64}$", re.MULTILINE)
 
 
 def validate(root: Path) -> None:
-    expected = {"postgres.container", "pg_hba.conf", "init-databases.sh", "rendered-values.json"}
+    expected = {
+        "postgres.container", "pg_hba.conf", "init-databases.sh", "rendered-values.json",
+        "postgres-recovery-init.service", "postgres-backup.service", "postgres-backup.timer",
+        "postgres-full-backup.service", "postgres-full-backup.timer", "restore.py",
+    }
     missing = expected - {path.name for path in root.iterdir()}
     if missing:
         raise ValueError(f"database bundle is incomplete: {', '.join(sorted(missing))}")
@@ -26,6 +30,28 @@ def validate(root: Path) -> None:
         raise ValueError("database unit contains a forbidden runtime socket")
     if "ssl=on" not in unit or "postgres_tls_private_key" not in unit:
         raise ValueError("database TLS is not fail-closed")
+    if (
+        "archive_mode=on" not in unit
+        or "archive-push" not in unit
+        or "pgbackrest_config" not in unit
+    ):
+        raise ValueError("continuous encrypted WAL recovery is not configured")
+    recovery = (root / "postgres-recovery-init.service").read_text(encoding="utf-8")
+    if (
+        "stanza-create" not in recovery
+        or "pgbackrest --stanza=makersbrain check" not in recovery
+        or recovery.count("exec --user 70:70") != 2
+    ):
+        raise ValueError("PostgreSQL recovery repository is not initialized and checked")
+    incremental = (root / "postgres-backup.service").read_text()
+    if "--type=incr backup" not in incremental or "exec --user 70:70" not in incremental:
+        raise ValueError("incremental PostgreSQL backup is missing")
+    full = (root / "postgres-full-backup.service").read_text()
+    if "--type=full backup" not in full or "exec --user 70:70" not in full:
+        raise ValueError("full PostgreSQL backup is missing")
+    restore = (root / "restore.py").read_text(encoding="utf-8")
+    if "isolated_restore" not in restore or "--pg1-path=/restore" not in restore:
+        raise ValueError("isolated PostgreSQL restore drill is missing")
     if f"hostssl all all {values['app_subnet_cidr']} scram-sha-256" not in hba:
         raise ValueError("pg_hba does not restrict clients to the application subnet")
     if "hostnossl all all 0.0.0.0/0 reject" not in hba:

@@ -1,0 +1,9 @@
+[Unit]
+Description=Create an encrypted full MakersBrain PostgreSQL backup
+Requires=postgres-recovery-init.service
+After=postgres-recovery-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman exec --user 70:70 makersbrain-postgres pgbackrest --stanza=makersbrain --type=full backup
+TimeoutStartSec=21600

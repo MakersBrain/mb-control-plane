@@ -86,6 +86,8 @@ def render(values_path: Path, output: Path) -> None:
             target.chmod(0o644)
     shutil.copy2(values_path, output / "rendered-values.json")
     (output / "rendered-values.json").chmod(0o600)
+    shutil.copy2(HERE.parent / "resolve-secret-env.sh", output / "resolve-secret-env.sh")
+    (output / "resolve-secret-env.sh").chmod(0o555)
 
 
 def main() -> None:

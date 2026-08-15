@@ -1,0 +1,12 @@
+[Unit]
+Description=Initialize and verify MakersBrain PostgreSQL recovery repository
+Requires=postgres.service
+After=postgres.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -ec 'attempt=0; until /usr/bin/podman exec makersbrain-postgres pg_isready -U postgres -h 127.0.0.1; do attempt=$$((attempt + 1)); test "$$attempt" -lt 60; sleep 2; done'
+ExecStart=/usr/bin/podman exec --user 70:70 makersbrain-postgres pgbackrest --stanza=makersbrain stanza-create
+ExecStart=/usr/bin/podman exec --user 70:70 makersbrain-postgres pgbackrest --stanza=makersbrain check
+RemainAfterExit=yes
+TimeoutStartSec=600

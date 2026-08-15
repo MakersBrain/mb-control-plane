@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly MakersBrain PostgreSQL full backup
+
+[Timer]
+OnCalendar=Sun *-*-* 02:15:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=postgres-full-backup.service
+
+[Install]
+WantedBy=timers.target
