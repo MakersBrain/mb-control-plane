@@ -82,9 +82,7 @@ VENDOR_REQUIRED_ENVIRONMENT = {
 
 def file_secret_value(name: str) -> bool:
     return (
-        name.endswith("DATABASE_URL")
-        or name.endswith("_TOKEN")
-        or name.endswith("_PASSWORD")
+        name.endswith(("DATABASE_URL", "_TOKEN", "_PASSWORD"))
         or (name.endswith("_KEY") and not name.endswith("_KEY_ID"))
         or name in {"PASSWORD", "POSTGRES_SUPERUSER_PASSWORD"}
     )
@@ -194,6 +192,33 @@ def unit_instances(name: str) -> tuple[str, ...]:
     return (match.group(1),) if match else ("",)
 
 
+def verify_mounted_file(
+    secret: Path,
+    setting: str,
+    mounts: list[tuple[Path, Path, bool]],
+) -> None:
+    if not secret.is_absolute() or not str(secret).startswith("/run/"):
+        raise ValueError(f"{setting} must name a scoped runtime file")
+    matches = [
+        mount
+        for mount in mounts
+        if secret == mount[0] or mount[0] in secret.parents
+    ]
+    if not matches:
+        raise ValueError(f"{setting} has no scoped secret mount")
+    target, host, source_is_file = max(
+        matches, key=lambda mount: len(mount[0].parts)
+    )
+    if source_is_file:
+        resolved = host
+    else:
+        relative = secret.relative_to(target)
+        if ".." in relative.parts:
+            raise ValueError(f"{setting} escapes its scoped secret mount")
+        resolved = host / relative
+    protected_path(resolved, directory=False)
+
+
 def verify_host_configuration(rendered: Path, config_root: Path) -> None:
     specification = json.loads(
         (Path(__file__).resolve().parents[1] / "configuration-spec.json").read_text(
@@ -227,28 +252,6 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                 protected_path(host, directory=not source_is_file, public=public)
                 mounts.append((target_path, host, source_is_file))
 
-            def verify_mounted_file(secret: Path, setting: str) -> None:
-                if not secret.is_absolute() or not str(secret).startswith("/run/"):
-                    raise ValueError(f"{setting} must name a scoped runtime file")
-                matches = [
-                    mount
-                    for mount in mounts
-                    if secret == mount[0] or mount[0] in secret.parents
-                ]
-                if not matches:
-                    raise ValueError(f"{setting} has no scoped secret mount")
-                target, host, source_is_file = max(
-                    matches, key=lambda mount: len(mount[0].parts)
-                )
-                if source_is_file:
-                    resolved = host
-                else:
-                    relative = secret.relative_to(target)
-                    if ".." in relative.parts:
-                        raise ValueError(f"{setting} escapes its scoped secret mount")
-                    resolved = host / relative
-                protected_path(resolved, directory=False)
-
             for line in lines:
                 if not line.startswith("EnvironmentFile="):
                     continue
@@ -271,9 +274,13 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                             f"{name} in {environment_file} must use a scoped file secret"
                         )
                     if reference.startswith("@/run/"):
-                        verify_mounted_file(Path(reference[1:]), f"{name} in {environment_file}")
+                        verify_mounted_file(
+                            Path(reference[1:]), f"{name} in {environment_file}", mounts
+                        )
                     elif name.endswith("_FILE"):
-                        verify_mounted_file(Path(reference), f"{name} in {environment_file}")
+                        verify_mounted_file(
+                            Path(reference), f"{name} in {environment_file}", mounts
+                        )
             process = UNIT_PROCESS.get(unit.name)
             if unit.name.startswith("control-workers@"):
                 process = WORKER_PROCESS.get(instance)

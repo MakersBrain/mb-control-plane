@@ -627,10 +627,10 @@ async fn signer_certificate(state: &MailGatewayState, url: Url) -> Result<Vec<u8
     let certificate = blocks[0].contents().to_vec();
     verify_signer_certificate(state, &certificate)?;
     let mut cache = state.signer_certificates.lock().await;
-    if cache.len() >= 4 {
-        if let Some(oldest) = cache.keys().next().cloned() {
-            cache.remove(&oldest);
-        }
+    if cache.len() >= 4
+        && let Some(oldest) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest);
     }
     cache.insert(url.into(), certificate.clone());
     Ok(certificate)
