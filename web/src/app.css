@@ -1,12 +1,16 @@
 /* The control plane's stylesheet is the shared design system plus whatever is
  * genuinely specific to this surface. If a rule below would be useful to the
- * landing page or the Odoo overrides too, it belongs in brand/ui.css instead.
+ * landing page or the Odoo overrides too, it belongs in the brand package's
+ * ui.css instead.
  *
- * styles/ is generated: edit brand/tokens.css or brand/ui.css and run
- * `make brand-sync`. `make check` fails if the copies have drifted. */
+ * The design system is a dependency, not a copy. It used to be generated into
+ * styles/ by `make brand-sync`, with `make check` failing when the copies
+ * drifted -- which worked, but meant the source of truth and the file this app
+ * imported were different files kept equal by a check. Now they are the same
+ * file, and the version in package-lock.json says which one. */
 
-@import './styles/tokens.css';
-@import './styles/ui.css';
+@import '@makersbrain/brand/tokens.css';
+@import '@makersbrain/brand/ui.css';
 
 /* Operations run for minutes and people leave the tab open, so a running
  * operation gets a live edge rather than only a percentage that has to be

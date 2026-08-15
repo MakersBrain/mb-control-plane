@@ -4,7 +4,7 @@
 	import { ACCOUNT_URL } from '$lib/config';
 	import { currentIdToken, discard, establish, session } from '$lib/session.svelte';
 	import { logoutUrl, signIn } from '$lib/oidc';
-	import BrandMark from '$lib/components/BrandMark.svelte';
+	import { BrandMark } from '@makersbrain/brand/svelte';
 	let { children } = $props();
 	const publicRoute = $derived(page.url.pathname.startsWith('/oauth/') || page.url.pathname === '/signed-out' || page.url.pathname.startsWith('/invitations/'));
 	let started = false;

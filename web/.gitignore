@@ -1,0 +1,6 @@
+# Generated from @makersbrain/brand by scripts/sync-icons.mjs before every
+# dev and build. Committing them would recreate the copies this app just
+# stopped keeping.
+static/favicon.svg
+static/favicon-32.png
+static/apple-touch-icon.png

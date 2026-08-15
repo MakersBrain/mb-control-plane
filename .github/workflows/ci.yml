@@ -38,6 +38,9 @@ jobs:
           --health-cmd "pg_isready -U control -d control_test"
           --health-interval 5s --health-timeout 5s --health-retries 12
         ports: ["5432:5432"]
+    permissions:
+      contents: read
+      packages: read
     env:
       CONTROL_TEST_DATABASE_URL: postgres://control:control@localhost:5432/control_test
       CONTROL_TEST_ADMIN_URL: postgres://control:control@localhost:5432/postgres
@@ -78,6 +81,13 @@ jobs:
           cargo run --quiet --manifest-path ../Cargo.toml --bin control-openapi -- --json /tmp/control-openapi-current.json
           python3 ../tools/check_openapi_compatibility.py ../deploy/openapi-v1-baseline.json /tmp/control-openapi-current.json
         working-directory: control-plane/web
+      # The design system is @makersbrain/brand on GitHub Packages, which npm
+      # cannot reach anonymously even for a package in this same org. The
+      # workflow's own token is enough; the job declares packages: read for it.
+      - name: Authenticate to GitHub Packages
+        run: npm config set --location=user //npm.pkg.github.com/:_authToken "$GITHUB_TOKEN"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: npm ci
         working-directory: control-plane/web
       - run: npm run check && npm run build

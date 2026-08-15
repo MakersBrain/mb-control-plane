@@ -1,0 +1,22 @@
+# How @makersbrain/brand is authenticated, in each of the three places it is
+# installed. The committed .npmrc carries only the registry mapping; none of
+# these credentials belong in the repository.
+#
+# A person, in ~/.npmrc (not here -- this directory is committed):
+#
+#   @makersbrain:registry=https://npm.pkg.github.com
+#   //npm.pkg.github.com/:_authToken=<a token with read:packages>
+#
+# GitHub Actions, written from the workflow's own token before `npm ci`:
+#
+#   - run: npm config set //npm.pkg.github.com/:_authToken "$GITHUB_TOKEN"
+#     env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+#
+#   The job also needs `permissions: { packages: read }`.
+#
+# The image build, as a BuildKit secret so it never lands in a layer:
+#
+#   RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+#       npm ci --no-audit --no-fund
+#
+#   docker buildx build --secret id=npmrc,src=$HOME/.npmrc ...

@@ -73,17 +73,29 @@ jobs:
           test -n "$COSIGN_PRIVATE_KEY"
           jq -e 'length == 5 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
       - name: Build once, mirror dependencies, scan and sign
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p release/sbom release/vulnerability
           printf '{}\n' > release/images.json
+
+          # The browser image installs @makersbrain/brand from GitHub Packages.
+          # The credential is passed as a BuildKit secret rather than an ARG or a
+          # COPY, so it is mounted only for the RUN that needs it and never
+          # reaches a layer, the image, or the SBOM. Builds that do not mount it
+          # simply ignore it.
+          npmrc=$(mktemp)
+          printf '//npm.pkg.github.com/:_authToken=%s\n' "$GITHUB_TOKEN" > "$npmrc"
 
           build_image() {
             name=$1
             context=$2
             dockerfile=$3
             tag="$REGISTRY/$REPOSITORY_PREFIX/$name:$GITHUB_SHA"
-            docker buildx build --platform linux/amd64 --file "$dockerfile" --tag "$tag" --push "$context"
+            docker buildx build --platform linux/amd64 --file "$dockerfile" \
+              --secret "id=npmrc,src=$npmrc" \
+              --tag "$tag" --push "$context"
             digest=$(docker buildx imagetools inspect "$tag" --raw | sha256sum | cut -d' ' -f1)
             immutable="$REGISTRY/$REPOSITORY_PREFIX/$name@sha256:$digest"
             record_image "$name" "$immutable"
