@@ -9,7 +9,7 @@ on:
         type: choice
         options: [build, certify-staging, promote-production]
       staging_release_artifact:
-        description: OCI artifact reference produced by build (promotion only)
+        description: Immutable OCI release artifact produced by build (certification and promotion)
         required: false
         type: string
       staging_evidence_artifact:
@@ -40,6 +40,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -59,7 +60,9 @@ jobs:
           secret-path: /image
           recursive: false
       - name: Authenticate to the controlled registry
-        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+        run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Validate protected release inputs
         run: |
           set -eu
@@ -133,7 +136,9 @@ jobs:
             release/images.json:application/json \
             release/sbom.tar.gz:application/vnd.makersbrain.sbom.layer.v1.tar+gzip \
             release/vulnerability.tar.gz:application/vnd.makersbrain.vulnerability.layer.v1.tar+gzip
-          printf '%s\n' "$artifact" > release/artifact-reference.txt
+          digest=$(oras resolve "$artifact")
+          printf '%s@%s\n' "$REGISTRY/$REPOSITORY_PREFIX/releases" "$digest" \
+            > release/artifact-reference.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: immutable-release-${{ github.sha }}
@@ -147,6 +152,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
@@ -163,7 +169,9 @@ jobs:
           secret-path: /image
           recursive: false
       - name: Authenticate to the controlled registry
-        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+        run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Validate, sign and publish staging qualification
         env:
           STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
@@ -171,8 +179,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$STAGING_ARTIFACT" in
-            "$REGISTRY/$REPOSITORY_PREFIX/releases:"*) ;;
-            *) echo "staging release is outside the configured repository" >&2; exit 1 ;;
+            "$REGISTRY/$REPOSITORY_PREFIX/releases@sha256:"*) ;;
+            *) echo "staging release must be an immutable repository digest" >&2; exit 1 ;;
           esac
           case "$EVIDENCE_ARTIFACT" in
             "$REGISTRY/$REPOSITORY_PREFIX/staging-evidence@sha256:"*) ;;
@@ -212,6 +220,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
@@ -228,7 +237,9 @@ jobs:
           secret-path: /image
           recursive: false
       - name: Authenticate to the controlled registry
-        run: printf '%s' "$OCI_REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$OCI_REGISTRY_USERNAME" --password-stdin
+        run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Verify staging record and sign production promotion
         env:
           STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
@@ -237,8 +248,8 @@ jobs:
           set -euo pipefail
           test -n "$STAGING_ARTIFACT"
           case "$STAGING_ARTIFACT" in
-            "$REGISTRY/$REPOSITORY_PREFIX/releases:"*) ;;
-            *) echo "staging artifact is outside the configured release repository" >&2; exit 1 ;;
+            "$REGISTRY/$REPOSITORY_PREFIX/releases@sha256:"*) ;;
+            *) echo "staging artifact must be an immutable repository digest" >&2; exit 1 ;;
           esac
           case "$QUALIFICATION_ARTIFACT" in
             "$REGISTRY/$REPOSITORY_PREFIX/qualifications@sha256:"*) ;;
