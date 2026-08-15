@@ -34,6 +34,11 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   tag or attempts to attach signatures to an upstream project.
 - The rootless `podman.socket` is enabled for `tenant-runtime` and is never
   exposed over TCP.
+- The digest-pinned `cloudflared` Quadlet uses only a file-scoped connector
+  token from `/etc/makersbrain/secrets/cloudflared/tunnel-token`. Remote tunnel
+  ingress targets `control-web:8080`, `control-api:8080`, `rauthy:8092` and
+  `tenant-gateway:8080` on the private Podman network; the connector receives
+  no database credentials or runtime socket.
 
 Render a bundle with:
 

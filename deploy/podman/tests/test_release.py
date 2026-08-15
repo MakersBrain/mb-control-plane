@@ -79,6 +79,10 @@ class ReleaseTests(unittest.TestCase):
                 'PG_TLS_ROOT_CA="-----BEGIN CERTIFICATE-----fixture"\n',
                 encoding="utf-8",
             )
+            tunnel_secret = config_root / "secrets/cloudflared"
+            tunnel_secret.mkdir(parents=True)
+            (tunnel_secret / "tunnel-token").write_text("token", encoding="utf-8")
+            (tunnel_secret / "tunnel-token").chmod(0o600)
             with self.assertRaisesRegex(ValueError, "PostgreSQL CA"):
                 RELEASE.verify_runtime_secrets(values, config_root)
             secret_root = Path(values["runtime_secret_source"])
@@ -106,6 +110,10 @@ class ReleaseTests(unittest.TestCase):
             values["runtime_secret_source"] = str(secret_root)
             config_root = root / "config"
             config_root.mkdir()
+            tunnel_secret = config_root / "secrets/cloudflared"
+            tunnel_secret.mkdir(parents=True)
+            (tunnel_secret / "tunnel-token").write_text("token", encoding="utf-8")
+            (tunnel_secret / "tunnel-token").chmod(0o600)
             (config_root / "rauthy.env").write_text(
                 "PG_TLS_ROOT_CA=\n", encoding="utf-8"
             )

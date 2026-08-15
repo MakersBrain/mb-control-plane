@@ -16,6 +16,7 @@ FORBIDDEN = ("docker.sock", "tcp://")
 def validate(root: Path) -> None:
     expected = {
         "makersbrain.network",
+        "cloudflared.container",
         "control-database-identities.container",
         "control-migrate.container",
         "privacy-export-init.container",
@@ -73,6 +74,11 @@ def validate(root: Path) -> None:
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")
+    cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
+    if "--no-autoupdate" not in cloudflared or "--token-file /run/secrets/tunnel-token" not in cloudflared:
+        raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")
+    if "EnvironmentFile=" in cloudflared or "postgres" in cloudflared.lower():
+        raise ValueError("Cloudflare Tunnel received unrelated application configuration")
     if values["environment"] == "production" and values["data_mode"] == "personal":
         if not values.get("production_personal_data_allowed"):
             raise ValueError("personal-data activation is not approved")

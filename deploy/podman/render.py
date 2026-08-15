@@ -38,7 +38,7 @@ def load_values(path: Path) -> dict:
         raise ValueError("runtime_secret_source must be a narrow absolute path")
     required_images = {
         "control", "web", "odoo", "rauthy", "redis", "nginx", "alpine", "postgres",
-        "paperless", "backup"
+        "paperless", "backup", "cloudflared"
     }
     images = values.get("images", {})
     if set(images) != required_images:

@@ -19,6 +19,7 @@ import validate
 RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$")
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
 PERSISTENT_UNITS = [
+    "cloudflared.service",
     "redis.service",
     "odoo.service",
     "rauthy.service",
@@ -109,6 +110,13 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
     )
     if len(root_ca) < 30 or "BEGIN CERTIFICATE" not in root_ca:
         raise ValueError("Rauthy PG_TLS_ROOT_CA must contain the PostgreSQL CA PEM")
+    tunnel_token = config_root / "secrets/cloudflared/tunnel-token"
+    if not tunnel_token.is_file() or tunnel_token.is_symlink():
+        raise ValueError(
+            f"Cloudflare Tunnel token must be a regular, non-symlink file: {tunnel_token}"
+        )
+    if tunnel_token.stat().st_mode & 0o077:
+        raise ValueError("Cloudflare Tunnel token must not be accessible by group or others")
 
 
 def activate(

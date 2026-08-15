@@ -1,5 +1,6 @@
 {
   "alpine": "docker.io/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
+  "cloudflared": "docker.io/cloudflare/cloudflared@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf",
   "nginx": "docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",
   "postgres": "docker.io/library/postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
   "rauthy": "ghcr.io/sebadob/rauthy@sha256:6f35e2e41753e973336d476c9593b4c1e41ac597803adf6ccaec08c7d8818cd0",

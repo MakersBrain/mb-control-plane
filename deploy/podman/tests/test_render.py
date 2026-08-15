@@ -46,6 +46,11 @@ class PodmanRendererTests(unittest.TestCase):
             rauthy = (output / "rauthy.container").read_text()
             self.assertIn("PG_TLS=require", rauthy)
             self.assertIn("PG_TLS_NO_VERIFY=false", rauthy)
+            cloudflared = (output / "cloudflared.container").read_text()
+            self.assertIn("--no-autoupdate", cloudflared)
+            self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
+            self.assertNotIn("EnvironmentFile=", cloudflared)
+            self.assertNotIn("podman.sock", cloudflared)
             for path in output.glob("*.container"):
                 if path.name != "control-container-driver.container":
                     self.assertNotIn("podman.sock", path.read_text())
