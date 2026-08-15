@@ -1,36 +1,62 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY, UnparsedPublicKey};
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use reqwest::header::{HeaderValue, USER_AGENT};
+use rustls_pki_types::{CertificateDer, UnixTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 use url::Url;
 use uuid::Uuid;
+use webpki::{ALL_VERIFICATION_ALGS, EndEntityCert, KeyUsage, anchor_from_trusted_cert};
 
 const SCALEWAY_ENDPOINT: &str =
     "https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/emails";
+const SNS_SIGNING_HOST: &str = "messaging.s3.fr-par.scw.cloud";
+const SNS_CONFIRMATION_HOST: &str = "sns.mnq.fr-par.scaleway.com";
+const MAX_SNS_BODY: usize = 320 * 1024;
+const MAX_CERTIFICATE_BODY: usize = 64 * 1024;
+const MAX_EVENT_JOURNAL: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct MailGatewayState {
     pub listen: SocketAddr,
     environment: String,
     internal_token: String,
-    client: reqwest::Client,
+    provider_client: reqwest::Client,
+    public_client: reqwest::Client,
     endpoint: Url,
     project_id: Uuid,
+    domain_id: Uuid,
     from_email: String,
     from_name: String,
     allowed_recipients: HashSet<String>,
+    sns_topic_arn: String,
+    sns_root_ca: Vec<u8>,
+    sns_intermediate_ca: Vec<u8>,
+    signer_certificates: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    event_journal: Arc<Mutex<EventJournal>>,
+}
+
+struct EventJournal {
+    path: PathBuf,
+    seen: HashSet<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +101,63 @@ struct ProviderEmail {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct SnsEnvelope {
+    #[serde(rename = "Type")]
+    kind: String,
+    #[serde(rename = "MessageId")]
+    message_id: String,
+    #[serde(rename = "TopicArn")]
+    topic_arn: String,
+    #[serde(rename = "Message")]
+    message: String,
+    #[serde(rename = "Timestamp")]
+    timestamp: String,
+    #[serde(rename = "SignatureVersion")]
+    signature_version: String,
+    #[serde(rename = "Signature")]
+    signature: String,
+    #[serde(rename = "SigningCertURL")]
+    signing_cert_url: String,
+    #[serde(rename = "Subject", default)]
+    subject: Option<String>,
+    #[serde(rename = "Token", default)]
+    token: Option<String>,
+    #[serde(rename = "SubscribeURL", default)]
+    subscribe_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TemEvent {
+    id: Uuid,
+    #[serde(rename = "type")]
+    event_type: String,
+    project_id: Uuid,
+    domain_id: Uuid,
+    created_at: String,
+    email_id: Option<Uuid>,
+    #[serde(default)]
+    email_headers: Vec<TemHeader>,
+}
+
+#[derive(Deserialize)]
+struct TemHeader {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRecord {
+    schema_version: u8,
+    event_id: Uuid,
+    sns_message_id: Uuid,
+    email_id: Uuid,
+    delivery_id: Uuid,
+    event_type: String,
+    created_at: String,
+}
+
 impl MailGatewayState {
     pub fn from_env() -> anyhow::Result<Self> {
         let required = |name| crate::runtime_secret::required(name).map_err(anyhow::Error::msg);
@@ -88,6 +171,7 @@ impl MailGatewayState {
             anyhow::bail!("MAIL_GATEWAY_SCW_ENDPOINT must use the Scaleway Paris TEM endpoint");
         }
         let project_id = required("MAIL_GATEWAY_SCW_PROJECT_ID")?.parse()?;
+        let domain_id = required("MAIL_GATEWAY_SCW_DOMAIN_ID")?.parse()?;
         let from_email = required("MAIL_GATEWAY_FROM_EMAIL")?.to_ascii_lowercase();
         validate_email(&from_email)?;
         let from_domain = from_email
@@ -120,21 +204,39 @@ impl MailGatewayState {
             USER_AGENT,
             HeaderValue::from_static("makersbrain-mail-gateway/1"),
         );
-        let client = reqwest::Client::builder()
+        let provider_client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        let public_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("makersbrain-mail-gateway/1")
+            .build()?;
+        let sns_topic_arn = required("MAIL_GATEWAY_SNS_TOPIC_ARN")?;
+        validate_topic_arn(&sns_topic_arn)?;
+        let (sns_root_ca, sns_intermediate_ca) =
+            load_sns_trust_chain(Path::new(&required("MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE")?))?;
+        let event_journal =
+            EventJournal::load(PathBuf::from(required("MAIL_GATEWAY_EVENT_JOURNAL_FILE")?))?;
         Ok(Self {
             listen,
             environment,
             internal_token: required("MAIL_GATEWAY_INTERNAL_TOKEN")?,
-            client,
+            provider_client,
+            public_client,
             endpoint,
             project_id,
+            domain_id,
             from_email,
             from_name,
             allowed_recipients,
+            sns_topic_arn,
+            sns_root_ca,
+            sns_intermediate_ca,
+            signer_certificates: Arc::new(Mutex::new(HashMap::new())),
+            event_journal: Arc::new(Mutex::new(event_journal)),
         })
     }
 }
@@ -145,8 +247,16 @@ pub fn app(state: MailGatewayState) -> Router {
             "/health/live",
             get(|| async { Json(json!({"status":"live"})) }),
         )
-        .route("/v1/mail", post(send))
-        .layer(RequestBodyLimitLayer::new(16 * 1024))
+        .merge(
+            Router::new()
+                .route("/v1/mail", post(send))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        .merge(
+            Router::new()
+                .route("/v1/mail/events", post(receive_sns_event))
+                .layer(RequestBodyLimitLayer::new(MAX_SNS_BODY)),
+        )
         .layer(SetSensitiveRequestHeadersLayer::new([
             header::AUTHORIZATION,
         ]))
@@ -199,7 +309,7 @@ async fn send(
         }],
     };
     let response = state
-        .client
+        .provider_client
         .post(state.endpoint.clone())
         .json(&payload)
         .send()
@@ -238,6 +348,459 @@ async fn send(
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn receive_sns_event(
+    State(state): State<Arc<MailGatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_none_or(|value| value.trim() != "application/json")
+    {
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let envelope: SnsEnvelope =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    validate_sns_headers(&headers, &envelope, &state.sns_topic_arn)?;
+    let message_id = validate_sns_envelope(&envelope, &state.sns_topic_arn)?;
+    let certificate_url = validate_signing_certificate_url(&envelope.signing_cert_url)?;
+    let certificate = signer_certificate(&state, certificate_url).await?;
+    verify_signer_certificate(&state, &certificate)?;
+    verify_sns_signature(&envelope, &certificate)?;
+
+    match envelope.kind.as_str() {
+        "SubscriptionConfirmation" => {
+            let confirmation = envelope
+                .subscribe_url
+                .as_deref()
+                .ok_or(StatusCode::BAD_REQUEST)
+                .and_then(validate_confirmation_url)?;
+            let response = state
+                .public_client
+                .get(confirmation)
+                .send()
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            if !response.status().is_success()
+                || response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_CERTIFICATE_BODY as u64)
+            {
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            if body.len() > MAX_CERTIFICATE_BODY {
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+        "Notification" => {
+            let record = parse_tem_event(&envelope.message, message_id, &state)?;
+            state
+                .event_journal
+                .lock()
+                .await
+                .append(record)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+impl EventJournal {
+    fn load(path: PathBuf) -> anyhow::Result<Self> {
+        if !path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
+            anyhow::bail!("MAIL_GATEWAY_EVENT_JOURNAL_FILE must be an absolute path without ..");
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("event journal requires a parent directory"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        if !parent_metadata.file_type().is_dir() {
+            anyhow::bail!("event journal parent must be a directory, not a symlink");
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                anyhow::bail!("event journal must not be a symlink or special file");
+            }
+            Ok(metadata) if metadata.len() > MAX_EVENT_JOURNAL => {
+                anyhow::bail!("event journal exceeded its configured bound");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).read(true);
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_EVENT_JOURNAL {
+            anyhow::bail!("event journal must be a bounded regular file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut seen = HashSet::new();
+        let contents = std::fs::read_to_string(&path)?;
+        for line in contents.lines() {
+            if line.is_empty() {
+                anyhow::bail!("event journal contains an empty record");
+            }
+            let record: JournalRecord = serde_json::from_str(line)?;
+            if record.schema_version != 1 || !seen.insert(record.event_id) {
+                anyhow::bail!("event journal contains an invalid or duplicate record");
+            }
+        }
+        Ok(Self { path, seen })
+    }
+
+    async fn append(&mut self, record: JournalRecord) -> anyhow::Result<()> {
+        if self.seen.contains(&record.event_id) {
+            return Ok(());
+        }
+        let metadata = tokio::fs::metadata(&self.path).await?;
+        if metadata.len() > MAX_EVENT_JOURNAL {
+            anyhow::bail!("event journal exceeded its configured bound");
+        }
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        if metadata.len().saturating_add(encoded.len() as u64) > MAX_EVENT_JOURNAL {
+            anyhow::bail!("event journal has no remaining capacity");
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .await?;
+        file.write_all(&encoded).await?;
+        file.sync_data().await?;
+        self.seen.insert(record.event_id);
+        Ok(())
+    }
+}
+
+fn validate_sns_headers(
+    headers: &HeaderMap,
+    envelope: &SnsEnvelope,
+    expected_topic: &str,
+) -> Result<(), StatusCode> {
+    let message_type = headers
+        .get("x-amz-sns-message-type")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let topic = headers
+        .get("x-amz-sns-topic-arn")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if message_type != envelope.kind || topic != expected_topic || topic != envelope.topic_arn {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn validate_sns_envelope(envelope: &SnsEnvelope, expected_topic: &str) -> Result<Uuid, StatusCode> {
+    if !matches!(
+        envelope.kind.as_str(),
+        "Notification" | "SubscriptionConfirmation"
+    ) || envelope.signature_version != "1"
+        || envelope.topic_arn != expected_topic
+        || envelope.message.len() > 256 * 1024
+        || envelope
+            .subject
+            .as_ref()
+            .is_some_and(|value| value.len() > 100)
+        || OffsetDateTime::parse(&envelope.timestamp, &Rfc3339).is_err()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let message_id = Uuid::parse_str(&envelope.message_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    match envelope.kind.as_str() {
+        "Notification" => {
+            if envelope.token.is_some() || envelope.subscribe_url.is_some() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        "SubscriptionConfirmation" => {
+            if envelope
+                .token
+                .as_ref()
+                .is_none_or(|value| value.is_empty() || value.len() > 4096)
+                || envelope.subscribe_url.is_none()
+                || envelope.subject.is_some()
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    Ok(message_id)
+}
+
+fn validate_signing_certificate_url(value: &str) -> Result<Url, StatusCode> {
+    let url = Url::parse(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let filename = url
+        .path()
+        .strip_prefix("/fr-par/sns/sns_certificate_")
+        .and_then(|value| value.strip_suffix(".crt"));
+    if url.scheme() != "https"
+        || url.host_str() != Some(SNS_SIGNING_HOST)
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || filename.is_none_or(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(url)
+}
+
+fn validate_confirmation_url(value: &str) -> Result<Url, StatusCode> {
+    let url = Url::parse(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if url.scheme() != "https"
+        || url.host_str() != Some(SNS_CONFIRMATION_HOST)
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(url)
+}
+
+async fn signer_certificate(state: &MailGatewayState, url: Url) -> Result<Vec<u8>, StatusCode> {
+    if let Some(certificate) = state
+        .signer_certificates
+        .lock()
+        .await
+        .get(url.as_str())
+        .cloned()
+    {
+        return Ok(certificate);
+    }
+    let response = state
+        .public_client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_CERTIFICATE_BODY as u64)
+    {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if body.len() > MAX_CERTIFICATE_BODY {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let blocks = pem::parse_many(&body).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if blocks.len() != 1 || blocks[0].tag() != "CERTIFICATE" {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let certificate = blocks[0].contents().to_vec();
+    verify_signer_certificate(state, &certificate)?;
+    let mut cache = state.signer_certificates.lock().await;
+    if cache.len() >= 4 {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(url.into(), certificate.clone());
+    Ok(certificate)
+}
+
+fn verify_signer_certificate(
+    state: &MailGatewayState,
+    certificate: &[u8],
+) -> Result<(), StatusCode> {
+    let end_der = CertificateDer::from(certificate);
+    let end = EndEntityCert::try_from(&end_der).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let root_der = CertificateDer::from(state.sns_root_ca.as_slice());
+    let root = anchor_from_trusted_cert(&root_der).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let intermediate = CertificateDer::from(state.sns_intermediate_ca.as_slice());
+    end.verify_for_usage(
+        ALL_VERIFICATION_ALGS,
+        &[root],
+        &[intermediate],
+        UnixTime::now(),
+        KeyUsage::server_auth(),
+        None,
+        None,
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(())
+}
+
+fn verify_sns_signature(envelope: &SnsEnvelope, certificate: &[u8]) -> Result<(), StatusCode> {
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&envelope.signature)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if signature.len() > 1024 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let end_der = CertificateDer::from(certificate);
+    let end = EndEntityCert::try_from(&end_der).map_err(|_| StatusCode::BAD_REQUEST)?;
+    verify_rsa_sha1(
+        end.subject_public_key_info().as_ref(),
+        canonical_sns_message(envelope)?.as_bytes(),
+        &signature,
+    )
+}
+
+fn verify_rsa_sha1(
+    subject_public_key_info: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), StatusCode> {
+    UnparsedPublicKey::new(
+        &RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
+        subject_public_key_info,
+    )
+    .verify(message, signature)
+    .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+fn canonical_sns_message(envelope: &SnsEnvelope) -> Result<String, StatusCode> {
+    let mut fields = Vec::new();
+    match envelope.kind.as_str() {
+        "Notification" => {
+            fields.push(("Message", envelope.message.as_str()));
+            fields.push(("MessageId", envelope.message_id.as_str()));
+            if let Some(subject) = envelope.subject.as_deref() {
+                fields.push(("Subject", subject));
+            }
+            fields.push(("Timestamp", envelope.timestamp.as_str()));
+            fields.push(("TopicArn", envelope.topic_arn.as_str()));
+            fields.push(("Type", envelope.kind.as_str()));
+        }
+        "SubscriptionConfirmation" => {
+            fields.push(("Message", envelope.message.as_str()));
+            fields.push(("MessageId", envelope.message_id.as_str()));
+            fields.push((
+                "SubscribeURL",
+                envelope
+                    .subscribe_url
+                    .as_deref()
+                    .ok_or(StatusCode::BAD_REQUEST)?,
+            ));
+            fields.push(("Timestamp", envelope.timestamp.as_str()));
+            fields.push((
+                "Token",
+                envelope.token.as_deref().ok_or(StatusCode::BAD_REQUEST)?,
+            ));
+            fields.push(("TopicArn", envelope.topic_arn.as_str()));
+            fields.push(("Type", envelope.kind.as_str()));
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    let mut canonical = String::new();
+    for (name, value) in fields {
+        canonical.push_str(name);
+        canonical.push('\n');
+        canonical.push_str(value);
+        canonical.push('\n');
+    }
+    Ok(canonical)
+}
+
+fn parse_tem_event(
+    message: &str,
+    sns_message_id: Uuid,
+    state: &MailGatewayState,
+) -> Result<JournalRecord, StatusCode> {
+    let event: TemEvent = serde_json::from_str(message).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if event.project_id != state.project_id
+        || event.domain_id != state.domain_id
+        || !matches!(
+            event.event_type.as_str(),
+            "email_queued"
+                | "email_deferred"
+                | "email_delivered"
+                | "email_dropped"
+                | "email_spam"
+                | "email_mailbox_not_found"
+                | "email_blocklisted"
+        )
+        || event.email_headers.len() > 100
+        || OffsetDateTime::parse(&event.created_at, &Rfc3339).is_err()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let email_id = event.email_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let mut delivery_id = None;
+    for item in event.email_headers {
+        if item.key.len() > 256 || item.value.len() > 4096 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if item.key.eq_ignore_ascii_case("X-MakersBrain-Delivery-ID") {
+            if delivery_id.is_some() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            delivery_id = Some(Uuid::parse_str(&item.value).map_err(|_| StatusCode::BAD_REQUEST)?);
+        }
+    }
+    Ok(JournalRecord {
+        schema_version: 1,
+        event_id: event.id,
+        sns_message_id,
+        email_id,
+        delivery_id: delivery_id.ok_or(StatusCode::BAD_REQUEST)?,
+        event_type: event.event_type,
+        created_at: event.created_at,
+    })
+}
+
+fn validate_topic_arn(value: &str) -> anyhow::Result<()> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 6
+        || parts[0..4] != ["arn", "scw", "sns", "fr-par"]
+        || Uuid::parse_str(parts[4]).is_err()
+        || parts[5].is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("MAIL_GATEWAY_SNS_TOPIC_ARN must be an exact Scaleway fr-par topic ARN");
+    }
+    Ok(())
+}
+
+fn load_sns_trust_chain(path: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CERTIFICATE_BODY as u64 {
+        anyhow::bail!("SNS trust chain must be a bounded regular file");
+    }
+    let blocks = pem::parse_many(std::fs::read(path)?)?;
+    if blocks.len() != 2 || blocks.iter().any(|block| block.tag() != "CERTIFICATE") {
+        anyhow::bail!("SNS trust chain must contain the Scaleway root then intermediate CA");
+    }
+    Ok((blocks[0].contents().to_vec(), blocks[1].contents().to_vec()))
 }
 
 fn render(template: &str, data: &Value) -> Result<(String, String, String), StatusCode> {
@@ -386,6 +949,53 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn test_state(endpoint: Url, provider_client: reqwest::Client) -> MailGatewayState {
+        let journal_directory =
+            std::env::temp_dir().join(format!("makersbrain-mail-gateway-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&journal_directory).unwrap();
+        MailGatewayState {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            environment: "staging".into(),
+            internal_token: "internal-secret".into(),
+            provider_client,
+            public_client: reqwest::Client::new(),
+            endpoint,
+            project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse().unwrap(),
+            domain_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".parse().unwrap(),
+            from_email: "notifications@notify.staging.makersbrain.net".into(),
+            from_name: "MakersBrain".into(),
+            allowed_recipients: HashSet::from(["synthetic@example.test".into()]),
+            sns_topic_arn:
+                "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem"
+                    .into(),
+            sns_root_ca: Vec::new(),
+            sns_intermediate_ca: Vec::new(),
+            signer_certificates: Arc::new(Mutex::new(HashMap::new())),
+            event_journal: Arc::new(Mutex::new(
+                EventJournal::load(journal_directory.join("events.jsonl")).unwrap(),
+            )),
+        }
+    }
+
+    fn notification_envelope() -> SnsEnvelope {
+        SnsEnvelope {
+            kind: "Notification".into(),
+            message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
+            topic_arn:
+                "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem"
+                    .into(),
+            message: "payload".into(),
+            timestamp: "2026-08-15T12:00:00Z".into(),
+            signature_version: "1".into(),
+            signature: "signature".into(),
+            signing_cert_url:
+                "https://messaging.s3.fr-par.scw.cloud/fr-par/sns/sns_certificate_123.crt".into(),
+            subject: Some("delivery".into()),
+            token: None,
+            subscribe_url: None,
+        }
+    }
+
     #[test]
     fn invitation_template_requires_a_scoped_https_capability() {
         let good = json!({
@@ -423,6 +1033,147 @@ mod tests {
         assert!(!authorized(&headers, "exact-valuE"));
     }
 
+    #[test]
+    fn topic_arn_is_exactly_scoped_to_scaleway_paris() {
+        assert!(
+            validate_topic_arn(
+                "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mail-events"
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "arn:aws:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mail-events",
+            "arn:scw:sns:nl-ams:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mail-events",
+            "arn:scw:sns:fr-par:not-a-uuid:mail-events",
+            "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:",
+        ] {
+            assert!(validate_topic_arn(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn sns_urls_are_pinned_to_expected_https_origins() {
+        assert!(
+            validate_signing_certificate_url(
+                "https://messaging.s3.fr-par.scw.cloud/fr-par/sns/sns_certificate_123.crt"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_confirmation_url(
+                "https://sns.mnq.fr-par.scaleway.com/?Action=ConfirmSubscription&Token=bound"
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "http://messaging.s3.fr-par.scw.cloud/fr-par/sns/sns_certificate_123.crt",
+            "https://messaging.s3.fr-par.scw.cloud.evil.test/fr-par/sns/sns_certificate_123.crt",
+            "https://messaging.s3.fr-par.scw.cloud/fr-par/sns/../sns_certificate_123.crt",
+            "https://messaging.s3.fr-par.scw.cloud/fr-par/sns/sns_certificate_123.crt?redirect=x",
+        ] {
+            assert!(
+                validate_signing_certificate_url(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            "http://sns.mnq.fr-par.scaleway.com/?Action=ConfirmSubscription",
+            "https://sns.mnq.fr-par.scaleway.com.evil.test/?Action=ConfirmSubscription",
+            "https://sns.mnq.fr-par.scaleway.com/",
+        ] {
+            assert!(validate_confirmation_url(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn bundled_scaleway_paris_trust_chain_is_parseable() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("deploy/podman/assets/scaleway-sns-fr-par-trust-chain.pem");
+        let (root, intermediate) = load_sns_trust_chain(&path).unwrap();
+        assert!(anchor_from_trusted_cert(&CertificateDer::from(root)).is_ok());
+        assert!(EndEntityCert::try_from(&CertificateDer::from(intermediate)).is_ok());
+    }
+
+    #[test]
+    fn sns_notification_canonical_form_is_stable() {
+        let envelope = notification_envelope();
+        assert_eq!(
+            canonical_sns_message(&envelope).unwrap(),
+            concat!(
+                "Message\npayload\n",
+                "MessageId\ncccccccc-cccc-4ccc-8ccc-cccccccccccc\n",
+                "Subject\ndelivery\n",
+                "Timestamp\n2026-08-15T12:00:00Z\n",
+                "TopicArn\narn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem\n",
+                "Type\nNotification\n"
+            )
+        );
+    }
+
+    #[test]
+    fn sns_rsa_sha1_signature_is_verified_and_tampering_is_rejected() {
+        // Fixed test-only RSA material generated for this canonical SNS fixture.
+        let subject_public_key_info = base64::engine::general_purpose::STANDARD
+            .decode("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTmxd/7ltYRDEoLNHEdTBnAdL9Z8T1Xr6f27raE3lW47a3lp7z936i8I5UoQrI7b9Iy0JVmE/fN5q//CoKaQYkUxCs/M/Lt1bxZr68eFsebzPizJrv6SeVPbn6aVZEKMS186qEWGBJfLC3ybWRXUvaTbWMfKpdkNtdENI18ESPzBReLHnYLpyKOEfs7BNINDXn6pl212x+v8BO87z+xnX5utpI/dsb+D3wWSdB4AJZK/k9s9ReM2ht5g7p3yje3ReRnzhNPqWWErpKolpxS35vfQotrKWC6Hm0vaLERV7iMVoGPf3IyiAUq7pnAJ/zinSXqsKp+n9z1hsQRX5FmDMwIDAQAB")
+            .unwrap();
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode("gqb3zVRCywH0XiEUlFy+KtWqlvWk12Gw1OOm0jfsaP7I0AVwRZ5gY1xqiw/q9rQUHFAdftWEMKH2uhie4c8uIu/FLP/RFfg4csOgtn+qwdrO8+X93urDI+9QVGpgImCjzurktmn7tvL7lzR24lRfkz4Bpaqo9bLgRJ53BPyNSoj4T4RAB3iuHcLNEWKkGkdcuiOeJLNfKdm7fPyJuQ6t4DaQ31EnwhdELT3sUl1lAKZHVYBoDTtgZqHY0MskIGije4PwkU11PE7TZf1zYqhBukR9IVmlMggP7shPA7a5MPCC/9DrWSW11tDmQWI5lgj/F1d+jb5yvp9yYdFeUY5yHQ==")
+            .unwrap();
+        let canonical = canonical_sns_message(&notification_envelope()).unwrap();
+        assert!(
+            verify_rsa_sha1(&subject_public_key_info, canonical.as_bytes(), &signature).is_ok()
+        );
+        assert_eq!(
+            verify_rsa_sha1(&subject_public_key_info, b"tampered", &signature).unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn tem_event_is_scoped_and_journaled_once_without_personal_data() {
+        let state = test_state(
+            Url::parse("http://127.0.0.1/emails").unwrap(),
+            reqwest::Client::new(),
+        );
+        let event_id = Uuid::new_v4();
+        let email_id = Uuid::new_v4();
+        let delivery_id = Uuid::new_v4();
+        let message = json!({
+            "id": event_id,
+            "type": "email_delivered",
+            "project_id": state.project_id,
+            "domain_id": state.domain_id,
+            "created_at": "2026-08-15T12:00:00Z",
+            "email_id": email_id,
+            "email_headers": [
+                {"key":"X-MakersBrain-Delivery-ID", "value":delivery_id},
+                {"key":"To", "value":"private-person@example.test"}
+            ]
+        })
+        .to_string();
+        let record = parse_tem_event(&message, Uuid::new_v4(), &state).unwrap();
+        let path = state.event_journal.lock().await.path.clone();
+        let mut journal = state.event_journal.lock().await;
+        journal.append(record).await.unwrap();
+        let duplicate = parse_tem_event(&message, Uuid::new_v4(), &state).unwrap();
+        journal.append(duplicate).await.unwrap();
+        drop(journal);
+
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert_eq!(persisted.lines().count(), 1);
+        assert!(persisted.contains(&delivery_id.to_string()));
+        assert!(!persisted.contains("private-person"));
+
+        let wrong_domain = message.replace(
+            &state.domain_id.to_string(),
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        );
+        assert_eq!(
+            parse_tem_event(&wrong_domain, Uuid::new_v4(), &state).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn authenticated_allowlisted_mail_is_submitted_without_exposing_provider_errors() {
         let provider = MockServer::start().await;
@@ -450,17 +1201,10 @@ mod tests {
             )]))
             .build()
             .unwrap();
-        let state = MailGatewayState {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            environment: "staging".into(),
-            internal_token: "internal-secret".into(),
+        let state = test_state(
+            Url::parse(&format!("{}/emails", provider.uri())).unwrap(),
             client,
-            endpoint: Url::parse(&format!("{}/emails", provider.uri())).unwrap(),
-            project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse().unwrap(),
-            from_email: "notifications@notify.staging.makersbrain.net".into(),
-            from_name: "MakersBrain".into(),
-            allowed_recipients: HashSet::from(["synthetic@example.test".into()]),
-        };
+        );
         let request = Request::builder()
             .method("POST")
             .uri("/v1/mail")

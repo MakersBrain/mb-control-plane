@@ -55,19 +55,36 @@ file references:
 MAIL_GATEWAY_LISTEN=0.0.0.0:8080
 MAIL_GATEWAY_SCW_ENDPOINT=https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/emails
 MAIL_GATEWAY_SCW_PROJECT_ID=00000000-0000-4000-8000-000000000000
+MAIL_GATEWAY_SCW_DOMAIN_ID=00000000-0000-4000-8000-000000000000
 MAIL_GATEWAY_FROM_EMAIL=notifications@notify.staging.makersbrain.net
 MAIL_GATEWAY_FROM_NAME=MakersBrain
 MAIL_GATEWAY_INTERNAL_TOKEN=@/run/secrets/mail_webhook_token
 MAIL_GATEWAY_SCW_SECRET_KEY=@/run/secrets/scaleway_tem_secret_key
 MAIL_GATEWAY_ALLOWED_RECIPIENTS_FILE=/run/secrets/mail_allowed_recipients
+MAIL_GATEWAY_SNS_TOPIC_ARN=arn:scw:sns:fr-par:00000000-0000-4000-8000-000000000000:makersbrain-staging-tem
+MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE=/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem
+MAIL_GATEWAY_EVENT_JOURNAL_FILE=/var/lib/makersbrain/mail-events/events.jsonl
 ```
 
-Materialize those three files in
+Materialize the two credentials and recipient allowlist in
 `/etc/makersbrain/secrets/control-mail-gateway` with directory mode `0700` and
 file mode `0600`. The staging allowlist has one synthetic recipient address per
 line; no wildcard or domain rule is accepted. The production file may be empty.
 The email worker receives a separate mount of the same internal bearer value,
 never the TEM credential.
+
+The public Scaleway `fr-par` SNS trust chain is pinned in the release bundle and
+mounted read-only by the Quadlet. Updating it therefore requires the same
+reviewed, signed release process as application code; it is not an operator
+download performed during activation.
+
+`POST /v1/mail/events` is the only public gateway route. It requires the exact
+SNS message-type and topic headers, the configured Topic ARN, signature version
+1, a signing-certificate URL below Scaleway's fixed Paris SNS prefix and a
+certificate chaining to the mounted long-lived Paris trust chain. Only then
+does it confirm subscriptions or append privacy-safe delivery identifiers to
+the bounded durable journal; recipient addresses and provider response text
+are never stored there.
 
 Render a bundle with:
 

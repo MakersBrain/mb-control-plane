@@ -92,6 +92,11 @@ def validate(root: Path) -> None:
     if (
         "MAIL_GATEWAY_ENVIRONMENT=" not in mail
         or "/secrets/control-mail-gateway:/run/secrets:ro" not in mail
+        or (
+            "scaleway-sns-fr-par-trust-chain.pem:"
+            "/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem:ro"
+        )
+        not in mail
         or "podman.sock" in mail
     ):
         raise ValueError("mail gateway is not isolated and environment-scoped")

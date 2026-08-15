@@ -55,10 +55,13 @@ lopdf = "0.44"
 opentelemetry = "0.32"
 opentelemetry-otlp = "0.32"
 opentelemetry_sdk = "0.32"
+pem = "4.0.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "http2", "charset", "stream"] }
 rand = "0.9"
 regex = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+rustls-webpki = { version = "0.103.14", features = ["aws-lc-rs", "alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_jcs = "0.2"
