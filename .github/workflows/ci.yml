@@ -278,44 +278,64 @@ jobs:
         run: |
           mkdir -p oca
           ALL_MODULES=$(ls addons | paste -sd, -)
-          docker run --rm --network host --user root \
-            -e HOST=localhost \
-            -v "$PWD/addons:/mnt/makersbrain-addons" \
-            "$ODOO_IMAGE" \
-            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
-                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
-                 --data-dir=/tmp/odoo \
-                 -d ci_i18n -i base --stop-after-init --without-demo=all --log-level=warn
-          docker run --rm --network host --user root \
-            -e HOST=localhost \
-            -v "$PWD/addons:/mnt/makersbrain-addons" \
-            "$ODOO_IMAGE" \
-            odoo i18n loadlang \
-                 --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
-                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
-                 --data-dir=/tmp/odoo -d ci_i18n -l fr_FR
-          docker run --rm --network host --user root \
-            -e HOST=localhost \
-            -v "$PWD/addons:/mnt/makersbrain-addons" \
-            "$ODOO_IMAGE" \
-            odoo --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
-                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
-                 --data-dir=/tmp/odoo \
-                 -d ci_i18n -i "$ALL_MODULES" --stop-after-init --without-demo=all --log-level=warn
-          docker run --rm --network host --user root \
-            -e HOST=localhost \
-            -v "$PWD/addons:/mnt/makersbrain-addons" \
-            "$ODOO_IMAGE" \
-            odoo i18n export \
-                 --addons-path=/mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons \
-                 --db_host=localhost --db_port=5432 --db_user=odoo --db_password=odoo \
-                 --data-dir=/tmp/odoo -d ci_i18n $(ls addons | tr '\n' ' ') -l pot
+
+          # Odoo 19 rewrote the `i18n` CLI. Its subcommands accept only
+          # -c/-d/-l/-o and module names: the --db_host/--db_port/--db_user/
+          # --db_password flags the server still takes are not options of
+          # `odoo i18n export`, and connection details have to arrive in a
+          # config file instead. The same file carries addons_path, so every
+          # invocation below reduces to `-c` plus what it is actually doing.
+          #
+          # Written with echo rather than a heredoc because this is a YAML block
+          # scalar: a heredoc body would carry the block's indentation into the
+          # file, and a leading space turns an ini key into a continuation of
+          # the line above it.
+          {
+            echo "[options]"
+            echo "addons_path = /mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons"
+            echo "db_host = localhost"
+            echo "db_port = 5432"
+            echo "db_user = odoo"
+            echo "db_password = odoo"
+            echo "data_dir = /tmp/odoo"
+          } > odoo-ci.conf
+
+          # --entrypoint odoo bypasses the image's own entrypoint, which appends
+          # a second --db_host/--db_port/--db_user/--db_password to whatever it
+          # is given. The server tolerates the duplicates; `odoo i18n` rejects
+          # them as unrecognized arguments and exits 2.
+          #
+          # --user root because the exporter writes into the mounted workspace
+          # and the image runs as uid 101. Nothing after this step writes to the
+          # tree.
+          odoo_ci() {
+            docker run --rm --network host --user root --entrypoint odoo \
+              -v "$PWD/addons:/mnt/makersbrain-addons" \
+              -v "$PWD/odoo-ci.conf:/tmp/odoo-ci.conf:ro" \
+              "$ODOO_IMAGE" "$@"
+          }
+
+          odoo_ci -c /tmp/odoo-ci.conf -d ci_i18n -i base \
+                  --stop-after-init --without-demo --log-level=warn
+          odoo_ci i18n loadlang -c /tmp/odoo-ci.conf -d ci_i18n -l fr_FR
+          odoo_ci -c /tmp/odoo-ci.conf -d ci_i18n -i "$ALL_MODULES" \
+                  --stop-after-init --without-demo --log-level=warn
+          odoo_ci i18n export -c /tmp/odoo-ci.conf -d ci_i18n \
+                  $(ls addons | tr '\n' ' ') -l pot
+
           sudo chown -R "$(id -u):$(id -g)" addons
           # `add -N` so a POT added in this very commit is visible to `git diff`
-          # rather than being silently skipped as untracked. `-I` because the
-          # exporter stamps both date headers on every run, which is not drift.
+          # rather than being silently skipped as untracked.
+          #
+          # `-I` because three headers move on every export without the source
+          # having changed: both date stamps, and Project-Id-Version, which
+          # carries the Odoo *image* build date rather than anything about this
+          # repository. Bumping the pinned image would otherwise fail this gate
+          # across every catalogue at once and say "stale" about files that are
+          # perfectly current.
           git add -N -- 'addons/*/i18n/*.pot'
-          git diff --exit-code -I '^"(POT-Creation-Date|PO-Revision-Date)' \
+          git diff --exit-code \
+            -I '^"(POT-Creation-Date|PO-Revision-Date|Project-Id-Version)' \
             -- 'addons/*/i18n/*.pot' \
             || { echo "::error::Committed POT files are stale. Re-export them."; exit 1; }
 
