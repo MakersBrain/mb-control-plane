@@ -289,7 +289,9 @@ jobs:
           # Written with echo rather than a heredoc because this is a YAML block
           # scalar: a heredoc body would carry the block's indentation into the
           # file, and a leading space turns an ini key into a continuation of
-          # the line above it.
+          # the line above it. It is written outside the checkout so it cannot
+          # be mistaken for a source file or show up in the drift diff.
+          conf_dir=$(mktemp -d)
           {
             echo "[options]"
             echo "addons_path = /mnt/makersbrain-addons,/usr/lib/python3/dist-packages/odoo/addons"
@@ -298,7 +300,7 @@ jobs:
             echo "db_user = odoo"
             echo "db_password = odoo"
             echo "data_dir = /tmp/odoo"
-          } > odoo-ci.conf
+          } > "$conf_dir/odoo-ci.conf"
 
           # --entrypoint odoo bypasses the image's own entrypoint, which appends
           # a second --db_host/--db_port/--db_user/--db_password to whatever it
@@ -311,7 +313,7 @@ jobs:
           odoo_ci() {
             docker run --rm --network host --user root --entrypoint odoo \
               -v "$PWD/addons:/mnt/makersbrain-addons" \
-              -v "$PWD/odoo-ci.conf:/tmp/odoo-ci.conf:ro" \
+              -v "$conf_dir/odoo-ci.conf:/tmp/odoo-ci.conf:ro" \
               "$ODOO_IMAGE" "$@"
           }
 
