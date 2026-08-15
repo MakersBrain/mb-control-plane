@@ -2,7 +2,7 @@
 Description=Apply MakersBrain control schema migrations
 Requires=control-database-identities.container
 After=control-database-identities.container
-Before=control-api.container control-workers@.container
+Before=control-api.container
 
 [Container]
 Image=@@CONTROL_IMAGE@@

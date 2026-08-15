@@ -221,10 +221,36 @@ def validate_runtime_environment(
                     f"{service} omits required {process} settings: "
                     f"{sorted(absent_required)}"
                 )
+    host_contracts = specification.get("host_runtime_environment", {})
+    if not isinstance(host_contracts, dict):
+        errors.append("host runtime environment ownership must be an object")
+    else:
+        for service, raw_contract in host_contracts.items():
+            if not isinstance(service, str) or not isinstance(raw_contract, dict):
+                errors.append("host runtime environment entries must be service objects")
+                continue
+            process = raw_contract.get("process")
+            variables = raw_contract.get("variables")
+            if not isinstance(process, str) or not isinstance(variables, list) or not all(
+                isinstance(name, str) for name in variables
+            ):
+                errors.append(f"host runtime environment contract for {service} is invalid")
+                continue
+            process_owners.add(process)
+            required_for_process = required.get(process)
+            if not isinstance(required_for_process, list):
+                errors.append(f"host runtime process {process} has no required environment contract")
+            else:
+                absent_required = set(required_for_process) - set(variables)
+                if absent_required:
+                    errors.append(
+                        f"{service} omits required {process} settings: "
+                        f"{sorted(absent_required)}"
+                    )
     missing_processes = set(required) - process_owners
     if missing_processes:
         errors.append(
-            "required processes lack a Compose runtime environment owner: "
+            "required processes lack a runtime environment owner: "
             f"{sorted(missing_processes)}"
         )
     return errors
@@ -479,6 +505,7 @@ def validate() -> list[str]:
         "src/bin/control-container-driver.rs": ["docker_driver"],
         "src/bin/control-backup-scheduler.rs": ["backup_scheduler"],
         "src/bin/document-extraction-broker.rs": ["document_extraction_broker"],
+        "src/bin/control-mail-gateway.rs": ["mail_gateway"],
         "src/bin/control-worker.rs": [
             "membership_worker", "provisioning_worker", "invoice_worker",
             "inventory_worker", "email_worker", "reconciliation_worker",

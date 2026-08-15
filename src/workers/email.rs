@@ -32,6 +32,12 @@ pub(crate) async fn deliver(
     store: &Store,
     operation: &LeasedOperation,
 ) -> Result<(), IntegrationError> {
+    // A timed-out provider submission may have succeeded. Automatic replay
+    // could send a second live invitation capability, so reconciliation stays
+    // fenced until the delivery event or an operator resolves the outcome.
+    if operation.reconciling {
+        return Err(IntegrationError::UnknownOutcome);
+    }
     let outbox = operation
         .payload
         .get("outbox_id")
@@ -131,7 +137,7 @@ pub(crate) async fn deliver(
     }
     let response = client
         .post(webhook_url)
-        .json(&json!({"to":recipient,"template":template,"data":data}))
+        .json(&json!({"delivery_id":outbox,"to":recipient,"template":template,"data":data}))
         .send()
         .await
         .map_err(|error| {
@@ -141,6 +147,9 @@ pub(crate) async fn deliver(
                 IntegrationError::Unavailable
             }
         })?;
+    if response.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
+        return Err(IntegrationError::UnknownOutcome);
+    }
     if !response.status().is_success() {
         sqlx::query("update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1")
             .bind(outbox).execute(store.pool()).await.ok();

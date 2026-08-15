@@ -10,6 +10,7 @@ pub mod integrations;
 pub mod inventory_label;
 pub mod invitation;
 pub mod invoice;
+pub mod mail_gateway;
 pub mod modules;
 pub mod openapi;
 pub mod persistence;

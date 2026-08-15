@@ -41,6 +41,33 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   ingress targets `control-web:8080`, `control-api:8080`, `rauthy:8092` and
   `tenant-gateway:8080` on the private Podman network; the connector receives
   no database credentials or runtime socket.
+- `control-mail-gateway` is the only process that receives the Scaleway TEM
+  credential. It accepts the worker's bounded invitation payload over the
+  private Podman network, requires an exact bearer credential, submits only to
+  the fixed Paris TEM API and does not log recipient addresses or invitation
+  capabilities. Staging additionally denies every recipient absent from its
+  protected exact allowlist.
+
+The mail gateway environment file contains only non-secret values and scoped
+file references:
+
+```dotenv
+MAIL_GATEWAY_LISTEN=0.0.0.0:8080
+MAIL_GATEWAY_SCW_ENDPOINT=https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/emails
+MAIL_GATEWAY_SCW_PROJECT_ID=00000000-0000-4000-8000-000000000000
+MAIL_GATEWAY_FROM_EMAIL=notifications@notify.staging.makersbrain.net
+MAIL_GATEWAY_FROM_NAME=MakersBrain
+MAIL_GATEWAY_INTERNAL_TOKEN=@/run/secrets/mail_webhook_token
+MAIL_GATEWAY_SCW_SECRET_KEY=@/run/secrets/scaleway_tem_secret_key
+MAIL_GATEWAY_ALLOWED_RECIPIENTS_FILE=/run/secrets/mail_allowed_recipients
+```
+
+Materialize those three files in
+`/etc/makersbrain/secrets/control-mail-gateway` with directory mode `0700` and
+file mode `0600`. The staging allowlist has one synthetic recipient address per
+line; no wildcard or domain rule is accepted. The production file may be empty.
+The email worker receives a separate mount of the same internal bearer value,
+never the TEM credential.
 
 Render a bundle with:
 

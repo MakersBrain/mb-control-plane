@@ -14,6 +14,17 @@ HERE = Path(__file__).resolve().parent
 IMAGE = re.compile(r"^[^\s]+@sha256:[a-f0-9]{64}$")
 NETWORK = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+WORKERS = (
+    "tenant-provisioning",
+    "membership-provisioning",
+    "invoice-capture",
+    "inventory-capture",
+    "email-delivery",
+    "tenant-reconciliation",
+    "tenant-lifecycle",
+    "release-adoption",
+    "privacy-operations",
+)
 
 
 def load_values(path: Path) -> dict:
@@ -73,15 +84,33 @@ def render(values_path: Path, output: Path) -> None:
         raise ValueError("output directory must be absent or empty")
     output.mkdir(parents=True, exist_ok=True)
     tokens = replacements(values)
+
+    def rendered(content: str, name: str) -> str:
+        for key, value in tokens.items():
+            content = content.replace(f"@@{key}@@", value)
+        if "@@" in content:
+            raise ValueError(f"unresolved template value in {name}")
+        return content
+
     for source_root in (HERE / "quadlets", HERE / "systemd", HERE / "assets"):
         for source in sorted(path for path in source_root.rglob("*") if path.is_file()):
-            target = output / source.relative_to(source_root)
+            relative = source.relative_to(source_root)
+            if any(part.endswith(".container.d") for part in relative.parts):
+                continue
+            if source.name == "control-workers@.container":
+                base = source.read_text(encoding="utf-8")
+                for worker in WORKERS:
+                    content = base
+                    dropin = source_root / f"control-workers@{worker}.container.d"
+                    for fragment in sorted(dropin.glob("*.conf")):
+                        content += "\n" + fragment.read_text(encoding="utf-8")
+                    target = output / f"control-workers@{worker}.container"
+                    target.write_text(rendered(content, target.name), encoding="utf-8")
+                    target.chmod(0o644)
+                continue
+            target = output / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            content = source.read_text(encoding="utf-8")
-            for key, value in tokens.items():
-                content = content.replace(f"@@{key}@@", value)
-            if "@@" in content:
-                raise ValueError(f"unresolved template value in {source.name}")
+            content = rendered(source.read_text(encoding="utf-8"), source.name)
             target.write_text(content, encoding="utf-8")
             target.chmod(0o644)
     shutil.copy2(values_path, output / "rendered-values.json")

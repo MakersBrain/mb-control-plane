@@ -23,7 +23,8 @@ RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registr
        target/release/control-docker-driver \
        target/release/control-container-driver \
        target/release/control-backup-scheduler \
-       target/release/document-extraction-broker /out/
+       target/release/document-extraction-broker \
+       target/release/control-mail-gateway /out/
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 RUN --mount=type=cache,id=control-apt-lists,target=/var/lib/apt/lists,sharing=locked \
@@ -40,6 +41,7 @@ COPY --from=builder /out/control-docker-driver /usr/local/bin/control-docker-dri
 COPY --from=builder /out/control-container-driver /usr/local/bin/control-container-driver
 COPY --from=builder /out/control-backup-scheduler /usr/local/bin/control-backup-scheduler
 COPY --from=builder /out/document-extraction-broker /usr/local/bin/document-extraction-broker
+COPY --from=builder /out/control-mail-gateway /usr/local/bin/control-mail-gateway
 COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign
 USER 10001:10001
 EXPOSE 8080

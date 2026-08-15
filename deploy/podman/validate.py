@@ -14,6 +14,14 @@ FORBIDDEN = ("docker.sock", "tcp://")
 
 
 def validate(root: Path) -> None:
+    workers = {
+        f"control-workers@{worker}.container"
+        for worker in (
+            "tenant-provisioning", "membership-provisioning", "invoice-capture",
+            "inventory-capture", "email-delivery", "tenant-reconciliation",
+            "tenant-lifecycle", "release-adoption", "privacy-operations",
+        )
+    }
     expected = {
         "makersbrain.network",
         "cloudflared.container",
@@ -24,16 +32,16 @@ def validate(root: Path) -> None:
         "rauthy-ready.container",
         "control-api.container",
         "control-container-driver.container",
-        "control-workers@.container",
         "control-backup-scheduler.container",
         "document-extraction.container",
+        "control-mail-gateway.container",
         "odoo.container",
         "rauthy.container",
         "redis.container",
         "tenant-gateway.container",
         "control-web.container",
         "resolve-secret-env.sh",
-    }
+    } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
     if missing:
         raise ValueError(f"bundle is incomplete: {', '.join(missing)}")
@@ -59,10 +67,9 @@ def validate(root: Path) -> None:
         "control-backup-scheduler.container",
         "control-database-identities.container",
         "control-migrate.container",
-        "control-workers@.container",
         "odoo.container",
     }
-    for name in tls_clients:
+    for name in tls_clients | workers:
         content = (root / name).read_text(encoding="utf-8")
         if "PGSSLMODE=verify-full" not in content:
             raise ValueError(f"PostgreSQL certificate verification is missing from {name}")
@@ -81,6 +88,26 @@ def validate(root: Path) -> None:
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
+    mail = (root / "control-mail-gateway.container").read_text(encoding="utf-8")
+    if (
+        "MAIL_GATEWAY_ENVIRONMENT=" not in mail
+        or "/secrets/control-mail-gateway:/run/secrets:ro" not in mail
+        or "podman.sock" in mail
+    ):
+        raise ValueError("mail gateway is not isolated and environment-scoped")
+    mail_worker = root / "control-workers@email-delivery.container"
+    if "Requires=control-mail-gateway.container" not in mail_worker.read_text():
+        raise ValueError("email worker does not wait for the mail gateway")
+    scoped_worker_markers = {
+        "control-workers@membership-provisioning.container": "paperless-client-secrets.volume",
+        "control-workers@invoice-capture.container": "paperless-client-secrets.volume",
+        "control-workers@inventory-capture.container": "tenant-secrets.volume",
+        "control-workers@tenant-reconciliation.container": "tenant-secrets.volume",
+        "control-workers@privacy-operations.container": "privacy-exports.volume",
+    }
+    for name, marker in scoped_worker_markers.items():
+        if marker not in (root / name).read_text():
+            raise ValueError(f"scoped worker capability is missing from {name}")
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")

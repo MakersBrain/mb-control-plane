@@ -116,6 +116,7 @@ mod tests {
             "docker_driver",
             "backup_scheduler",
             "document_extraction_broker",
+            "mail_gateway",
         ] {
             assert!(
                 specification.required_environment.contains_key(process),

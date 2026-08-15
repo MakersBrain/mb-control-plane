@@ -29,6 +29,7 @@ PERSISTENT_UNITS = [
     "control-api.service",
     "control-web.service",
     "document-extraction.service",
+    "control-mail-gateway.service",
     "control-container-driver.service",
     "control-backup-scheduler.service",
     "control-workers@tenant-provisioning.service",
@@ -46,6 +47,7 @@ UNIT_PROCESS = {
     "control-api.container": "api",
     "control-container-driver.container": "docker_driver",
     "document-extraction.container": "document_extraction_broker",
+    "control-mail-gateway.container": "mail_gateway",
     "control-backup-scheduler.container": "backup_scheduler",
 }
 WORKER_PROCESS = {
@@ -188,13 +190,8 @@ def configured_host_path(raw: str, config_root: Path) -> Path:
 
 
 def unit_instances(name: str) -> tuple[str, ...]:
-    if name != "control-workers@.container":
-        return ("",)
-    return tuple(
-        service.removeprefix("control-workers@").removesuffix(".service")
-        for service in PERSISTENT_UNITS
-        if service.startswith("control-workers@")
-    )
+    match = re.fullmatch(r"control-workers@([a-z-]+)\.container", name)
+    return (match.group(1),) if match else ("",)
 
 
 def verify_host_configuration(rendered: Path, config_root: Path) -> None:
@@ -278,7 +275,7 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                     elif name.endswith("_FILE"):
                         verify_mounted_file(Path(reference), f"{name} in {environment_file}")
             process = UNIT_PROCESS.get(unit.name)
-            if unit.name == "control-workers@.container":
+            if unit.name.startswith("control-workers@"):
                 process = WORKER_PROCESS.get(instance)
                 if process is None:
                     raise ValueError(f"unknown worker instance in release contract: {instance}")

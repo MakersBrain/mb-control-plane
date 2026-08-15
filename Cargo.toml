@@ -38,6 +38,10 @@ path = "src/bin/control-backup-scheduler.rs"
 name = "document-extraction-broker"
 path = "src/bin/document-extraction-broker.rs"
 
+[[bin]]
+name = "control-mail-gateway"
+path = "src/bin/control-mail-gateway.rs"
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"

@@ -37,7 +37,7 @@ class PodmanRendererTests(unittest.TestCase):
                 "control-backup-scheduler.container",
                 "control-database-identities.container",
                 "control-migrate.container",
-                "control-workers@.container",
+                "control-workers@email-delivery.container",
                 "odoo.container",
             ):
                 content = (output / name).read_text()
@@ -54,6 +54,14 @@ class PodmanRendererTests(unittest.TestCase):
             )
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
+            self.assertIn(
+                "paperless-client-secrets.volume",
+                (output / "control-workers@invoice-capture.container").read_text(),
+            )
+            self.assertIn(
+                "control-mail-gateway.container",
+                (output / "control-workers@email-delivery.container").read_text(),
+            )
             cloudflared = (output / "cloudflared.container").read_text()
             self.assertIn("--no-autoupdate", cloudflared)
             self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
