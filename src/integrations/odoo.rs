@@ -51,6 +51,7 @@ pub struct TenantBootstrapCommand {
     pub oidc_client_id: String,
     pub oidc_issuer: String,
     pub bridge_token: String,
+    pub public_hostname: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +326,7 @@ mod tests {
             oidc_client_id: "makersbrain-odoo-fixture".into(),
             oidc_issuer: "https://identity.example.test".into(),
             bridge_token: "a".repeat(64),
+            public_hostname: "atelier.example.test".into(),
         };
         Mock::given(method("POST"))
             .and(path("/mb_control/v1/tenant/bootstrap"))

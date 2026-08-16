@@ -710,11 +710,12 @@ async fn provision(
     )
     .map_err(DriverError::internal)?;
     let bootstrap = TenantBootstrapCommand {
-        operation_key: format!("tenant-bootstrap-v2:{workshop}"),
+        operation_key: format!("tenant-bootstrap-v3:{workshop}"),
         workshop_id: workshop,
         oidc_client_id: odoo_client_id.clone(),
         oidc_issuer: state.config.oidc_issuer.clone(),
         bridge_token: tenant_bridge_token.clone(),
+        public_hostname: odoo_hostname.to_owned(),
     };
     match tenant_odoo.bootstrap_tenant(&bootstrap).await {
         Ok(_) => {}

@@ -12,7 +12,7 @@ pub struct ModuleBundle {
     pub minimum_release: &'static str,
 }
 
-pub const REGISTRY_VERSION: u32 = 1;
+pub const REGISTRY_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EmbeddedCapabilityRegistry {
@@ -31,7 +31,7 @@ pub(crate) struct EmbeddedCapability {
     pub service: Option<String>,
 }
 
-const EMBEDDED_REGISTRY: &[u8] = include_bytes!("../deploy/capability-registry-v1.json");
+const EMBEDDED_REGISTRY: &[u8] = include_bytes!("../deploy/capability-registry-v2.json");
 
 pub(crate) fn embedded_registry() -> anyhow::Result<EmbeddedCapabilityRegistry> {
     serde_json::from_slice(EMBEDDED_REGISTRY)
@@ -106,6 +106,15 @@ pub const CATALOG: &[ModuleBundle] = &[
             "mb_account_payment_sumup",
             "mb_pos_sumup",
         ],
+        dependencies: &[],
+        service: None,
+        minimum_release: "0.1.0",
+    },
+    ModuleBundle {
+        key: "webshop",
+        name: "Artisan webshop",
+        description: "Publish a craft storefront with native theme editing, stock-aware checkout, delivery and collection.",
+        odoo_modules: &["mb_webshop"],
         dependencies: &[],
         service: None,
         minimum_release: "0.1.0",
@@ -190,7 +199,7 @@ mod tests {
         for bundle in CATALOG {
             assert!(bundle.dependencies.iter().all(|key| keys.contains(key)));
         }
-        assert_eq!(REGISTRY_VERSION, 1);
+        assert_eq!(REGISTRY_VERSION, 2);
         let embedded = embedded_registry().unwrap();
         assert_eq!(embedded.version, REGISTRY_VERSION);
         assert_eq!(embedded.capabilities.len(), CATALOG.len());
@@ -202,5 +211,6 @@ mod tests {
             bundle("kiln-connectivity").unwrap().dependencies,
             &["firings"]
         );
+        assert_eq!(bundle("webshop").unwrap().odoo_modules, &["mb_webshop"]);
     }
 }
