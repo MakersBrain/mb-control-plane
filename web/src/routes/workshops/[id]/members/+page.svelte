@@ -130,7 +130,7 @@
 	<div class="grid services">
 		{#if integrations.length === 0}<div class="card empty">Services are still being provisioned.</div>{/if}
 		{#each integrations as integration (integration.service)}
-			<article class="card stack"><div class="row"><strong>{sentence(integration.service)}</strong><StatusBadge state={integration.health} /></div><p class="muted">Access version {integration.applied_epoch} of {integration.desired_epoch}{integration.error ? ` · ${sentence(integration.error)}` : ''}</p>{#if integrationReady(integration)}<a class="button" href={integration.url} target="_blank" rel="noreferrer">Open {sentence(integration.service)} ↗</a>{:else}<button disabled>Available after reconciliation</button>{/if}</article>
+			<article class="card stack"><div class="row"><strong>{sentence(integration.service)}</strong><StatusBadge state={integration.health} /></div><p class="muted">Access version {integration.applied_epoch} of {integration.desired_epoch}{integration.error ? ` · ${sentence(integration.error)}` : ''}</p>{#if integrationReady(integration) && integration.external_url}<a class="button" href={integration.external_url} target="_blank" rel="noreferrer">Open {sentence(integration.service)} ↗</a>{:else}<button disabled>Available after reconciliation</button>{/if}</article>
 		{/each}
 	</div>
 </section>

@@ -682,19 +682,47 @@ async fn integrations(
 ) -> ApiResult<Json<Vec<IntegrationResponse>>> {
     let who = principal(&state, &headers).await?;
     authority(&state, who.user_id, id).await?;
+    let route = sqlx::query_as::<_, (String, Option<String>)>(
+        "select w.slug,d.public_hostname from control.workshops w
+         left join control.odoo_databases d on d.workshop_id=w.id and d.kind='primary'
+           and d.deleted_at is null
+         where w.id=$1",
+    )
+    .bind(id)
+    .fetch_one(state.store.pool())
+    .await?;
     let rows=sqlx::query_as::<_,(String,String,String,i32,i32,Option<String>)>("select service,base_url,health,desired_epoch,applied_epoch,safe_error_class from control.service_instances where workshop_id=$1 order by service").bind(id).fetch_all(state.store.pool()).await?;
     Ok(Json(
         rows.into_iter()
-            .map(|row| IntegrationResponse {
-                service: row.0,
-                url: row.1,
-                health: row.2,
-                desired_epoch: row.3,
-                applied_epoch: row.4,
-                error: row.5,
+            .map(|row| {
+                let external_url =
+                    service_external_url(&state.config, &row.0, &route.0, route.1.as_deref());
+                IntegrationResponse {
+                    service: row.0,
+                    url: row.1,
+                    external_url,
+                    health: row.2,
+                    desired_epoch: row.3,
+                    applied_epoch: row.4,
+                    error: row.5,
+                }
             })
             .collect(),
     ))
+}
+
+fn service_external_url(
+    config: &Config,
+    service: &str,
+    workshop_slug: &str,
+    primary_hostname: Option<&str>,
+) -> Option<String> {
+    let hostname = match service {
+        "odoo" => primary_hostname?.to_owned(),
+        "paperless" => format!("docs-{workshop_slug}.{}", config.tenant_domain),
+        _ => return None,
+    };
+    Some(config.tenant_origin(&hostname))
 }
 
 async fn modules(

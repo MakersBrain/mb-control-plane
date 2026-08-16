@@ -113,6 +113,8 @@ pub(super) async fn platform_workshop(
         "select public_hostname from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null and public_hostname is not null",
     ).bind(id).fetch_optional(state.store.pool()).await?;
     let operations = platform_operation_rows(&state, Some(id), None, 30).await?;
+    let workshop_slug = workshop.0.clone();
+    let primary_hostname_for_services = primary_hostname.clone();
     let deletion = sqlx::query_as::<_, (String,Uuid,Uuid,OffsetDateTime,Option<OffsetDateTime>,OffsetDateTime,Option<String>)>(
         "select state,operation_id,final_recovery_point_id,requested_at,quarantined_at,purge_after,failure_class from control.workshop_deletions where workshop_id=$1",
     ).bind(id).fetch_optional(state.store.pool()).await?;
@@ -139,14 +141,23 @@ pub(super) async fn platform_workshop(
             .collect(),
         services: services
             .into_iter()
-            .map(|row| PlatformServiceInstanceResponse {
-                service: row.0,
-                url: row.1,
-                health: row.2,
-                release_id: row.3,
-                error: row.4,
-                desired_epoch: row.5,
-                applied_epoch: row.6,
+            .map(|row| {
+                let external_url = service_external_url(
+                    &state.config,
+                    &row.0,
+                    &workshop_slug,
+                    primary_hostname_for_services.as_deref(),
+                );
+                PlatformServiceInstanceResponse {
+                    service: row.0,
+                    url: row.1,
+                    external_url,
+                    health: row.2,
+                    release_id: row.3,
+                    error: row.4,
+                    desired_epoch: row.5,
+                    applied_epoch: row.6,
+                }
             })
             .collect(),
         entitlement: entitlement.map(|row| EntitlementResponse {

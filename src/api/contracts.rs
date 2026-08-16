@@ -68,6 +68,7 @@ pub(crate) struct MemberDetailResponse {
 pub(crate) struct IntegrationResponse {
     pub service: String,
     pub url: String,
+    pub external_url: Option<String>,
     pub health: String,
     pub desired_epoch: i32,
     pub applied_epoch: i32,
@@ -596,6 +597,7 @@ pub(crate) struct PlatformMemberResponse {
 pub(crate) struct PlatformServiceInstanceResponse {
     pub service: String,
     pub url: String,
+    pub external_url: Option<String>,
     pub health: String,
     pub release_id: Option<String>,
     pub error: Option<String>,

@@ -24,6 +24,7 @@ pub struct Config {
     pub oidc_audience: String,
     pub oidc_discovery_url: Url,
     pub tenant_domain: String,
+    tenant_public_port: Option<u16>,
     pub internal_token: String,
     pub release_publish_token: String,
     pub invitation_verification_keys_file: PathBuf,
@@ -60,6 +61,7 @@ impl Config {
             oidc_audience: required("CONTROL_OIDC_AUDIENCE")?,
             oidc_discovery_url: absolute_url("CONTROL_OIDC_DISCOVERY_URL")?,
             tenant_domain: tenant_domain()?,
+            tenant_public_port: optional_port("CONTROL_TENANT_PUBLIC_PORT")?,
             internal_token: required("CONTROL_INTERNAL_TOKEN")?,
             release_publish_token: required("CONTROL_RELEASE_PUBLISH_TOKEN")?,
             invitation_verification_keys_file: PathBuf::from(required(
@@ -79,6 +81,37 @@ impl Config {
             request_timeout: Duration::from_secs(20),
             synthetic_data_only: Self::synthetic_data_only()?,
         })
+    }
+
+    pub(crate) fn tenant_origin(&self, hostname: &str) -> String {
+        tenant_origin(
+            self.public_origin.scheme(),
+            self.tenant_public_port,
+            hostname,
+        )
+    }
+}
+
+fn optional_port(name: &'static str) -> Result<Option<u16>, ConfigError> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error| ConfigError::Invalid {
+            name,
+            reason: format!("must be a TCP port: {error}"),
+        })
+}
+
+fn tenant_origin(scheme: &str, port: Option<u16>, hostname: &str) -> String {
+    match port {
+        Some(port) => format!("{scheme}://{hostname}:{port}"),
+        None => format!("{scheme}://{hostname}"),
     }
 }
 
@@ -211,6 +244,18 @@ fn trusted_origin(name: &'static str) -> Result<Url, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_origins_use_the_public_scheme_and_optional_edge_port() {
+        assert_eq!(
+            tenant_origin("https", None, "atelier.dev1.makersbrain.net"),
+            "https://atelier.dev1.makersbrain.net"
+        );
+        assert_eq!(
+            tenant_origin("http", Some(8169), "atelier.localhost"),
+            "http://atelier.localhost:8169"
+        );
+    }
 
     #[test]
     fn data_mode_is_explicit_and_fail_closed() {

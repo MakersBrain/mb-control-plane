@@ -256,6 +256,7 @@ services:
       CONTROL_OIDC_AUDIENCE: makersbrain-members
       CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: localhost
+      CONTROL_TENANT_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
       CONTROL_INTERNAL_TOKEN: "@/run/secrets/control_internal_token"
       CONTROL_RELEASE_PUBLISH_TOKEN: "@/run/secrets/control_release_publish_token"
       CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
