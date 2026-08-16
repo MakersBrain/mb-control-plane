@@ -1,11 +1,25 @@
-import { API } from './config';import { callControlApi,type ControlApiCallOptions,type ControlApiOperationId } from './generated/control-api';import { forget,refresh,remember,signIn,type Tokens } from './oidc';import type { Me } from './types';
+import { API } from './config';import { callControlApi,controlApiOperations,type ControlApiCallOptions,type ControlApiOperationId } from './generated/control-api';import { forget,refresh,remember,signIn,type Tokens } from './oidc';import type { Me } from './types';
 let access:string|null=null,idToken:string|null=null,expires=0,refreshing:Promise<string|null>|null=null;
 export const session=$state({ready:false,me:null as Me|null,error:'',lost:false});
 export function adopt(tokens:Tokens){access=tokens.access_token;expires=Date.now()+tokens.expires_in*1000;idToken=tokens.id_token||idToken;remember(tokens)}
 export async function bearer(){if(access&&Date.now()<expires-30000)return access;refreshing??=(async()=>{try{const tokens=await refresh();if(!tokens)return null;adopt(tokens);session.lost=false;return access}catch{discard();session.lost=true;return null}finally{refreshing=null}})();return refreshing}
 export function discard(){access=null;idToken=null;expires=0;forget();session.me=null}
 export function currentIdToken(){return idToken}
-export async function request<T=unknown>(path:string,init:RequestInit={}):Promise<T>{const token=await bearer();if(!token)throw new Error('Your session has expired.');const response=await fetch(`${API}${path}`,{...init,headers:{authorization:`Bearer ${token}`,'content-type':'application/json',...(init.headers||{})}});if(response.status===401)session.lost=true;if(response.status===204)return undefined as T;const body=await response.json().catch(()=>({error:'invalid_response'}));if(!response.ok)throw new Error(body.message||body.error||`Request failed (${response.status})`);return body}
+/*
+ * Endpoints the contract marks `requiresIdempotencyKey` answer 428 without the
+ * header. `callControlApi` sends it, but the pages use the raw `request()`
+ * below, so it has to honour the same rule or every write in the UI fails —
+ * which is what "Idempotency-Key is required" on a Retry button was.
+ *
+ * The key is minted per call, which is weaker than the contract intends: a key
+ * belongs to an INTENT, and holding one across the retries of a single intent
+ * is what stops a dropped response turning one command into two. A caller that
+ * needs that passes its own `idempotency-key` and the spread below leaves it
+ * alone. Minting here is strictly better than sending nothing.
+ */
+const IDEMPOTENT_ROUTES=Object.values(controlApiOperations).filter((o)=>o.requiresIdempotencyKey).map((o)=>({method:o.method,pattern:new RegExp('^'+o.path.replace(/[.*+?^${}()|[\]\\]/g,'\\$&').replace(/\\\{[a-z_]+\\\}/g,'[^/]+')+'$')}));
+export function needsIdempotencyKey(method:string,path:string){const clean=path.split('?')[0];return IDEMPOTENT_ROUTES.some((r)=>r.method===method.toUpperCase()&&r.pattern.test(clean))}
+export async function request<T=unknown>(path:string,init:RequestInit={}):Promise<T>{const token=await bearer();if(!token)throw new Error('Your session has expired.');const response=await fetch(`${API}${path}`,{...init,headers:{authorization:`Bearer ${token}`,'content-type':'application/json',...(needsIdempotencyKey(init.method||'GET',path)?{'idempotency-key':crypto.randomUUID()}:{}),...(init.headers||{})}});if(response.status===401)session.lost=true;if(response.status===204)return undefined as T;const body=await response.json().catch(()=>({error:'invalid_response'}));if(!response.ok)throw new Error(body.message||body.error||`Request failed (${response.status})`);return body}
 export async function download(path:string):Promise<{blob:Blob;filename:string}>{const token=await bearer();if(!token)throw new Error('Your session has expired.');const response=await fetch(`${API}${path}`,{method:'POST',headers:{authorization:`Bearer ${token}`}});if(response.status===401)session.lost=true;if(!response.ok){const body=await response.json().catch(()=>({error:'invalid_response'}));throw new Error(body.message||body.error||`Request failed (${response.status})`)}const disposition=response.headers.get('content-disposition')||'';const filename=/filename="([^"]+)"/.exec(disposition)?.[1]||'privacy-export.json';return {blob:await response.blob(),filename}}
 export async function operation<T=unknown>(operationId:ControlApiOperationId,options:ControlApiCallOptions={}):Promise<T>{const token=await bearer();if(!token)throw new Error('Your session has expired.');return callControlApi<T>(API,token,operationId,options)}
 export async function establish(returnTo:string){const token=await bearer();if(!token){await signIn(returnTo);return}try{try{session.me=await operation<Me>('getV1Me')}catch{await operation('postV1IdentityLink',{idempotencyKey:'identity-link'});session.me=await operation<Me>('getV1Me')}}catch(error){session.error=error instanceof Error?error.message:'Sign-in failed'}finally{session.ready=true}}
