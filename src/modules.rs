@@ -120,6 +120,15 @@ pub const CATALOG: &[ModuleBundle] = &[
         minimum_release: "0.1.0",
     },
     ModuleBundle {
+        key: "shop-catalogue-import",
+        name: "Shop catalogue import",
+        description: "Review scraper catalogue artifacts before importing products, prices, stock and images.",
+        odoo_modules: &["mb_shop_import"],
+        dependencies: &[],
+        service: None,
+        minimum_release: "0.1.0",
+    },
+    ModuleBundle {
         key: "shipping-boxtal",
         name: "Boxtal shipping",
         description: "Buy Boxtal labels, offer parcel-point checkout and receive signed tracking updates.",
@@ -221,6 +230,10 @@ mod tests {
             &["firings"]
         );
         assert_eq!(bundle("webshop").unwrap().odoo_modules, &["mb_webshop"]);
+        assert_eq!(
+            bundle("shop-catalogue-import").unwrap().odoo_modules,
+            &["mb_shop_import"]
+        );
         assert_eq!(
             bundle("shipping-boxtal").unwrap().odoo_modules,
             &["mb_webshop_carrier_base", "mb_webshop_carrier_boxtal"]

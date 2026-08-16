@@ -3,7 +3,7 @@
   "contract_version": 2,
   "application_release_schema": "application-release.schema.json",
   "public_openapi_baseline": "openapi-v1-baseline.json",
-  "capability_registry": {"path":"capability-registry-v2.json","version":2,"sha256":"73fb30545589d0c750e8736f53cf65460863e1f7db62a4f58f25999c75f40702"},
+  "capability_registry": {"path":"capability-registry-v2.json","version":2,"sha256":"43449107e00c8c20d41b8f2f6dfaa4dec570df99598dc86cb21ec7b7038ece84"},
   "release": "0.1.0",
   "schema_release": "0034_carrier_credentials",
   "schema_compatibility": ">=0024_worker_heartbeats,<0025",
