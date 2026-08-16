@@ -12,6 +12,7 @@ Environment=PGSSLMODE=verify-full
 Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
 EnvironmentFile=/etc/makersbrain/odoo.env
 Volume=/etc/makersbrain/secrets/odoo:/run/secrets:ro
+Volume=odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro
 Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Volume=odoo-data.volume:/var/lib/odoo
 Volume=./resolve-secret-env.sh:/run/makersbrain/resolve-secret-env.sh:ro

@@ -15,6 +15,65 @@ async fn store() -> Store {
 
 #[tokio::test]
 #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn carrier_secret_metadata_is_tenant_carrier_and_environment_scoped() {
+    let store = store().await;
+    let user = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    sqlx::query("insert into control.users(id,email) values($1,$2)")
+        .bind(user)
+        .bind(format!("{user}@example.test"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    for workshop in [first, second] {
+        sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Carrier fixture','Europe/Paris')")
+            .bind(workshop)
+            .bind(format!("carrier-{}", workshop.simple()))
+            .execute(store.pool()).await.unwrap();
+    }
+    for workshop in [first, second] {
+        let secret = Uuid::new_v4();
+        sqlx::query("insert into control.carrier_secrets(id,workshop_id,provider,environment,company_id,carrier_id,secret_ref,created_by) values($1,$2,'boxtal','test',1,7,$3,$4)")
+            .bind(secret).bind(workshop)
+            .bind(format!("docker/{workshop}/carrier/{secret}"))
+            .bind(user).execute(store.pool()).await.unwrap();
+    }
+    let invalid = sqlx::query("insert into control.carrier_secrets(id,workshop_id,provider,environment,company_id,carrier_id,secret_ref,created_by) values($1,$2,'boxtal','production-copy',1,8,'not/scoped',$3)")
+        .bind(Uuid::new_v4()).bind(first).bind(user).execute(store.pool()).await;
+    assert!(
+        invalid.is_err(),
+        "invalid environment/reference must fail closed"
+    );
+    let stale = Uuid::new_v4();
+    sqlx::query("update control.carrier_secrets set cleanup_pending_ref=$2 where workshop_id=$1")
+        .bind(first)
+        .bind(format!("docker/{first}/carrier/{stale}"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let premature_delete = sqlx::query(
+        "update control.carrier_secrets set state='deleted',deleted_at=now() where workshop_id=$1",
+    )
+    .bind(first)
+    .execute(store.pool())
+    .await;
+    assert!(
+        premature_delete.is_err(),
+        "a credential with pending secure cleanup cannot be finalized as deleted"
+    );
+    let row = sqlx::query_as::<_, (String, i64, i64)>(
+        "update control.carrier_secrets set state='deleted',deleted_at=now(),cleanup_pending_ref=null,version=version+1 where workshop_id=$1 returning state,version,carrier_id",
+    )
+    .bind(first)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(row, ("deleted".into(), 2, 7));
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
 async fn database_enforces_last_owner_and_non_owner_invitations() {
     let store = store().await;
     let user = Uuid::new_v4();

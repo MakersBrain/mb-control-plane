@@ -24,6 +24,7 @@ Environment=DRIVER_BACKUP_VOLUME=makersbrain-backup-data
 Environment=DRIVER_ODOO_DATA_ROOT=/var/lib/odoo
 Environment=DRIVER_BACKUP_ROOT=/backups
 Environment=DRIVER_SECRET_ROOT=/run/makersbrain-secrets
+Environment=DRIVER_ODOO_CLIENT_SECRET_ROOT=/run/makersbrain-odoo-client-secrets
 Environment=DRIVER_PAPERLESS_CLIENT_SECRET_ROOT=/run/makersbrain-paperless-client-secrets
 Environment=DRIVER_ROUTE_ROOT=/run/makersbrain-routes
 Environment=DRIVER_GATEWAY_CONTAINER=tenant-gateway
@@ -35,6 +36,7 @@ Volume=odoo-data.volume:/var/lib/odoo
 Volume=backup-data.volume:/backups
 Volume=gateway-routes.volume:/run/makersbrain-routes
 Volume=tenant-secrets.volume:/run/makersbrain-secrets
+Volume=odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets
 Volume=paperless-client-secrets.volume:/run/makersbrain-paperless-client-secrets
 Volume=%t/podman/podman.sock:/run/podman/podman.sock
 Exec=/usr/local/bin/control-container-driver

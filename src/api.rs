@@ -39,6 +39,7 @@ pub(crate) mod governance;
 use governance::*;
 pub(crate) mod contracts;
 use contracts::*;
+pub(crate) mod carrier_secrets;
 pub(crate) mod recovery;
 pub(crate) use recovery::{DuplicateBody, RecoveryPointBody, RestoreBody};
 use recovery::{confirm_slug, ensure_lifecycle_idle, lock_lifecycle, primary_database};
@@ -133,6 +134,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/v1/entitlements/{workshop_id}/ack",
             post(internal::ack_entitlement),
+        )
+        .route(
+            "/internal/v1/carrier-secrets/resolve",
+            post(carrier_secrets::resolve),
         )
         .route(
             "/internal/v1/application-releases",

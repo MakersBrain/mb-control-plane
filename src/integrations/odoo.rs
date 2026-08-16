@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
@@ -85,6 +86,37 @@ pub struct PrivacyExportCommand {
     pub user_id: Uuid,
 }
 
+#[derive(Clone, Serialize)]
+pub struct CarrierSecretMaterial {
+    pub access_key: String,
+    pub secret_key: String,
+    pub webhook_secret: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CarrierSecretBindingCommand {
+    pub workshop_id: Uuid,
+    pub company_id: i64,
+    pub carrier_id: i64,
+    pub provider: String,
+    pub environment: String,
+    pub secret_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<CarrierSecretMaterial>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+pub struct CarrierTarget {
+    pub company_id: i64,
+    pub company_name: String,
+    pub carrier_id: i64,
+    pub carrier_name: String,
+    pub provider: String,
+    pub environment: String,
+    pub service_code: String,
+    pub configured: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AppliedCommand {
     pub applied: bool,
@@ -151,6 +183,26 @@ impl OdooClient {
         body: &T,
     ) -> Result<R, IntegrationError> {
         self.post_bounded(path, body, MAX_RESPONSE_BYTES).await
+    }
+
+    async fn get<R: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<R, IntegrationError> {
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|_| IntegrationError::ContractDrift)?;
+        let response = self.http.get(url).send().await.map_err(|error| {
+            if error.is_timeout() {
+                IntegrationError::UnknownOutcome
+            } else {
+                IntegrationError::Unavailable
+            }
+        })?;
+        let status = response.status();
+        let bytes = bounded_body(response, MAX_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            return Err(classify_status(status));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| IntegrationError::ContractDrift)
     }
 
     async fn post_bounded<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -308,6 +360,26 @@ impl OdooClient {
     ) -> Result<Value, IntegrationError> {
         self.post("/mb_control/v1/modules/restrict", command).await
     }
+
+    pub async fn carrier_targets(&self) -> Result<Vec<CarrierTarget>, IntegrationError> {
+        self.get("/mb_control/v1/carriers").await
+    }
+
+    pub async fn bind_carrier_secret(
+        &self,
+        command: &CarrierSecretBindingCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/carriers/bind-secret", command)
+            .await
+    }
+
+    pub async fn unbind_carrier_secret(
+        &self,
+        command: &CarrierSecretBindingCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/carriers/unbind-secret", command)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +388,36 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn carrier_rotation_material_is_sent_only_when_explicitly_present() {
+        let command = CarrierSecretBindingCommand {
+            workshop_id: Uuid::nil(),
+            company_id: 1,
+            carrier_id: 2,
+            provider: "boxtal".into(),
+            environment: "test".into(),
+            secret_ref: format!("docker/{}/carrier/{}", Uuid::nil(), Uuid::nil()),
+            credentials: Some(CarrierSecretMaterial {
+                access_key: "access-key".into(),
+                secret_key: "secret-key".into(),
+                webhook_secret: "webhook-secret".into(),
+            }),
+        };
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["credentials"]["webhook_secret"], "webhook-secret");
+
+        let without_material = CarrierSecretBindingCommand {
+            credentials: None,
+            ..command
+        };
+        assert!(
+            serde_json::to_value(without_material)
+                .unwrap()
+                .get("credentials")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn provisioning_bootstrap_uses_the_idempotent_tenant_endpoint() {

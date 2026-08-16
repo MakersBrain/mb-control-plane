@@ -134,6 +134,15 @@ pub(super) async fn lifecycle(
         return result;
     }
     if deleting && result.is_ok() {
+        let carrier_secrets = state
+            .config
+            .secret_root
+            .join("docker")
+            .join(workshop.to_string())
+            .join("carrier");
+        if carrier_secrets.exists() {
+            std::fs::remove_dir_all(&carrier_secrets).map_err(DriverError::internal)?;
+        }
         tracing::info!(%workshop, "workshop final backup verified; retaining maintenance quarantine");
         return result;
     }
@@ -423,6 +432,7 @@ async fn lifecycle_quiesced(
                 RECOVERY_FORMAT_V2,
             )
             .await?;
+            neutralize_duplicate_carriers(state, target_ref).await?;
             Ok(
                 json!({"action":"duplicate","database":{"database_ref":target_ref,"routable":false}}),
             )
@@ -451,6 +461,34 @@ async fn lifecycle_quiesced(
         (Err(error), Ok(())) => Err(error),
         (_, Err(error)) => Err(error),
     }
+}
+
+async fn neutralize_duplicate_carriers(
+    state: &DriverState,
+    database: &str,
+) -> Result<(), DriverError> {
+    if !safe_pg_identifier(database) {
+        return Err(DriverError::bad("unsafe duplicate database reference"));
+    }
+    let sql = "do $neutralize$ begin if to_regclass('public.delivery_carrier') is not null and exists (select 1 from information_schema.columns where table_schema='public' and table_name='delivery_carrier' and column_name='mb_secret_ref') then update public.delivery_carrier set mb_secret_ref=null,mb_subscription_id=null,mb_credential_state='unconfigured',mb_provider_enabled=false,prod_environment=false where mb_provider_code is not null; end if; end $neutralize$;";
+    run_postgres_job(
+        state,
+        &format!(
+            "mb-pg-neutralize-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        vec![
+            "psql".into(),
+            "--no-psqlrc".into(),
+            "--set=ON_ERROR_STOP=1".into(),
+            format!("--host={}", state.config.postgres_host),
+            format!("--port={}", state.config.postgres_port),
+            format!("--username={}", state.config.postgres_admin_user),
+            format!("--dbname={database}"),
+            format!("--command={sql}"),
+        ],
+    )
+    .await
 }
 
 pub(super) async fn set_database_connection_limit(

@@ -378,6 +378,7 @@ services:
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
       DRIVER_REDIS_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/makersbrain-secrets
+      DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/makersbrain-odoo-client-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
       DRIVER_RUNTIME_SECRET_SOURCE: makersbrain-control-backup-secrets
       DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
@@ -394,6 +395,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - tenant-secrets:/run/makersbrain-secrets
+      - odoo-client-secrets:/run/makersbrain-odoo-client-secrets
       - paperless-client-secrets:/run/makersbrain-paperless-client-secrets
       - backup-secrets:/run/makersbrain-backup-secrets
       - tenant-routes:/routes
@@ -589,10 +591,12 @@ services:
       PASSWORD: "@/run/secrets/odoo_postgres_password"
       MB_CONTROL_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       MB_CONTROL_API_URL: http://control-api:8080
+      MB_CARRIER_CONTROL_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
     command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes:
       - odoo-data:/var/lib/odoo
       - ./resolve-secret-env.sh:/run/makersbrain/resolve-secret-env.sh:ro
+      - odoo-client-secrets:/run/makersbrain-odoo-client-secrets:ro
     secrets: [odoo_postgres_password, odoo_bridge_token]
     depends_on:
       postgres: {condition: service_healthy}
@@ -696,6 +700,8 @@ volumes:
     name: makersbrain-control-tenant-secrets
   paperless-client-secrets:
     name: makersbrain-control-paperless-client-secrets
+  odoo-client-secrets:
+    name: makersbrain-control-odoo-client-secrets
   backup-data:
     name: makersbrain-control-backups
   backup-secrets:

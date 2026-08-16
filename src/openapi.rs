@@ -1,6 +1,10 @@
 use serde_json::{Map, Value, json};
 use utoipa::OpenApi;
 
+use crate::api::carrier_secrets::{
+    CarrierCredentials, CarrierSecretBody, CarrierSecretDeleteResponse, CarrierSecretResponse,
+    CarrierTargetResponse,
+};
 use crate::api::contracts::{
     ApplicationReleaseDetailResponse, ApplicationReleaseResponse, AttentionOperationResponse,
     AuditEventResponse, BackupStatusResponse, CommandInProgressResponse, CountDisabledResponse,
@@ -148,7 +152,12 @@ use crate::domain::WorkshopRole;
     CreatePrivacyIncident,
     PrivacyIncidentAssessment,
     CreateLegalHold,
-    ReleaseLegalHold
+    ReleaseLegalHold,
+    CarrierCredentials,
+    CarrierSecretBody,
+    CarrierSecretDeleteResponse,
+    CarrierSecretResponse,
+    CarrierTargetResponse
 )))]
 struct PublicSchemas;
 
@@ -301,6 +310,16 @@ pub fn document() -> Value {
             ("/v1/workshops/{id}/modules", "get") => {
                 json!({"type":"array","items":{"$ref":"#/components/schemas/ModuleResponse"}})
             }
+            ("/v1/workshops/{id}/carrier-secrets", "get") => {
+                json!({"type":"array","items":{"$ref":"#/components/schemas/CarrierSecretResponse"}})
+            }
+            ("/v1/workshops/{id}/carrier-targets", "get") => {
+                json!({"type":"array","items":{"$ref":"#/components/schemas/CarrierTargetResponse"}})
+            }
+            ("/v1/workshops/{id}/carrier-secrets", "post") => command("CarrierSecretResponse"),
+            ("/v1/workshops/{id}/carrier-secrets/{secret_id}", "delete") => {
+                command("CarrierSecretDeleteResponse")
+            }
             ("/v1/workshops/{id}/database", "get") => {
                 json!({"$ref":"#/components/schemas/DatabaseResponse"})
             }
@@ -452,6 +471,7 @@ pub fn document() -> Value {
             | ("/v1/workshops/{id}/database/backups", "post") => Some("RecoveryPointBody"),
             ("/v1/workshops/{id}/database/restores", "post") => Some("RestoreBody"),
             ("/v1/workshops/{id}/database/duplicates", "post") => Some("DuplicateBody"),
+            ("/v1/workshops/{id}/carrier-secrets", "post") => Some("CarrierSecretBody"),
             _ => None,
         };
         let mut operation = json!({

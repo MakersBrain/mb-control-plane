@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0033_processing_hold_trigger_privilege_boundary";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0034_carrier_credentials";
 
 #[derive(Clone)]
 pub struct Store {

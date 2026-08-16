@@ -357,6 +357,179 @@
         ],
         "type": "object"
       },
+      "CarrierCredentials": {
+        "properties": {
+          "access_key": {
+            "type": "string"
+          },
+          "secret_key": {
+            "type": "string"
+          },
+          "webhook_secret": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_key",
+          "secret_key",
+          "webhook_secret"
+        ],
+        "type": "object"
+      },
+      "CarrierSecretBody": {
+        "properties": {
+          "carrier_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "company_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "credentials": {
+            "$ref": "#/components/schemas/CarrierCredentials"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "environment",
+          "company_id",
+          "carrier_id",
+          "credentials"
+        ],
+        "type": "object"
+      },
+      "CarrierSecretDeleteResponse": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "CarrierSecretResponse": {
+        "properties": {
+          "carrier_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "company_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "secret_ref": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "secret_ref",
+          "provider",
+          "environment",
+          "company_id",
+          "carrier_id",
+          "version",
+          "state"
+        ],
+        "type": "object"
+      },
+      "CarrierTarget": {
+        "properties": {
+          "carrier_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "carrier_name": {
+            "type": "string"
+          },
+          "company_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "company_name": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "service_code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "company_id",
+          "company_name",
+          "carrier_id",
+          "carrier_name",
+          "provider",
+          "environment",
+          "service_code",
+          "configured"
+        ],
+        "type": "object"
+      },
+      "CommandInProgressResponse": {
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "in_progress": {
+            "type": "boolean"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "in_progress"
+        ],
+        "type": "object"
+      },
       "CountDisabledResponse": {
         "properties": {
           "disabled": {
@@ -679,6 +852,27 @@
         ],
         "type": "object"
       },
+      "DuplicateCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "routable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "operation_id",
+          "routable"
+        ],
+        "type": "object"
+      },
       "DuplicateDatabaseResponse": {
         "properties": {
           "created_at": {
@@ -866,6 +1060,22 @@
         ],
         "type": "object"
       },
+      "IdentityLinkResponse": {
+        "properties": {
+          "linked": {
+            "type": "boolean"
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "linked"
+        ],
+        "type": "object"
+      },
       "IntegrationResponse": {
         "properties": {
           "applied_epoch": {
@@ -898,6 +1108,74 @@
           "health",
           "desired_epoch",
           "applied_epoch"
+        ],
+        "type": "object"
+      },
+      "InvitationAcceptanceResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workshop_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workshop_id",
+          "user_id",
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "InvitationCreateResponse": {
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "InvitationResendResponse": {
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "resent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "resent",
+          "generation"
         ],
         "type": "object"
       },
@@ -949,6 +1227,29 @@
         ],
         "type": "object"
       },
+      "InvitationValidationResponse": {
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "locale": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "workshop_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "role",
+          "locale",
+          "workshop_name"
+        ],
+        "type": "object"
+      },
       "InviteBody": {
         "properties": {
           "email": {
@@ -964,6 +1265,30 @@
         "required": [
           "email",
           "role"
+        ],
+        "type": "object"
+      },
+      "LegalHoldCreateResponse": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version"
         ],
         "type": "object"
       },
@@ -1192,6 +1517,62 @@
         ],
         "type": "object"
       },
+      "MemberUpdateCommandResponse": {
+        "properties": {
+          "authority_epoch": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_id",
+          "role",
+          "authority_epoch",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ModuleEnableCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "state"
+        ],
+        "type": "object"
+      },
       "ModuleResponse": {
         "properties": {
           "application_release_id": {
@@ -1272,6 +1653,18 @@
         ],
         "type": "object"
       },
+      "OperationCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "type": "object"
+      },
       "OperationResponse": {
         "properties": {
           "attempt": {
@@ -1345,6 +1738,73 @@
           "max_attempts",
           "created_at",
           "progress_percent"
+        ],
+        "type": "object"
+      },
+      "OperationRetryResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "OwnershipTransferAcceptResponse": {
+        "properties": {
+          "accepted": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "accepted",
+          "version",
+          "operation_ids"
+        ],
+        "type": "object"
+      },
+      "OwnershipTransferCreateResponse": {
+        "properties": {
+          "expires_in_seconds": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "expires_in_seconds",
+          "version"
         ],
         "type": "object"
       },
@@ -1959,6 +2419,34 @@
         ],
         "type": "object"
       },
+      "PrivacyDecisionCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "version"
+        ],
+        "type": "object"
+      },
       "PrivacyIncidentAssessment": {
         "properties": {
           "authority_notification_ref": {
@@ -1998,6 +2486,52 @@
           "risk_level",
           "notification_required",
           "decision_ref"
+        ],
+        "type": "object"
+      },
+      "PrivacyIncidentAssessmentResponse": {
+        "properties": {
+          "containment_state": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "notification_required": {
+            "type": "boolean"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "containment_state",
+          "notification_required",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PrivacyIncidentCreateResponse": {
+        "properties": {
+          "containment_state": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "containment_state"
         ],
         "type": "object"
       },
@@ -2206,6 +2740,31 @@
           "status",
           "digest",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "PrivacyRequestCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "request_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "request_type",
+          "status",
+          "version"
         ],
         "type": "object"
       },
@@ -2428,6 +2987,23 @@
         },
         "type": "object"
       },
+      "RecoveryPointCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "operation_id"
+        ],
+        "type": "object"
+      },
       "RecoveryPointResponse": {
         "properties": {
           "archive_size_bytes": {
@@ -2580,6 +3156,37 @@
         ],
         "type": "object"
       },
+      "ReleaseAdoptionCommandResponse": {
+        "properties": {
+          "fleet_run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "tenant_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "fleet_run_id",
+          "tenant_count",
+          "status",
+          "version"
+        ],
+        "type": "object"
+      },
       "ReleaseLegalHold": {
         "properties": {
           "reason_code": {
@@ -2588,6 +3195,59 @@
         },
         "required": [
           "reason_code"
+        ],
+        "type": "object"
+      },
+      "ReleasePreflightCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "status",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ReleasedCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "released": {
+            "type": "boolean"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "released",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ReplayResponse": {
+        "properties": {
+          "replayed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "replayed"
         ],
         "type": "object"
       },
@@ -2604,6 +3264,23 @@
         "required": [
           "recovery_point_id",
           "confirmation"
+        ],
+        "type": "object"
+      },
+      "RestoreCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "safety_recovery_point_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "safety_recovery_point_id"
         ],
         "type": "object"
       },
@@ -2710,6 +3387,53 @@
         ],
         "type": "object"
       },
+      "RoleGrantCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "role",
+          "version"
+        ],
+        "type": "object"
+      },
+      "RoleRevokeCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "revoked",
+          "version"
+        ],
+        "type": "object"
+      },
       "RuntimeReleaseSlotResponse": {
         "properties": {
           "evidence": {
@@ -2763,6 +3487,27 @@
           "service",
           "health",
           "count"
+        ],
+        "type": "object"
+      },
+      "StateCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "version"
         ],
         "type": "object"
       },
@@ -2899,6 +3644,23 @@
         ],
         "type": "object"
       },
+      "VersionedOperationCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "version"
+        ],
+        "type": "object"
+      },
       "WorkerStatusResponse": {
         "properties": {
           "active_operation_id": {
@@ -2940,6 +3702,50 @@
           "started_at",
           "last_heartbeat_at",
           "fresh"
+        ],
+        "type": "object"
+      },
+      "WorkshopCreateCommandResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "WorkshopDeletionCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "recovery_point_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "retention_days": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "recovery_point_id",
+          "retention_days",
+          "version"
         ],
         "type": "object"
       },
@@ -3061,14 +3867,35 @@
     "/v1/identity/link": {
       "post": {
         "operationId": "postV1IdentityLink",
-        "parameters": [],
+        "parameters": [
+          {
+            "description": "Optional v1-compatible command key. If omitted, the server uses the stable identity-link key; identical requests still replay the stored result.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/IdentityLinkResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3078,8 +3905,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/IdentityLinkResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3089,8 +3925,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/IdentityLinkResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3162,8 +4007,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationAcceptanceResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3173,8 +4027,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationAcceptanceResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3184,8 +4047,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationAcceptanceResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3245,8 +4117,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "$ref": "#/components/schemas/InvitationValidationResponse"
                 }
               }
             },
@@ -3256,8 +4127,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "$ref": "#/components/schemas/InvitationValidationResponse"
                 }
               }
             },
@@ -3267,8 +4137,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "$ref": "#/components/schemas/InvitationValidationResponse"
                 }
               }
             },
@@ -3332,37 +4201,16 @@
         ],
         "responses": {
           "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful response"
+            "description": "Reserved compatibility response with no representation."
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response with no representation."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response with no representation."
+          },
+          "204": {
+            "description": "Invitation revoked"
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -3429,8 +4277,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationResendResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3440,8 +4297,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationResendResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3451,8 +4317,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationResendResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3509,26 +4384,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -3591,26 +4450,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -3677,8 +4520,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationRetryResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3688,8 +4540,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationRetryResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3699,8 +4560,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationRetryResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -3780,34 +4650,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferAcceptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferAcceptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferAcceptResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -3875,26 +4796,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -3950,26 +4855,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4054,26 +4943,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4126,26 +4999,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4198,26 +5055,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4285,8 +5126,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4296,8 +5146,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4307,8 +5166,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4398,34 +5266,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentAssessmentResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentAssessmentResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyIncidentAssessmentResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4493,8 +5412,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/LegalHoldCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4504,8 +5432,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/LegalHoldCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4515,8 +5452,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/LegalHoldCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -4606,34 +5552,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasedCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasedCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasedCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4719,34 +5716,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/StateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4802,26 +5850,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -4907,34 +5939,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyDecisionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyDecisionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyDecisionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5002,7 +6085,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RetentionRunCommandResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RetentionRunCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5012,8 +6105,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RetentionRunCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5023,8 +6125,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RetentionRunCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5084,26 +6195,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5165,26 +6260,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5269,34 +6348,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleaseAdoptionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleaseAdoptionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleaseAdoptionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5371,34 +6501,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasePreflightCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasePreflightCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleasePreflightCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5470,37 +6651,37 @@
         ],
         "responses": {
           "200": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response with no representation.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Successful response"
+            }
           },
           "201": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response with no representation.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Resource created"
+            }
           },
           "202": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response with no representation.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Durable operation accepted"
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5565,26 +6746,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5640,26 +6805,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5725,8 +6874,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleGrantCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5736,8 +6894,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleGrantCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5747,8 +6914,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleGrantCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -5838,34 +7014,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleRevokeCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleRevokeCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RoleRevokeCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5918,26 +7145,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -5993,26 +7204,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6068,26 +7263,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6150,26 +7329,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6255,34 +7418,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopDeletionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopDeletionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopDeletionCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6349,8 +7563,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6360,8 +7583,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6371,8 +7603,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6432,26 +7673,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6517,8 +7742,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyRequestCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6528,8 +7762,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyRequestCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6539,8 +7782,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/PrivacyRequestCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6607,26 +7859,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6680,36 +7916,36 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful binary response"
           },
           "201": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Successful binary response"
           },
           "202": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Successful binary response"
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6763,26 +7999,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6834,26 +8054,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -6919,8 +8123,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopCreateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6930,8 +8143,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopCreateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -6941,8 +8163,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkshopCreateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7009,11 +8240,184 @@
             "description": "Successful response"
           },
           "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/carrier-secrets": {
+      "get": {
+        "operationId": "getV1WorkshopsIdCarrierSecrets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "items": {
+                    "$ref": "#/components/schemas/CarrierSecretResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      },
+      "post": {
+        "operationId": "postV1WorkshopsIdCarrierSecrets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CarrierSecretBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7023,12 +8427,220 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
             "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/carrier-secrets/{secret_id}": {
+      "delete": {
+        "operationId": "deleteV1WorkshopsIdCarrierSecretsSecretId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretDeleteResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretDeleteResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/CarrierSecretDeleteResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/carrier-targets": {
+      "get": {
+        "operationId": "getV1WorkshopsIdCarrierTargets",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CarrierTargetResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -7091,26 +8703,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -7187,8 +8783,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7198,8 +8803,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7209,8 +8823,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7277,36 +8900,36 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful binary response"
           },
           "201": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Successful binary response"
           },
           "202": {
             "content": {
-              "application/json": {
+              "application/octet-stream": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "format": "binary",
+                  "type": "string"
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Successful binary response"
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -7383,8 +9006,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DuplicateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7394,8 +9026,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DuplicateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7405,8 +9046,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/DuplicateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7487,8 +9137,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RestoreCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7498,8 +9157,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RestoreCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7509,8 +9177,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RestoreCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7591,8 +9268,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7602,8 +9288,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7613,8 +9308,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RecoveryPointCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7684,26 +9388,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -7769,26 +9457,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -7863,8 +9535,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7874,8 +9555,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7885,8 +9575,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/InvitationCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -7956,26 +9655,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8060,34 +9743,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/VersionedOperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/VersionedOperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/VersionedOperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8154,29 +9888,37 @@
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response; this read operation returns 200.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Resource created"
+            }
           },
           "202": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response; this read operation returns 200.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Durable operation accepted"
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8269,34 +10011,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/MemberUpdateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/MemberUpdateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/MemberUpdateCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8362,26 +10155,10 @@
             "description": "Successful response"
           },
           "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Resource created"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Durable operation accepted"
+            "description": "Reserved compatibility response; this read operation returns 200."
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8465,34 +10242,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8555,29 +10383,37 @@
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response; this read operation returns 200.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Resource created"
+            }
           },
           "202": {
-            "content": {
-              "application/json": {
+            "description": "Reserved compatibility response; this read operation returns 200.",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "type": "string"
                 }
               }
-            },
-            "description": "Durable operation accepted"
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"
@@ -8661,34 +10497,85 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Successful response"
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Resource created"
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OwnershipTransferCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Durable operation accepted"
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/ValidationError"

@@ -76,6 +76,9 @@ public_routes! {
     "/v1/workshops/{id}/integrations", true => [get(integrations)];
     "/v1/workshops/{id}/modules", true => [get(modules)];
     "/v1/workshops/{id}/modules/{module_key}/enable", true => [post(enable_module)];
+    "/v1/workshops/{id}/carrier-secrets", true => [get(carrier_secrets::list), post(carrier_secrets::upsert)];
+    "/v1/workshops/{id}/carrier-targets", true => [get(carrier_secrets::targets)];
+    "/v1/workshops/{id}/carrier-secrets/{secret_id}", true => [delete(carrier_secrets::delete)];
     "/v1/workshops/{id}/database", true => [get(recovery::database)];
     "/v1/workshops/{id}/database/snapshots", true => [post(recovery::create_snapshot)];
     "/v1/workshops/{id}/database/backups", true => [post(recovery::create_backup)];

@@ -89,6 +89,14 @@ begin
      or has_table_privilege('control_reconciliation_worker','control.tenant_release_adoptions','UPDATE') then
     raise exception 'capability restriction reconciliation privileges are incomplete or excessive';
   end if;
+  if not has_table_privilege('control_api','control.carrier_secrets','INSERT')
+     or has_table_privilege('control_api','control.carrier_secrets','DELETE')
+     or not has_table_privilege('control_provisioning_worker','control.carrier_secrets','UPDATE')
+     or not has_table_privilege('control_reconciliation_worker','control.carrier_secrets','UPDATE')
+     or not has_table_privilege('control_lifecycle_worker','control.carrier_secrets','UPDATE')
+     or has_table_privilege('control_email_worker','control.carrier_secrets','SELECT') then
+    raise exception 'carrier credential metadata privileges are incomplete or excessive';
+  end if;
   if not has_table_privilege('control_driver_ledger','control.odoo_databases','UPDATE')
      or not has_table_privilege('control_driver_ledger','control.workshop_recovery_components','INSERT')
      or not has_table_privilege('control_driver_ledger','control.data_subject_requests','SELECT')

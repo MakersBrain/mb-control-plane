@@ -88,6 +88,8 @@ def validate(root: Path) -> None:
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
+    if "odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro" not in odoo:
+        raise ValueError("Odoo cannot authenticate tenant-scoped outbound bridge calls")
     mail = (root / "control-mail-gateway.container").read_text(encoding="utf-8")
     if (
         "MAIL_GATEWAY_ENVIRONMENT=" not in mail

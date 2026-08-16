@@ -6,6 +6,11 @@ export type ApplicationReleaseResponse = { change_class: string; id: string; ima
 export type AttentionOperationResponse = { created_at: string; failure_class?: string | null; id: string; kind: string; progress_percent: number; state: string; workshop_id?: string | null; workshop_name?: string | null };
 export type AuditEventResponse = { action: string; actor_email?: string | null; correlation_id: string; created_at: string; detail: Record<string, unknown>; id: string; outcome: string; target_id?: string | null; target_type?: string | null; workshop_id?: string | null; workshop_name?: string | null };
 export type BackupStatusResponse = { id: string; ready_at: string; source_release?: string | null; workshop_id: string; workshop_name: string };
+export type CarrierCredentials = { access_key: string; secret_key: string; webhook_secret: string };
+export type CarrierSecretBody = { carrier_id: number; company_id: number; credentials: CarrierCredentials; environment: string; provider: string };
+export type CarrierSecretDeleteResponse = { deleted: boolean; id: string };
+export type CarrierSecretResponse = { carrier_id: number; company_id: number; environment: string; id: string; provider: string; secret_ref: string; state: string; version: number };
+export type CarrierTarget = { carrier_id: number; carrier_name: string; company_id: number; company_name: string; configured: boolean; environment: string; provider: string; service_code: string };
 export type CommandInProgressResponse = { command_id?: string | null; in_progress: boolean; operation_id?: string | null };
 export type CountDisabledResponse = { disabled: number; total: number };
 export type CountHealthResponse = { attention: number; healthy: number; total: number };
@@ -124,6 +129,16 @@ export const controlApiOperations = {
     ],
     "requiresIdempotencyKey": true,
     "requiresIfMatch": true
+  },
+  "deleteV1WorkshopsIdCarrierSecretsSecretId": {
+    "method": "DELETE",
+    "path": "/v1/workshops/{id}/carrier-secrets/{secret_id}",
+    "pathParameters": [
+      "id",
+      "secret_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
   },
   "deleteV1WorkshopsIdMembersUserId": {
     "method": "DELETE",
@@ -288,6 +303,24 @@ export const controlApiOperations = {
   "getV1WorkshopsId": {
     "method": "GET",
     "path": "/v1/workshops/{id}",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
+  "getV1WorkshopsIdCarrierSecrets": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/carrier-secrets",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
+  "getV1WorkshopsIdCarrierTargets": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/carrier-targets",
     "pathParameters": [
       "id"
     ],
@@ -545,6 +578,15 @@ export const controlApiOperations = {
     "method": "POST",
     "path": "/v1/workshops",
     "pathParameters": [],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "postV1WorkshopsIdCarrierSecrets": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/carrier-secrets",
+    "pathParameters": [
+      "id"
+    ],
     "requiresIdempotencyKey": true,
     "requiresIfMatch": false
   },

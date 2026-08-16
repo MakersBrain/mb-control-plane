@@ -111,6 +111,7 @@ pub struct DockerDriverConfig {
     s3_backup: Option<S3BackupConfig>,
     redis_address: String,
     secret_root: PathBuf,
+    odoo_client_secret_root: PathBuf,
     paperless_client_secret_root: PathBuf,
     runtime_secret_source: String,
     job_secret_root: PathBuf,
@@ -291,6 +292,7 @@ impl DockerDriverConfig {
             s3_backup,
             redis_address: required("DRIVER_REDIS_ADDRESS")?,
             secret_root: required("DRIVER_SECRET_ROOT")?.into(),
+            odoo_client_secret_root: required("DRIVER_ODOO_CLIENT_SECRET_ROOT")?.into(),
             paperless_client_secret_root: required("DRIVER_PAPERLESS_CLIENT_SECRET_ROOT")?.into(),
             runtime_secret_source,
             job_secret_root: required("DRIVER_JOB_SECRET_ROOT")?.into(),
@@ -391,6 +393,16 @@ struct StoredRecovery {
 pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.secret_root)?;
     normalize_secret_permissions(&config.secret_root)?;
+    if config.odoo_client_secret_root != Path::new("/run/makersbrain-odoo-client-secrets") {
+        anyhow::bail!("DRIVER_ODOO_CLIENT_SECRET_ROOT must use the isolated Odoo client mount");
+    }
+    std::fs::create_dir_all(&config.odoo_client_secret_root)?;
+    normalize_secret_permissions(&config.odoo_client_secret_root)?;
+    std::os::unix::fs::chown(
+        &config.odoo_client_secret_root,
+        Some(config.odoo_uid),
+        Some(config.odoo_gid),
+    )?;
     if config.paperless_client_secret_root != Path::new("/run/makersbrain-paperless-client-secrets")
     {
         anyhow::bail!(
@@ -585,6 +597,8 @@ async fn tenant(
             | "resume"
             | "erasure"
             | "restrict"
+            | "carrier-secret"
+            | "carrier-secret-delete"
     ) {
         return Err(DriverError(StatusCode::NOT_FOUND, "unknown action".into()));
     }
@@ -630,6 +644,8 @@ async fn tenant(
         "resume" => resume_after_erasure_replay(&state, workshop, &payload).await,
         "erasure" => apply_restored_erasure(&state, workshop, &payload).await,
         "restrict" => restrict_capability(&state, workshop, &payload).await,
+        "carrier-secret" => write_carrier_secret(&state, workshop, &payload),
+        "carrier-secret-delete" => delete_carrier_secret(&state, workshop, &payload),
         _ => unreachable!(),
     };
     match result {
@@ -644,6 +660,95 @@ async fn tenant(
             Err(error)
         }
     }
+}
+
+fn carrier_secret_path(
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
+) -> Result<(Uuid, PathBuf), DriverError> {
+    let id = payload
+        .get("secret_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| DriverError::bad("secret_id must be a UUID"))?;
+    Ok((
+        id,
+        state
+            .config
+            .secret_root
+            .join("docker")
+            .join(workshop.to_string())
+            .join("carrier")
+            .join(id.to_string()),
+    ))
+}
+
+fn write_carrier_secret(
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
+) -> Result<Value, DriverError> {
+    let object = payload
+        .as_object()
+        .filter(|value| {
+            value.len() == 2 && value.contains_key("secret_id") && value.contains_key("credentials")
+        })
+        .ok_or_else(|| DriverError::bad("carrier secret payload is invalid"))?;
+    let credentials = object
+        .get("credentials")
+        .and_then(Value::as_object)
+        .filter(|value| {
+            value.len() == 3
+                && ["access_key", "secret_key", "webhook_secret"]
+                    .iter()
+                    .all(|key| {
+                        value
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|secret| {
+                                ((*key == "access_key" && (8..=256).contains(&secret.len()))
+                                    || (*key != "access_key" && (24..=512).contains(&secret.len())))
+                                    && !secret
+                                        .chars()
+                                        .any(|character| matches!(character, '\r' | '\n' | '\0'))
+                            })
+                    })
+        })
+        .ok_or_else(|| DriverError::bad("Boxtal credentials are invalid"))?;
+    let (id, path) = carrier_secret_path(state, workshop, payload)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| DriverError::bad("carrier secret path is invalid"))?;
+    secure_directory(parent).map_err(DriverError::internal)?;
+    let serialized = serde_json::to_string(credentials).map_err(DriverError::internal)?;
+    write_secret(&path, &serialized).map_err(DriverError::internal)?;
+    Ok(json!({
+        "secret_ref": format!("docker/{workshop}/carrier/{id}"),
+        "stored": true
+    }))
+}
+
+fn delete_carrier_secret(
+    state: &DriverState,
+    workshop: Uuid,
+    payload: &Value,
+) -> Result<Value, DriverError> {
+    if payload
+        .as_object()
+        .is_none_or(|value| value.len() != 1 || !value.contains_key("secret_id"))
+    {
+        return Err(DriverError::bad(
+            "carrier secret deletion payload is invalid",
+        ));
+    }
+    let (id, path) = carrier_secret_path(state, workshop, payload)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DriverError::internal(error)),
+    }
+    Ok(json!({"secret_ref": format!("docker/{workshop}/carrier/{id}"), "deleted": true}))
 }
 
 async fn provision(
@@ -700,6 +805,23 @@ async fn provision(
     let tenant_bridge_token = tenant_bridge_secret(
         &tenant_secret_dir.join("odoo"),
         &state.config.odoo_bridge_token,
+    )
+    .map_err(DriverError::internal)?;
+    write_secret(
+        &state
+            .config
+            .odoo_client_secret_root
+            .join(workshop.to_string()),
+        &tenant_bridge_token,
+    )
+    .map_err(DriverError::internal)?;
+    std::os::unix::fs::chown(
+        state
+            .config
+            .odoo_client_secret_root
+            .join(workshop.to_string()),
+        Some(state.config.odoo_uid),
+        Some(state.config.odoo_gid),
     )
     .map_err(DriverError::internal)?;
     let tenant_odoo = OdooClient::new(
@@ -975,6 +1097,22 @@ fn normalize_secret_permissions(root: &Path) -> std::io::Result<()> {
                     }
                     std::fs::set_permissions(
                         runtime_secret.path(),
+                        std::fs::Permissions::from_mode(0o640),
+                    )?;
+                }
+            } else if file_type.is_dir() && secret.file_name() == "carrier" {
+                std::fs::set_permissions(secret.path(), std::fs::Permissions::from_mode(0o750))?;
+                for carrier_secret in std::fs::read_dir(secret.path())? {
+                    let carrier_secret = carrier_secret?;
+                    if !carrier_secret.file_type()?.is_file()
+                        || Uuid::parse_str(&carrier_secret.file_name().to_string_lossy()).is_err()
+                    {
+                        return Err(std::io::Error::other(
+                            "carrier secret directory contains an unexpected entry",
+                        ));
+                    }
+                    std::fs::set_permissions(
+                        carrier_secret.path(),
                         std::fs::Permissions::from_mode(0o640),
                     )?;
                 }

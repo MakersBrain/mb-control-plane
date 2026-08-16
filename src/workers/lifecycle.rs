@@ -99,6 +99,8 @@ pub(crate) async fn run(
                 .map_err(|_| IntegrationError::Unavailable)?;
                 sqlx::query("update control.service_instances set health='suspended',safe_error_class=null,last_observed_at=now() where workshop_id=$1")
                     .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+                sqlx::query("update control.carrier_secrets set state='deleted',deleted_at=now(),cleanup_pending_ref=null,version=version+1 where workshop_id=$1 and state<>'deleted'")
+                    .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
                 tx.commit()
                     .await
                     .map_err(|_| IntegrationError::Unavailable)?;

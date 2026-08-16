@@ -54,6 +54,7 @@ class PodmanRendererTests(unittest.TestCase):
             )
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
+            self.assertIn("odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro", odoo)
             self.assertIn(
                 "paperless-client-secrets.volume",
                 (output / "control-workers@invoice-capture.container").read_text(),
