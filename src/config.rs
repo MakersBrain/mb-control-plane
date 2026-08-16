@@ -84,11 +84,13 @@ impl Config {
     }
 
     pub(crate) fn tenant_origin(&self, hostname: &str) -> String {
-        tenant_origin(
-            self.public_origin.scheme(),
-            self.tenant_public_port,
-            hostname,
-        )
+        // The edge port is only meaningful for the local `.localhost` gateway.
+        // Cloudflare-backed environments expose tenant hosts on standard HTTPS;
+        // carrying the Docker gateway port into those links makes them unusable.
+        let port = (self.tenant_domain == "localhost")
+            .then_some(self.tenant_public_port)
+            .flatten();
+        tenant_origin(self.public_origin.scheme(), port, hostname)
     }
 }
 
