@@ -243,9 +243,11 @@ async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<us
         / WEBSHOP_DOMAIN_RECONCILIATION_INTERVAL.as_secs();
     let domains = sqlx::query_as::<_, (Uuid, Uuid)>(
         "select id,workshop_id from control.webshop_domains d
-          where desired_state='active'
-            and state in ('dns_pending','certificate_pending','testing')
-            and ownership_verified_at is not null
+          where ((desired_state='active'
+                  and state in ('dns_pending','certificate_pending','testing')
+                  and ownership_verified_at is not null)
+              or (desired_state='disconnected'
+                  and state in ('disconnecting','action_required')))
             and not exists(select 1 from control.operations o
                 where o.id=d.operation_id and o.state in ('pending','in_flight','awaiting_reconciliation'))
           order by id limit 500",
@@ -271,8 +273,12 @@ async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<us
         .await?;
         let changed = sqlx::query(
             "update control.webshop_domains set operation_id=$2,updated_at=now(),version=version+1
-              where id=$1 and desired_state='active'
-                and state in ('dns_pending','certificate_pending','testing')",
+              where id=$1
+                and ((desired_state='active'
+                      and state in ('dns_pending','certificate_pending','testing')
+                      and ownership_verified_at is not null)
+                  or (desired_state='disconnected'
+                      and state in ('disconnecting','action_required'))) ",
         )
         .bind(domain_id)
         .bind(operation_id)
@@ -1437,6 +1443,58 @@ mod tests {
             },
         }
     }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn terminal_disconnect_failure_is_admitted_again() {
+        let url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for disposable PostgreSQL");
+        let store = Store::connect(&url).await.expect("connect test PostgreSQL");
+        store.migrate().await.expect("migrate test PostgreSQL");
+        let user = Uuid::new_v4();
+        let workshop = Uuid::new_v4();
+        let domain = Uuid::new_v4();
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(user)
+            .bind(format!("{user}@example.test"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Disconnect retry fixture','Europe/Paris')")
+            .bind(workshop)
+            .bind(format!("disconnect-retry-{}", workshop.simple()))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,state,desired_state,last_error_class,created_by) values($1,$2,$3,$4,$5,'shops.makersbrain.com','action_required','disconnected','reconciliation_failed',$6)")
+            .bind(domain)
+            .bind(workshop)
+            .bind(format!("{}.example.test", domain.simple()))
+            .bind(format!("_makersbrain-challenge.{}.example.test", domain.simple()))
+            .bind(format!("makersbrain-verification={}", &domain.simple().to_string()[..32]))
+            .bind(user)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admit_webshop_domain_reconciliation(&store).await.unwrap(),
+            1
+        );
+        let admitted = sqlx::query_as::<_, (String, String)>(
+            "select o.kind,o.state from control.webshop_domains d
+               join control.operations o on o.id=d.operation_id where d.id=$1",
+        )
+        .bind(domain)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            admitted,
+            ("webshop-domain.reconcile".into(), "pending".into())
+        );
+    }
+
     #[test]
     fn secret_names_cannot_escape_environment_namespace() {
         assert_eq!(
