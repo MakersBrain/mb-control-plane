@@ -1317,23 +1317,6 @@ fn backup_writer_binds(
     binds
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backup_writer_never_receives_recovery_secret_bind() {
-        let workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
-        let binds = backup_writer_binds("mb-backups", "mb-odoo", workshop, true);
-
-        assert_eq!(binds.len(), 5);
-        assert!(binds.iter().all(|bind| !bind.contains("recovery-secret")));
-        assert!(binds.iter().all(|bind| !bind.contains("age-identity")));
-        assert_eq!(binds[0], "mb-backups:/backups");
-        assert_eq!(binds[1], "mb-odoo:/odoo:ro");
-    }
-}
-
 async fn update_recovery_progress(
     state: &DriverState,
     recovery: Uuid,
@@ -2385,5 +2368,22 @@ async fn validate_local_dump(
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), _) => Err(error),
         (_, Err(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_writer_never_receives_recovery_secret_bind() {
+        let workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
+        let binds = backup_writer_binds("mb-backups", "mb-odoo", workshop, true);
+
+        assert_eq!(binds.len(), 5);
+        assert!(binds.iter().all(|bind| !bind.contains("recovery-secret")));
+        assert!(binds.iter().all(|bind| !bind.contains("age-identity")));
+        assert_eq!(binds[0], "mb-backups:/backups");
+        assert_eq!(binds[1], "mb-odoo:/odoo:ro");
     }
 }
