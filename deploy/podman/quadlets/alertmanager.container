@@ -1,0 +1,25 @@
+[Unit]
+Description=MakersBrain private Alertmanager
+
+[Container]
+Image=@@ALERTMANAGER_IMAGE@@
+Pull=never
+ContainerName=alertmanager
+Network=makersbrain.network
+User=0
+ReadOnly=true
+Volume=%h/.config/containers/systemd/makersbrain/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+Volume=/etc/makersbrain/secrets/alertmanager:/run/secrets:ro
+Volume=alertmanager-data.volume:/alertmanager
+Exec=--config.file=/etc/alertmanager/alertmanager.yml --storage.path=/alertmanager --web.listen-address=0.0.0.0:9093
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

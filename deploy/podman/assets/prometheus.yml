@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: '@@ENVIRONMENT@@'
+
+rule_files:
+  - /etc/prometheus/rules/prometheus-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]
+
+scrape_configs:
+  - job_name: control-api-live
+    metrics_path: /internal/metrics/live
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/control-metrics-token
+    static_configs:
+      - targets: [control-api:8080]
+
+  - job_name: control-api-database
+    metrics_path: /internal/metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/control-metrics-token
+    static_configs:
+      - targets: [control-api:8080]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: [alertmanager:9093]

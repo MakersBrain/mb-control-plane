@@ -131,7 +131,7 @@ pub struct WebshopSmtpStatusCommand {
     pub workshop_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct WebshopSmtpConfigureCommand {
     pub operation_key: String,
     pub workshop_id: Uuid,

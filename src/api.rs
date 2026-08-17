@@ -156,6 +156,7 @@ pub fn app(state: AppState) -> Router {
             post(platform::publish_release),
         )
         .route("/internal/metrics", get(metrics))
+        .route("/internal/metrics/live", get(live_metrics))
         .layer(
             CorsLayer::new()
                 .allow_origin(origin)
@@ -211,6 +212,7 @@ async fn enforce_privacy_production_gate(
                 | "/v1/me"
                 | "/v1/identity/link"
                 | "/internal/metrics"
+                | "/internal/metrics/live"
                 | "/internal/v1/application-releases"
         )
         || path.starts_with("/v1/privacy/requests")
@@ -309,34 +311,49 @@ fn etag(resource_prefix: &str, version: i64) -> ApiResult<HeaderMap> {
     Ok(headers)
 }
 
-fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
-    let supplied = headers
+fn exact_bearer(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(supplied) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if supplied != Some(state.config.internal_token.as_str()) {
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let supplied = supplied.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = supplied.len() ^ expected.len();
+    for index in 0..supplied.len().max(expected.len()) {
+        difference |= usize::from(
+            supplied.get(index).copied().unwrap_or_default()
+                ^ expected.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if !exact_bearer(headers, &state.config.internal_token) {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(())
+}
+
+fn metrics_reader(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if !exact_bearer(headers, &state.config.metrics_token) {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())
 }
 
 fn mail_event_gateway(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if supplied != Some(state.config.mail_event_token.as_str()) {
+    if !exact_bearer(headers, &state.config.mail_event_token) {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())
 }
 
 fn release_publisher(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if supplied != Some(state.config.release_publish_token.as_str()) {
+    if !exact_bearer(headers, &state.config.release_publish_token) {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())
@@ -399,7 +416,7 @@ async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, String)> {
-    internal(&state, &headers)?;
+    metrics_reader(&state, &headers)?;
     let queues=sqlx::query_as::<_,(String,i64,i64,f64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='dead_letter'),coalesce(extract(epoch from now()-min(o.next_attempt_at) filter(where o.state in ('pending','awaiting_reconciliation') and o.next_attempt_at<=now())),0)::float8 from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue")
         .fetch_all(state.store.pool()).await?;
     let workers=sqlx::query_as::<_,(String,i64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(h.worker_id) filter(where h.shutdown_at is null and h.last_heartbeat_at>now()-interval '30 seconds') from known left join control.worker_heartbeats h on h.queue=known.queue group by known.queue order by known.queue")
@@ -471,6 +488,23 @@ async fn metrics(
     );
     response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok((response_headers, body))
+}
+
+async fn live_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<(HeaderMap, &'static str)> {
+    metrics_reader(&state, &headers)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok((
+        response_headers,
+        "# TYPE makersbrain_application_live gauge\nmakersbrain_application_live 1\n",
+    ))
 }
 
 async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
@@ -1299,7 +1333,7 @@ async fn audit_command(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{ApiError, api_timestamp, etag, expected_version, valid_gtin14};
+    use super::{ApiError, api_timestamp, etag, exact_bearer, expected_version, valid_gtin14};
 
     #[test]
     fn api_timestamps_are_rfc3339_for_browser_parsers() {
@@ -1340,5 +1374,21 @@ mod tests {
             etag("member-a-b", 4).unwrap().get(header::ETAG).unwrap(),
             "\"member-a-b-v4\""
         );
+    }
+
+    #[test]
+    fn internal_bearers_are_exact_and_scheme_sensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer metrics-only-secret"),
+        );
+        assert!(exact_bearer(&headers, "metrics-only-secret"));
+        assert!(!exact_bearer(&headers, "metrics-only-secret-extra"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer metrics-only-secret"),
+        );
+        assert!(!exact_bearer(&headers, "metrics-only-secret"));
     }
 }

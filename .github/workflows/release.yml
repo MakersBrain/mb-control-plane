@@ -71,7 +71,7 @@ jobs:
           test -n "$REGISTRY"
           test -n "$REPOSITORY_PREFIX"
           test -n "$COSIGN_PRIVATE_KEY"
-          jq -e 'length == 5 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
+          jq -e 'length == 7 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
       - name: Build once, mirror dependencies, scan and sign
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,7 +128,8 @@ jobs:
             record_image "$name" "$REGISTRY/$REPOSITORY_PREFIX/$name@sha256:$digest"
           done
 
-          test "$(jq length release/images.json)" -eq 11
+          test "$(jq length release/images.json)" -eq 13
+          jq -e 'keys == ["alertmanager", "alpine", "backup", "cloudflared", "control", "nginx", "odoo", "paperless", "postgres", "prometheus", "rauthy", "redis", "web"]' release/images.json >/dev/null
           release_id="control-$(date -u +%Y.%m.%d)-${GITHUB_SHA:0:16}"
           jq -n \
             --arg release_id "$release_id" \

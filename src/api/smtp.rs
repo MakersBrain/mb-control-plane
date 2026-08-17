@@ -170,4 +170,21 @@ mod tests {
         body.host = "127.0.0.1".into();
         assert!(validate(&body).is_err());
     }
+
+    #[test]
+    fn public_status_can_only_report_password_presence() {
+        let status = WebshopSmtpResponse {
+            transport: "smtp".into(),
+            configured: true,
+            host: Some("smtp.example.fr".into()),
+            port: Some(465),
+            encryption: Some("ssl".into()),
+            username: Some("orders@example.fr".into()),
+            from_email: Some("orders@example.fr".into()),
+            password_configured: true,
+        };
+        let response = serde_json::to_value(status).unwrap();
+        assert_eq!(response["password_configured"], true);
+        assert!(response.get("password").is_none());
+    }
 }

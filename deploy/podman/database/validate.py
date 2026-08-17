@@ -17,6 +17,7 @@ def validate(root: Path) -> None:
         "postgres.container", "pg_hba.conf", "init-databases.sh", "rendered-values.json",
         "postgres-recovery-init.service", "postgres-backup.service", "postgres-backup.timer",
         "postgres-full-backup.service", "postgres-full-backup.timer", "restore.py",
+        "write-fence.py",
     }
     missing = expected - {path.name for path in root.iterdir()}
     if missing:
@@ -52,6 +53,9 @@ def validate(root: Path) -> None:
     restore = (root / "restore.py").read_text(encoding="utf-8")
     if "isolated_restore" not in restore or "--pg1-path=/restore" not in restore:
         raise ValueError("isolated PostgreSQL restore drill is missing")
+    fence = (root / "write-fence.py").read_text(encoding="utf-8")
+    if "default_transaction_read_only" not in fence or "pg_terminate_backend" not in fence:
+        raise ValueError("database write fence is missing or does not terminate old sessions")
     if f"hostssl all all {values['app_subnet_cidr']} scram-sha-256" not in hba:
         raise ValueError("pg_hba does not restrict clients to the application subnet")
     if "hostnossl all all 0.0.0.0/0 reject" not in hba:

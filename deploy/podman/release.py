@@ -32,6 +32,8 @@ PERSISTENT_UNITS = [
     "control-mail-gateway.service",
     "control-container-driver.service",
     "control-backup-scheduler.service",
+    "alertmanager.service",
+    "prometheus.service",
     "control-workers@tenant-provisioning.service",
     "control-workers@membership-provisioning.service",
     "control-workers@invoice-capture.service",
@@ -137,6 +139,11 @@ def verify_and_pull(images: dict[str, str], key: Path) -> None:
 
 def verify_runtime_secrets(values: dict, config_root: Path) -> None:
     secret_root = Path(values["runtime_secret_source"])
+    recovery_root = Path(values["recovery_secret_source"])
+    if recovery_root == secret_root:
+        raise ValueError("runtime and recovery secret roots must be distinct")
+    protected_path(recovery_root, directory=True)
+    protected_path(recovery_root / "age-identity.txt", directory=False)
     postgres_ca = secret_root / "postgres-ca.crt"
     if not postgres_ca.is_file() or postgres_ca.is_symlink():
         raise ValueError(
@@ -167,6 +174,29 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
         )
     if tunnel_token.stat().st_mode & 0o077:
         raise ValueError("Cloudflare Tunnel token must not be accessible by group or others")
+    metrics_token = config_root / "secrets/control-api/control_metrics_token"
+    protected_path(metrics_token, directory=False)
+    metrics_value = metrics_token.read_text(encoding="utf-8")
+    if not 32 <= len(metrics_value) <= 512 or any(
+        character in metrics_value for character in "\r\n\0"
+    ):
+        raise ValueError("Prometheus metrics token must be a bounded single-line secret")
+    webhook_url = config_root / "secrets/alertmanager/webhook-url"
+    webhook_token = config_root / "secrets/alertmanager/webhook-token"
+    protected_path(webhook_url, directory=False)
+    protected_path(webhook_token, directory=False)
+    url_value = webhook_url.read_text(encoding="utf-8")
+    token_value = webhook_token.read_text(encoding="utf-8")
+    if (
+        not url_value.startswith("https://")
+        or len(url_value) > 2048
+        or any(character.isspace() for character in url_value)
+    ):
+        raise ValueError("Alertmanager webhook URL must be a bounded HTTPS capability")
+    if not 32 <= len(token_value) <= 512 or any(
+        character in token_value for character in "\r\n\0"
+    ):
+        raise ValueError("Alertmanager webhook token must be a bounded single-line secret")
 
 
 def protected_path(path: Path, *, directory: bool, public: bool = False) -> None:
@@ -296,23 +326,31 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                 )
 
 
-def activate(
+def stage(
     rendered: Path,
     release_id: str,
     state_root: Path,
-    quadlet_root: Path | None = None,
 ) -> None:
     releases = state_root / "releases"
-    quadlet_root = quadlet_root or Path.home() / ".config/containers/systemd"
     release_root = releases / release_id
     if release_root.exists():
         raise ValueError("release has already been staged")
     releases.mkdir(parents=True, exist_ok=True, mode=0o700)
-    quadlet_root.mkdir(parents=True, exist_ok=True, mode=0o750)
     shutil.copytree(rendered, release_root)
     for path in release_root.rglob("*"):
         path.chmod(0o755 if path.is_dir() else 0o644)
 
+
+def start_staged(
+    release_id: str,
+    state_root: Path,
+    quadlet_root: Path | None = None,
+) -> None:
+    quadlet_root = quadlet_root or Path.home() / ".config/containers/systemd"
+    release_root = state_root / "releases" / release_id
+    if not release_root.is_dir():
+        raise ValueError("requested release has not been staged")
+    quadlet_root.mkdir(parents=True, exist_ok=True, mode=0o750)
     current = quadlet_root / "makersbrain"
     previous = os.readlink(current) if current.is_symlink() else None
     temporary = quadlet_root / f".makersbrain-{release_id}"
@@ -331,6 +369,16 @@ def activate(
         raise
 
 
+def activate(
+    rendered: Path,
+    release_id: str,
+    state_root: Path,
+    quadlet_root: Path | None = None,
+) -> None:
+    stage(rendered, release_id, state_root)
+    start_staged(release_id, state_root, quadlet_root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--values", type=Path, required=True)
@@ -346,7 +394,10 @@ def main() -> None:
         default=Path.home() / ".config/containers/systemd",
     )
     parser.add_argument("--config-root", type=Path, default=Path("/etc/makersbrain"))
-    parser.add_argument("--activate", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--activate", action="store_true")
+    mode.add_argument("--stage-only", action="store_true")
+    mode.add_argument("--start-staged", action="store_true")
     args = parser.parse_args()
 
     if not args.cosign_key.is_file():
@@ -358,12 +409,17 @@ def main() -> None:
         rendered = Path(temporary)
         render.render(args.values, rendered)
         validate.validate(rendered)
-        if args.activate:
+        changes_host = args.activate or args.stage_only or args.start_staged
+        if changes_host:
             verify_runtime_secrets(values, args.config_root)
             verify_host_configuration(rendered, args.config_root)
         verify_and_pull(values["images"], args.cosign_key)
         if args.activate:
             activate(rendered, record["release_id"], args.state_root, args.quadlet_root)
+        elif args.stage_only:
+            stage(rendered, record["release_id"], args.state_root)
+        elif args.start_staged:
+            start_staged(record["release_id"], args.state_root, args.quadlet_root)
         else:
             print("release signatures, images, record and Quadlets are valid")
 

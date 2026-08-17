@@ -114,6 +114,7 @@ pub struct DockerDriverConfig {
     odoo_client_secret_root: PathBuf,
     paperless_client_secret_root: PathBuf,
     runtime_secret_source: String,
+    recovery_secret_source: String,
     job_secret_root: PathBuf,
     route_root: PathBuf,
     gateway_container: String,
@@ -222,8 +223,10 @@ impl DockerDriverConfig {
             if !age_recipient.starts_with("age1") {
                 anyhow::bail!("BACKUP_AGE_RECIPIENT must be an age X25519 recipient");
             }
-            if !age_identity_file.starts_with("/run/makersbrain-backup-secrets/") {
-                anyhow::bail!("BACKUP_AGE_IDENTITY_FILE must use the isolated backup-secret mount");
+            if !age_identity_file.starts_with("/run/makersbrain-recovery-secrets/") {
+                anyhow::bail!(
+                    "BACKUP_AGE_IDENTITY_FILE must use the isolated recovery-secret mount"
+                );
             }
             Some(S3BackupConfig {
                 bucket,
@@ -247,10 +250,19 @@ impl DockerDriverConfig {
             anyhow::bail!("DRIVER_TOKEN and DRIVER_PRIVACY_TOKEN must be distinct");
         }
         let runtime_secret_source = required("DRIVER_RUNTIME_SECRET_SOURCE")?;
+        let recovery_secret_source = required("DRIVER_RECOVERY_SECRET_SOURCE")?;
         if container_runtime == ContainerRuntimeKind::Podman
             && !Path::new(&runtime_secret_source).is_absolute()
         {
             anyhow::bail!("DRIVER_RUNTIME_SECRET_SOURCE must be an absolute host path for Podman");
+        }
+        if container_runtime == ContainerRuntimeKind::Podman
+            && !Path::new(&recovery_secret_source).is_absolute()
+        {
+            anyhow::bail!("DRIVER_RECOVERY_SECRET_SOURCE must be an absolute host path for Podman");
+        }
+        if recovery_secret_source == runtime_secret_source {
+            anyhow::bail!("runtime and recovery secret sources must be distinct");
         }
         let postgres_ca_source = optional("DRIVER_POSTGRES_CA_SOURCE")?.map(PathBuf::from);
         if environment != "development" {
@@ -295,6 +307,7 @@ impl DockerDriverConfig {
             odoo_client_secret_root: required("DRIVER_ODOO_CLIENT_SECRET_ROOT")?.into(),
             paperless_client_secret_root: required("DRIVER_PAPERLESS_CLIENT_SECRET_ROOT")?.into(),
             runtime_secret_source,
+            recovery_secret_source,
             job_secret_root: required("DRIVER_JOB_SECRET_ROOT")?.into(),
             route_root: required("DRIVER_ROUTE_ROOT")?.into(),
             gateway_container: required("DRIVER_GATEWAY_CONTAINER")?,
@@ -411,8 +424,12 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     }
     std::fs::create_dir_all(&config.paperless_client_secret_root)?;
     normalize_secret_permissions(&config.paperless_client_secret_root)?;
-    if config.job_secret_root != Path::new("/run/makersbrain-backup-secrets/jobs") {
-        anyhow::bail!("DRIVER_JOB_SECRET_ROOT must use the isolated job-secret mount");
+    let expected_job_root = match config.container_runtime {
+        ContainerRuntimeKind::Docker => PathBuf::from("/run/makersbrain-backup-secrets/jobs"),
+        ContainerRuntimeKind::Podman => Path::new(&config.runtime_secret_source).join("jobs"),
+    };
+    if config.job_secret_root != expected_job_root {
+        anyhow::bail!("DRIVER_JOB_SECRET_ROOT must use the scoped runtime job-secret directory");
     }
     secure_directory(&config.job_secret_root)?;
     clear_stale_job_secrets(&config.job_secret_root)?;
@@ -1312,10 +1329,6 @@ fn postgres_ca_mount(state: &DriverState) -> Result<Option<Value>, DriverError> 
         "Target":"/run/makersbrain-postgres-ca/postgres-ca.crt",
         "ReadOnly":true
     })))
-}
-
-fn runtime_secret_root_bind(state: &DriverState, target: &str) -> String {
-    format!("{}:{target}:ro", state.config.runtime_secret_source)
 }
 
 fn secret_value(path: &Path, length: usize) -> std::io::Result<String> {

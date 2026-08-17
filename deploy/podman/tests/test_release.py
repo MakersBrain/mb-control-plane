@@ -19,6 +19,30 @@ RECORD = json.loads((ROOT / "release-record.example.json").read_text(encoding="u
 
 
 class ReleaseTests(unittest.TestCase):
+    def write_recovery_identity(self, values: dict, root: Path) -> None:
+        recovery = root / "recovery-secrets"
+        recovery.mkdir()
+        recovery.chmod(0o700)
+        (recovery / "age-identity.txt").write_text("AGE-SECRET-KEY-fixture")
+        (recovery / "age-identity.txt").chmod(0o600)
+        values["recovery_secret_source"] = str(recovery)
+
+    def write_observability_secrets(self, config_root: Path) -> None:
+        control = config_root / "secrets/control-api"
+        control.mkdir(parents=True, exist_ok=True)
+        control.chmod(0o700)
+        (control / "control_metrics_token").write_text("m" * 48, encoding="utf-8")
+        (control / "control_metrics_token").chmod(0o600)
+        alertmanager = config_root / "secrets/alertmanager"
+        alertmanager.mkdir(parents=True, exist_ok=True)
+        alertmanager.chmod(0o700)
+        (alertmanager / "webhook-url").write_text(
+            "https://alerts.example.test/makersbrain", encoding="utf-8"
+        )
+        (alertmanager / "webhook-token").write_text("a" * 48, encoding="utf-8")
+        (alertmanager / "webhook-url").chmod(0o600)
+        (alertmanager / "webhook-token").chmod(0o600)
+
     def test_release_record_signature_is_verified_as_a_blob(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -77,6 +101,7 @@ class ReleaseTests(unittest.TestCase):
             root = Path(temporary)
             values = copy.deepcopy(VALUES)
             values["runtime_secret_source"] = str(root / "runtime-secrets")
+            self.write_recovery_identity(values, root)
             config_root = root / "config"
             config_root.mkdir()
             rauthy_secret = config_root / "secrets/rauthy"
@@ -91,6 +116,7 @@ class ReleaseTests(unittest.TestCase):
             tunnel_secret.mkdir(parents=True)
             (tunnel_secret / "tunnel-token").write_text("token", encoding="utf-8")
             (tunnel_secret / "tunnel-token").chmod(0o600)
+            self.write_observability_secrets(config_root)
             with self.assertRaisesRegex(ValueError, "PostgreSQL CA"):
                 RELEASE.verify_runtime_secrets(values, config_root)
             secret_root = Path(values["runtime_secret_source"])
@@ -121,12 +147,14 @@ class ReleaseTests(unittest.TestCase):
                 encoding="utf-8",
             )
             values["runtime_secret_source"] = str(secret_root)
+            self.write_recovery_identity(values, root)
             config_root = root / "config"
             config_root.mkdir()
             tunnel_secret = config_root / "secrets/cloudflared"
             tunnel_secret.mkdir(parents=True)
             (tunnel_secret / "tunnel-token").write_text("token", encoding="utf-8")
             (tunnel_secret / "tunnel-token").chmod(0o600)
+            self.write_observability_secrets(config_root)
             rauthy_secret = config_root / "secrets/rauthy"
             rauthy_secret.mkdir(parents=True)
             (rauthy_secret / "config.toml").write_text(
@@ -248,6 +276,55 @@ class ReleaseTests(unittest.TestCase):
             run.assert_any_call(
                 ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
             )
+
+    @mock.patch.object(RELEASE, "run")
+    def test_stage_only_copies_release_without_touching_live_quadlets(self, run):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            (rendered / "makersbrain.network").write_text("[Network]\n")
+            RELEASE.stage(
+                rendered,
+                RECORD["release_id"],
+                root / "state",
+            )
+            self.assertTrue((root / "state/releases" / RECORD["release_id"]).is_dir())
+            self.assertFalse((root / "quadlets/makersbrain").exists())
+            run.assert_not_called()
+
+    @mock.patch.object(RELEASE, "run")
+    def test_start_staged_requires_exact_current_release(self, run):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "state/releases" / RECORD["release_id"]
+            release.mkdir(parents=True)
+            quadlets = root / "quadlets"
+            quadlets.mkdir()
+            RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
+            self.assertEqual((quadlets / "makersbrain").resolve(), release)
+            run.assert_any_call(
+                ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
+            )
+            with self.assertRaisesRegex(ValueError, "has not been staged"):
+                RELEASE.start_staged("control-2026.08.15-ffffffffffffffff", root / "state", quadlets)
+
+    @mock.patch.object(RELEASE, "run")
+    def test_failed_staged_start_restores_previous_release(self, run):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "state/releases/previous"
+            candidate = root / "state/releases" / RECORD["release_id"]
+            previous.mkdir(parents=True)
+            candidate.mkdir()
+            quadlets = root / "quadlets"
+            quadlets.mkdir()
+            current = quadlets / "makersbrain"
+            current.symlink_to(previous, target_is_directory=True)
+            run.side_effect = [None, RuntimeError("unit failed"), None, None, None]
+            with self.assertRaisesRegex(RuntimeError, "unit failed"):
+                RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
+            self.assertEqual(current.resolve(), previous)
 
 
 if __name__ == "__main__":

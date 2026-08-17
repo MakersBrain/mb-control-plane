@@ -8,6 +8,7 @@ Pull=never
 Network=makersbrain.network
 Environment=PGSSLMODE=verify-full
 Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
+Environment=PGHOST=@@POSTGRES_HOST@@
 EnvironmentFile=/etc/makersbrain/control-database-identities.env
 Volume=./reconcile-database-identities.sh:/run/makersbrain/reconcile-database-identities.sh:ro
 Volume=/etc/makersbrain/secrets/database-identities:/run/secrets:ro

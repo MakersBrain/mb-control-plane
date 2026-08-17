@@ -40,6 +40,11 @@ def validate(root: Path) -> None:
         "redis.container",
         "tenant-gateway.container",
         "control-web.container",
+        "alertmanager.container",
+        "prometheus.container",
+        "prometheus.yml",
+        "prometheus-alerts.yml",
+        "alertmanager.yml",
         "resolve-secret-env.sh",
     } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
@@ -123,6 +128,26 @@ def validate(root: Path) -> None:
         raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")
     if "EnvironmentFile=" in cloudflared or "postgres" in cloudflared.lower():
         raise ValueError("Cloudflare Tunnel received unrelated application configuration")
+    prometheus = (root / "prometheus.container").read_text(encoding="utf-8")
+    prometheus_config = (root / "prometheus.yml").read_text(encoding="utf-8")
+    if (
+        "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro"
+        not in prometheus
+        or "credentials_file: /run/secrets/control-metrics-token"
+        not in prometheus_config
+        or "/internal/metrics/live" not in prometheus_config
+        or "/internal/metrics" not in prometheus_config
+    ):
+        raise ValueError("Prometheus does not use the isolated metrics credential and probes")
+    alertmanager = (root / "alertmanager.container").read_text(encoding="utf-8")
+    alertmanager_config = (root / "alertmanager.yml").read_text(encoding="utf-8")
+    if (
+        "/secrets/alertmanager:/run/secrets:ro" not in alertmanager
+        or "url_file: /run/secrets/webhook-url" not in alertmanager_config
+        or "credentials_file: /run/secrets/webhook-token" not in alertmanager_config
+        or "send_resolved: true" not in alertmanager_config
+    ):
+        raise ValueError("Alertmanager trigger/recovery delivery is not secret-backed")
     if values["environment"] == "production" and values["data_mode"] == "personal":
         if not values.get("production_personal_data_allowed"):
             raise ValueError("personal-data activation is not approved")

@@ -1,0 +1,28 @@
+[Unit]
+Description=MakersBrain private Prometheus
+Requires=control-api.container alertmanager.container
+After=control-api.container alertmanager.container
+
+[Container]
+Image=@@PROMETHEUS_IMAGE@@
+Pull=never
+ContainerName=prometheus
+Network=makersbrain.network
+User=0
+ReadOnly=true
+Volume=%h/.config/containers/systemd/makersbrain/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+Volume=%h/.config/containers/systemd/makersbrain/prometheus-alerts.yml:/etc/prometheus/rules/prometheus-alerts.yml:ro
+Volume=/etc/makersbrain/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro
+Volume=prometheus-data.volume:/prometheus
+Exec=--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d --web.listen-address=0.0.0.0:9090
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

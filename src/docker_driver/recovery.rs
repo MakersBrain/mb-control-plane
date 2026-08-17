@@ -1087,18 +1087,12 @@ async fn create_remote_recovery_set(
     let compact = tenant_key(workshop);
     let paperless_database = format!("pl_{compact}");
     let includes_paperless = component_scope.iter().any(|item| item == "paperless");
-    let mut binds = vec![
-        format!("{}:/backups", state.config.backup_volume),
-        format!("{}:/odoo:ro", state.config.odoo_volume),
-        runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets"),
-    ];
-    if includes_paperless {
-        for suffix in ["data", "media", "consume"] {
-            binds.push(format!(
-                "mb-paperless-{workshop}-{suffix}:/paperless/{suffix}:ro"
-            ));
-        }
-    }
+    let binds = backup_writer_binds(
+        &state.config.backup_volume,
+        &state.config.odoo_volume,
+        workshop,
+        includes_paperless,
+    );
     let pgpass = postgres_admin_pgpass(state);
     let mut command = format!(
         "set -eu; set -o pipefail; umask 077; export PGPASSFILE=/run/makersbrain-job-secrets/pgpass; AGE_RECIPIENT=$(cat /run/makersbrain-job-secrets/age-recipient); reject_special() {{ test ! -d \"$1\" || test -z \"$(find \"$1\" -mindepth 1 ! -type d ! -type f -print -quit)\"; }}; encrypt_stream() {{ output=$1; checksum=$2; fifo=\"${{checksum}}.fifo\"; mkfifo \"$fifo\"; sha256sum <\"$fifo\" | cut -d' ' -f1 >\"$checksum\" & hash_pid=$!; tee \"$fifo\" | zstd -q -T0 | age -r \"$AGE_RECIPIENT\" -o \"$output\"; wait \"$hash_pid\"; rm -f \"$fifo\"; }}; out=/backups/{}; mkdir -p \"$out/odoo\"; pg_dump --format=custom --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" \"$ODOO_DATABASE\" | encrypt_stream \"$out/odoo/database.dump.enc\" \"$out/odoo/database.dump.plain.sha256\"; reject_special \"/odoo/filestore/$ODOO_DATABASE\"; if [ -d \"/odoo/filestore/$ODOO_DATABASE\" ]; then tar -C \"/odoo/filestore/$ODOO_DATABASE\" -cf - .; else tar -cf - --files-from /dev/null; fi | encrypt_stream \"$out/odoo/filestore.tar.zst.enc\" \"$out/odoo/filestore.plain.sha256\"",
@@ -1303,6 +1297,43 @@ async fn create_remote_recovery_set(
     }))
 }
 
+fn backup_writer_binds(
+    backup_volume: &str,
+    odoo_volume: &str,
+    workshop: Uuid,
+    includes_paperless: bool,
+) -> Vec<String> {
+    let mut binds = vec![
+        format!("{backup_volume}:/backups"),
+        format!("{odoo_volume}:/odoo:ro"),
+    ];
+    if includes_paperless {
+        for suffix in ["data", "media", "consume"] {
+            binds.push(format!(
+                "mb-paperless-{workshop}-{suffix}:/paperless/{suffix}:ro"
+            ));
+        }
+    }
+    binds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_writer_never_receives_recovery_secret_bind() {
+        let workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
+        let binds = backup_writer_binds("mb-backups", "mb-odoo", workshop, true);
+
+        assert_eq!(binds.len(), 5);
+        assert!(binds.iter().all(|bind| !bind.contains("recovery-secret")));
+        assert!(binds.iter().all(|bind| !bind.contains("age-identity")));
+        assert_eq!(binds[0], "mb-backups:/backups");
+        assert_eq!(binds[1], "mb-odoo:/odoo:ro");
+    }
+}
+
 async fn update_recovery_progress(
     state: &DriverState,
     recovery: Uuid,
@@ -1499,6 +1530,22 @@ fn s3_job_secrets(s3: &S3BackupConfig, writer: bool) -> [(&'static str, &str); 2
     ]
 }
 
+fn recovery_identity_bind(state: &DriverState, s3: &S3BackupConfig) -> Result<String, DriverError> {
+    let container_root = Path::new("/run/makersbrain-recovery-secrets");
+    let identity = Path::new(&s3.age_identity_file);
+    let relative = identity
+        .strip_prefix(container_root)
+        .map_err(|_| DriverError::internal("age identity escapes recovery-secret mount"))?;
+    let relative = validated_secret_relative_path(relative)?;
+    Ok(format!(
+        "{}:{}:ro",
+        Path::new(&state.config.recovery_secret_source)
+            .join(relative)
+            .display(),
+        identity.display()
+    ))
+}
+
 fn aws_secret_prelude() -> &'static str {
     "export AWS_ACCESS_KEY_ID=$(cat /run/makersbrain-job-secrets/aws-access-key-id); export AWS_SECRET_ACCESS_KEY=$(cat /run/makersbrain-job-secrets/aws-secret-access-key)"
 }
@@ -1584,7 +1631,7 @@ async fn restore_remote_recovery_inner(
             "Cmd": ["sh", "-ec", bootstrap],
             "Env": environment,
             "Labels": {"makersbrain.kind":"s3-restore-download-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1703,7 +1750,7 @@ async fn restore_remote_recovery_inner(
             "Cmd": ["sh", "-ec", download],
             "Env": environment,
             "Labels": {"makersbrain.kind":"s3-restore-verify-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
+            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1736,7 +1783,7 @@ async fn restore_remote_recovery_inner(
     let mut binds = vec![
         format!("{}:/backups:ro", state.config.backup_volume),
         format!("{}:/odoo", state.config.odoo_volume),
-        runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets"),
+        recovery_identity_bind(state, s3)?,
     ];
     if expected_scope.iter().any(|item| item == "paperless") {
         for suffix in ["data", "media", "consume"] {
@@ -1828,7 +1875,7 @@ async fn validate_remote_database_dumps(
                 format!("PAPERLESS_TEMPORARY={paperless_temporary}"),
             ],
             "Labels": {"makersbrain.kind":"restore-preflight-job"},
-            "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), runtime_secret_root_bind(state, "/run/makersbrain-backup-secrets")]}
+            "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &[("pgpass", &pgpass)],
     )

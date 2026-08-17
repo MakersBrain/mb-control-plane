@@ -37,3 +37,34 @@ The key ring is decryption-only, bounded to 16 entries and 64 KiB; new exports
 always use the current key. For suspected key compromise, do not retain the old
 key: revoke access even though its outstanding exports become unavailable, and
 record/reissue those requests through the privacy workflow.
+
+## Backup age recipient rotation
+
+An age recipient is a write-time encryption selector, while its private
+identity is recovery material. Rotate them as a pair without assuming that
+changing the recipient makes retained backup sets readable by the new identity.
+
+1. Generate the replacement identity in protected recovery custody and derive
+   its public recipient without printing either value to logs or passing it as
+   a command argument. Keep both files mode `0600` below a `0700` directory.
+2. Store the new public recipient and a new non-secret key ID in the secret
+   manager. Do not upload the private recovery identity to an application path.
+3. Deploy the new recipient to backup writers. Keep the old private identity in
+   recovery custody for every retained set encrypted to it; do not configure
+   writers to keep using the old recipient merely to create an overlap.
+4. Produce a new encrypted backup under the replacement recipient and restore
+   it into an isolated target using only the replacement private identity.
+5. Prove one still-retained old set remains restorable with the old identity,
+   then record its expiry date. If no old set exists, record the inventory
+   evidence rather than fabricating a restore.
+6. After the final old set expires or is deliberately superseded by a verified
+   replacement set, remove the old identity from host-accessible recovery
+   bundles and revoke its secret-manager versions. Preserve any required
+   offline legal/recovery escrow according to the retention policy.
+
+For suspected disclosure, stop issuing new backups to the old recipient as
+soon as the replacement restore passes. The old identity may remain in isolated
+recovery custody only for the shortest retained-backup overlap; it must never
+be installed in an ordinary application or backup-writer secret path. A restore
+agent may receive the exact identity file read-only for the bounded recovery
+operation; it must not receive either complete runtime secret root.

@@ -258,6 +258,7 @@ services:
       CONTROL_TENANT_DOMAIN: localhost
       CONTROL_TENANT_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
       CONTROL_INTERNAL_TOKEN: "@/run/secrets/control_internal_token"
+      CONTROL_METRICS_TOKEN: "@/run/secrets/control_metrics_token"
       CONTROL_MAIL_EVENT_TOKEN: "@/run/secrets/control_mail_event_token"
       CONTROL_RELEASE_PUBLISH_TOKEN: "@/run/secrets/control_release_publish_token"
       CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
@@ -283,6 +284,7 @@ services:
     secrets:
       - control_api_database_url
       - control_internal_token
+      - control_metrics_token
       - control_mail_event_token
       - control_release_publish_token
       - document_extraction_token
@@ -384,6 +386,7 @@ services:
       DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/makersbrain-odoo-client-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
       DRIVER_RUNTIME_SECRET_SOURCE: makersbrain-control-backup-secrets
+      DRIVER_RECOVERY_SECRET_SOURCE: /var/empty/makersbrain-recovery-secrets
       DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes
       DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
@@ -657,6 +660,7 @@ secrets:
   rauthy_hql_secret_api: {file: ./secrets/runtime/rauthy_hql_secret_api}
   rauthy_config: {file: ./secrets/runtime/rauthy_config.toml}
   control_internal_token: {file: ./secrets/runtime/control_internal_token}
+  control_metrics_token: {file: ./secrets/runtime/control_metrics_token}
   control_mail_event_token: {file: ./secrets/runtime/control_mail_event_token}
   control_release_publish_token: {file: ./secrets/runtime/control_release_publish_token}
   odoo_bridge_token: {file: ./secrets/runtime/odoo_bridge_token}

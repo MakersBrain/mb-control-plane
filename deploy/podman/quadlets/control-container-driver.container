@@ -14,6 +14,7 @@ Environment=DRIVER_CONTAINER_RUNTIME=podman
 Environment=DRIVER_RUNTIME_SOCKET=/run/podman/podman.sock
 Environment=DRIVER_RUNTIME_NETWORK=@@RUNTIME_NETWORK@@
 Environment=DRIVER_RUNTIME_SECRET_SOURCE=@@RUNTIME_SECRET_SOURCE@@
+Environment=DRIVER_RECOVERY_SECRET_SOURCE=@@RECOVERY_SECRET_SOURCE@@
 Environment=DRIVER_POSTGRES_CA_SOURCE=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt
 Environment=DRIVER_ODOO_IMAGE=@@ODOO_IMAGE@@
 Environment=DRIVER_POSTGRES_IMAGE=@@POSTGRES_IMAGE@@
@@ -28,10 +29,11 @@ Environment=DRIVER_ODOO_CLIENT_SECRET_ROOT=/run/makersbrain-odoo-client-secrets
 Environment=DRIVER_PAPERLESS_CLIENT_SECRET_ROOT=/run/makersbrain-paperless-client-secrets
 Environment=DRIVER_ROUTE_ROOT=/run/makersbrain-routes
 Environment=DRIVER_GATEWAY_CONTAINER=tenant-gateway
-Environment=DRIVER_JOB_SECRET_ROOT=/run/makersbrain-backup-secrets/jobs
+Environment=DRIVER_JOB_SECRET_ROOT=@@RUNTIME_SECRET_SOURCE@@/jobs
 EnvironmentFile=/etc/makersbrain/control-container-driver.env
 Volume=/etc/makersbrain/secrets/control-container-driver:/run/secrets:ro
-Volume=@@RUNTIME_SECRET_SOURCE@@:/run/makersbrain-backup-secrets
+Volume=@@RUNTIME_SECRET_SOURCE@@:@@RUNTIME_SECRET_SOURCE@@
+Volume=@@RECOVERY_SECRET_SOURCE@@:/run/makersbrain-recovery-secrets:ro
 Volume=odoo-data.volume:/var/lib/odoo
 Volume=backup-data.volume:/backups
 Volume=gateway-routes.volume:/run/makersbrain-routes

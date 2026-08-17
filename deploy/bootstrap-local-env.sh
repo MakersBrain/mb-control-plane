@@ -89,6 +89,7 @@ write_secret RAUTHY_BOOTSTRAP_ADMIN_PASSWORD "$admin_password"
 write_secret RAUTHY_HQL_SECRET_RAFT "$hql_secret_raft"
 write_secret RAUTHY_HQL_SECRET_API "$hql_secret_api"
 write_secret CONTROL_INTERNAL_TOKEN "$(random_hex)"
+write_secret CONTROL_METRICS_TOKEN "$(random_hex)"
 write_secret CONTROL_MAIL_EVENT_TOKEN "$(random_hex)"
 write_secret CONTROL_RELEASE_PUBLISH_TOKEN "$(random_hex)"
 write_secret ODOO_BRIDGE_TOKEN "$(random_hex)"
@@ -201,6 +202,7 @@ chmod 0644 "$invitation_public"
     "RAUTHY_HQL_SECRET_RAFT=$(secret_ref RAUTHY_HQL_SECRET_RAFT)" \
     "RAUTHY_HQL_SECRET_API=$(secret_ref RAUTHY_HQL_SECRET_API)" \
     "CONTROL_INTERNAL_TOKEN=$(secret_ref CONTROL_INTERNAL_TOKEN)" \
+    "CONTROL_METRICS_TOKEN=$(secret_ref CONTROL_METRICS_TOKEN)" \
     "CONTROL_MAIL_EVENT_TOKEN=$(secret_ref CONTROL_MAIL_EVENT_TOKEN)" \
     "CONTROL_RELEASE_PUBLISH_TOKEN=$(secret_ref CONTROL_RELEASE_PUBLISH_TOKEN)" \
     "CONTROL_RELEASE_ID=control-local-$source_commit" \

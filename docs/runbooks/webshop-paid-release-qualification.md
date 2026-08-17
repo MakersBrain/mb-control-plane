@@ -148,6 +148,19 @@ forbidden labels declared in `deploy/release-contract.json`. The privacy-safe
 evidence summary states only that all three alert lifecycles and the label review
 passed for the candidate release.
 
+Before the drill, confirm `prometheus.service` and `alertmanager.service` are
+the digest-pinned units in the candidate image map and that neither publishes a
+host port. Exercise the application rule by stopping the API process, then
+restore it. Exercise the database rule by fencing or stopping the staging DB
+while leaving the API process running, then restore connectivity. Exercise the
+backup rule by stopping the staging backup scheduler only after a verified
+synthetic recovery point exists and allowing the normal 26-hour freshness
+threshold to expire. Budget that interval in the qualification window; never
+shorten or edit a live rule, alter recovery timestamps, or inject an
+Alertmanager event. Restart the scheduler, require a new verified backup, and
+capture Prometheus rule state plus the receiver's
+trigger/acknowledgement/resolution timestamps in protected evidence.
+
 ## Evidence and promotion
 
 For each successful named check, write the five-field JSON evidence file

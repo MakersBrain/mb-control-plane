@@ -47,9 +47,14 @@ def load_values(path: Path) -> dict:
     secret_source = Path(values.get("runtime_secret_source", ""))
     if not secret_source.is_absolute() or secret_source == Path("/"):
         raise ValueError("runtime_secret_source must be a narrow absolute path")
+    recovery_source = Path(values.get("recovery_secret_source", ""))
+    if not recovery_source.is_absolute() or recovery_source == Path("/"):
+        raise ValueError("recovery_secret_source must be a narrow absolute path")
+    if recovery_source == secret_source:
+        raise ValueError("runtime and recovery secret sources must be distinct")
     required_images = {
         "control", "web", "odoo", "rauthy", "redis", "nginx", "alpine", "postgres",
-        "paperless", "backup", "cloudflared"
+        "paperless", "backup", "cloudflared", "prometheus", "alertmanager"
     }
     images = values.get("images", {})
     if set(images) != required_images:
@@ -71,6 +76,7 @@ def replacements(values: dict) -> dict[str, str]:
         "DATA_MODE": values["data_mode"],
         "RUNTIME_NETWORK": values["runtime_network"],
         "RUNTIME_SECRET_SOURCE": values["runtime_secret_source"],
+        "RECOVERY_SECRET_SOURCE": values["recovery_secret_source"],
         "PUBLIC_BIND_IP": values["public_bind_ip"],
         "POSTGRES_HOST": values["postgres_host"],
     }
@@ -117,6 +123,8 @@ def render(values_path: Path, output: Path) -> None:
     (output / "rendered-values.json").chmod(0o600)
     shutil.copy2(HERE.parent / "resolve-secret-env.sh", output / "resolve-secret-env.sh")
     (output / "resolve-secret-env.sh").chmod(0o555)
+    shutil.copy2(HERE.parent / "prometheus-alerts.yml", output / "prometheus-alerts.yml")
+    (output / "prometheus-alerts.yml").chmod(0o644)
 
 
 def main() -> None:

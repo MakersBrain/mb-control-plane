@@ -514,6 +514,39 @@ def validate() -> list[str]:
     if spec.get("optional_environment") != contract.get("optional_environment"):
         errors.append("optional_environment drift between config spec and release contract")
 
+    release_images = contract.get("images", {})
+    third_party_path = ROOT / ".github/release-third-party-images.json"
+    workflow_path = ROOT / ".github/workflows/release.yml"
+    try:
+        third_party = load_json(third_party_path)
+    except ValueError as error:
+        errors.append(str(error))
+        third_party = {}
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    built_images = set(
+        re.findall(r"(?m)^\s+build_image ([a-z0-9-]+)\s", workflow_text)
+    )
+    expected_images = set(release_images) if isinstance(release_images, dict) else set()
+    delivered_images = built_images | set(third_party)
+    if delivered_images != expected_images:
+        errors.append(
+            "release image delivery drift: "
+            f"missing={sorted(expected_images - delivered_images)} "
+            f"extra={sorted(delivered_images - expected_images)}"
+        )
+    for name, source in third_party.items():
+        if not isinstance(source, str) or not re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", source):
+            errors.append(f"third-party image {name} is not digest pinned")
+            continue
+        contract_source = (
+            release_images.get(name, {}).get("upstream_source")
+            if isinstance(release_images, dict)
+            and isinstance(release_images.get(name), dict)
+            else None
+        )
+        if contract_source != source:
+            errors.append(f"third-party image {name} drifts from the release contract")
+
     try:
         implemented_checks = staging_qualification_checks()
     except (SyntaxError, ValueError) as error:

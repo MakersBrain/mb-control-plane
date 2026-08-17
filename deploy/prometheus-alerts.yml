@@ -1,6 +1,27 @@
 groups:
   - name: makersbrain-control-plane
     rules:
+      - alert: MakersBrainApplicationUnavailable
+        expr: up{job="control-api-live"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The control application process is unavailable"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      - alert: MakersBrainDatabaseUnavailable
+        expr: up{job="control-api-database"} == 0 and on() up{job="control-api-live"} == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The control database path is unavailable while the API process is live"
+          runbook_url: "docs/runbooks/failed-restore.md"
+      - alert: MakersBrainAlertmanagerUnavailable
+        expr: up{job="alertmanager"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Prometheus cannot reach the private Alertmanager"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainRequiredWorkerAbsent
         expr: makersbrain_worker_fresh < 1
         for: 2m

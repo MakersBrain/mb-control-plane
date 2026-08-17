@@ -32,6 +32,19 @@ class PodmanRendererTests(unittest.TestCase):
                 "DRIVER_POSTGRES_CA_SOURCE=/var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt",
                 driver,
             )
+            self.assertIn(
+                "DRIVER_RECOVERY_SECRET_SOURCE=/var/lib/makersbrain/tenant-recovery-secrets",
+                driver,
+            )
+            self.assertIn(
+                "/var/lib/makersbrain/tenant-runtime-secrets:/var/lib/makersbrain/tenant-runtime-secrets",
+                driver,
+            )
+            self.assertIn(
+                "/var/lib/makersbrain/tenant-recovery-secrets:/run/makersbrain-recovery-secrets:ro",
+                driver,
+            )
+            self.assertNotIn("/run/makersbrain-backup-secrets", driver)
             for name in (
                 "control-api.container",
                 "control-backup-scheduler.container",
@@ -68,6 +81,20 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
             self.assertNotIn("EnvironmentFile=", cloudflared)
             self.assertNotIn("podman.sock", cloudflared)
+            prometheus = (output / "prometheus.container").read_text()
+            self.assertIn(
+                "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro",
+                prometheus,
+            )
+            prometheus_config = (output / "prometheus.yml").read_text()
+            self.assertIn("metrics_path: /internal/metrics/live", prometheus_config)
+            self.assertIn("metrics_path: /internal/metrics", prometheus_config)
+            self.assertIn("environment: 'staging'", prometheus_config)
+            alertmanager = (output / "alertmanager.container").read_text()
+            self.assertIn("/secrets/alertmanager:/run/secrets:ro", alertmanager)
+            alertmanager_config = (output / "alertmanager.yml").read_text()
+            self.assertIn("url_file: /run/secrets/webhook-url", alertmanager_config)
+            self.assertIn("credentials_file: /run/secrets/webhook-token", alertmanager_config)
             for path in output.glob("*.container"):
                 if path.name != "control-container-driver.container":
                     self.assertNotIn("podman.sock", path.read_text())
@@ -81,6 +108,13 @@ class PodmanRendererTests(unittest.TestCase):
         values["images"]["control"] = "registry.example.test/makersbrain/control:latest"
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(ValueError, "not pinned by digest"):
+                RENDER.load_values(self.write_values(Path(temporary), values))
+
+    def test_runtime_and_recovery_secret_roots_must_be_distinct(self):
+        values = copy.deepcopy(EXAMPLE)
+        values["recovery_secret_source"] = values["runtime_secret_source"]
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "must be distinct"):
                 RENDER.load_values(self.write_values(Path(temporary), values))
 
     def test_staging_personal_data_is_rejected(self):

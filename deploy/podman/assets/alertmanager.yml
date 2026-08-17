@@ -1,0 +1,16 @@
+route:
+  receiver: operator-webhook
+  group_by: [alertname, environment]
+  group_wait: 15s
+  group_interval: 2m
+  repeat_interval: 4h
+
+receivers:
+  - name: operator-webhook
+    webhook_configs:
+      - url_file: /run/secrets/webhook-url
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /run/secrets/webhook-token
