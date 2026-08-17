@@ -2,12 +2,18 @@ import importlib.util
 import json
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 PODMAN = Path(__file__).parents[1]
+# The scripts under test import each other by bare name, which only resolves
+# when their own directory is importable. Test discovery runs from the repo
+# root, so put it there before loading any of them.
+if str(PODMAN) not in sys.path:
+    sys.path.insert(0, str(PODMAN))
 
 
 def _load(name):
