@@ -65,11 +65,11 @@
 	}
 	async function addEmailDomain() {
 		busy = 'add-email'; error = ''; notice = '';
-		try { await request(`/v1/workshops/${id}/email-domains`, { method: 'POST', body: JSON.stringify({ domain_name: emailDomain, sender_local_part: senderLocalPart }) }); emailDomain = ''; notice = 'Sender domain registration queued. Publish the DNS records below when they appear.'; await load(); }
+		try { await request(`/v1/workshops/${id}/email-domains`, { method: 'POST', headers: {'idempotency-key': crypto.randomUUID()}, body: JSON.stringify({ domain_name: emailDomain, sender_local_part: senderLocalPart }) }); emailDomain = ''; notice = 'Sender domain registration queued. Publish the DNS records below when they appear.'; await load(); }
 		catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { busy = ''; }
 	}
-	async function checkEmailDomain(domain: EmailDomain) { busy = domain.id; error=''; notice=''; try { await request(`/v1/workshops/${id}/email-domains/${domain.id}/check`, {method:'POST'}); notice='Verification check queued. A test message is sent before activation once all required records are valid.'; await load(); } catch(cause){error=cause instanceof Error?cause.message:String(cause)} finally{busy=''} }
-	async function disconnectEmailDomain(domain: EmailDomain) { if(!confirm(`Disconnect ${domain.domain_name} from the MakersBrain relay? Your selected SMTP or relay transport will not change.`))return; busy=domain.id; error=''; try{await request(`/v1/workshops/${id}/email-domains/${domain.id}`,{method:'DELETE'});notice='Sender-domain disconnect queued. Your selected SMTP or relay transport is unchanged.';await load()}catch(cause){error=cause instanceof Error?cause.message:String(cause)}finally{busy=''} }
+	async function checkEmailDomain(domain: EmailDomain) { busy = domain.id; error=''; notice=''; try { await request(`/v1/workshops/${id}/email-domains/${domain.id}/check`, {method:'POST',headers:{'idempotency-key':crypto.randomUUID()}}); notice='Verification check queued. A test message is sent before activation once all required records are valid.'; await load(); } catch(cause){error=cause instanceof Error?cause.message:String(cause)} finally{busy=''} }
+	async function disconnectEmailDomain(domain: EmailDomain) { if(!confirm(`Disconnect ${domain.domain_name} from the MakersBrain relay? Your selected SMTP or relay transport will not change.`))return; busy=domain.id; error=''; try{await request(`/v1/workshops/${id}/email-domains/${domain.id}`,{method:'DELETE',headers:{'idempotency-key':crypto.randomUUID()}});notice='Sender-domain disconnect queued. Your selected SMTP or relay transport is unchanged.';await load()}catch(cause){error=cause instanceof Error?cause.message:String(cause)}finally{busy=''} }
 	async function saveSmtp() {
 		busy='smtp'; error=''; notice='';
 		try {

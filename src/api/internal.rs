@@ -61,7 +61,9 @@ pub(super) async fn mail_delivery_event(
     let mut tx = state.store.begin().await?;
     let outbox = sqlx::query_as::<_, (Uuid, String)>(
         "select workshop_id,recipient from control.outbox
-          where id=$1 and provider_message_id=$2 and provider_domain_id=$3 and kind='odoo_transactional'
+          where id=$1 and kind='odoo_transactional'
+            and (provider_message_id is null or provider_message_id=$2)
+            and (provider_domain_id is null or provider_domain_id=$3)
           for update",
     )
     .bind(body.delivery_id)
@@ -112,12 +114,19 @@ pub(super) async fn mail_delivery_event(
         }
     }
     sqlx::query(
-        "update control.outbox set delivery_state=$2,last_event_at=$3
+        "update control.outbox
+            set delivery_state=$2,last_event_at=$3,
+                provider_message_id=coalesce(provider_message_id,$4),
+                provider_domain_id=coalesce(provider_domain_id,$5),
+                state=case when state='sending' then 'sent' else state end,
+                sent_at=case when state='sending' then coalesce(sent_at,now()) else sent_at end
           where id=$1 and (last_event_at is null or last_event_at <= $3)",
     )
     .bind(body.delivery_id)
     .bind(delivery_state)
     .bind(occurred_at)
+    .bind(body.email_id)
+    .bind(body.domain_id)
     .execute(&mut *tx)
     .await?;
     if body.event_type == "email_delivered" {

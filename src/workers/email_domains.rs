@@ -160,6 +160,34 @@ pub(crate) async fn run(
     Ok(())
 }
 
+pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
+    let Some(workshop) = operation.workshop_id else {
+        return;
+    };
+    let Some(id) = operation
+        .payload
+        .get("email_domain_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return;
+    };
+    if let Err(error) = sqlx::query(
+        "update control.webshop_email_domains
+            set state='action_required',last_error_class='reconciliation_failed',
+                last_health_checked_at=now(),updated_at=now(),version=version+1
+          where id=$1 and workshop_id=$2 and operation_id=$3 and state<>'disconnected'",
+    )
+    .bind(id)
+    .bind(workshop)
+    .bind(operation.id)
+    .execute(store.pool())
+    .await
+    {
+        tracing::error!(operation=%operation.id,error=%error,"could not mark webshop email domain reconciliation failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

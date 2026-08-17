@@ -32,18 +32,28 @@ pub(crate) async fn deliver(
     store: &Store,
     operation: &LeasedOperation,
 ) -> Result<(), IntegrationError> {
-    // A timed-out provider submission may have succeeded. Automatic replay
-    // could send a second live invitation capability, so reconciliation stays
-    // fenced until the delivery event or an operator resolves the outcome.
-    if operation.reconciling {
-        return Err(IntegrationError::UnknownOutcome);
-    }
     let outbox = operation
         .payload
         .get("outbox_id")
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
+    // A timed-out submission is reconciled by the authenticated provider event,
+    // which fills the provider identifiers and advances the outbox to `sent`.
+    // Until that evidence arrives, replay remains fenced to avoid duplicates.
+    if operation.reconciling {
+        let state = sqlx::query_scalar::<_, String>("select state from control.outbox where id=$1")
+            .bind(outbox)
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?
+            .ok_or(IntegrationError::NotFound)?;
+        return if matches!(state.as_str(), "sent" | "dead_letter") {
+            Ok(())
+        } else {
+            Err(IntegrationError::UnknownOutcome)
+        };
+    }
     // Validate the gateway before claiming the row. Broken secret mounts must
     // not strand durable mail in `sending`.
     let client = client(&required("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
@@ -168,7 +178,7 @@ pub(crate) async fn deliver(
     if claimed != 1 {
         return Ok(());
     }
-    let response = client
+    let response = match client
         .post(webhook_url)
         .json(&json!({
             "delivery_id":outbox,"to":recipient,"template":template,"data":data,
@@ -177,13 +187,22 @@ pub(crate) async fn deliver(
         }))
         .send()
         .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => {
+            // DNS, TCP and TLS connection failures happen before the gateway can
+            // accept the delivery. Put the row back into the selectable retry set.
+            sqlx::query(
+                "update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1 and state='sending'",
+            )
+            .bind(outbox)
+            .execute(store.pool())
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+            return Err(IntegrationError::Unavailable);
+        }
+        Err(_) => return Err(IntegrationError::UnknownOutcome),
+    };
     let status = response.status();
     if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
         return Err(IntegrationError::UnknownOutcome);

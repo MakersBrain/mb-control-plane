@@ -176,6 +176,11 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
                     {
                         crate::workers::domains::failed(&store, &operation).await;
                     }
+                    if operation.kind == "webshop-email-domain.reconcile"
+                        && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
+                    {
+                        crate::workers::email_domains::failed(&store, &operation).await;
+                    }
                     if operation.kind == "module.enable"
                         && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
                         && let (Some(workshop),Some(module_key))=(operation.workshop_id,operation.payload.get("module_key").and_then(Value::as_str))
@@ -210,7 +215,7 @@ async fn admit_webshop_email_domain_reconciliation(store: &Store) -> anyhow::Res
         .unwrap_or_default()
         .as_secs()
         / WEBSHOP_EMAIL_DOMAIN_RECONCILIATION_INTERVAL.as_secs();
-    let rows=sqlx::query_as::<_,(Uuid,Uuid)>("select id,workshop_id from control.webshop_email_domains d where desired_state='active' and state in ('registering','dns_pending','testing') and not exists(select 1 from control.operations o where o.id=d.operation_id and o.state in ('pending','in_flight','awaiting_reconciliation')) order by id limit 500").fetch_all(store.pool()).await?;
+    let rows=sqlx::query_as::<_,(Uuid,Uuid)>("select id,workshop_id from control.webshop_email_domains d where ((desired_state='active' and state in ('registering','dns_pending','testing')) or (desired_state='disconnected' and state in ('disconnecting','action_required'))) and not exists(select 1 from control.operations o where o.id=d.operation_id and o.state in ('pending','in_flight','awaiting_reconciliation')) order by id limit 500").fetch_all(store.pool()).await?;
     let mut admitted = 0;
     for (id, workshop) in rows {
         let mut tx = store.begin().await?;
@@ -228,7 +233,7 @@ async fn admit_webshop_email_domain_reconciliation(store: &Store) -> anyhow::Res
             },
         )
         .await?;
-        let changed=sqlx::query("update control.webshop_email_domains set operation_id=$2,updated_at=now(),version=version+1 where id=$1 and desired_state='active' and state in ('registering','dns_pending','testing')").bind(id).bind(operation).execute(&mut *tx).await?.rows_affected();
+        let changed=sqlx::query("update control.webshop_email_domains set operation_id=$2,updated_at=now(),version=version+1 where id=$1 and ((desired_state='active' and state in ('registering','dns_pending','testing')) or (desired_state='disconnected' and state in ('disconnecting','action_required')))").bind(id).bind(operation).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         admitted += usize::from(changed == 1);
     }
@@ -241,8 +246,10 @@ async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<us
         .unwrap_or_default()
         .as_secs()
         / WEBSHOP_DOMAIN_RECONCILIATION_INTERVAL.as_secs();
-    let domains = sqlx::query_as::<_, (Uuid, Uuid)>(
-        "select id,workshop_id from control.webshop_domains d
+    let domains = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
+        "select id,workshop_id,
+                desired_state='disconnected' and redirect_target is not null
+           from control.webshop_domains d
           where ((desired_state='active'
                   and state in ('dns_pending','certificate_pending','testing')
                   and ownership_verified_at is not null)
@@ -255,7 +262,7 @@ async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<us
     .fetch_all(store.pool())
     .await?;
     let mut admitted = 0;
-    for (domain_id, workshop) in domains {
+    for (domain_id, workshop, restore_platform_canonical) in domains {
         let mut tx = store.begin().await?;
         let operation_id = Store::enqueue(
             &mut tx,
@@ -264,7 +271,11 @@ async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<us
                 workshop_id: Some(workshop),
                 target_user_id: None,
                 desired_epoch: None,
-                payload: &json!({"domain_id":domain_id,"reason":"periodic_observation"}),
+                payload: &json!({
+                    "domain_id":domain_id,
+                    "reason":"periodic_observation",
+                    "restore_platform_canonical":restore_platform_canonical
+                }),
                 requested_by: None,
                 correlation_id: Uuid::new_v4(),
                 idempotency_key: &format!("periodic-domain:{domain_id}:{bucket}"),
@@ -1466,7 +1477,7 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
-        sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,state,desired_state,last_error_class,created_by) values($1,$2,$3,$4,$5,'shops.makersbrain.com','action_required','disconnected','reconciliation_failed',$6)")
+        sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,state,desired_state,last_error_class,redirect_target,created_by) values($1,$2,$3,$4,$5,'shops.makersbrain.com','action_required','disconnected','reconciliation_failed','platform.example.test',$6)")
             .bind(domain)
             .bind(workshop)
             .bind(format!("{}.example.test", domain.simple()))
@@ -1481,8 +1492,66 @@ mod tests {
             admit_webshop_domain_reconciliation(&store).await.unwrap(),
             1
         );
+        let admitted = sqlx::query_as::<_, (String, String, Value)>(
+            "select o.kind,o.state,o.payload from control.webshop_domains d
+               join control.operations o on o.id=d.operation_id where d.id=$1",
+        )
+        .bind(domain)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (admitted.0, admitted.1),
+            ("webshop-domain.reconcile".into(), "pending".into())
+        );
+        assert_eq!(
+            admitted
+                .2
+                .get("restore_platform_canonical")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn terminal_email_domain_disconnect_is_admitted_again() {
+        let url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for disposable PostgreSQL");
+        let store = Store::connect(&url).await.expect("connect test PostgreSQL");
+        store.migrate().await.expect("migrate test PostgreSQL");
+        let user = Uuid::new_v4();
+        let workshop = Uuid::new_v4();
+        let domain = Uuid::new_v4();
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(user)
+            .bind(format!("{user}@example.test"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Email disconnect retry fixture','Europe/Paris')")
+            .bind(workshop)
+            .bind(format!("email-disconnect-retry-{}", workshop.simple()))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("insert into control.webshop_email_domains(id,workshop_id,domain_name,state,desired_state,last_error_class,created_by) values($1,$2,$3,'action_required','disconnected','reconciliation_failed',$4)")
+            .bind(domain)
+            .bind(workshop)
+            .bind(format!("{}.example.test", domain.simple()))
+            .bind(user)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admit_webshop_email_domain_reconciliation(&store)
+                .await
+                .unwrap(),
+            1
+        );
         let admitted = sqlx::query_as::<_, (String, String)>(
-            "select o.kind,o.state from control.webshop_domains d
+            "select o.kind,o.state from control.webshop_email_domains d
                join control.operations o on o.id=d.operation_id where d.id=$1",
         )
         .bind(domain)
@@ -1491,7 +1560,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             admitted,
-            ("webshop-domain.reconcile".into(), "pending".into())
+            ("webshop-email-domain.reconcile".into(), "pending".into())
         );
     }
 

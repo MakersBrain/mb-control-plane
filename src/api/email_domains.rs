@@ -117,13 +117,55 @@ pub(super) async fn create(
     headers: HeaderMap,
     Path(workshop): Path<Uuid>,
     Json(body): Json<EmailDomainCreateBody>,
-) -> ApiResult<(StatusCode, Json<EmailDomainResponse>)> {
+) -> ApiResult<(StatusCode, Json<Value>)> {
     let who = principal(&state, &headers).await?;
     manager(&state, who.user_id, workshop).await?;
     let domain = domains::normalize_custom_hostname(&body.domain_name, &state.config.tenant_domain)
         .map_err(ApiError::Validation)?;
     let sender = local_part(&body.sender_local_part)?;
+    let client_key = idempotency(&headers)?;
+    let semantic = json!({"domain_name":domain,"sender_local_part":sender});
+    let scope = format!("workshop:{workshop}:webshop-email-domains");
     let mut tx = state.store.begin().await?;
+    let command_id = match admit_command(
+        &mut tx,
+        NewCommand {
+            actor_user_id: who.user_id,
+            scope: &scope,
+            command_kind: "webshop-email-domain.create",
+            idempotency_key: client_key,
+            semantic_request: &semantic,
+            expected_version: None,
+        },
+    )
+    .await
+    .map_err(command_error)?
+    {
+        CommandAdmission::New { command_id } => command_id,
+        CommandAdmission::Replay {
+            response_status,
+            response_body,
+            ..
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::from_u16(response_status).unwrap_or(StatusCode::ACCEPTED),
+                Json(response_body.unwrap_or_else(|| json!({"replayed":true}))),
+            ));
+        }
+        CommandAdmission::InProgress {
+            command_id,
+            operation_id,
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "command_id":command_id,"operation_id":operation_id,"in_progress":true
+                })),
+            ));
+        }
+    };
     let id = Uuid::new_v4();
     sqlx::query("insert into control.webshop_email_domains(id,workshop_id,domain_name,sender_local_part,created_by) values($1,$2,$3,$4,$5)").bind(id).bind(workshop).bind(domain).bind(sender).bind(who.user_id).execute(&mut *tx).await.map_err(|e|if e.as_database_error().is_some_and(|d|d.is_unique_violation()){ApiError::Conflict("This email domain is already claimed")}else{e.into()})?;
     let operation = Store::enqueue(
@@ -136,7 +178,7 @@ pub(super) async fn create(
             payload: &json!({"email_domain_id":id,"reason":"created"}),
             requested_by: Some(who.user_id),
             correlation_id: Uuid::new_v4(),
-            idempotency_key: &format!("email-domain-create:{id}"),
+            idempotency_key: &format!("command:{command_id}"),
         },
     )
     .await?;
@@ -149,8 +191,32 @@ pub(super) async fn create(
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
+    let public = serde_json::to_value(response(row, true))
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    audit_command(
+        &mut tx,
+        (Some(who.user_id), Some(workshop)),
+        "webshop-email-domain.create",
+        "webshop-email-domain",
+        id.to_string(),
+        Uuid::new_v4(),
+        command_id,
+    )
+    .await?;
+    complete_command(
+        &mut tx,
+        command_id,
+        CommandResult {
+            operation_id: Some(operation),
+            response_status: StatusCode::ACCEPTED.as_u16(),
+            response_body: Some(&public),
+            result_ref: None,
+        },
+    )
+    .await
+    .map_err(command_error)?;
     tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(response(row, true))))
+    Ok((StatusCode::ACCEPTED, Json(public)))
 }
 
 pub(super) async fn check(
@@ -160,7 +226,17 @@ pub(super) async fn check(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let who = principal(&state, &headers).await?;
     manager(&state, who.user_id, workshop).await?;
-    queue(&state, workshop, id, who.user_id, "manual-check", false).await
+    let client_key = idempotency(&headers)?;
+    queue(
+        &state,
+        workshop,
+        id,
+        who.user_id,
+        "manual-check",
+        false,
+        client_key,
+    )
+    .await
 }
 pub(super) async fn disconnect(
     State(state): State<Arc<AppState>>,
@@ -169,7 +245,17 @@ pub(super) async fn disconnect(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let who = principal(&state, &headers).await?;
     manager(&state, who.user_id, workshop).await?;
-    queue(&state, workshop, id, who.user_id, "disconnect", true).await
+    let client_key = idempotency(&headers)?;
+    queue(
+        &state,
+        workshop,
+        id,
+        who.user_id,
+        "disconnect",
+        true,
+        client_key,
+    )
+    .await
 }
 
 async fn queue(
@@ -179,9 +265,56 @@ async fn queue(
     user: Uuid,
     reason: &str,
     disconnect: bool,
+    client_key: &str,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let mut tx = state.store.begin().await?;
-    let current=sqlx::query_scalar::<_,i64>("select version from control.webshop_email_domains where id=$1 and workshop_id=$2 and state<>'disconnected' for update").bind(id).bind(workshop).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
+    let semantic = json!({"email_domain_id":id,"reason":reason});
+    let scope = format!("workshop:{workshop}:webshop-email-domain:{id}");
+    let command_kind = if disconnect {
+        "webshop-email-domain.disconnect"
+    } else {
+        "webshop-email-domain.check"
+    };
+    let command_id = match admit_command(
+        &mut tx,
+        NewCommand {
+            actor_user_id: user,
+            scope: &scope,
+            command_kind,
+            idempotency_key: client_key,
+            semantic_request: &semantic,
+            expected_version: None,
+        },
+    )
+    .await
+    .map_err(command_error)?
+    {
+        CommandAdmission::New { command_id } => command_id,
+        CommandAdmission::Replay {
+            response_status,
+            response_body,
+            ..
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::from_u16(response_status).unwrap_or(StatusCode::ACCEPTED),
+                Json(response_body.unwrap_or_else(|| json!({"replayed":true}))),
+            ));
+        }
+        CommandAdmission::InProgress {
+            command_id,
+            operation_id,
+        } => {
+            tx.commit().await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "command_id":command_id,"operation_id":operation_id,"in_progress":true
+                })),
+            ));
+        }
+    };
+    sqlx::query_scalar::<_, i64>("select version from control.webshop_email_domains where id=$1 and workshop_id=$2 and state<>'disconnected' for update").bind(id).bind(workshop).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
     let operation = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -192,16 +325,36 @@ async fn queue(
             payload: &json!({"email_domain_id":id,"reason":reason}),
             requested_by: Some(user),
             correlation_id: Uuid::new_v4(),
-            idempotency_key: &format!("email-domain:{id}:{reason}:{current}"),
+            idempotency_key: &format!("command:{command_id}"),
         },
     )
     .await?;
     sqlx::query("update control.webshop_email_domains set operation_id=$2,desired_state=case when $3 then 'disconnected' else desired_state end,state=case when $3 then 'disconnecting' else state end,updated_at=now(),version=version+1 where id=$1").bind(id).bind(operation).bind(disconnect).execute(&mut *tx).await?;
+    let public = json!({"command_id":command_id,"operation_id":operation});
+    audit_command(
+        &mut tx,
+        (Some(user), Some(workshop)),
+        command_kind,
+        "webshop-email-domain",
+        id.to_string(),
+        Uuid::new_v4(),
+        command_id,
+    )
+    .await?;
+    complete_command(
+        &mut tx,
+        command_id,
+        CommandResult {
+            operation_id: Some(operation),
+            response_status: StatusCode::ACCEPTED.as_u16(),
+            response_body: Some(&public),
+            result_ref: None,
+        },
+    )
+    .await
+    .map_err(command_error)?;
     tx.commit().await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({"operation_id":operation})),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(public)))
 }
 
 #[cfg(test)]

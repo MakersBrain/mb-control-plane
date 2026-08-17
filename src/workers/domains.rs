@@ -173,6 +173,7 @@ pub(crate) async fn run(
             "update control.webshop_domains
                 set state='disconnected',disconnected_at=now(),provider_ref=null,
                     certificate_state='pending',edge_verification_records='[]'::jsonb,
+                    redirect_target=null,
                     last_error_class=null,last_health_checked_at=now(),updated_at=now(),version=version+1
               where id=$1 and workshop_id=$2 and operation_id=$3 and desired_state='disconnected'",
         )

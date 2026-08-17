@@ -390,23 +390,7 @@ pub(super) async fn verify(
     let who = principal(&state, &headers).await?;
     require_webshop_manager(&state, who.user_id, workshop).await?;
     let client_key = idempotency(&headers)?;
-    let existing = sqlx::query_as::<_, DomainRow>(
-        "select id,hostname,state,desired_state,dns_state,certificate_state,
-                verification_name,verification_value,routing_target,ownership_verified_at,
-                last_health_checked_at,last_error_class,canonical,redirect_target,
-                edge_verification_records,operation_id,version
-           from control.webshop_domains
-          where id=$1 and workshop_id=$2 and desired_state='active'
-            and state in ('ownership_pending','action_required')",
-    )
-    .bind(domain_id)
-    .bind(workshop)
-    .fetch_optional(state.store.pool())
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    let present =
-        ownership_txt_present(&existing.verification_name, &existing.verification_value).await?;
-    let semantic = json!({"domain_id":domain_id,"verification_value":existing.verification_value,"observed":present});
+    let semantic = json!({"domain_id":domain_id});
     let scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
     let mut tx = state.store.begin().await?;
     let command_id = match admit_command(
@@ -443,6 +427,22 @@ pub(super) async fn verify(
             ));
         }
     };
+    let existing = sqlx::query_as::<_, DomainRow>(
+        "select id,hostname,state,desired_state,dns_state,certificate_state,
+                verification_name,verification_value,routing_target,ownership_verified_at,
+                last_health_checked_at,last_error_class,canonical,redirect_target,
+                edge_verification_records,operation_id,version
+           from control.webshop_domains
+          where id=$1 and workshop_id=$2 and desired_state='active'
+            and state in ('ownership_pending','action_required')",
+    )
+    .bind(domain_id)
+    .bind(workshop)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let present =
+        ownership_txt_present(&existing.verification_name, &existing.verification_value).await?;
     sqlx::query(
         "update control.webshop_domains
             set state=case when $3 then 'dns_pending' else 'ownership_pending' end,
@@ -754,13 +754,16 @@ pub(super) async fn disconnect(
     sqlx::query(
         "update control.webshop_domains
             set state='disconnecting',desired_state='disconnected',canonical=false,
-                redirect_target=null,operation_id=$3,last_error_class=null,
+                redirect_target=case when $4 then $5 else null end,
+                operation_id=$3,last_error_class=null,
                 updated_at=now(),version=version+1
           where id=$1 and workshop_id=$2",
     )
     .bind(domain_id)
     .bind(workshop)
     .bind(operation_id)
+    .bind(was_canonical)
+    .bind(&platform_hostname)
     .execute(&mut *tx)
     .await?;
     if was_canonical {
