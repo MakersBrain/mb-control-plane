@@ -49,6 +49,17 @@ impl Config {
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
+        // The metrics credential exists so that Prometheus, which holds it on
+        // disk in its own container, cannot call the internal API. Reusing the
+        // internal token here would hand it exactly that, silently.
+        let internal_token = required("CONTROL_INTERNAL_TOKEN")?;
+        let metrics_token = required("CONTROL_METRICS_TOKEN")?;
+        distinct_secret(
+            "CONTROL_METRICS_TOKEN",
+            &metrics_token,
+            "CONTROL_INTERNAL_TOKEN",
+            &internal_token,
+        )?;
         Ok(Self {
             listen: required("CONTROL_LISTEN")?
                 .parse()
@@ -64,8 +75,8 @@ impl Config {
             oidc_discovery_url: absolute_url("CONTROL_OIDC_DISCOVERY_URL")?,
             tenant_domain: tenant_domain()?,
             tenant_public_port: optional_port("CONTROL_TENANT_PUBLIC_PORT")?,
-            internal_token: required("CONTROL_INTERNAL_TOKEN")?,
-            metrics_token: required("CONTROL_METRICS_TOKEN")?,
+            internal_token,
+            metrics_token,
             mail_event_token: required("CONTROL_MAIL_EVENT_TOKEN")?,
             release_publish_token: required("CONTROL_RELEASE_PUBLISH_TOKEN")?,
             invitation_verification_keys_file: PathBuf::from(required(
@@ -96,6 +107,21 @@ impl Config {
             .flatten();
         tenant_origin(self.public_origin.scheme(), port, hostname)
     }
+}
+
+fn distinct_secret(
+    name: &'static str,
+    value: &str,
+    other_name: &str,
+    other: &str,
+) -> Result<(), ConfigError> {
+    if value == other {
+        return Err(ConfigError::Invalid {
+            name,
+            reason: format!("must differ from {other_name}"),
+        });
+    }
+    Ok(())
 }
 
 fn optional_port(name: &'static str) -> Result<Option<u16>, ConfigError> {
@@ -250,6 +276,35 @@ fn trusted_origin(name: &'static str) -> Result<Url, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_metrics_credential_may_not_be_the_internal_token() {
+        // Prometheus keeps this one on disk in its own container; if it were the
+        // internal token, that container would hold the internal API.
+        let error = distinct_secret(
+            "CONTROL_METRICS_TOKEN",
+            "same-value",
+            "CONTROL_INTERNAL_TOKEN",
+            "same-value",
+        )
+        .expect_err("identical tokens must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::Invalid {
+                name: "CONTROL_METRICS_TOKEN",
+                ..
+            }
+        ));
+        assert!(
+            distinct_secret(
+                "CONTROL_METRICS_TOKEN",
+                "metrics-value",
+                "CONTROL_INTERNAL_TOKEN",
+                "internal-value",
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn tenant_origins_use_the_public_scheme_and_optional_edge_port() {

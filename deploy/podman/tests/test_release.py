@@ -310,6 +310,39 @@ class ReleaseTests(unittest.TestCase):
                 RELEASE.start_staged("control-2026.08.15-ffffffffffffffff", root / "state", quadlets)
 
     @mock.patch.object(RELEASE, "run")
+    def test_start_staged_rejects_a_bundle_that_no_longer_matches(self, run):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            (rendered / "makersbrain.network").write_text("[Network]\n")
+            RELEASE.stage(rendered, RECORD["release_id"], root / "state")
+            quadlets = root / "quadlets"
+            quadlets.mkdir()
+            RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets, rendered)
+
+            # The values moved but the release id did not, so what was verified
+            # and what would be activated are two different bundles.
+            (rendered / "makersbrain.network").write_text("[Network]\nLabel=changed\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets, rendered)
+
+    def test_secret_files_may_end_with_a_newline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_root = Path(temporary) / "config"
+            config_root.mkdir()
+            self.write_observability_secrets(config_root)
+            alertmanager = config_root / "secrets/alertmanager"
+            control = config_root / "secrets/control-api"
+            (control / "control_metrics_token").write_text("m" * 48 + "\n", encoding="utf-8")
+            (alertmanager / "webhook-url").write_text(
+                "https://alerts.example.test/makersbrain\n", encoding="utf-8"
+            )
+            (alertmanager / "webhook-token").write_text("a" * 48 + "\n", encoding="utf-8")
+
+            RELEASE.verify_observability_secrets(config_root)
+
+    @mock.patch.object(RELEASE, "run")
     def test_failed_staged_start_restores_previous_release(self, run):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

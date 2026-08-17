@@ -81,6 +81,23 @@ class MaterializeTests(unittest.TestCase):
             )
             self.assertEqual(stat.S_IMODE(current.resolve().stat().st_mode), 0o700)
 
+    def test_refuses_the_old_layout_before_installing_anything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.prepare(root)
+            # The first run on a host still carrying the pre-generation layout,
+            # where the link path is a real directory of rendered .env files.
+            legacy = root / "current"
+            legacy.mkdir()
+            (legacy / "control-api.env").write_text("CONTROL_LISTEN=0.0.0.0:8080\n", encoding="utf-8")
+
+            result = self.run_tool(root, self.write_manifest(root))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not a generation symlink", result.stderr)
+            self.assertFalse((root / "generations/release-1").exists())
+            self.assertTrue((legacy / "control-api.env").is_file())
+
     def test_check_does_not_create_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

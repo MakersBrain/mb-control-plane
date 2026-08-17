@@ -151,7 +151,12 @@ passed for the candidate release.
 Before the drill, confirm `prometheus.service` and `alertmanager.service` are
 the digest-pinned units in the candidate image map and that neither publishes a
 host port. Exercise the application rule by stopping the API process, then
-restore it. Exercise the database rule by fencing or stopping the staging DB
+restore it; confirm as part of that step that `prometheus.service` stays running
+while the API is down, since a monitoring unit that stops with its target
+records a false pass. Confirm the receiver is still receiving
+`MakersBrainMonitoringHeartbeat` on its five-minute cadence, and that a gap in it
+raises an out-of-band alert on the receiver side: that gap is the only signal
+available when Alertmanager itself is the component that failed. Exercise the database rule by fencing or stopping the staging DB
 while leaving the API process running, then restore connectivity. Exercise the
 backup rule by stopping the staging backup scheduler only after a verified
 synthetic recovery point exists and allowing the normal 26-hour freshness

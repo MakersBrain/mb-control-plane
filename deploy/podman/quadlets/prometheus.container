@@ -1,6 +1,9 @@
 [Unit]
 Description=MakersBrain private Prometheus
-Requires=control-api.container alertmanager.container
+# Deliberately Wants=, not Requires=: systemd propagates a stop to units that
+# require a stopped unit, so requiring the API would take the monitoring down
+# with it — exactly when the availability alert is supposed to fire.
+Wants=control-api.container alertmanager.container
 After=control-api.container alertmanager.container
 
 [Container]

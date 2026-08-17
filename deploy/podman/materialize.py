@@ -207,6 +207,15 @@ def install_generation(
     destination = generation_root / generation
     if destination.exists() or destination.is_symlink():
         fail(f"generation already exists: {generation}")
+    # Refuse before installing anything, not at the cutover. The first run on a
+    # host still carrying the old layout finds a real directory where the
+    # generation symlink belongs; discovering that after the generation is in
+    # place leaves it installed but unreferenced, with no way back but by hand.
+    if current_link.exists() and not current_link.is_symlink():
+        fail(
+            f"{current_link} is a {'directory' if current_link.is_dir() else 'file'}, "
+            "not a generation symlink: move the old layout aside before materializing"
+        )
     temporary = Path(tempfile.mkdtemp(prefix=f".{generation}.", dir=generation_root))
     os.chmod(temporary, 0o700)
     os.chown(temporary, uid, gid)
@@ -251,6 +260,11 @@ def install_generation(
     except Exception:
         if temporary.exists():
             shutil.rmtree(temporary)
+        # The staging tree is gone by cutover time, so clean up the half-written
+        # link too rather than leaving a stray .tmp symlink behind.
+        link_temporary = current_link.with_name(f".{current_link.name}.{os.getpid()}.tmp")
+        if link_temporary.is_symlink() or link_temporary.exists():
+            link_temporary.unlink()
         raise
 
 

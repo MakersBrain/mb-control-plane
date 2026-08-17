@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -174,9 +175,14 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
         )
     if tunnel_token.stat().st_mode & 0o077:
         raise ValueError("Cloudflare Tunnel token must not be accessible by group or others")
+    verify_observability_secrets(config_root)
+
+
+def verify_observability_secrets(config_root: Path) -> None:
+    """Check the credentials Prometheus and Alertmanager read off disk."""
     metrics_token = config_root / "secrets/control-api/control_metrics_token"
     protected_path(metrics_token, directory=False)
-    metrics_value = metrics_token.read_text(encoding="utf-8")
+    metrics_value = read_secret_line(metrics_token)
     if not 32 <= len(metrics_value) <= 512 or any(
         character in metrics_value for character in "\r\n\0"
     ):
@@ -185,8 +191,8 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
     webhook_token = config_root / "secrets/alertmanager/webhook-token"
     protected_path(webhook_url, directory=False)
     protected_path(webhook_token, directory=False)
-    url_value = webhook_url.read_text(encoding="utf-8")
-    token_value = webhook_token.read_text(encoding="utf-8")
+    url_value = read_secret_line(webhook_url)
+    token_value = read_secret_line(webhook_token)
     if (
         not url_value.startswith("https://")
         or len(url_value) > 2048
@@ -197,6 +203,20 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
         character in token_value for character in "\r\n\0"
     ):
         raise ValueError("Alertmanager webhook token must be a bounded single-line secret")
+
+
+def read_secret_line(path: Path) -> str:
+    """Read a one-line secret, tolerating the trailing newline files normally carry.
+
+    Prometheus and Alertmanager trim it when they read these files, so rejecting
+    it here would block a deployment that works.
+    """
+    value = path.read_text(encoding="utf-8")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if value.endswith("\r"):
+        value = value[:-1]
+    return value
 
 
 def protected_path(path: Path, *, directory: bool, public: bool = False) -> None:
@@ -341,15 +361,35 @@ def stage(
         path.chmod(0o755 if path.is_dir() else 0o644)
 
 
+def tree_digest(root: Path) -> str:
+    """Content digest of a rendered or staged bundle, over relative paths and bytes."""
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def start_staged(
     release_id: str,
     state_root: Path,
     quadlet_root: Path | None = None,
+    rendered: Path | None = None,
 ) -> None:
     quadlet_root = quadlet_root or Path.home() / ".config/containers/systemd"
     release_root = state_root / "releases" / release_id
     if not release_root.is_dir():
         raise ValueError("requested release has not been staged")
+    # Everything verified above was rendered fresh from --values; what gets
+    # activated is whatever was staged earlier. If the values moved while the
+    # release id did not, those are two different bundles.
+    if rendered is not None and tree_digest(rendered) != tree_digest(release_root):
+        raise ValueError(
+            "staged release does not match the bundle rendered from --values: "
+            "re-stage under a new release id"
+        )
     quadlet_root.mkdir(parents=True, exist_ok=True, mode=0o750)
     current = quadlet_root / "makersbrain"
     previous = os.readlink(current) if current.is_symlink() else None
@@ -376,7 +416,7 @@ def activate(
     quadlet_root: Path | None = None,
 ) -> None:
     stage(rendered, release_id, state_root)
-    start_staged(release_id, state_root, quadlet_root)
+    start_staged(release_id, state_root, quadlet_root, rendered)
 
 
 def main() -> None:
@@ -419,7 +459,7 @@ def main() -> None:
         elif args.stage_only:
             stage(rendered, record["release_id"], args.state_root)
         elif args.start_staged:
-            start_staged(record["release_id"], args.state_root, args.quadlet_root)
+            start_staged(record["release_id"], args.state_root, args.quadlet_root, rendered)
         else:
             print("release signatures, images, record and Quadlets are valid")
 

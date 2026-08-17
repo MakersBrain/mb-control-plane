@@ -386,6 +386,9 @@ services:
       DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/makersbrain-odoo-client-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
       DRIVER_RUNTIME_SECRET_SOURCE: makersbrain-control-backup-secrets
+      # Development has no recovery secrets: S3 backups are unconfigured here, so
+      # nothing ever binds this path. Point it at the real host directory holding
+      # the age identity before enabling BACKUP_S3_BUCKET on this stack.
       DRIVER_RECOVERY_SECRET_SOURCE: /var/empty/makersbrain-recovery-secrets
       DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes

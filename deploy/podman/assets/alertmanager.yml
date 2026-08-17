@@ -4,6 +4,14 @@ route:
   group_wait: 15s
   group_interval: 2m
   repeat_interval: 4h
+  routes:
+    # The heartbeat has to arrive on a predictable cadence for its absence to
+    # mean anything, so it is not batched or backed off like a real alert.
+    - matchers: [severity="heartbeat"]
+      receiver: operator-webhook
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 5m
 
 receivers:
   - name: operator-webhook

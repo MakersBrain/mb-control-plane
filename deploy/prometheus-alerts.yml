@@ -15,6 +15,19 @@ groups:
         annotations:
           summary: "The control database path is unavailable while the API process is live"
           runbook_url: "docs/runbooks/failed-restore.md"
+      # Always firing, on purpose. It is the only signal that survives the
+      # monitoring stack itself failing: the receiver treats a gap in these
+      # heartbeats as an outage, because nothing else can report one.
+      - alert: MakersBrainMonitoringHeartbeat
+        expr: vector(1)
+        labels: {severity: heartbeat}
+        annotations:
+          summary: "Monitoring is alive; alert on the absence of this signal"
+          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
+      # Useful in the Prometheus console and for post-hoc analysis, but it
+      # cannot page anyone: its only delivery path is the Alertmanager it is
+      # reporting as unreachable. The heartbeat above is what actually catches
+      # this case.
       - alert: MakersBrainAlertmanagerUnavailable
         expr: up{job="alertmanager"} == 0
         for: 2m
