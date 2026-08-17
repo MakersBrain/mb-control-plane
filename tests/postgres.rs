@@ -74,6 +74,198 @@ async fn carrier_secret_metadata_is_tenant_carrier_and_environment_scoped() {
 
 #[tokio::test]
 #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn webshop_domain_registry_enforces_global_claim_and_active_evidence() {
+    let store = store().await;
+    let user = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    sqlx::query("insert into control.users(id,email) values($1,$2)")
+        .bind(user)
+        .bind(format!("{user}@example.test"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    for workshop in [first, second] {
+        sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Domain fixture','Europe/Paris')")
+            .bind(workshop).bind(format!("domain-{}",workshop.simple()))
+            .execute(store.pool()).await.unwrap();
+    }
+    let domain = Uuid::new_v4();
+    sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_makersbrain-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
+        .bind(domain).bind(first)
+        .bind("makersbrain-verification=0123456789abcdefghijklmnopqrstuv")
+        .bind(user).execute(store.pool()).await.unwrap();
+    let stolen = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_makersbrain-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
+        .bind(Uuid::new_v4()).bind(second)
+        .bind("makersbrain-verification=abcdefghijklmnopqrstuvwxyz012345")
+        .bind(user).execute(store.pool()).await;
+    assert!(
+        stolen.is_err(),
+        "a hostname cannot be claimed by two tenants"
+    );
+    let premature = sqlx::query("update control.webshop_domains set state='active' where id=$1")
+        .bind(domain)
+        .execute(store.pool())
+        .await;
+    assert!(
+        premature.is_err(),
+        "an active route requires ownership, DNS, TLS and provider evidence"
+    );
+    sqlx::query("update control.webshop_domains set state='active',dns_state='verified',certificate_state='active',ownership_verified_at=now(),provider_ref='cloudflare:test' where id=$1")
+        .bind(domain).execute(store.pool()).await.unwrap();
+    let duplicate_canonical = Uuid::new_v4();
+    sqlx::query("update control.webshop_domains set canonical=true where id=$1")
+        .bind(domain)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let result = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by,canonical) values($1,$2,'shop.atelier-luna.fr','_makersbrain-challenge.shop.atelier-luna.fr',$3,'shops.makersbrain.com',$4,true)")
+        .bind(duplicate_canonical).bind(first)
+        .bind("makersbrain-verification=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+        .bind(user).execute(store.pool()).await;
+    assert!(
+        result.is_err(),
+        "only one connected custom hostname can be canonical"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn webshop_transactional_outbox_is_tenant_scoped_and_idempotent() {
+    let store = store().await;
+    let workshop = Uuid::new_v4();
+    sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Mail fixture','Europe/Paris')")
+        .bind(workshop)
+        .bind(format!("mail-{}", workshop.simple()))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let payload = json!({
+        "content":{"subject":"Order confirmed","text":"Confirmed","html":"<p>Confirmed</p>"},
+        "sender_name":"Atelier via MakersBrain",
+        "reply_to":"studio@example.fr",
+        "model":"sale.order",
+        "attachments":[]
+    });
+    let source_key = format!("odoo:42:0:{}", Uuid::new_v4().simple());
+    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional','customer@example.fr','odoo-rendered-v1',$2,$3,$4)")
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .bind(workshop)
+        .bind(&source_key)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let duplicate = sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional','customer@example.fr','odoo-rendered-v1',$2,$3,$4)")
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .bind(workshop)
+        .bind(&source_key)
+        .execute(store.pool())
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "one durable row is allowed per Odoo source key"
+    );
+    let unscoped = sqlx::query("insert into control.outbox(id,kind,recipient,template,payload) values($1,'odoo_transactional','customer@example.fr','odoo-rendered-v1',$2)")
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .execute(store.pool())
+        .await;
+    assert!(
+        unscoped.is_err(),
+        "transactional mail must belong to one workshop"
+    );
+    let wrong_template = sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional','customer@example.fr','workshop-invitation',$2,$3,$4)")
+        .bind(Uuid::new_v4())
+        .bind(&payload)
+        .bind(workshop)
+        .bind(format!("odoo:43:0:{}", Uuid::new_v4().simple()))
+        .execute(store.pool())
+        .await;
+    assert!(
+        wrong_template.is_err(),
+        "rendered Odoo mail cannot select another template"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn branded_email_domain_requires_dns_and_delivered_test_evidence() {
+    let store = store().await;
+    let user = Uuid::new_v4();
+    let workshop = Uuid::new_v4();
+    sqlx::query("insert into control.users(id,email) values($1,$2)")
+        .bind(user)
+        .bind(format!("{user}@example.test"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Email domain fixture','Europe/Paris')").bind(workshop).bind(format!("mail-{}",workshop.simple())).execute(store.pool()).await.unwrap();
+    let id = Uuid::new_v4();
+    sqlx::query("insert into control.webshop_email_domains(id,workshop_id,domain_name,created_by) values($1,$2,'mail.atelier-luna.fr',$3)").bind(id).bind(workshop).bind(user).execute(store.pool()).await.unwrap();
+    let premature=sqlx::query("update control.webshop_email_domains set state='active',provider_ref=$2,provider_status='checked' where id=$1").bind(id).bind(Uuid::new_v4()).execute(store.pool()).await;
+    assert!(
+        premature.is_err(),
+        "provider status alone cannot activate branded sending"
+    );
+    let duplicate=sqlx::query("insert into control.webshop_email_domains(id,workshop_id,domain_name,created_by) values($1,$2,'mail.atelier-luna.fr',$3)").bind(Uuid::new_v4()).bind(workshop).bind(user).execute(store.pool()).await;
+    assert!(duplicate.is_err(), "an email domain has one global owner");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+async fn webshop_onboarding_persists_progress_and_requires_completion_evidence() {
+    let store = store().await;
+    let workshop = Uuid::new_v4();
+    sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Onboarding fixture','Europe/Paris')")
+        .bind(workshop)
+        .bind(format!("onboarding-{}", workshop.simple()))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("insert into control.webshop_onboarding(workshop_id,state,observation,odoo_issues,started_at,last_checked_at,version) values($1,'ready',$2,'[]',now(),now(),2)")
+        .bind(workshop)
+        .bind(json!({"launch_ready":true,"catalog":true}))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let premature =
+        sqlx::query("update control.webshop_onboarding set state='completed' where workshop_id=$1")
+            .bind(workshop)
+            .execute(store.pool())
+            .await;
+    assert!(
+        premature.is_err(),
+        "completed state requires a durable completion timestamp"
+    );
+    sqlx::query("update control.webshop_onboarding set state='completed',completed_at=now(),version=version+1 where workshop_id=$1")
+        .bind(workshop)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let persisted = sqlx::query_as::<_, (String, i64, bool)>(
+        "select state,version,(observation->>'launch_ready')::boolean from control.webshop_onboarding where workshop_id=$1",
+    )
+    .bind(workshop)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(persisted, ("completed".into(), 3, true));
+
+    let operation = Uuid::new_v4();
+    sqlx::query("insert into control.operations(id,kind,queue,workshop_id,payload,correlation_id,idempotency_key) values($1,'webshop-onboarding.reconcile','tenant-reconciliation',$2,'{}',$3,$4)")
+        .bind(operation)
+        .bind(workshop)
+        .bind(Uuid::new_v4())
+        .bind(format!("onboarding:{workshop}"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
 async fn database_enforces_last_owner_and_non_owner_invitations() {
     let store = store().await;
     let user = Uuid::new_v4();

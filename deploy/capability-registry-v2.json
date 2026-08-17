@@ -10,7 +10,7 @@
     {"key":"labels","dependencies":[],"odoo_modules":["mb_label","mb_label_pos"]},
     {"key":"depot","dependencies":[],"odoo_modules":["mb_depot"]},
     {"key":"sumup","dependencies":[],"odoo_modules":["mb_payment_sumup","mb_account_payment_sumup","mb_pos_sumup"]},
-    {"key":"webshop","dependencies":[],"odoo_modules":["mb_webshop"]},
+    {"key":"webshop","dependencies":[],"odoo_modules":["mb_webshop","mb_email_bridge"]},
     {"key":"shop-catalogue-import","dependencies":[],"odoo_modules":["mb_shop_import"]},
     {"key":"shipping-boxtal","dependencies":["webshop"],"odoo_modules":["mb_webshop_carrier_base","mb_webshop_carrier_boxtal"]},
     {"key":"inventory-capture","dependencies":[],"odoo_modules":["mb_inventory_capture"]},

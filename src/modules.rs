@@ -114,7 +114,7 @@ pub const CATALOG: &[ModuleBundle] = &[
         key: "webshop",
         name: "Artisan webshop",
         description: "Publish a craft storefront with native theme editing, stock-aware checkout, delivery and collection.",
-        odoo_modules: &["mb_webshop"],
+        odoo_modules: &["mb_webshop", "mb_email_bridge"],
         dependencies: &[],
         service: None,
         minimum_release: "0.1.0",
@@ -229,7 +229,10 @@ mod tests {
             bundle("kiln-connectivity").unwrap().dependencies,
             &["firings"]
         );
-        assert_eq!(bundle("webshop").unwrap().odoo_modules, &["mb_webshop"]);
+        assert_eq!(
+            bundle("webshop").unwrap().odoo_modules,
+            &["mb_webshop", "mb_email_bridge"]
+        );
         assert_eq!(
             bundle("shop-catalogue-import").unwrap().odoo_modules,
             &["mb_shop_import"]

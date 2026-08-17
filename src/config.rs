@@ -26,6 +26,7 @@ pub struct Config {
     pub tenant_domain: String,
     tenant_public_port: Option<u16>,
     pub internal_token: String,
+    pub mail_event_token: String,
     pub release_publish_token: String,
     pub invitation_verification_keys_file: PathBuf,
     pub invitation_signing_key_id: String,
@@ -63,6 +64,7 @@ impl Config {
             tenant_domain: tenant_domain()?,
             tenant_public_port: optional_port("CONTROL_TENANT_PUBLIC_PORT")?,
             internal_token: required("CONTROL_INTERNAL_TOKEN")?,
+            mail_event_token: required("CONTROL_MAIL_EVENT_TOKEN")?,
             release_publish_token: required("CONTROL_RELEASE_PUBLISH_TOKEN")?,
             invitation_verification_keys_file: PathBuf::from(required(
                 "CONTROL_INVITATION_VERIFICATION_KEYS_FILE",

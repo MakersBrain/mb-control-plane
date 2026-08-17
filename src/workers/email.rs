@@ -44,16 +44,8 @@ pub(crate) async fn deliver(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
-    // Validate local delivery configuration before claiming the row. A broken
-    // key mount or webhook setting must not strand mail in `sending`.
-    let signer = InvitationSigner::from_json_file(
-        required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
-        std::path::Path::new(&required("CONTROL_INVITATION_SIGNING_KEYS_FILE")?),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
-    let mut invitation_origin = url::Url::parse(&required("CONTROL_PUBLIC_ORIGIN")?)
-        .and_then(|origin| origin.join("invitations/accept"))
-        .map_err(|_| IntegrationError::ContractDrift)?;
+    // Validate the gateway before claiming the row. Broken secret mounts must
+    // not strand durable mail in `sending`.
     let client = client(&required("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
     let webhook_url = required("CONTROL_MAIL_WEBHOOK_URL")?;
     let row = sqlx::query_as::<
@@ -68,11 +60,19 @@ pub(crate) async fn deliver(
             Option<time::OffsetDateTime>,
             Option<time::OffsetDateTime>,
             Option<String>,
+            Option<String>,
+            Option<Uuid>,
         ),
     >(
         "select o.kind,o.recipient,o.template,o.payload,o.invitation_id,
-           o.token_generation,o.capability_issued_at,o.capability_expires_at,o.signing_key_id
+           o.token_generation,o.capability_issued_at,o.capability_expires_at,o.signing_key_id,
+           case when ed.provider_status='checked' then ed.sender_local_part||'@'||ed.domain_name end,
+           case when ed.provider_status='checked' then ed.provider_ref end
          from control.outbox o
+         left join lateral (select d.* from control.webshop_email_domains d
+             where d.workshop_id=o.workshop_id and d.desired_state='active'
+               and (d.state='active' or d.test_outbox_id=o.id)
+             order by (d.test_outbox_id=o.id) desc,d.updated_at desc limit 1) ed on true
          where o.id=$1 and o.state in('queued','deferred')
            and (o.kind<>'invitation' or exists (
              select 1 from control.invitations i
@@ -94,13 +94,23 @@ pub(crate) async fn deliver(
         issued,
         expires,
         key_id,
+        sender_email,
+        sender_domain_id,
     )) = row
     else {
         sqlx::query("update control.outbox set state='dead_letter' where id=$1 and kind='invitation' and state in ('queued','deferred')")
             .bind(outbox).execute(store.pool()).await.map_err(|_| IntegrationError::Unavailable)?;
         return Ok(());
     };
-    if kind == "invitation" {
+    let (sender_name, reply_to, attachments) = if kind == "invitation" {
+        let signer = InvitationSigner::from_json_file(
+            required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
+            std::path::Path::new(&required("CONTROL_INVITATION_SIGNING_KEYS_FILE")?),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?;
+        let mut invitation_origin = url::Url::parse(&required("CONTROL_PUBLIC_ORIGIN")?)
+            .and_then(|origin| origin.join("invitations/accept"))
+            .map_err(|_| IntegrationError::ContractDrift)?;
         let token = signer
             .sign_with_key_id(
                 &key_id.ok_or(IntegrationError::ContractDrift)?,
@@ -117,7 +127,30 @@ pub(crate) async fn deliver(
                 "accept_url".into(),
                 Value::String(invitation_origin.to_string()),
             );
-    }
+        (None, None, json!([]))
+    } else if kind == "odoo_transactional" {
+        let object = data.as_object().ok_or(IntegrationError::ContractDrift)?;
+        let content = object
+            .get("content")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        let sender_name = object
+            .get("sender_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let reply_to = object
+            .get("reply_to")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let attachments = object
+            .get("attachments")
+            .cloned()
+            .ok_or(IntegrationError::ContractDrift)?;
+        data = content;
+        (sender_name, reply_to, attachments)
+    } else {
+        return Err(IntegrationError::ContractDrift);
+    };
     let claimed = sqlx::query(
         "update control.outbox o set state='sending',attempts=attempts+1
          where o.id=$1 and o.state in('queued','deferred')
@@ -137,7 +170,11 @@ pub(crate) async fn deliver(
     }
     let response = client
         .post(webhook_url)
-        .json(&json!({"delivery_id":outbox,"to":recipient,"template":template,"data":data}))
+        .json(&json!({
+            "delivery_id":outbox,"to":recipient,"template":template,"data":data,
+            "sender_name":sender_name,"reply_to":reply_to,"attachments":attachments,
+            "sender_email":sender_email,"sender_domain_id":sender_domain_id
+        }))
         .send()
         .await
         .map_err(|error| {
@@ -147,16 +184,44 @@ pub(crate) async fn deliver(
                 IntegrationError::Unavailable
             }
         })?;
-    if response.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
+    let status = response.status();
+    if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
         return Err(IntegrationError::UnknownOutcome);
     }
-    if !response.status().is_success() {
-        sqlx::query("update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1")
-            .bind(outbox).execute(store.pool()).await.ok();
-        return Err(crate::integrations::classify_status(response.status()));
+    if !status.is_success() {
+        let error = crate::integrations::classify_status(status);
+        if error.retryable() {
+            sqlx::query("update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1")
+                .bind(outbox).execute(store.pool()).await.ok();
+        } else {
+            sqlx::query(
+                "update control.outbox set state='dead_letter',next_attempt_at=null where id=$1",
+            )
+            .bind(outbox)
+            .execute(store.pool())
+            .await
+            .ok();
+        }
+        return Err(error);
     }
-    sqlx::query("update control.outbox set state='sent',sent_at=now() where id=$1")
+    let body = crate::integrations::bounded_body(response, 4096).await?;
+    let provider_response =
+        serde_json::from_slice::<Value>(&body).map_err(|_| IntegrationError::ContractDrift)?;
+    let provider_message_id = provider_response
+        .get("provider_message_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or(IntegrationError::ContractDrift)?;
+    let provider_domain_id = provider_response
+        .get("provider_domain_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(IntegrationError::ContractDrift)?;
+    sqlx::query("update control.outbox set state='sent',sent_at=now(),delivery_state='submitted',provider_message_id=$2,provider_domain_id=$3 where id=$1")
         .bind(outbox)
+        .bind(provider_message_id)
+        .bind(provider_domain_id)
         .execute(store.pool())
         .await
         .map_err(|_| IntegrationError::Unavailable)?;

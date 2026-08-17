@@ -34,10 +34,17 @@ use crate::api::contracts::{
     WorkerStatusResponse, WorkshopCreateCommandResponse, WorkshopDeletionCommandResponse,
     WorkshopDeletionResponse, WorkshopSummaryResponse,
 };
+use crate::api::domains::{CustomDomainCreateBody, WebshopDomainResponse};
+use crate::api::email_domains::{EmailDomainCreateBody, EmailDomainResponse};
 use crate::api::governance::{
     CreateLegalHold, CreatePrivacyIncident, CreatePrivacyRequest, CreateRetentionRun,
     PlatformRoleGrant, PlatformRoleRevoke, PrivacyDecision, PrivacyIncidentAssessment,
     ProcessorTaskAcknowledgement, ReleaseLegalHold,
+};
+use crate::api::smtp::{WebshopSmtpBody, WebshopSmtpResponse};
+use crate::api::webshop::{
+    WebshopCheckResponse, WebshopDashboardResponse, WebshopIssueResponse,
+    WebshopOnboardingCommandResponse,
 };
 use crate::api::{
     AdoptReleaseBody, CreateWorkshop, DeleteWorkshopBody, DuplicateBody, InvitationTokenBody,
@@ -157,7 +164,17 @@ use crate::domain::WorkshopRole;
     CarrierSecretBody,
     CarrierSecretDeleteResponse,
     CarrierSecretResponse,
-    CarrierTargetResponse
+    CarrierTargetResponse,
+    CustomDomainCreateBody,
+    WebshopDomainResponse,
+    EmailDomainCreateBody,
+    EmailDomainResponse,
+    WebshopSmtpBody,
+    WebshopSmtpResponse,
+    WebshopCheckResponse,
+    WebshopIssueResponse,
+    WebshopDashboardResponse,
+    WebshopOnboardingCommandResponse
 )))]
 struct PublicSchemas;
 
@@ -206,6 +223,11 @@ pub fn document() -> Value {
         "/v1/workshops/{id}/ownership-transfers",
         "/v1/ownership-transfers/{id}/accept",
         "/v1/workshops/{id}/modules/{module_key}/enable",
+        "/v1/workshops/{id}/domains/{domain_id}/canonical",
+        "/v1/workshops/{id}/domains/{domain_id}",
+        "/v1/workshops/{id}/webshop/onboarding/refresh",
+        "/v1/workshops/{id}/webshop/onboarding/complete",
+        "/v1/workshops/{id}/webshop/deactivate",
     ];
     let mut paths = Map::new();
     let typed = |name: &str| json!({"$ref":format!("#/components/schemas/{name}")});
@@ -310,12 +332,45 @@ pub fn document() -> Value {
             ("/v1/workshops/{id}/modules", "get") => {
                 json!({"type":"array","items":{"$ref":"#/components/schemas/ModuleResponse"}})
             }
+            ("/v1/workshops/{id}/webshop", "get")
+            | ("/v1/platform/workshops/{id}/webshop", "get") => typed("WebshopDashboardResponse"),
+            ("/v1/workshops/{id}/webshop/onboarding/refresh", "post")
+            | ("/v1/workshops/{id}/webshop/onboarding/complete", "post") => {
+                command("WebshopOnboardingCommandResponse")
+            }
+            ("/v1/workshops/{id}/webshop/deactivate", "post") => {
+                command("ModuleEnableCommandResponse")
+            }
             ("/v1/workshops/{id}/carrier-secrets", "get") => {
                 json!({"type":"array","items":{"$ref":"#/components/schemas/CarrierSecretResponse"}})
             }
             ("/v1/workshops/{id}/carrier-targets", "get") => {
                 json!({"type":"array","items":{"$ref":"#/components/schemas/CarrierTargetResponse"}})
             }
+            ("/v1/workshops/{id}/domains", "get") => {
+                json!({"type":"array","items":{"$ref":"#/components/schemas/WebshopDomainResponse"}})
+            }
+            ("/v1/workshops/{id}/domains", "post") => command("WebshopDomainResponse"),
+            ("/v1/workshops/{id}/domains/{domain_id}/verify", "post") => {
+                command("WebshopDomainResponse")
+            }
+            ("/v1/workshops/{id}/domains/{domain_id}/canonical", "post") => {
+                command("WebshopDomainResponse")
+            }
+            ("/v1/workshops/{id}/domains/{domain_id}", "delete") => {
+                command("WebshopDomainResponse")
+            }
+            ("/v1/workshops/{id}/email-domains", "get") => {
+                json!({"type":"array","items":{"$ref":"#/components/schemas/EmailDomainResponse"}})
+            }
+            ("/v1/workshops/{id}/email-domains", "post") => command("EmailDomainResponse"),
+            ("/v1/workshops/{id}/email-domains/{domain_id}/check", "post")
+            | ("/v1/workshops/{id}/email-domains/{domain_id}", "delete") => {
+                command("OperationCommandResponse")
+            }
+            ("/v1/workshops/{id}/email/smtp", "get")
+            | ("/v1/workshops/{id}/email/smtp", "post")
+            | ("/v1/workshops/{id}/email/smtp", "delete") => typed("WebshopSmtpResponse"),
             ("/v1/workshops/{id}/carrier-secrets", "post") => command("CarrierSecretResponse"),
             ("/v1/workshops/{id}/carrier-secrets/{secret_id}", "delete") => {
                 command("CarrierSecretDeleteResponse")
@@ -472,6 +527,9 @@ pub fn document() -> Value {
             ("/v1/workshops/{id}/database/restores", "post") => Some("RestoreBody"),
             ("/v1/workshops/{id}/database/duplicates", "post") => Some("DuplicateBody"),
             ("/v1/workshops/{id}/carrier-secrets", "post") => Some("CarrierSecretBody"),
+            ("/v1/workshops/{id}/domains", "post") => Some("CustomDomainCreateBody"),
+            ("/v1/workshops/{id}/email-domains", "post") => Some("EmailDomainCreateBody"),
+            ("/v1/workshops/{id}/email/smtp", "post") => Some("WebshopSmtpBody"),
             _ => None,
         };
         let mut operation = json!({

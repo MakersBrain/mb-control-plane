@@ -73,6 +73,83 @@ pub struct ModuleRestrictCommand {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WebshopDomainCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebshopStatusCommand {
+    pub workshop_id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WebshopReadiness {
+    pub catalog: bool,
+    pub online_payment: bool,
+    pub fulfilment: bool,
+    pub sender: bool,
+    pub domain: bool,
+    pub returns: bool,
+    pub product_count: i64,
+    pub payment_count: i64,
+    pub fulfilment_count: i64,
+    pub launch_ready: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WebshopOdooIssue {
+    pub kind: String,
+    pub state: String,
+    pub count: i64,
+    pub action_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WebshopStatusObservation {
+    pub workshop_id: Uuid,
+    pub website_id: i64,
+    pub readiness: WebshopReadiness,
+    pub issues: Vec<WebshopOdooIssue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+pub struct WebshopSmtpStatus {
+    pub transport: String,
+    pub configured: bool,
+    pub host: Option<String>,
+    pub port: Option<i64>,
+    pub encryption: Option<String>,
+    pub username: Option<String>,
+    pub from_email: Option<String>,
+    pub password_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebshopSmtpStatusCommand {
+    pub workshop_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebshopSmtpConfigureCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+    pub host: String,
+    pub port: i64,
+    pub encryption: String,
+    pub username: String,
+    pub password: String,
+    pub from_email: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebshopSmtpResetCommand {
+    pub operation_key: String,
+    pub workshop_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ErasureReplayCommand {
     pub operation_key: String,
     pub workshop_id: Uuid,
@@ -361,6 +438,70 @@ impl OdooClient {
         self.post("/mb_control/v1/modules/restrict", command).await
     }
 
+    pub async fn project_webshop_domain(
+        &self,
+        command: &WebshopDomainCommand,
+    ) -> Result<Value, IntegrationError> {
+        self.post("/mb_control/v1/webshop/domain", command).await
+    }
+
+    pub async fn webshop_status(
+        &self,
+        command: &WebshopStatusCommand,
+    ) -> Result<WebshopStatusObservation, IntegrationError> {
+        let observation: WebshopStatusObservation =
+            self.post("/mb_control/v1/webshop/status", command).await?;
+        let valid = observation.workshop_id == command.workshop_id
+            && observation.website_id > 0
+            && observation.readiness.product_count >= 0
+            && observation.readiness.payment_count >= 0
+            && observation.readiness.fulfilment_count >= 0
+            && observation.issues.iter().all(|issue| {
+                matches!(issue.kind.as_str(), "payment" | "shipment" | "return")
+                    && issue.state == "action_required"
+                    && issue.count > 0
+                    && issue.action_path.as_deref().is_none_or(|path| {
+                        path.strip_prefix("/odoo/action-").is_some_and(|id| {
+                            !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    })
+            });
+        if !valid {
+            return Err(IntegrationError::ContractDrift);
+        }
+        Ok(observation)
+    }
+
+    pub async fn webshop_smtp_status(
+        &self,
+        command: &WebshopSmtpStatusCommand,
+    ) -> Result<WebshopSmtpStatus, IntegrationError> {
+        let status: WebshopSmtpStatus = self
+            .post("/mb_control/v1/webshop/smtp/status", command)
+            .await?;
+        validate_smtp_status(status)
+    }
+
+    pub async fn configure_webshop_smtp(
+        &self,
+        command: &WebshopSmtpConfigureCommand,
+    ) -> Result<WebshopSmtpStatus, IntegrationError> {
+        let status: WebshopSmtpStatus = self
+            .post("/mb_control/v1/webshop/smtp/configure", command)
+            .await?;
+        validate_smtp_status(status)
+    }
+
+    pub async fn reset_webshop_smtp(
+        &self,
+        command: &WebshopSmtpResetCommand,
+    ) -> Result<WebshopSmtpStatus, IntegrationError> {
+        let status: WebshopSmtpStatus = self
+            .post("/mb_control/v1/webshop/smtp/reset", command)
+            .await?;
+        validate_smtp_status(status)
+    }
+
     pub async fn carrier_targets(&self) -> Result<Vec<CarrierTarget>, IntegrationError> {
         self.get("/mb_control/v1/carriers").await
     }
@@ -380,6 +521,27 @@ impl OdooClient {
         self.post("/mb_control/v1/carriers/unbind-secret", command)
             .await
     }
+}
+
+fn validate_smtp_status(status: WebshopSmtpStatus) -> Result<WebshopSmtpStatus, IntegrationError> {
+    let valid = matches!(status.transport.as_str(), "platform" | "smtp")
+        && (!status.configured
+            || (status.transport == "smtp"
+                && status
+                    .host
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                && status
+                    .port
+                    .is_some_and(|value| (1..=65535).contains(&value))
+                && status
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| matches!(value, "starttls" | "ssl"))
+                && status.password_configured));
+    valid
+        .then_some(status)
+        .ok_or(IntegrationError::ContractDrift)
 }
 
 #[cfg(test)]
@@ -454,6 +616,67 @@ mod tests {
         .bootstrap_tenant(&command)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_webshop_domain_uses_the_narrow_tenant_endpoint() {
+        let server = MockServer::start().await;
+        let command = WebshopDomainCommand {
+            operation_key: "webshop-domain:fixture".into(),
+            workshop_id: Uuid::new_v4(),
+            hostname: "www.atelier-luna.fr".into(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/webshop/domain"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "projected":true,"website_id":1,"hostname":"www.atelier-luna.fr"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        OdooClient::new(&server.uri(), "fixture-token", None, Duration::from_secs(2))
+            .unwrap()
+            .project_webshop_domain(&command)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn webshop_status_is_tenant_scoped_and_contract_checked() {
+        let server = MockServer::start().await;
+        let workshop = Uuid::new_v4();
+        let command = WebshopStatusCommand {
+            workshop_id: workshop,
+        };
+        Mock::given(method("POST"))
+            .and(path("/mb_control/v1/webshop/status"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(&command))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "workshop_id":workshop,
+                "website_id":7,
+                "readiness":{
+                    "catalog":true,"online_payment":true,"fulfilment":true,
+                    "sender":true,"domain":true,"returns":true,
+                    "product_count":4,"payment_count":1,"fulfilment_count":2,
+                    "launch_ready":true
+                },
+                "issues":[{"kind":"payment","state":"action_required","count":1,
+                    "action_path":"/odoo/action-42"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let observed =
+            OdooClient::new(&server.uri(), "fixture-token", None, Duration::from_secs(2))
+                .unwrap()
+                .webshop_status(&command)
+                .await
+                .unwrap();
+        assert!(observed.readiness.launch_ready);
+        assert_eq!(observed.issues[0].kind, "payment");
     }
 
     #[tokio::test]

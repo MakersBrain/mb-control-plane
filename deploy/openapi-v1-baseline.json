@@ -746,6 +746,17 @@
         ],
         "type": "object"
       },
+      "CustomDomainCreateBody": {
+        "properties": {
+          "hostname": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "type": "object"
+      },
       "DataSubjectExportStatusResponse": {
         "properties": {
           "consumed_at": {
@@ -944,6 +955,92 @@
         ],
         "type": "object"
       },
+      "EmailDomainCreateBody": {
+        "properties": {
+          "domain_name": {
+            "type": "string"
+          },
+          "sender_local_part": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain_name"
+        ],
+        "type": "object"
+      },
+      "EmailDomainResponse": {
+        "properties": {
+          "can_manage": {
+            "type": "boolean"
+          },
+          "desired_state": {
+            "type": "string"
+          },
+          "dns_records": {},
+          "domain_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "last_error_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_local_part": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "test_delivered_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification": {},
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "domain_name",
+          "sender_local_part",
+          "state",
+          "desired_state",
+          "dns_records",
+          "verification",
+          "version",
+          "can_manage"
+        ],
+        "type": "object"
+      },
       "EntitlementResponse": {
         "properties": {
           "expires_at": {
@@ -1087,6 +1184,12 @@
             "type": "integer"
           },
           "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "external_url": {
             "type": [
               "string",
               "null"
@@ -2096,6 +2199,12 @@
             "type": "integer"
           },
           "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "external_url": {
             "type": [
               "string",
               "null"
@@ -3657,6 +3766,293 @@
         },
         "required": [
           "operation_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "WebshopCheckResponse": {
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "href": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "next_action": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "ready",
+          "next_action"
+        ],
+        "type": "object"
+      },
+      "WebshopDashboardResponse": {
+        "properties": {
+          "can_manage": {
+            "type": "boolean"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/WebshopCheckResponse"
+            },
+            "type": "array"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "type": "string"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/WebshopIssueResponse"
+            },
+            "type": "array"
+          },
+          "last_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "odoo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "version",
+          "etag",
+          "checks",
+          "issues",
+          "can_manage"
+        ],
+        "type": "object"
+      },
+      "WebshopDomainResponse": {
+        "properties": {
+          "can_manage": {
+            "type": "boolean"
+          },
+          "canonical": {
+            "type": "boolean"
+          },
+          "certificate_state": {
+            "type": "string"
+          },
+          "desired_state": {
+            "type": "string"
+          },
+          "dns_state": {
+            "type": "string"
+          },
+          "edge_verification_records": {},
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_error_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ownership_verified_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "redirect_target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "routing_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "routing_target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "verification_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verification_value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "hostname",
+          "kind",
+          "state",
+          "desired_state",
+          "dns_state",
+          "certificate_state",
+          "canonical",
+          "edge_verification_records",
+          "version",
+          "can_manage"
+        ],
+        "type": "object"
+      },
+      "WebshopIssueResponse": {
+        "properties": {
+          "can_retry": {
+            "type": "boolean"
+          },
+          "category": {
+            "type": "string"
+          },
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "href": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "next_action": {
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "safe_error_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "category",
+          "state",
+          "count",
+          "next_action",
+          "can_retry"
+        ],
+        "type": "object"
+      },
+      "WebshopOnboardingCommandResponse": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
           "version"
         ],
         "type": "object"
@@ -7654,6 +8050,72 @@
         ]
       }
     },
+    "/v1/platform/workshops/{id}/webshop": {
+      "get": {
+        "operationId": "getV1PlatformWorkshopsIdWebshop",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebshopDashboardResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthyOperator": []
+          }
+        ],
+        "tags": [
+          "platform"
+        ]
+      }
+    },
     "/v1/privacy/requests": {
       "get": {
         "operationId": "getV1PrivacyRequests",
@@ -9359,6 +9821,1118 @@
         ]
       }
     },
+    "/v1/workshops/{id}/domains": {
+      "get": {
+        "operationId": "getV1WorkshopsIdDomains",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WebshopDomainResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      },
+      "post": {
+        "operationId": "postV1WorkshopsIdDomains",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomDomainCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/domains/{domain_id}": {
+      "delete": {
+        "operationId": "deleteV1WorkshopsIdDomainsDomainId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact strong resource ETag. Stale versions return 412.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/domains/{domain_id}/canonical": {
+      "post": {
+        "operationId": "postV1WorkshopsIdDomainsDomainIdCanonical",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact strong resource ETag. Stale versions return 412.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/domains/{domain_id}/verify": {
+      "post": {
+        "operationId": "postV1WorkshopsIdDomainsDomainIdVerify",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/email-domains": {
+      "get": {
+        "operationId": "getV1WorkshopsIdEmailDomains",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/EmailDomainResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      },
+      "post": {
+        "operationId": "postV1WorkshopsIdEmailDomains",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailDomainCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/EmailDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/EmailDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/EmailDomainResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/email-domains/{domain_id}": {
+      "delete": {
+        "operationId": "deleteV1WorkshopsIdEmailDomainsDomainId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/email-domains/{domain_id}/check": {
+      "post": {
+        "operationId": "postV1WorkshopsIdEmailDomainsDomainIdCheck",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/OperationCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
     "/v1/workshops/{id}/integrations": {
       "get": {
         "operationId": "getV1WorkshopsIdIntegrations",
@@ -10556,6 +12130,534 @@
                   "oneOf": [
                     {
                       "$ref": "#/components/schemas/OwnershipTransferCreateResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/webshop": {
+      "get": {
+        "operationId": "getV1WorkshopsIdWebshop",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebshopDashboardResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "202": {
+            "description": "Reserved compatibility response; this read operation returns 200."
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/webshop/deactivate": {
+      "post": {
+        "operationId": "postV1WorkshopsIdWebshopDeactivate",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact strong resource ETag. Stale versions return 412.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ModuleEnableCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/webshop/onboarding/complete": {
+      "post": {
+        "operationId": "postV1WorkshopsIdWebshopOnboardingComplete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact strong resource ETag. Stale versions return 412.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Durable operation accepted",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthenticationError"
+          },
+          "403": {
+            "$ref": "#/components/responses/AuthorityError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          },
+          "410": {
+            "$ref": "#/components/responses/GoneError"
+          },
+          "412": {
+            "$ref": "#/components/responses/StaleWriteError"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionError"
+          },
+          "503": {
+            "$ref": "#/components/responses/PrivacyGateError"
+          }
+        },
+        "security": [
+          {
+            "rauthy": []
+          }
+        ],
+        "tags": [
+          "workshops"
+        ]
+      }
+    },
+    "/v1/workshops/{id}/webshop/onboarding/refresh": {
+      "post": {
+        "operationId": "postV1WorkshopsIdWebshopOnboardingRefresh",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bounded command key. Identical semantic requests replay the stored result; reuse with another request returns 409.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact strong resource ETag. Stale versions return 412.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommandInProgressResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReplayResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Resource created",
+            "headers": {
+              "ETag": {
+                "description": "Strong resource version returned after the command.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WebshopOnboardingCommandResponse"
                     },
                     {
                       "$ref": "#/components/schemas/CommandInProgressResponse"

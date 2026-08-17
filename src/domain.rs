@@ -82,6 +82,9 @@ pub enum OperationKind {
     OdooReleaseAdopt,
     PrivacyRetention,
     PrivacyDataSubjectRequest,
+    WebshopDomainReconcile,
+    WebshopEmailDomainReconcile,
+    WebshopOnboardingReconcile,
 }
 
 impl OperationKind {
@@ -100,6 +103,9 @@ impl OperationKind {
             Self::OdooReleaseAdopt => "odoo.release.adopt",
             Self::PrivacyRetention => "privacy.retention",
             Self::PrivacyDataSubjectRequest => "privacy.data_subject_request",
+            Self::WebshopDomainReconcile => "webshop-domain.reconcile",
+            Self::WebshopEmailDomainReconcile => "webshop-email-domain.reconcile",
+            Self::WebshopOnboardingReconcile => "webshop-onboarding.reconcile",
         }
     }
 
@@ -117,6 +123,9 @@ impl OperationKind {
             Self::ModuleRestrict => "tenant-reconciliation",
             Self::OdooReleaseAdopt => "release-adoption",
             Self::PrivacyRetention | Self::PrivacyDataSubjectRequest => "privacy-operations",
+            Self::WebshopDomainReconcile => "tenant-reconciliation",
+            Self::WebshopEmailDomainReconcile => "tenant-reconciliation",
+            Self::WebshopOnboardingReconcile => "tenant-reconciliation",
         }
     }
 }
@@ -228,6 +237,9 @@ mod tests {
             OperationKind::OdooReleaseAdopt,
             OperationKind::PrivacyRetention,
             OperationKind::PrivacyDataSubjectRequest,
+            OperationKind::WebshopDomainReconcile,
+            OperationKind::WebshopEmailDomainReconcile,
+            OperationKind::WebshopOnboardingReconcile,
         ] {
             assert!(!kind.as_str().is_empty());
             assert!(!kind.queue().is_empty());

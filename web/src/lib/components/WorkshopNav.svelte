@@ -4,6 +4,8 @@
 	const links = $derived([
 		{ href: `/workshops/${id}/members`, label: 'People & access' },
 		{ href: `/workshops/${id}/modules`, label: 'Modules' },
+		{ href: `/workshops/${id}/webshop`, label: 'Webshop' },
+		{ href: `/workshops/${id}/domains`, label: 'Domains' },
 		{ href: `/workshops/${id}/shipping`, label: 'Shipping' },
 		{ href: `/workshops/${id}/database`, label: 'Recovery' }
 	]);

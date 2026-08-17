@@ -5,14 +5,14 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
-use crate::domain::IntegrationError;
+use crate::domain::{IntegrationError, OperationKind};
 use crate::integrations::extraction::ExtractionBrokerClient;
 use crate::integrations::odoo::{
     EntitlementCommand, MembershipCommand, ModuleEnableCommand, ModuleRestrictCommand, OdooClient,
 };
 use crate::integrations::paperless::PaperlessClient;
 use crate::integrations::rauthy::RauthyClient;
-use crate::persistence::{LeasedOperation, OperationOutcome, Store};
+use crate::persistence::{LeasedOperation, NewOperation, OperationOutcome, Store};
 use crate::privacy_crypto;
 
 const QUEUES: [&str; 9] = [
@@ -27,6 +27,23 @@ const QUEUES: [&str; 9] = [
     "privacy-operations",
 ];
 const TENANT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const WEBSHOP_DOMAIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const WEBSHOP_EMAIL_DOMAIN_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) async fn routable_custom_hostnames(
+    store: &Store,
+    workshop: Uuid,
+) -> Result<Value, sqlx::Error> {
+    sqlx::query_scalar::<_, Value>(
+        "select coalesce(jsonb_agg(jsonb_build_object(
+                    'hostname',hostname,'canonical',canonical) order by hostname),'[]'::jsonb)
+           from control.webshop_domains
+          where workshop_id=$1 and state in ('testing','active') and desired_state='active'",
+    )
+    .bind(workshop)
+    .fetch_one(store.pool())
+    .await
+}
 
 pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
     if !QUEUES.contains(&queue) {
@@ -56,6 +73,8 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
     tracing::info!(queue,worker=%worker_id,"worker started");
     let mut next_privacy_export_cleanup = Instant::now();
     let mut next_tenant_reconciliation = Instant::now();
+    let mut next_webshop_domain_reconciliation = Instant::now();
+    let mut next_webshop_email_domain_reconciliation = Instant::now();
     loop {
         tokio::select! {
             _=tokio::time::sleep(Duration::from_secs(2))=>{
@@ -64,6 +83,16 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
                 }
                 if queue == "tenant-reconciliation" {
                     admit_capability_restriction(&store).await?;
+                    if Instant::now() >= next_webshop_domain_reconciliation {
+                        let admitted = admit_webshop_domain_reconciliation(&store).await?;
+                        tracing::info!(admitted,"admitted webshop domain reconciliation operations");
+                        next_webshop_domain_reconciliation = Instant::now() + WEBSHOP_DOMAIN_RECONCILIATION_INTERVAL;
+                    }
+                    if Instant::now() >= next_webshop_email_domain_reconciliation {
+                        let admitted = admit_webshop_email_domain_reconciliation(&store).await?;
+                        tracing::info!(admitted,"admitted webshop email domain reconciliation operations");
+                        next_webshop_email_domain_reconciliation = Instant::now() + WEBSHOP_EMAIL_DOMAIN_RECONCILIATION_INTERVAL;
+                    }
                     if Instant::now() >= next_tenant_reconciliation {
                         let admitted = admit_periodic_tenant_reconciliation(&store).await?;
                         tracing::info!(admitted,"admitted periodic tenant reconciliation operations");
@@ -137,6 +166,16 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
                     {
                         crate::workers::release::failed(&store, &operation).await;
                     }
+                    if operation.kind == "webshop-onboarding.reconcile"
+                        && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
+                    {
+                        crate::workers::onboarding::failed(&store, &operation).await;
+                    }
+                    if operation.kind == "webshop-domain.reconcile"
+                        && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
+                    {
+                        crate::workers::domains::failed(&store, &operation).await;
+                    }
                     if operation.kind == "module.enable"
                         && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
                         && let (Some(workshop),Some(module_key))=(operation.workshop_id,operation.payload.get("module_key").and_then(Value::as_str))
@@ -165,14 +204,99 @@ pub async fn run(store: Store, queue: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn admit_webshop_email_domain_reconciliation(store: &Store) -> anyhow::Result<usize> {
+    let bucket = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / WEBSHOP_EMAIL_DOMAIN_RECONCILIATION_INTERVAL.as_secs();
+    let rows=sqlx::query_as::<_,(Uuid,Uuid)>("select id,workshop_id from control.webshop_email_domains d where desired_state='active' and state in ('registering','dns_pending','testing') and not exists(select 1 from control.operations o where o.id=d.operation_id and o.state in ('pending','in_flight','awaiting_reconciliation')) order by id limit 500").fetch_all(store.pool()).await?;
+    let mut admitted = 0;
+    for (id, workshop) in rows {
+        let mut tx = store.begin().await?;
+        let operation = Store::enqueue(
+            &mut tx,
+            NewOperation {
+                kind: OperationKind::WebshopEmailDomainReconcile,
+                workshop_id: Some(workshop),
+                target_user_id: None,
+                desired_epoch: None,
+                payload: &json!({"email_domain_id":id,"reason":"periodic_observation"}),
+                requested_by: None,
+                correlation_id: Uuid::new_v4(),
+                idempotency_key: &format!("periodic-email-domain:{id}:{bucket}"),
+            },
+        )
+        .await?;
+        let changed=sqlx::query("update control.webshop_email_domains set operation_id=$2,updated_at=now(),version=version+1 where id=$1 and desired_state='active' and state in ('registering','dns_pending','testing')").bind(id).bind(operation).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        admitted += usize::from(changed == 1);
+    }
+    Ok(admitted)
+}
+
+async fn admit_webshop_domain_reconciliation(store: &Store) -> anyhow::Result<usize> {
+    let bucket = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / WEBSHOP_DOMAIN_RECONCILIATION_INTERVAL.as_secs();
+    let domains = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "select id,workshop_id from control.webshop_domains d
+          where desired_state='active'
+            and state in ('dns_pending','certificate_pending','testing')
+            and ownership_verified_at is not null
+            and not exists(select 1 from control.operations o
+                where o.id=d.operation_id and o.state in ('pending','in_flight','awaiting_reconciliation'))
+          order by id limit 500",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    let mut admitted = 0;
+    for (domain_id, workshop) in domains {
+        let mut tx = store.begin().await?;
+        let operation_id = Store::enqueue(
+            &mut tx,
+            NewOperation {
+                kind: OperationKind::WebshopDomainReconcile,
+                workshop_id: Some(workshop),
+                target_user_id: None,
+                desired_epoch: None,
+                payload: &json!({"domain_id":domain_id,"reason":"periodic_observation"}),
+                requested_by: None,
+                correlation_id: Uuid::new_v4(),
+                idempotency_key: &format!("periodic-domain:{domain_id}:{bucket}"),
+            },
+        )
+        .await?;
+        let changed = sqlx::query(
+            "update control.webshop_domains set operation_id=$2,updated_at=now(),version=version+1
+              where id=$1 and desired_state='active'
+                and state in ('dns_pending','certificate_pending','testing')",
+        )
+        .bind(domain_id)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        admitted += usize::from(changed == 1);
+    }
+    Ok(admitted)
+}
+
 async fn admit_periodic_tenant_reconciliation(store: &Store) -> anyhow::Result<usize> {
     let domain = std::env::var("CONTROL_TENANT_DOMAIN")
         .map_err(|_| anyhow::anyhow!("CONTROL_TENANT_DOMAIN is required for reconciliation"))?;
-    let tenants = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
+    let tenants = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool, Value)>(
         "select w.id,d.id,w.slug,d.database_ref,d.public_hostname,
                 exists(select 1 from control.workshop_modules m
                        where m.workshop_id=w.id and m.module_key='documents'
-                         and m.state='enabled')
+                         and m.state='enabled'),
+                coalesce((select jsonb_agg(jsonb_build_object(
+                    'hostname',h.hostname,'canonical',h.canonical) order by h.hostname)
+                    from control.webshop_domains h where h.workshop_id=w.id
+                      and h.state in ('testing','active') and h.desired_state='active'),'[]'::jsonb)
            from control.workshops w
            join control.odoo_databases d on d.workshop_id=w.id
           where w.status in ('trial','active','past_due','restricted','suspended')
@@ -199,13 +323,23 @@ async fn admit_periodic_tenant_reconciliation(store: &Store) -> anyhow::Result<u
         .as_secs()
         / TENANT_RECONCILIATION_INTERVAL.as_secs();
     let mut admitted = 0;
-    for (workshop, database_id, slug, database_ref, public_hostname, paperless_enabled) in tenants {
+    for (
+        workshop,
+        database_id,
+        slug,
+        database_ref,
+        public_hostname,
+        paperless_enabled,
+        custom_hostnames,
+    ) in tenants
+    {
         let payload = json!({
             "database_id":database_id,
             "database_ref":database_ref,
             "public_hostname":public_hostname,
             "paperless_hostname":format!("docs-{slug}.{domain}"),
             "paperless_enabled":paperless_enabled,
+            "custom_hostnames":custom_hostnames,
             "reason":"periodic_drift_reconciliation",
         });
         let mut tx = store.begin().await?;
@@ -244,6 +378,11 @@ async fn handle(store: &Store, operation: &LeasedOperation) -> Result<(), Integr
         "email.delivery" => crate::workers::email::deliver(store, operation).await,
         "module.enable" => enable_module(store, operation).await,
         "module.restrict" => restrict_module(store, operation).await,
+        "webshop-domain.reconcile" => crate::workers::domains::run(store, operation).await,
+        "webshop-email-domain.reconcile" => {
+            crate::workers::email_domains::run(store, operation).await
+        }
+        "webshop-onboarding.reconcile" => crate::workers::onboarding::run(store, operation).await,
         "odoo.release.adopt" => crate::workers::release::adopt(store, operation).await,
         "privacy.retention" => crate::workers::privacy::retention(store, operation).await,
         "privacy.data_subject_request" => {
@@ -692,6 +831,8 @@ async fn enable_paperless(
         "public_hostname": tenant.3,
         "paperless_hostname": paperless_hostname,
         "paperless_enabled": true,
+        "custom_hostnames": routable_custom_hostnames(store, workshop)
+            .await.map_err(|_| IntegrationError::Unavailable)?,
     });
     let value = driver_request(store, operation.id, workshop, "reconcile", &payload).await?;
     let paperless = value

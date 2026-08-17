@@ -41,6 +41,8 @@ pub struct MailGatewayState {
     internal_token: String,
     provider_client: reqwest::Client,
     public_client: reqwest::Client,
+    control_event_url: Url,
+    control_event_token: String,
     endpoint: Url,
     project_id: Uuid,
     domain_id: Uuid,
@@ -66,6 +68,24 @@ struct MailRequest {
     to: String,
     template: String,
     data: Value,
+    #[serde(default)]
+    sender_name: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default)]
+    attachments: Vec<MailAttachment>,
+    #[serde(default)]
+    sender_email: Option<String>,
+    #[serde(default)]
+    sender_domain_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailAttachment {
+    name: String,
+    content_type: String,
+    content_base64: String,
 }
 
 #[derive(Serialize)]
@@ -81,6 +101,14 @@ struct ProviderHeader<'a> {
 }
 
 #[derive(Serialize)]
+struct ProviderAttachment<'a> {
+    name: &'a str,
+    #[serde(rename = "type")]
+    content_type: &'a str,
+    content: &'a str,
+}
+
+#[derive(Serialize)]
 struct ProviderRequest<'a> {
     from: Address<'a>,
     to: [Address<'a>; 1],
@@ -88,7 +116,8 @@ struct ProviderRequest<'a> {
     text: String,
     html: String,
     project_id: Uuid,
-    additional_headers: [ProviderHeader<'a>; 1],
+    attachments: Vec<ProviderAttachment<'a>>,
+    additional_headers: Vec<ProviderHeader<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -146,7 +175,7 @@ struct TemHeader {
     value: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalRecord {
     schema_version: u8,
@@ -154,6 +183,8 @@ struct JournalRecord {
     sns_message_id: Uuid,
     email_id: Uuid,
     delivery_id: Uuid,
+    #[serde(default)]
+    domain_id: Uuid,
     event_type: String,
     created_at: String,
 }
@@ -214,6 +245,16 @@ impl MailGatewayState {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("makersbrain-mail-gateway/1")
             .build()?;
+        let control_event_url = Url::parse(&required("MAIL_GATEWAY_CONTROL_EVENT_URL")?)?;
+        if !matches!(control_event_url.scheme(), "http" | "https")
+            || control_event_url.path() != "/internal/v1/mail-events"
+            || control_event_url.query().is_some()
+            || control_event_url.fragment().is_some()
+        {
+            anyhow::bail!(
+                "MAIL_GATEWAY_CONTROL_EVENT_URL must select the exact control event route"
+            );
+        }
         let sns_topic_arn = required("MAIL_GATEWAY_SNS_TOPIC_ARN")?;
         validate_topic_arn(&sns_topic_arn)?;
         let (sns_root_ca, sns_intermediate_ca) =
@@ -226,6 +267,8 @@ impl MailGatewayState {
             internal_token: required("MAIL_GATEWAY_INTERNAL_TOKEN")?,
             provider_client,
             public_client,
+            control_event_url,
+            control_event_token: required("MAIL_GATEWAY_CONTROL_EVENT_TOKEN")?,
             endpoint,
             project_id,
             domain_id,
@@ -250,7 +293,7 @@ pub fn app(state: MailGatewayState) -> Router {
         .merge(
             Router::new()
                 .route("/v1/mail", post(send))
-                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+                .layer(RequestBodyLimitLayer::new(16 * 1024 * 1024)),
         )
         .merge(
             Router::new()
@@ -276,12 +319,57 @@ async fn send(
     State(state): State<Arc<MailGatewayState>>,
     headers: HeaderMap,
     Json(request): Json<MailRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
     if !authorized(&headers, &state.internal_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let recipient = request.to.trim();
     validate_email(recipient).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sender_name = request.sender_name.as_deref().unwrap_or(&state.from_name);
+    if sender_name.is_empty()
+        || sender_name.len() > 100
+        || sender_name.chars().any(char::is_control)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Some(reply_to) = request.reply_to.as_deref() {
+        validate_email(reply_to).map_err(|_| StatusCode::BAD_REQUEST)?;
+    }
+    if request.sender_email.is_some() != request.sender_domain_id.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let from_email = request.sender_email.as_deref().unwrap_or(&state.from_email);
+    validate_email(from_email).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if request.sender_domain_id.is_some_and(|id| id.is_nil()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if request.attachments.len() > 5 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut attachment_bytes = 0usize;
+    for attachment in &request.attachments {
+        if attachment.name.is_empty()
+            || attachment.name.len() > 255
+            || attachment.name.contains('/')
+            || attachment.name.contains('\\')
+            || attachment.name.chars().any(char::is_control)
+            || attachment.content_type.is_empty()
+            || attachment.content_type.len() > 127
+            || attachment
+                .content_type
+                .chars()
+                .any(|character| character.is_control() || character.is_ascii_whitespace())
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&attachment.content_base64)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        attachment_bytes = attachment_bytes.saturating_add(decoded.len());
+    }
+    if attachment_bytes > 8 * 1024 * 1024 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     if state.environment == "staging"
         && !state
             .allowed_recipients
@@ -290,10 +378,20 @@ async fn send(
         return Err(StatusCode::FORBIDDEN);
     }
     let (subject, text, html) = render(&request.template, &request.data)?;
+    let mut additional_headers = vec![ProviderHeader {
+        key: "X-MakersBrain-Delivery-ID",
+        value: request.delivery_id.to_string(),
+    }];
+    if let Some(reply_to) = request.reply_to.as_deref() {
+        additional_headers.push(ProviderHeader {
+            key: "Reply-To",
+            value: reply_to.to_owned(),
+        });
+    }
     let payload = ProviderRequest {
         from: Address {
-            email: &state.from_email,
-            name: &state.from_name,
+            email: from_email,
+            name: sender_name,
         },
         to: [Address {
             email: recipient,
@@ -303,10 +401,16 @@ async fn send(
         text,
         html,
         project_id: state.project_id,
-        additional_headers: [ProviderHeader {
-            key: "X-MakersBrain-Delivery-ID",
-            value: request.delivery_id.to_string(),
-        }],
+        attachments: request
+            .attachments
+            .iter()
+            .map(|attachment| ProviderAttachment {
+                name: &attachment.name,
+                content_type: &attachment.content_type,
+                content: &attachment.content_base64,
+            })
+            .collect(),
+        additional_headers,
     };
     let response = state
         .provider_client
@@ -339,15 +443,17 @@ async fn send(
     }
     let response: ProviderResponse =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if response.emails.is_empty()
-        || response
-            .emails
-            .iter()
-            .any(|email| Uuid::parse_str(&email.id).is_err())
-    {
+    if response.emails.len() != 1 {
         return Err(StatusCode::BAD_GATEWAY);
     }
-    Ok(StatusCode::ACCEPTED)
+    let provider_message_id =
+        Uuid::parse_str(&response.emails[0].id).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(
+            json!({"provider_message_id":provider_message_id,"provider_domain_id":request.sender_domain_id.unwrap_or(state.domain_id)}),
+        ),
+    ))
 }
 
 async fn receive_sns_event(
@@ -410,13 +516,35 @@ async fn receive_sns_event(
                 .event_journal
                 .lock()
                 .await
-                .append(record)
+                .append(record.clone())
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            publish_delivery_event(&state, &record).await?;
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(StatusCode::BAD_REQUEST),
     }
+}
+
+async fn publish_delivery_event(
+    state: &MailGatewayState,
+    record: &JournalRecord,
+) -> Result<(), StatusCode> {
+    let response = state
+        .public_client
+        .post(state.control_event_url.clone())
+        .bearer_auth(&state.control_event_token)
+        .json(record)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !matches!(
+        response.status(),
+        StatusCode::CREATED | StatusCode::NO_CONTENT
+    ) {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(())
 }
 
 impl EventJournal {
@@ -737,7 +865,6 @@ fn parse_tem_event(
 ) -> Result<JournalRecord, StatusCode> {
     let event: TemEvent = serde_json::from_str(message).map_err(|_| StatusCode::BAD_REQUEST)?;
     if event.project_id != state.project_id
-        || event.domain_id != state.domain_id
         || !matches!(
             event.event_type.as_str(),
             "email_queued"
@@ -772,6 +899,7 @@ fn parse_tem_event(
         sns_message_id,
         email_id,
         delivery_id: delivery_id.ok_or(StatusCode::BAD_REQUEST)?,
+        domain_id: event.domain_id,
         event_type: event.event_type,
         created_at: event.created_at,
     })
@@ -804,6 +932,39 @@ fn load_sns_trust_chain(path: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 }
 
 fn render(template: &str, data: &Value) -> Result<(String, String, String), StatusCode> {
+    if template == "odoo-rendered-v1" {
+        let object = data.as_object().ok_or(StatusCode::BAD_REQUEST)?;
+        if object.len() != 3
+            || !object.contains_key("subject")
+            || !object.contains_key("text")
+            || !object.contains_key("html")
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let subject = object
+            .get("subject")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 255
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= 256 * 1024 && !value.contains('\0'))
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let html = object
+            .get("html")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= 512 * 1024 && !value.contains('\0'))
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        if text.trim().is_empty() && html.trim().is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok((subject.to_owned(), text.to_owned(), html.to_owned()));
+    }
     if template != "workshop-invitation" {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -943,7 +1104,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::ServiceExt;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -959,6 +1120,8 @@ mod tests {
             internal_token: "internal-secret".into(),
             provider_client,
             public_client: reqwest::Client::new(),
+            control_event_url: Url::parse("http://127.0.0.1/internal/v1/mail-events").unwrap(),
+            control_event_token: "control-event-secret".into(),
             endpoint,
             project_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse().unwrap(),
             domain_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".parse().unwrap(),
@@ -1010,6 +1173,50 @@ mod tests {
         assert_eq!(
             render("workshop-invitation", &bad).unwrap_err(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn odoo_rendered_template_is_exact_and_bounded() {
+        let content = json!({
+            "subject":"Order confirmed",
+            "text":"Your order is confirmed.",
+            "html":"<p>Your order is confirmed.</p>"
+        });
+        assert_eq!(
+            render("odoo-rendered-v1", &content).unwrap(),
+            (
+                "Order confirmed".into(),
+                "Your order is confirmed.".into(),
+                "<p>Your order is confirmed.</p>".into()
+            )
+        );
+        assert!(
+            render(
+                "odoo-rendered-v1",
+                &json!({
+                    "subject":"Order confirmed", "text":"body", "html":"", "extra":"no"
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            render(
+                "odoo-rendered-v1",
+                &json!({
+                    "subject":"Order\r\nBcc: victim@example.test", "text":"body", "html":""
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            render(
+                "odoo-rendered-v1",
+                &json!({
+                    "subject":"Order confirmed", "text":"", "html":""
+                })
+            )
+            .is_err()
         );
     }
 
@@ -1168,23 +1375,67 @@ mod tests {
             &state.domain_id.to_string(),
             "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         );
-        assert_eq!(
-            parse_tem_event(&wrong_domain, Uuid::new_v4(), &state).unwrap_err(),
-            StatusCode::BAD_REQUEST
+        assert_ne!(
+            parse_tem_event(&wrong_domain, Uuid::new_v4(), &state)
+                .unwrap()
+                .domain_id,
+            state.domain_id
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_event_is_projected_with_a_separate_exact_bearer() {
+        let control = MockServer::start().await;
+        let event = JournalRecord {
+            schema_version: 1,
+            event_id: Uuid::new_v4(),
+            sns_message_id: Uuid::new_v4(),
+            email_id: Uuid::new_v4(),
+            delivery_id: Uuid::new_v4(),
+            domain_id: Uuid::new_v4(),
+            event_type: "email_spam".into(),
+            created_at: "2026-08-15T12:00:00Z".into(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/internal/v1/mail-events"))
+            .and(header("authorization", "Bearer control-event-secret"))
+            .and(body_partial_json(json!({
+                "event_id":event.event_id,
+                "email_id":event.email_id,
+                "delivery_id":event.delivery_id,
+                "event_type":"email_spam"
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&control)
+            .await;
+        let mut state = test_state(
+            Url::parse("http://127.0.0.1/emails").unwrap(),
+            reqwest::Client::new(),
+        );
+        state.control_event_url =
+            Url::parse(&format!("{}/internal/v1/mail-events", control.uri())).unwrap();
+        publish_delivery_event(&state, &event).await.unwrap();
     }
 
     #[tokio::test]
     async fn authenticated_allowlisted_mail_is_submitted_without_exposing_provider_errors() {
         let provider = MockServer::start().await;
         let provider_id = Uuid::new_v4();
+        let delivery_id = Uuid::new_v4();
         Mock::given(method("POST"))
             .and(path("/emails"))
             .and(header("X-Auth-Token", "provider-secret"))
             .and(body_partial_json(json!({
                 "project_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "from":{"email":"notifications@notify.staging.makersbrain.net","name":"Atelier Luna via MakersBrain"},
                 "to":[{"email":"Synthetic@Example.test","name":""}],
-                "subject":"MakersBrain invitation"
+                "subject":"Order confirmed",
+                "attachments":[{"name":"receipt.pdf","type":"application/pdf","content":"cGRm"}],
+                "additional_headers":[
+                    {"key":"X-MakersBrain-Delivery-ID","value":delivery_id},
+                    {"key":"Reply-To","value":"studio@example.test"}
+                ]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "emails":[{"id":provider_id}]
@@ -1212,19 +1463,31 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "delivery_id":Uuid::new_v4(),
+                    "delivery_id":delivery_id,
                     "to":"Synthetic@Example.test",
-                    "template":"workshop-invitation",
+                    "template":"odoo-rendered-v1",
                     "data":{
-                        "accept_url":"https://staging.makersbrain.net/invitations/accept#token=synthetic-capability-value",
-                        "role":"artisan",
-                        "locale":"en"
-                    }
+                        "subject":"Order confirmed",
+                        "text":"Your order is confirmed.",
+                        "html":"<p>Your order is confirmed.</p>"
+                    },
+                    "sender_name":"Atelier Luna via MakersBrain",
+                    "reply_to":"studio@example.test",
+                    "attachments":[{
+                        "name":"receipt.pdf",
+                        "content_type":"application/pdf",
+                        "content_base64":"cGRm"
+                    }]
                 })
                 .to_string(),
             ))
             .unwrap();
         let response = app(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"provider_message_id":provider_id,"provider_domain_id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})
+        );
     }
 }

@@ -40,7 +40,11 @@ use governance::*;
 pub(crate) mod contracts;
 use contracts::*;
 pub(crate) mod carrier_secrets;
+pub(crate) mod domains;
+pub(crate) mod email_domains;
 pub(crate) mod recovery;
+pub(crate) mod smtp;
+pub(crate) mod webshop;
 pub(crate) use recovery::{DuplicateBody, RecoveryPointBody, RestoreBody};
 use recovery::{confirm_slug, ensure_lifecycle_idle, lock_lifecycle, primary_database};
 pub(crate) mod internal;
@@ -128,6 +132,14 @@ pub fn app(state: AppState) -> Router {
             post(internal::inventory_product_lookup),
         )
         .route(
+            "/internal/v1/workshops/{workshop_id}/webshop-mails",
+            post(internal::webshop_transactional_mail),
+        )
+        .route(
+            "/internal/v1/mail-events",
+            post(internal::mail_delivery_event),
+        )
+        .route(
             "/internal/v1/tenants/{workshop_id}/reconcile",
             post(internal::reconcile_tenant),
         )
@@ -155,7 +167,9 @@ pub fn app(state: AppState) -> Router {
                     header::HeaderName::from_static("idempotency-key"),
                 ]),
         )
-        .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        // Transactional mail accepts bounded HTML, text, and 8 MiB of raw
+        // attachments. Base64 and JSON escaping make the valid wire envelope larger.
+        .layer(RequestBodyLimitLayer::new(16 * 1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             state.config.request_timeout,
@@ -301,6 +315,17 @@ fn internal(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     if supplied != Some(state.config.internal_token.as_str()) {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(())
+}
+
+fn mail_event_gateway(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if supplied != Some(state.config.mail_event_token.as_str()) {
         return Err(ApiError::Unauthenticated);
     }
     Ok(())

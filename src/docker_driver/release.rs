@@ -603,12 +603,21 @@ async fn ensure_release_runtime(
             format!("PORT={}", state.config.postgres_port),
             format!("USER={runtime_role}"),
             format!("MB_RUNTIME_PASSWORD_FILE=/run/makersbrain-release-secrets/{runtime_role}"),
+            format!("MB_CONTROL_API_URL={}", state.config.control_internal_url),
+            "MB_ODOO_CLIENT_TOKEN_ROOT=/run/makersbrain-odoo-client-secrets".into(),
         ];
-        let mut mounts = vec![runtime_secret_mount(
-            state,
-            Path::new("releases"),
-            "/run/makersbrain-release-secrets",
-        )?];
+        let mut mounts = vec![
+            runtime_secret_mount(
+                state,
+                Path::new("releases"),
+                "/run/makersbrain-release-secrets",
+            )?,
+            runtime_secret_mount(
+                state,
+                Path::new("odoo-clients"),
+                "/run/makersbrain-odoo-client-secrets",
+            )?,
+        ];
         if let Some(ca_mount) = postgres_ca_mount(state)? {
             environment.push("PGSSLMODE=verify-full".into());
             environment.push("PGSSLROOTCERT=/run/makersbrain-postgres-ca/postgres-ca.crt".into());

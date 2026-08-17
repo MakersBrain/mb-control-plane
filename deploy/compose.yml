@@ -258,6 +258,7 @@ services:
       CONTROL_TENANT_DOMAIN: localhost
       CONTROL_TENANT_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
       CONTROL_INTERNAL_TOKEN: "@/run/secrets/control_internal_token"
+      CONTROL_MAIL_EVENT_TOKEN: "@/run/secrets/control_mail_event_token"
       CONTROL_RELEASE_PUBLISH_TOKEN: "@/run/secrets/control_release_publish_token"
       CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
       CONTROL_INVITATION_VERIFICATION_KEYS_FILE: /run/makersbrain-invitation/public-keys.json
@@ -282,6 +283,7 @@ services:
     secrets:
       - control_api_database_url
       - control_internal_token
+      - control_mail_event_token
       - control_release_publish_token
       - document_extraction_token
       - deployment_driver_token
@@ -513,8 +515,13 @@ services:
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_CLOUDFLARE_API_TOKEN: "@/run/secrets/control_cloudflare_api_token"
+      CONTROL_CLOUDFLARE_ZONE_ID: ${CONTROL_CLOUDFLARE_ZONE_ID:-}
+      CONTROL_MAIL_SCW_PROJECT_ID: ${CONTROL_MAIL_SCW_PROJECT_ID:-}
+      CONTROL_MAIL_SCW_SECRET_KEY: "@/run/secrets/control_mail_scw_secret_key"
+      CONTROL_MAIL_SNS_TOPIC_ARN: ${CONTROL_MAIL_SNS_TOPIC_ARN:-}
     volumes: ["tenant-secrets:/run/makersbrain-secrets:ro"]
-    secrets: [control_reconciliation_database_url, deployment_driver_token]
+    secrets: [control_reconciliation_database_url, deployment_driver_token, control_cloudflare_api_token, control_mail_scw_secret_key]
   worker-lifecycle:
     <<: *worker
     command: ["/usr/local/bin/control-worker", "tenant-lifecycle"]
@@ -592,6 +599,7 @@ services:
       PASSWORD: "@/run/secrets/odoo_postgres_password"
       MB_CONTROL_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       MB_CONTROL_API_URL: http://control-api:8080
+      MB_ODOO_CLIENT_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
       MB_CARRIER_CONTROL_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
     command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes:
@@ -625,6 +633,8 @@ services:
 
 secrets:
   cloudflare_tunnel_token: {file: ./secrets/runtime/cloudflare_tunnel_token}
+  control_cloudflare_api_token: {file: ./secrets/runtime/control_cloudflare_api_token}
+  control_mail_scw_secret_key: {file: ./secrets/runtime/control_mail_scw_secret_key}
   postgres_superuser_password: {file: ./secrets/runtime/postgres_superuser_password}
   control_postgres_password: {file: ./secrets/runtime/control_postgres_password}
   control_api_postgres_password: {file: ./secrets/runtime/control_api_postgres_password}
@@ -647,6 +657,7 @@ secrets:
   rauthy_hql_secret_api: {file: ./secrets/runtime/rauthy_hql_secret_api}
   rauthy_config: {file: ./secrets/runtime/rauthy_config.toml}
   control_internal_token: {file: ./secrets/runtime/control_internal_token}
+  control_mail_event_token: {file: ./secrets/runtime/control_mail_event_token}
   control_release_publish_token: {file: ./secrets/runtime/control_release_publish_token}
   odoo_bridge_token: {file: ./secrets/runtime/odoo_bridge_token}
   document_extraction_token: {file: ./secrets/runtime/document_extraction_token}

@@ -771,6 +771,7 @@ async fn provision(
     let release_id = active_platform_release(state).await?;
     let database_ref = opaque_database(payload, "database_ref")?;
     let odoo_hostname = hostname(payload, "public_hostname")?;
+    let custom_hostnames = custom_hostname_routes(payload)?;
     let paperless_enabled = payload
         .get("paperless_enabled")
         .and_then(Value::as_bool)
@@ -813,6 +814,19 @@ async fn provision(
             .odoo_client_secret_root
             .join(workshop.to_string()),
         &tenant_bridge_token,
+    )
+    .map_err(DriverError::internal)?;
+    let runtime_clients = driver_runtime_secret_root(state).join("odoo-clients");
+    secure_directory(&runtime_clients).map_err(DriverError::internal)?;
+    write_secret(
+        &runtime_clients.join(workshop.to_string()),
+        &tenant_bridge_token,
+    )
+    .map_err(DriverError::internal)?;
+    std::os::unix::fs::chown(
+        runtime_clients.join(workshop.to_string()),
+        Some(state.config.odoo_uid),
+        Some(state.config.odoo_gid),
     )
     .map_err(DriverError::internal)?;
     std::os::unix::fs::chown(
@@ -1001,6 +1015,7 @@ async fn provision(
             .as_ref()
             .map(|(hostname, container)| (*hostname, container.as_str())),
         false,
+        &custom_hostnames,
     )
     .await?;
     Ok(response)
@@ -1054,6 +1069,43 @@ fn hostname<'a>(payload: &'a Value, key: &str) -> Result<&'a str, DriverError> {
         return Err(DriverError::bad(format!("{key} is invalid")));
     }
     Ok(value)
+}
+
+fn custom_hostname_routes(payload: &Value) -> Result<Vec<CustomHostnameRoute>, DriverError> {
+    let Some(values) = payload.get("custom_hostnames") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .filter(|values| values.len() <= 20)
+        .ok_or_else(|| DriverError::bad("custom_hostnames must be a bounded array"))?;
+    let mut result = Vec::with_capacity(values.len());
+    let mut canonical_seen = false;
+    let mut unique = std::collections::HashSet::new();
+    for value in values {
+        let object = value
+            .as_object()
+            .filter(|object| {
+                object.len() == 2
+                    && object.contains_key("hostname")
+                    && object.contains_key("canonical")
+            })
+            .ok_or_else(|| DriverError::bad("custom hostname route is invalid"))?;
+        let hostname = hostname(value, "hostname")?.to_owned();
+        let canonical = object
+            .get("canonical")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| DriverError::bad("custom hostname canonical flag is invalid"))?;
+        if !unique.insert(hostname.clone()) || (canonical && canonical_seen) {
+            return Err(DriverError::bad("custom hostname routes conflict"));
+        }
+        canonical_seen |= canonical;
+        result.push(CustomHostnameRoute {
+            hostname,
+            canonical,
+        });
+    }
+    Ok(result)
 }
 
 fn secure_directory(path: &Path) -> std::io::Result<()> {
@@ -1544,6 +1596,74 @@ mod tests {
     fn public_hostnames_cannot_inject_gateway_configuration() {
         assert!(hostname(&json!({"host":"atelier.dev1.makersbrain.net"}), "host").is_ok());
         assert!(hostname(&json!({"host":"atelier; return 200"}), "host").is_err());
+    }
+
+    #[test]
+    fn custom_hostname_routes_are_bounded_unique_and_injection_safe() {
+        let routes = custom_hostname_routes(&json!({"custom_hostnames":[
+            {"hostname":"www.atelier-luna.fr","canonical":true},
+            {"hostname":"shop.atelier-luna.fr","canonical":false}
+        ]}))
+        .unwrap();
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].canonical);
+        assert!(
+            custom_hostname_routes(&json!({"custom_hostnames":[
+                {"hostname":"atelier; return 200","canonical":true}
+            ]}))
+            .is_err()
+        );
+        assert!(
+            custom_hostname_routes(&json!({"custom_hostnames":[
+                {"hostname":"a.example.fr","canonical":true},
+                {"hostname":"b.example.fr","canonical":true}
+            ]}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_custom_hostname_keeps_platform_origin_and_redirects_custom_aliases() {
+        let config = route_config_with_custom_hostnames(
+            "mb_00000000000000000000000000000001",
+            "atelier.makersbrain.com",
+            None,
+            false,
+            &[
+                CustomHostnameRoute {
+                    hostname: "www.atelier-luna.fr".into(),
+                    canonical: true,
+                },
+                CustomHostnameRoute {
+                    hostname: "shop.atelier-luna.fr".into(),
+                    canonical: false,
+                },
+            ],
+        );
+        assert!(config.contains("server_name www.atelier-luna.fr atelier.makersbrain.com;"));
+        assert!(config.contains(
+            "server_name shop.atelier-luna.fr;\n  return 308 https://www.atelier-luna.fr$request_uri;"
+        ));
+        assert_eq!(config.matches("X-Odoo-Dbfilter").count(), 1);
+    }
+
+    #[test]
+    fn platform_hostname_redirects_active_noncanonical_custom_hosts() {
+        let config = route_config_with_custom_hostnames(
+            "mb_00000000000000000000000000000001",
+            "atelier.makersbrain.com",
+            None,
+            false,
+            &[CustomHostnameRoute {
+                hostname: "www.atelier-luna.fr".into(),
+                canonical: false,
+            }],
+        );
+        assert!(config.contains("server_name atelier.makersbrain.com;"));
+        assert!(config.contains(
+            "server_name www.atelier-luna.fr;\n  return 308 https://atelier.makersbrain.com$request_uri;"
+        ));
+        assert_eq!(config.matches("X-Odoo-Dbfilter").count(), 1);
     }
 
     #[test]

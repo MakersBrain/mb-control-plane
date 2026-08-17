@@ -20,6 +20,7 @@ export type CreatePrivacyIncident = { affected_categories: Array<string>; affect
 export type CreatePrivacyRequest = { request_type: string; workshop_ids?: Array<unknown> | null };
 export type CreateRetentionRun = { dry_run: boolean; policy_version: number };
 export type CreateWorkshop = { country_code?: string | null; display_name: string; slug: string; time_zone: string };
+export type CustomDomainCreateBody = { hostname: string };
 export type DataSubjectExportStatusResponse = { consumed_at?: string | null; expires_at: string; filename?: string | null; id: string; plaintext_size?: number | null; ready_at?: string | null; state: string };
 export type DatabaseResponse = { can_manage: boolean; duplicates: Array<DuplicateDatabaseResponse>; primary?: null | PrimaryDatabaseResponse; recovery_points: Array<RecoveryPointResponse> };
 export type DeleteWorkshopBody = { confirmation: string };
@@ -27,6 +28,8 @@ export type DuplicateBody = { confirmation: string; label: string };
 export type DuplicateCommandResponse = { id: string; operation_id: string; routable: boolean };
 export type DuplicateDatabaseResponse = { created_at: string; id: string; label: string; routable: boolean; state: string };
 export type EmailDeliveryResponse = { attempts: number; created_at: string; id: string; next_attempt_at: string; recipient: string; sent_at?: string | null; state: string; template: string };
+export type EmailDomainCreateBody = { domain_name: string; sender_local_part?: string };
+export type EmailDomainResponse = { can_manage: boolean; desired_state: string; dns_records: unknown; domain_name: string; id: string; last_error_class?: string | null; last_health_checked_at?: string | null; operation_id?: string | null; provider_status?: string | null; sender_local_part: string; state: string; test_delivered_at?: string | null; verification: unknown; version: number };
 export type EntitlementResponse = { expires_at?: string | null; limits: Record<string, unknown>; plan: string; status: string; updated_at: string; version: number };
 export type ErasureRestoreReplayResponse = { completed_at?: string | null; completed_locations: Array<string>; created_at: string; id: string; operation_id: string; recovery_point_id: string; required_locations: Array<string>; safe_error_class?: string | null; started_at?: string | null; state: string; tombstone_id: string };
 export type IdentityLinkResponse = { linked: boolean; user_id: string };
@@ -105,6 +108,13 @@ export type TenantReleaseAdoptionResponse = { backup_recovery_id?: string | null
 export type TransferBody = { to_user_id: string };
 export type UsageCounterResponse = { metric: string; quantity: number; updated_at: string };
 export type VersionedOperationCommandResponse = { operation_id: string; version: number };
+export type WebshopCheckResponse = { count?: number | null; href?: string | null; key: string; label: string; next_action: string; ready: boolean };
+export type WebshopDashboardResponse = { can_manage: boolean; checks: Array<WebshopCheckResponse>; completed_at?: string | null; etag: string; issues: Array<WebshopIssueResponse>; last_checked_at?: string | null; odoo_url?: string | null; operation_id?: string | null; operation_state?: string | null; state: string; version: number };
+export type WebshopDomainResponse = { can_manage: boolean; canonical: boolean; certificate_state: string; desired_state: string; dns_state: string; edge_verification_records: unknown; hostname: string; id?: string | null; kind: string; last_error_class?: string | null; last_health_checked_at?: string | null; operation_id?: string | null; ownership_verified_at?: string | null; redirect_target?: string | null; routing_name?: string | null; routing_target?: string | null; state: string; verification_name?: string | null; verification_value?: string | null; version: number };
+export type WebshopIssueResponse = { can_retry: boolean; category: string; count: number; href?: string | null; key: string; next_action: string; operation_id?: string | null; safe_error_class?: string | null; state: string };
+export type WebshopOnboardingCommandResponse = { operation_id?: string | null; state: string; version: number };
+export type WebshopSmtpBody = { encryption: string; from_email: string; host: string; password: string; port: number; username: string };
+export type WebshopSmtpStatus = { configured: boolean; encryption?: string | null; from_email?: string | null; host?: string | null; password_configured: boolean; port?: number | null; transport: string; username?: string | null };
 export type WorkerStatusResponse = { active_operation_id?: string | null; fresh: boolean; last_heartbeat_at: string; queue: string; release_id: string; shutdown_at?: string | null; started_at: string; worker_id: string };
 export type WorkshopCreateCommandResponse = { id: string; operation_id: string };
 export type WorkshopDeletionCommandResponse = { operation_id: string; recovery_point_id: string; retention_days: number; version: number };
@@ -136,6 +146,35 @@ export const controlApiOperations = {
     "pathParameters": [
       "id",
       "secret_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "deleteV1WorkshopsIdDomainsDomainId": {
+    "method": "DELETE",
+    "path": "/v1/workshops/{id}/domains/{domain_id}",
+    "pathParameters": [
+      "id",
+      "domain_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": true
+  },
+  "deleteV1WorkshopsIdEmailDomainsDomainId": {
+    "method": "DELETE",
+    "path": "/v1/workshops/{id}/email-domains/{domain_id}",
+    "pathParameters": [
+      "id",
+      "domain_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "deleteV1WorkshopsIdEmailSmtp": {
+    "method": "DELETE",
+    "path": "/v1/workshops/{id}/email/smtp",
+    "pathParameters": [
+      "id"
     ],
     "requiresIdempotencyKey": true,
     "requiresIfMatch": false
@@ -270,6 +309,15 @@ export const controlApiOperations = {
     "requiresIdempotencyKey": false,
     "requiresIfMatch": false
   },
+  "getV1PlatformWorkshopsIdWebshop": {
+    "method": "GET",
+    "path": "/v1/platform/workshops/{id}/webshop",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
   "getV1PrivacyRequests": {
     "method": "GET",
     "path": "/v1/privacy/requests",
@@ -336,6 +384,33 @@ export const controlApiOperations = {
     "requiresIdempotencyKey": false,
     "requiresIfMatch": false
   },
+  "getV1WorkshopsIdDomains": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/domains",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
+  "getV1WorkshopsIdEmailDomains": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/email-domains",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
+  "getV1WorkshopsIdEmailSmtp": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/email/smtp",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
   "getV1WorkshopsIdIntegrations": {
     "method": "GET",
     "path": "/v1/workshops/{id}/integrations",
@@ -385,6 +460,15 @@ export const controlApiOperations = {
   "getV1WorkshopsIdOwnershipTransfers": {
     "method": "GET",
     "path": "/v1/workshops/{id}/ownership-transfers",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": false,
+    "requiresIfMatch": false
+  },
+  "getV1WorkshopsIdWebshop": {
+    "method": "GET",
+    "path": "/v1/workshops/{id}/webshop",
     "pathParameters": [
       "id"
     ],
@@ -636,6 +720,63 @@ export const controlApiOperations = {
     "requiresIdempotencyKey": true,
     "requiresIfMatch": false
   },
+  "postV1WorkshopsIdDomains": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/domains",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "postV1WorkshopsIdDomainsDomainIdCanonical": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/domains/{domain_id}/canonical",
+    "pathParameters": [
+      "id",
+      "domain_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": true
+  },
+  "postV1WorkshopsIdDomainsDomainIdVerify": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/domains/{domain_id}/verify",
+    "pathParameters": [
+      "id",
+      "domain_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "postV1WorkshopsIdEmailDomains": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/email-domains",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "postV1WorkshopsIdEmailDomainsDomainIdCheck": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/email-domains/{domain_id}/check",
+    "pathParameters": [
+      "id",
+      "domain_id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
+  "postV1WorkshopsIdEmailSmtp": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/email/smtp",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": false
+  },
   "postV1WorkshopsIdInvitations": {
     "method": "POST",
     "path": "/v1/workshops/{id}/invitations",
@@ -658,6 +799,33 @@ export const controlApiOperations = {
   "postV1WorkshopsIdOwnershipTransfers": {
     "method": "POST",
     "path": "/v1/workshops/{id}/ownership-transfers",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": true
+  },
+  "postV1WorkshopsIdWebshopDeactivate": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/webshop/deactivate",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": true
+  },
+  "postV1WorkshopsIdWebshopOnboardingComplete": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/webshop/onboarding/complete",
+    "pathParameters": [
+      "id"
+    ],
+    "requiresIdempotencyKey": true,
+    "requiresIfMatch": true
+  },
+  "postV1WorkshopsIdWebshopOnboardingRefresh": {
+    "method": "POST",
+    "path": "/v1/workshops/{id}/webshop/onboarding/refresh",
     "pathParameters": [
       "id"
     ],

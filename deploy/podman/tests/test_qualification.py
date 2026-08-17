@@ -45,6 +45,20 @@ class QualificationTests(unittest.TestCase):
             self.assertTrue(record["synthetic_data_only"])
             self.assertEqual(set(record["checks"]), set(QUALIFICATION.CHECKS))
 
+    def test_paid_webshop_provider_checks_are_independently_mandatory(self):
+        self.assertTrue(
+            {
+                "webshop_cloudflare_dns_tls",
+                "webshop_scaleway_mail",
+                "webshop_sumup_payment",
+                "webshop_boxtal_shipping",
+                "webshop_browser_accessibility",
+            }.issubset(QUALIFICATION.CHECKS)
+        )
+
+    def test_observability_delivery_is_independently_mandatory(self):
+        self.assertIn("observability_delivery", QUALIFICATION.CHECKS)
+
     def test_failed_check_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             release, evidence, output = self.fixture(Path(temporary))

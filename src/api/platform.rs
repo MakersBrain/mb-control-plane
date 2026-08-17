@@ -393,7 +393,8 @@ pub(super) async fn platform_reconcile_workshop(
     let tenant=sqlx::query_as::<_,(Uuid,String,String,String)>("select d.id,w.slug,d.database_ref,d.public_hostname from control.workshops w join control.odoo_databases d on d.workshop_id=w.id where w.id=$1 and w.status<>'deleted' and d.kind='primary' and d.deleted_at is null and d.public_hostname is not null")
         .bind(id).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
     let paperless_enabled=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')").bind(id).fetch_one(&mut *tx).await?;
-    let payload = json!({"database_id":tenant.0,"database_ref":tenant.2,"public_hostname":tenant.3,"paperless_hostname":format!("docs-{}.{}",tenant.1,state.config.tenant_domain),"paperless_enabled":paperless_enabled});
+    let custom_hostnames = crate::worker::routable_custom_hostnames(&state.store, id).await?;
+    let payload = json!({"database_id":tenant.0,"database_ref":tenant.2,"public_hostname":tenant.3,"paperless_hostname":format!("docs-{}.{}",tenant.1,state.config.tenant_domain),"paperless_enabled":paperless_enabled,"custom_hostnames":custom_hostnames});
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {

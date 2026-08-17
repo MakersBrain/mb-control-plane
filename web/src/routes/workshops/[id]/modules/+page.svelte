@@ -39,6 +39,17 @@
 		finally { busy = ''; }
 	}
 
+	async function deactivate(module: Module) {
+		if (!confirm('Deactivate the webshop now? Checkout and the public storefront will close, while orders, configuration, domains and transactional mail records are retained.')) return;
+		busy = module.key; error = ''; notice = '';
+		try {
+			await request(`/v1/workshops/${id}/webshop/deactivate`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID(),'if-match':module.etag} });
+			notice = 'Webshop deactivation is queued. Historical commerce data and external services are retained.';
+			await load();
+		} catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+		finally { busy = ''; }
+	}
+
 	const missingDependencies = (module: Module) => module.dependencies.filter((key) => !modules.some((candidate) => candidate.key === key && candidate.state === 'enabled'));
 	const moduleName = (key: string) => modules.find((module) => module.key === key)?.name || sentence(key);
 </script>
@@ -74,7 +85,10 @@
 			{:else if module.state === 'unavailable'}
 				<p class="muted">Upgrade this workshop to a compatible application release before enabling it.</p>
 			{:else if module.state === 'restricted'}
-				<p class="muted">Installed data is retained, but processing is disabled until entitlement is restored.</p>
+				<p class="muted">Installed data and configuration are retained. Domains and mail services remain independent.</p>
+				{#if module.key === 'webshop'}<button disabled={!module.can_manage || busy === module.key} onclick={() => enable(module)}>{busy === module.key ? 'Queuing…' : 'Reactivate webshop'}</button>{/if}
+			{:else if module.state === 'enabled' && module.key === 'webshop'}
+				<p class="notice">Ready for this workshop.</p><button class="secondary" disabled={!module.can_manage || busy === module.key} onclick={() => deactivate(module)}>{busy === module.key ? 'Queuing…' : 'Deactivate webshop'}</button>
 			{:else}
 				<p class="notice">Ready for this workshop.</p>
 			{/if}

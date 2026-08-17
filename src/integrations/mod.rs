@@ -1,10 +1,12 @@
 pub mod azure;
+pub mod cloudflare;
 pub mod extraction;
 pub mod inventory_vision;
 pub mod odoo;
 pub mod paperless;
 pub mod product_lookup;
 pub mod rauthy;
+pub mod scaleway_tem;
 
 use futures_util::StreamExt as _;
 use reqwest::StatusCode;

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -61,6 +62,20 @@ def worker_queues() -> set[str]:
 def compose_worker_queues() -> set[str]:
     text = (DEPLOY / "compose.yml").read_text()
     return set(re.findall(r'"/usr/local/bin/control-worker", "([a-z-]+)"', text))
+
+
+def staging_qualification_checks() -> list[str]:
+    path = DEPLOY / "podman/qualification.py"
+    module = ast.parse(path.read_text(), filename=str(path))
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "CHECKS" for target in statement.targets):
+            value = ast.literal_eval(statement.value)
+            if not isinstance(value, tuple) or not all(isinstance(item, str) for item in value):
+                break
+            return list(value)
+    raise ValueError("deploy/podman/qualification.py: CHECKS tuple not found")
 
 
 def compose_service_block(name: str) -> str:
@@ -498,6 +513,19 @@ def validate() -> list[str]:
         errors.append("required_environment drift between config spec and release contract")
     if spec.get("optional_environment") != contract.get("optional_environment"):
         errors.append("optional_environment drift between config spec and release contract")
+
+    try:
+        implemented_checks = staging_qualification_checks()
+    except (SyntaxError, ValueError) as error:
+        errors.append(str(error))
+    else:
+        contracted_checks = contract.get("staging_qualification", {}).get(
+            "mandatory_checks"
+        )
+        if contracted_checks != implemented_checks:
+            errors.append(
+                "staging qualification checks drift between release contract and builder"
+            )
 
     startup_entrypoints = {
         "src/bin/control-api.rs": ["api"],
