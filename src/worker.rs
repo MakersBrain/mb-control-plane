@@ -549,12 +549,13 @@ async fn enable_module(store: &Store, operation: &LeasedOperation) -> Result<(),
         })
         .await?;
     }
-    if module_key == "shipping-boxtal" {
+    if let Some(provider) = module_key.strip_prefix("shipping-") {
         sqlx::query(
             "update control.carrier_secrets set state='active',deleted_at=null
-              where workshop_id=$1 and provider='boxtal' and state='suspended'",
+              where workshop_id=$1 and provider=$2 and state='suspended'",
         )
         .bind(workshop)
+        .bind(provider)
         .execute(store.pool())
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
@@ -794,16 +795,6 @@ async fn restrict_module(
             != Some(true)
     {
         return Err(IntegrationError::ContractDrift);
-    }
-    if module_key == "shipping-boxtal" {
-        sqlx::query(
-            "update control.carrier_secrets set state='suspended'
-              where workshop_id=$1 and provider='boxtal' and state='active'",
-        )
-        .bind(workshop)
-        .execute(store.pool())
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
     }
     let changed = sqlx::query(
         "update control.workshop_modules set state='restricted',restriction_evidence=$4,

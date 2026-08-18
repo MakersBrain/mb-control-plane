@@ -709,30 +709,49 @@ fn write_carrier_secret(
     let object = payload
         .as_object()
         .filter(|value| {
-            value.len() == 2 && value.contains_key("secret_id") && value.contains_key("credentials")
+            value.len() == 3
+                && value.contains_key("secret_id")
+                && value.contains_key("provider")
+                && value.contains_key("credentials")
         })
         .ok_or_else(|| DriverError::bad("carrier secret payload is invalid"))?;
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::bad("carrier provider is invalid"))?;
     let credentials = object
         .get("credentials")
         .and_then(Value::as_object)
-        .filter(|value| {
-            value.len() == 3
-                && ["access_key", "secret_key", "webhook_secret"]
-                    .iter()
-                    .all(|key| {
-                        value
-                            .get(*key)
-                            .and_then(Value::as_str)
-                            .is_some_and(|secret| {
-                                ((*key == "access_key" && (8..=256).contains(&secret.len()))
-                                    || (*key != "access_key" && (24..=512).contains(&secret.len())))
-                                    && !secret
-                                        .chars()
-                                        .any(|character| matches!(character, '\r' | '\n' | '\0'))
-                            })
-                    })
-        })
-        .ok_or_else(|| DriverError::bad("Boxtal credentials are invalid"))?;
+        .ok_or_else(|| DriverError::bad("carrier credentials are invalid"))?;
+    let valid_value = |key: &str, minimum: usize, maximum: usize| {
+        credentials
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|secret| {
+                (minimum..=maximum).contains(&secret.len())
+                    && !secret
+                        .chars()
+                        .any(|character| matches!(character, '\r' | '\n' | '\0'))
+            })
+    };
+    let valid = match provider {
+        "boxtal" => {
+            credentials.len() == 3
+                && valid_value("access_key", 8, 256)
+                && valid_value("secret_key", 24, 512)
+                && valid_value("webhook_secret", 24, 512)
+        }
+        "sendcloud" => {
+            matches!(credentials.len(), 2 | 3)
+                && valid_value("public_key", 8, 256)
+                && valid_value("private_key", 16, 512)
+                && (credentials.len() == 2 || valid_value("webhook_signature_key", 16, 512))
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(DriverError::bad("carrier credentials are invalid"));
+    }
     let (id, path) = carrier_secret_path(state, workshop, payload)?;
     let parent = path
         .parent()

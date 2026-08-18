@@ -164,13 +164,6 @@ pub struct PrivacyExportCommand {
 }
 
 #[derive(Clone, Serialize)]
-pub struct CarrierSecretMaterial {
-    pub access_key: String,
-    pub secret_key: String,
-    pub webhook_secret: String,
-}
-
-#[derive(Clone, Serialize)]
 pub struct CarrierSecretBindingCommand {
     pub workshop_id: Uuid,
     pub company_id: i64,
@@ -179,7 +172,7 @@ pub struct CarrierSecretBindingCommand {
     pub environment: String,
     pub secret_ref: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credentials: Option<CarrierSecretMaterial>,
+    pub credentials: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
@@ -560,11 +553,11 @@ mod tests {
             provider: "boxtal".into(),
             environment: "test".into(),
             secret_ref: format!("docker/{}/carrier/{}", Uuid::nil(), Uuid::nil()),
-            credentials: Some(CarrierSecretMaterial {
-                access_key: "access-key".into(),
-                secret_key: "secret-key".into(),
-                webhook_secret: "webhook-secret".into(),
-            }),
+            credentials: Some(json!({
+                "access_key":"access-key",
+                "secret_key":"secret-key",
+                "webhook_secret":"webhook-secret"
+            })),
         };
         let encoded = serde_json::to_value(&command).unwrap();
         assert_eq!(encoded["credentials"]["webhook_secret"], "webhook-secret");

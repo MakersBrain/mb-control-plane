@@ -52,6 +52,7 @@ class QualificationTests(unittest.TestCase):
                 "webshop_scaleway_mail",
                 "webshop_sumup_payment",
                 "webshop_boxtal_shipping",
+                "webshop_sendcloud_shipping",
                 "webshop_browser_accessibility",
             }.issubset(QUALIFICATION.CHECKS)
         )

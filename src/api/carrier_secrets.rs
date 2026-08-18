@@ -3,10 +3,26 @@ use super::*;
 use serde::Serialize;
 
 #[derive(Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CarrierCredentials {
-    access_key: String,
-    secret_key: String,
-    webhook_secret: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    access_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    secret_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    webhook_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    private_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    webhook_signature_key: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -26,6 +42,7 @@ pub(crate) struct ResolveCarrierSecretBody {
     secret_ref: String,
     environment: String,
     purpose: String,
+    provider: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -73,23 +90,79 @@ fn valid_secret(value: &str, minimum: usize, maximum: usize) -> bool {
             .any(|character| matches!(character, '\r' | '\n' | '\0'))
 }
 
-fn resolve_lifecycle_scope(purpose: &str) -> Option<(&'static str, &'static str)> {
+fn resolve_lifecycle_scope(purpose: &str) -> Option<(Vec<String>, Vec<String>)> {
     match purpose {
-        "provider_operation" => Some(("active", "enabled")),
-        "webhook_suspension" => Some(("active", "restricting")),
-        "webhook_reactivation" => Some(("suspended", "installing")),
+        "provider_operation" => Some((vec!["active".into()], vec!["enabled".into()])),
+        "cancellation"
+        | "document_recovery"
+        | "reconciliation"
+        | "tracking_lookup"
+        | "webhook_verification"
+        | "webhook_processing" => Some((
+            vec!["active".into()],
+            vec!["enabled".into(), "restricted".into()],
+        )),
+        "webhook_suspension" => Some((vec!["active".into()], vec!["restricting".into()])),
+        "webhook_reactivation" => Some((vec!["suspended".into()], vec!["installing".into()])),
         _ => None,
     }
 }
 
+fn provider_module(provider: &str) -> Option<&'static str> {
+    match provider {
+        "boxtal" => Some("shipping-boxtal"),
+        "sendcloud" => Some("shipping-sendcloud"),
+        _ => None,
+    }
+}
+
+fn credential_value(body: &CarrierCredentials) -> ApiResult<Value> {
+    serde_json::to_value(body).map_err(|error| ApiError::Internal(error.into()))
+}
+
 fn validate(body: &CarrierSecretBody) -> ApiResult<()> {
-    if body.provider != "boxtal"
+    let boxtal = body.provider == "boxtal"
+        && body.credentials.public_key.is_none()
+        && body.credentials.private_key.is_none()
+        && body.credentials.webhook_signature_key.is_none()
+        && body
+            .credentials
+            .access_key
+            .as_deref()
+            .is_some_and(|v| valid_secret(v, 8, 256))
+        && body
+            .credentials
+            .secret_key
+            .as_deref()
+            .is_some_and(|v| valid_secret(v, 24, 512))
+        && body
+            .credentials
+            .webhook_secret
+            .as_deref()
+            .is_some_and(|v| valid_secret(v, 24, 512));
+    let sendcloud = body.provider == "sendcloud"
+        && body.credentials.access_key.is_none()
+        && body.credentials.secret_key.is_none()
+        && body.credentials.webhook_secret.is_none()
+        && body
+            .credentials
+            .public_key
+            .as_deref()
+            .is_some_and(|v| valid_secret(v, 8, 256))
+        && body
+            .credentials
+            .private_key
+            .as_deref()
+            .is_some_and(|v| valid_secret(v, 16, 512))
+        && body
+            .credentials
+            .webhook_signature_key
+            .as_deref()
+            .is_none_or(|v| valid_secret(v, 16, 512));
+    if !(boxtal || sendcloud)
         || !matches!(body.environment.as_str(), "test" | "production")
         || body.company_id <= 0
         || body.carrier_id <= 0
-        || !valid_secret(&body.credentials.access_key, 8, 256)
-        || !valid_secret(&body.credentials.secret_key, 24, 512)
-        || !valid_secret(&body.credentials.webhook_secret, 24, 512)
     {
         return Err(ApiError::Validation(
             "carrier credential payload is invalid",
@@ -141,16 +214,20 @@ async fn require_manager(state: &AppState, user: Uuid, workshop: Uuid) -> ApiRes
     Ok(())
 }
 
-async fn require_enabled(state: &AppState, workshop: Uuid) -> ApiResult<()> {
+async fn require_enabled(state: &AppState, workshop: Uuid, provider: &str) -> ApiResult<()> {
+    let module_key = provider_module(provider).ok_or(ApiError::Validation(
+        "carrier credential payload is invalid",
+    ))?;
     let enabled = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.workshop_modules
-          where workshop_id=$1 and module_key='shipping-boxtal' and state='enabled')",
+          where workshop_id=$1 and module_key=$2 and state='enabled')",
     )
     .bind(workshop)
+    .bind(module_key)
     .fetch_one(state.store.pool())
     .await?;
     if !enabled {
-        return Err(ApiError::Conflict("Boxtal shipping is not enabled"));
+        return Err(ApiError::Conflict("The shipping provider is not enabled"));
     }
     Ok(())
 }
@@ -225,7 +302,6 @@ pub(super) async fn targets(
 ) -> ApiResult<Json<Vec<CarrierTargetResponse>>> {
     let who = principal(&state, &headers).await?;
     authority(&state, who.user_id, workshop).await?;
-    require_enabled(&state, workshop).await?;
     let targets = odoo(&state, workshop)
         .await?
         .carrier_targets()
@@ -243,7 +319,7 @@ pub(super) async fn upsert(
     validate(&body)?;
     let who = principal(&state, &headers).await?;
     require_manager(&state, who.user_id, workshop).await?;
-    require_enabled(&state, workshop).await?;
+    require_enabled(&state, workshop, &body.provider).await?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({
         "provider":body.provider,"environment":body.environment,
@@ -329,11 +405,8 @@ pub(super) async fn upsert(
         command_id,
         &json!({
             "secret_id":storage_id,
-            "credentials":{
-                "access_key":body.credentials.access_key,
-                "secret_key":body.credentials.secret_key,
-                "webhook_secret":body.credentials.webhook_secret
-            }
+            "provider":body.provider,
+            "credentials":credential_value(&body.credentials)?
         }),
     )
     .await?;
@@ -353,11 +426,8 @@ pub(super) async fn upsert(
         secret_ref: secret_ref.to_owned(),
         credentials: existing
             .as_ref()
-            .map(|_| crate::integrations::odoo::CarrierSecretMaterial {
-                access_key: body.credentials.access_key.clone(),
-                secret_key: body.credentials.secret_key.clone(),
-                webhook_secret: body.credentials.webhook_secret.clone(),
-            }),
+            .map(|_| credential_value(&body.credentials))
+            .transpose()?,
     };
     if odoo(&state, workshop)
         .await?
@@ -583,35 +653,47 @@ pub(super) async fn resolve(
     if body.company_id <= 0
         || body.carrier_id <= 0
         || !matches!(body.environment.as_str(), "test" | "production")
+        || provider_module(&body.provider).is_none()
         || lifecycle_scope.is_none()
     {
         return Err(ApiError::Validation("carrier secret scope is invalid"));
     }
-    let (secret_state, module_state) = lifecycle_scope.expect("validated lifecycle scope");
-    let reference=sqlx::query_scalar::<_,String>(
+    let (secret_states, module_states) = lifecycle_scope.expect("validated lifecycle scope");
+    let module_key = provider_module(&body.provider).expect("validated provider");
+    let reference = sqlx::query_scalar::<_, String>(
         "select cs.secret_ref from control.carrier_secrets cs
-          join control.workshop_modules wm on wm.workshop_id=cs.workshop_id and wm.module_key='shipping-boxtal'
+          join control.workshop_modules wm on wm.workshop_id=cs.workshop_id and wm.module_key=$6
          where cs.workshop_id=$1 and cs.company_id=$2 and cs.carrier_id=$3
-           and cs.secret_ref=$4 and cs.environment=$5 and cs.provider='boxtal'
-           and cs.state=$6 and wm.state=$7"
-    ).bind(body.workshop_id).bind(body.company_id).bind(body.carrier_id)
-     .bind(&body.secret_ref).bind(&body.environment)
-     .bind(secret_state).bind(module_state)
-     .fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+           and cs.secret_ref=$4 and cs.environment=$5 and cs.provider=$7
+           and cs.state=any($8) and wm.state=any($9)",
+    )
+    .bind(body.workshop_id)
+    .bind(body.company_id)
+    .bind(body.carrier_id)
+    .bind(&body.secret_ref)
+    .bind(&body.environment)
+    .bind(module_key)
+    .bind(&body.provider)
+    .bind(secret_states)
+    .bind(module_states)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let serialized = crate::worker::secret(&reference).map_err(|_| ApiError::NotFound)?;
     let credentials: Value =
         serde_json::from_str(&serialized).map_err(|error| ApiError::Internal(error.into()))?;
-    let valid = credentials.as_object().is_some_and(|value| {
-        value.len() == 3
-            && ["access_key", "secret_key", "webhook_secret"]
-                .iter()
-                .all(|key| {
-                    value
-                        .get(*key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|secret| valid_secret(secret, 8, 512))
-                })
-    });
+    let valid = serde_json::from_value::<CarrierCredentials>(credentials.clone())
+        .ok()
+        .is_some_and(|stored| {
+            validate(&CarrierSecretBody {
+                provider: body.provider.clone(),
+                environment: body.environment.clone(),
+                company_id: body.company_id,
+                carrier_id: body.carrier_id,
+                credentials: stored,
+            })
+            .is_ok()
+        });
     if !valid {
         return Err(ApiError::Internal(anyhow::anyhow!(
             "stored carrier secret contract drift"
@@ -633,9 +715,12 @@ mod tests {
             company_id: 1,
             carrier_id: 2,
             credentials: CarrierCredentials {
-                access_key: "access-key".into(),
-                secret_key: "s".repeat(24),
-                webhook_secret: "w".repeat(24),
+                access_key: Some("access-key".into()),
+                secret_key: Some("s".repeat(24)),
+                webhook_secret: Some("w".repeat(24)),
+                public_key: None,
+                private_key: None,
+                webhook_signature_key: None,
             },
         }
     }
@@ -648,8 +733,27 @@ mod tests {
     #[test]
     fn credential_values_cannot_inject_multiline_secret_files() {
         let mut request = body();
-        request.credentials.webhook_secret = format!("{}\nleak", "w".repeat(24));
+        request.credentials.webhook_secret = Some(format!("{}\nleak", "w".repeat(24)));
         assert!(validate(&request).is_err());
+    }
+
+    #[test]
+    fn exact_sendcloud_scope_and_optional_webhook_key_are_accepted() {
+        let request = CarrierSecretBody {
+            provider: "sendcloud".into(),
+            environment: "test".into(),
+            company_id: 1,
+            carrier_id: 2,
+            credentials: CarrierCredentials {
+                access_key: None,
+                secret_key: None,
+                webhook_secret: None,
+                public_key: Some("public-key".into()),
+                private_key: Some("p".repeat(24)),
+                webhook_signature_key: Some("w".repeat(24)),
+            },
+        };
+        assert!(validate(&request).is_ok());
     }
 
     #[test]
@@ -683,15 +787,18 @@ mod tests {
     fn credential_resolution_purposes_are_bound_to_exact_lifecycle_states() {
         assert_eq!(
             resolve_lifecycle_scope("provider_operation"),
-            Some(("active", "enabled"))
+            Some((vec!["active".into()], vec!["enabled".into()]))
         );
         assert_eq!(
-            resolve_lifecycle_scope("webhook_suspension"),
-            Some(("active", "restricting"))
+            resolve_lifecycle_scope("tracking_lookup"),
+            Some((
+                vec!["active".into()],
+                vec!["enabled".into(), "restricted".into()]
+            ))
         );
         assert_eq!(
             resolve_lifecycle_scope("webhook_reactivation"),
-            Some(("suspended", "installing"))
+            Some((vec!["suspended".into()], vec!["installing".into()]))
         );
         assert_eq!(resolve_lifecycle_scope("credential_export"), None);
     }

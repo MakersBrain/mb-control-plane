@@ -138,6 +138,17 @@ pub const CATALOG: &[ModuleBundle] = &[
         minimum_release: "0.1.0",
     },
     ModuleBundle {
+        key: "shipping-sendcloud",
+        name: "Sendcloud shipping",
+        description: "Buy Sendcloud labels and returns, offer service-point checkout and reconcile signed tracking updates.",
+        // The Sendcloud manifest depends on the shared carrier base. Keep the
+        // catalogue ownership unique and let Odoo resolve that dependency.
+        odoo_modules: &["mb_webshop_carrier_sendcloud"],
+        dependencies: &["webshop"],
+        service: None,
+        minimum_release: "0.1.0",
+    },
+    ModuleBundle {
         key: "inventory-capture",
         name: "Product photo inventory capture",
         description: "Identify receipt products and supplier lots from sanitized label photographs.",
@@ -243,6 +254,14 @@ mod tests {
         );
         assert_eq!(
             bundle("shipping-boxtal").unwrap().dependencies,
+            &["webshop"]
+        );
+        assert_eq!(
+            bundle("shipping-sendcloud").unwrap().odoo_modules,
+            &["mb_webshop_carrier_sendcloud"]
+        );
+        assert_eq!(
+            bundle("shipping-sendcloud").unwrap().dependencies,
             &["webshop"]
         );
     }
