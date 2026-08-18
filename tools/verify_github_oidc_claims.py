@@ -26,6 +26,8 @@ def decode_payload(token: str) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
+    parser.add_argument("--repository-id", required=True)
+    parser.add_argument("--repository-owner-id", required=True)
     parser.add_argument("--environment", required=True)
     parser.add_argument("--audience", required=True)
     args = parser.parse_args()
@@ -35,13 +37,31 @@ def main() -> int:
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
-    expected_subject = f"repo:{args.repository}:environment:{args.environment}"
+    try:
+        owner, repository_name = args.repository.split("/", 1)
+    except ValueError as error:
+        raise SystemExit("repository must be OWNER/NAME") from error
+    for name, value in (
+        ("repository-id", args.repository_id),
+        ("repository-owner-id", args.repository_owner_id),
+    ):
+        if not value.isdecimal() or int(value) <= 0:
+            raise SystemExit(f"{name} must be a positive decimal ID")
+    expected_subject = (
+        f"repo:{owner}@{args.repository_owner_id}/"
+        f"{repository_name}@{args.repository_id}:environment:{args.environment}"
+    )
     audiences = payload.get("aud")
     if isinstance(audiences, str):
         audiences = [audiences]
     checks = {
         "sub": (payload.get("sub"), expected_subject),
         "repository": (payload.get("repository"), args.repository),
+        "repository_id": (payload.get("repository_id"), args.repository_id),
+        "repository_owner_id": (
+            payload.get("repository_owner_id"),
+            args.repository_owner_id,
+        ),
         "environment": (payload.get("environment"), args.environment),
     }
     failures = [
@@ -60,6 +80,8 @@ def main() -> int:
                 "sub": payload["sub"],
                 "aud": audiences,
                 "repository": payload["repository"],
+                "repository_id": payload["repository_id"],
+                "repository_owner_id": payload["repository_owner_id"],
                 "environment": payload["environment"],
             },
             sort_keys=True,

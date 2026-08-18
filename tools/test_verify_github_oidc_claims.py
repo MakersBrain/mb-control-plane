@@ -26,6 +26,10 @@ def invoke(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
             str(SCRIPT),
             "--repository",
             "MakersBrain/odoo",
+            "--repository-id",
+            "1332519958",
+            "--repository-owner-id",
+            "311501550",
             "--environment",
             "release",
             "--audience",
@@ -40,9 +44,11 @@ def invoke(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     claims = {
-        "sub": "repo:MakersBrain/odoo:environment:release",
+        "sub": "repo:MakersBrain@311501550/odoo@1332519958:environment:release",
         "aud": "makersbrain-release",
         "repository": "MakersBrain/odoo",
+        "repository_id": "1332519958",
+        "repository_owner_id": "311501550",
         "environment": "release",
     }
     accepted = invoke(claims)
@@ -56,6 +62,8 @@ def main() -> int:
         ("sub", "repo:MakersBrain/odoo:ref:refs/heads/main"),
         ("aud", "wrong-audience"),
         ("repository", "Other/odoo"),
+        ("repository_id", "999"),
+        ("repository_owner_id", "999"),
         ("environment", "production"),
     ):
         rejected = invoke({**claims, name: value})
@@ -70,6 +78,10 @@ def main() -> int:
             str(SCRIPT),
             "--repository",
             "MakersBrain/odoo",
+            "--repository-id",
+            "1332519958",
+            "--repository-owner-id",
+            "311501550",
             "--environment",
             "release",
             "--audience",

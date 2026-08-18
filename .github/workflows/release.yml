@@ -60,7 +60,10 @@ jobs:
             "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
             | jq -er .value \
             | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" --environment release \
+                --repository "$GITHUB_REPOSITORY" \
+                --repository-id "${{ github.repository_id }}" \
+                --repository-owner-id "${{ github.repository_owner_id }}" \
+                --environment release \
                 --audience makersbrain-release
       - name: Fetch staging release secrets through Infisical OIDC
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
@@ -196,7 +199,10 @@ jobs:
             "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
             | jq -er .value \
             | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" --environment staging \
+                --repository "$GITHUB_REPOSITORY" \
+                --repository-id "${{ github.repository_id }}" \
+                --repository-owner-id "${{ github.repository_owner_id }}" \
+                --environment staging \
                 --audience makersbrain-release
       - name: Fetch staging certification secrets through Infisical OIDC
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
@@ -278,7 +284,10 @@ jobs:
             "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
             | jq -er .value \
             | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" --environment production \
+                --repository "$GITHUB_REPOSITORY" \
+                --repository-id "${{ github.repository_id }}" \
+                --repository-owner-id "${{ github.repository_owner_id }}" \
+                --environment production \
                 --audience makersbrain-release
       - name: Fetch production promotion secrets through Infisical OIDC
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
