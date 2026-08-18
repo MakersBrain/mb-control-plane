@@ -68,6 +68,16 @@ def verify_database_secrets() -> None:
         run(["podman", "secret", "inspect", name])
 
 
+def ensure_data_directory(path: Path) -> None:
+    """Create the validated database data child without accepting a symlink."""
+    if path.is_symlink():
+        raise ValueError("database data directory must not be a symlink")
+    if path.exists() and not path.is_dir():
+        raise ValueError("database data path must be a directory")
+    path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    path.chmod(0o700)
+
+
 def activate(
     rendered: Path,
     release_id: str,
@@ -102,7 +112,10 @@ def activate(
         os.symlink(release_root, temporary, target_is_directory=True)
         os.replace(temporary, current)
         run(["systemctl", "--user", "daemon-reload"])
-        run(["systemctl", "--user", "enable", "--now", "postgres.service"])
+        # Quadlet generates postgres.service at daemon-reload time. Generated
+        # units cannot be enabled directly; the Quadlet [Install] section owns
+        # its default.target linkage, so activation only needs to start it.
+        run(["systemctl", "--user", "start", "postgres.service"])
         run(["systemctl", "--user", "start", "postgres-recovery-init.service"])
         run(
             [
@@ -175,6 +188,7 @@ def main() -> None:
         run(["cosign", "verify", "--key", str(args.cosign_key), image])
         run(["podman", "pull", image])
         if args.activate:
+            ensure_data_directory(Path(values["data_directory"]))
             activate(
                 rendered,
                 record["release_id"],

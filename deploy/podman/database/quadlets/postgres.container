@@ -5,6 +5,8 @@ Description=MakersBrain private PostgreSQL runtime
 Image=@@POSTGRES_IMAGE@@
 Pull=never
 ContainerName=makersbrain-postgres
+User=70:70
+UserNS=keep-id:uid=70,gid=70
 PublishPort=@@PRIVATE_BIND_IP@@:5432:5432
 Environment=POSTGRES_USER=postgres
 Environment=POSTGRES_PASSWORD_FILE=/run/secrets/postgres_superuser_password

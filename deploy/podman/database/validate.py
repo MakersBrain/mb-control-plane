@@ -29,8 +29,20 @@ def validate(root: Path) -> None:
         raise ValueError("PostgreSQL image is not digest-pinned")
     if "docker.sock" in unit or "podman.sock" in unit or "tcp://" in unit:
         raise ValueError("database unit contains a forbidden runtime socket")
+    if (
+        "DropCapability=all" not in unit
+        or "User=70:70" not in unit
+        or "UserNS=keep-id:uid=70,gid=70" not in unit
+        or "AddCapability=" in unit
+    ):
+        raise ValueError("database unit must run rootless as PostgreSQL with no capabilities")
     if "ssl=on" not in unit or "postgres_tls_private_key" not in unit:
         raise ValueError("database TLS is not fail-closed")
+    if (
+        "Secret=postgres_superuser_password,target=postgres_superuser_password,"
+        "uid=70,gid=70,mode=0400"
+    ) not in unit:
+        raise ValueError("PostgreSQL bootstrap secret is not scoped to the runtime user")
     if (
         "archive_mode=on" not in unit
         or "archive-push" not in unit
@@ -42,6 +54,7 @@ def validate(root: Path) -> None:
         "stanza-create" not in recovery
         or "pgbackrest --stanza=makersbrain check" not in recovery
         or recovery.count("exec --user 70:70") != 2
+        or "JobRunningTimeoutSec=180" not in recovery
     ):
         raise ValueError("PostgreSQL recovery repository is not initialized and checked")
     incremental = (root / "postgres-backup.service").read_text()
@@ -58,6 +71,8 @@ def validate(root: Path) -> None:
         raise ValueError("database write fence is missing or does not terminate old sessions")
     if f"hostssl all all {values['app_subnet_cidr']} scram-sha-256" not in hba:
         raise ValueError("pg_hba does not restrict clients to the application subnet")
+    if not hba.startswith("local all postgres peer\nlocal all all scram-sha-256\n"):
+        raise ValueError("local PostgreSQL administration must use exact-user peer auth")
     if "hostnossl all all 0.0.0.0/0 reject" not in hba:
         raise ValueError("unencrypted PostgreSQL clients are not rejected")
 
