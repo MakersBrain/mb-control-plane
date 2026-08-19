@@ -111,7 +111,6 @@ def main() -> int:
             "CONTROL_DATA_MODE",
             "CONTROL_RELEASE_ID",
             "INVITATION_SIGNING_KEY_ID",
-            "RELEASE_SLSA_BUILDER_ID",
         }
         legacy_lines: list[str] = []
         preserved_internal_token = ""

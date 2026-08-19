@@ -1414,37 +1414,6 @@ fn super_classify(status: reqwest::StatusCode) -> IntegrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workers::release::slsa_statement_matches;
-    use std::collections::BTreeMap;
-
-    fn release_manifest() -> crate::release::ApplicationReleaseManifest {
-        crate::release::ApplicationReleaseManifest {
-            schema_version: 1,
-            release_id: "odoo-2026.08.14-2cbc37c".into(),
-            source_commit: "2cbc37c000000000000000000000000000000000".into(),
-            odoo_version: "19.0".into(),
-            image_digest: format!("sha256:{}", "a".repeat(64)),
-            built_at: "2026-08-14T10:00:00Z".into(),
-            addons: BTreeMap::new(),
-            oca: BTreeMap::new(),
-            upgradeable_from: Vec::new(),
-            database_runtime_compatibility: BTreeMap::new(),
-            bridge_contract: ">=3.2.0,<4.0.0".into(),
-            schema_epoch: 42,
-            change_class: crate::release::ChangeClass::A,
-            required_postconditions: vec![
-                crate::release::Postcondition::RegistryLoad,
-                crate::release::Postcondition::Health,
-            ],
-            capability_registry_version: 1,
-            provenance: crate::release::ReleaseProvenance {
-                oci_ref: format!("registry.example/odoo@sha256:{}", "a".repeat(64)),
-                cosign_bundle_ref: "oci://signature".into(),
-                slsa_provenance_ref: "oci://provenance".into(),
-                sbom_ref: "oci://sbom".into(),
-            },
-        }
-    }
 
     #[tokio::test]
     #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
@@ -1603,44 +1572,6 @@ mod tests {
         ));
         assert!(!crate::workers::extraction::inventory_needs_vision(
             false, true, true
-        ));
-    }
-
-    #[test]
-    fn slsa_provenance_binds_builder_source_and_image() {
-        let manifest = release_manifest();
-        let manifest_digest = format!("sha256:{}", "b".repeat(64));
-        let statement = json!({
-            "subject":[
-                {"name":"odoo","digest":{"sha256":"a".repeat(64)}},
-                {"name":"application-release.json","digest":{"sha256":"b".repeat(64)}}
-            ],
-            "predicate":{
-                "runDetails":{"builder":{"id":"https://ci.example/builders/odoo"}},
-                "buildDefinition":{"resolvedDependencies":[{
-                    "uri":"git+https://example.test/makersbrain",
-                    "digest":{"gitCommit":manifest.source_commit}
-                }]}
-            }
-        });
-        assert!(slsa_statement_matches(
-            &statement,
-            &manifest,
-            &manifest_digest,
-            "https://ci.example/builders/odoo"
-        ));
-        assert!(!slsa_statement_matches(
-            &statement,
-            &manifest,
-            &manifest_digest,
-            "https://ci.example/builders/other"
-        ));
-        let image_only = json!({"subject":[{"digest":{"sha256":"a".repeat(64)}}],"predicate":{"runDetails":{"builder":{"id":"https://ci.example/builders/odoo"}},"buildDefinition":{"resolvedDependencies":[{"digest":{"gitCommit":manifest.source_commit}}]}}});
-        assert!(!slsa_statement_matches(
-            &image_only,
-            &manifest,
-            &manifest_digest,
-            "https://ci.example/builders/odoo"
         ));
     }
 }

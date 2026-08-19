@@ -97,7 +97,6 @@ class BuildSecretStageTests(unittest.TestCase):
         root: Path,
         source: Path,
         ca: Path,
-        cosign: Path,
         environment: str = "staging",
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -118,8 +117,6 @@ class BuildSecretStageTests(unittest.TestCase):
                 str(ca),
                 "--driver-ca-path",
                 "/run/secrets/postgres-ca.crt",
-                "--release-cosign-key",
-                str(cosign),
                 "--member-origin",
                 "https://app.staging.example.test",
             ],
@@ -133,7 +130,7 @@ class BuildSecretStageTests(unittest.TestCase):
             source, ca, cosign = self.canonical(root)
             stage = root / "stage"
             stage.mkdir(mode=0o700)
-            result = self.run_secret_builder(root, source, ca, cosign)
+            result = self.run_secret_builder(root, source, ca)
             self.assertEqual(result.returncode, 0, result.stderr)
             references = json.loads((root / "secret-references.json").read_text())
             serialized_references = json.dumps(references)
@@ -242,7 +239,7 @@ class BuildSecretStageTests(unittest.TestCase):
             (root / "stage").mkdir(mode=0o700)
 
             result = self.run_secret_builder(
-                root, source, ca, cosign, environment="production"
+                root, source, ca, environment="production"
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -258,7 +255,7 @@ class BuildSecretStageTests(unittest.TestCase):
             (source / "mail/ALLOWED_RECIPIENTS").write_bytes(b"")
             (root / "stage").mkdir(mode=0o700)
 
-            result = self.run_secret_builder(root, source, ca, cosign)
+            result = self.run_secret_builder(root, source, ca)
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("canonical source is empty", result.stderr)
@@ -279,7 +276,7 @@ class BuildSecretStageTests(unittest.TestCase):
                     target.unlink()
                     target.symlink_to(source / "application/DEPLOYMENT_DRIVER_TOKEN")
                     expected = "symlink"
-                result = self.run_secret_builder(root, source, ca, cosign)
+                result = self.run_secret_builder(root, source, ca)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
 

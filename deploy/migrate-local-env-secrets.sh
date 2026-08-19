@@ -186,7 +186,6 @@ append_setting CONTROL_PRIVACY_LOOKUP_KEY_ID "local-privacy-$today"
 append_setting CONTROL_PRIVACY_EXPORT_KEY_ID "local-export-$today"
 append_setting CONTROL_RELEASE_ID "control-local-$source_commit"
 append_setting INVITATION_SIGNING_KEY_ID "$invitation_key_id"
-append_setting RELEASE_SLSA_BUILDER_ID local-synthetic-builder
 chmod 0600 "$environment_temporary"
 mkdir -p "$(dirname "$runtime_dir")"
 mv "$runtime_temporary" "$runtime_dir"

@@ -43,29 +43,11 @@ class ReleaseTests(unittest.TestCase):
         (vmagent / "access-client-id").chmod(0o600)
         (vmagent / "access-client-secret").chmod(0o600)
 
-    def test_release_record_signature_is_verified_as_a_blob(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            record = root / "record.json"
-            signature = root / "record.json.sig"
-            key = root / "release.pub"
-            record.write_text("{}", encoding="utf-8")
-            signature.write_text("signature", encoding="utf-8")
-            key.write_text("key", encoding="utf-8")
-            with mock.patch.object(RELEASE, "run") as run:
-                RELEASE.verify_release_record(record, signature, key)
-            run.assert_called_once_with(
-                [
-                    "cosign",
-                    "verify-blob",
-                    "--insecure-ignore-tlog",
-                    "--key",
-                    str(key),
-                    "--signature",
-                    str(signature),
-                    str(record),
-                ]
-            )
+    def test_digest_pinned_images_are_pulled_without_host_signing_state(self):
+        images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
+        with mock.patch.object(RELEASE, "run") as run:
+            RELEASE.verify_and_pull(images)
+        run.assert_called_once_with(["podman", "pull", images["control"]])
 
     def write_json(self, root: Path, name: str, value: dict) -> Path:
         path = root / name
@@ -79,6 +61,15 @@ class ReleaseTests(unittest.TestCase):
             record["images"]["control"] = record["images"]["web"]
             path = self.write_json(root, "record.json", record)
             with self.assertRaisesRegex(ValueError, "images differ"):
+                RELEASE.load_release(path, VALUES)
+
+    def test_release_record_requires_an_exact_source_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = copy.deepcopy(RECORD)
+            record["source_ref"] = "main"
+            path = self.write_json(root, "record.json", record)
+            with self.assertRaisesRegex(ValueError, "source_ref is invalid"):
                 RELEASE.load_release(path, VALUES)
 
     def test_production_requires_staging_qualification(self):

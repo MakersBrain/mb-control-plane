@@ -217,8 +217,7 @@ chmod 0644 "$invitation_public"
     "MAIL_WEBHOOK_TOKEN=$(secret_ref MAIL_WEBHOOK_TOKEN)" \
     "DEPLOYMENT_DRIVER_URL=http://docker-driver:8080" \
     "DEPLOYMENT_DRIVER_TOKEN=$(secret_ref DEPLOYMENT_DRIVER_TOKEN)" \
-    "PRIVACY_DRIVER_TOKEN=$(secret_ref PRIVACY_DRIVER_TOKEN)" \
-    "RELEASE_SLSA_BUILDER_ID=local-synthetic-builder"
+    "PRIVACY_DRIVER_TOKEN=$(secret_ref PRIVACY_DRIVER_TOKEN)"
 } > "$temporary"
 chmod 0600 "$temporary"
 mkdir -p "$(dirname "$runtime_dir")"

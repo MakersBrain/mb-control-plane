@@ -20,6 +20,7 @@ import validate
 
 RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$")
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
+SOURCE_REF = re.compile(r"^refs/(heads|tags)/[^\s]+$")
 QUALIFICATION_REF = re.compile(r"^\S+/qualifications@sha256:[a-f0-9]{64}$")
 PERSISTENT_UNITS = [
     "cloudflared.service",
@@ -108,6 +109,8 @@ def load_release(path: Path, values: dict) -> dict:
         raise ValueError("release_id is invalid")
     if not COMMIT.fullmatch(record.get("source_commit", "")):
         raise ValueError("source_commit is invalid")
+    if not SOURCE_REF.fullmatch(record.get("source_ref", "")):
+        raise ValueError("source_ref is invalid")
     if not record.get("ci_run_url", "").startswith("https://"):
         raise ValueError("ci_run_url must be HTTPS")
     if record.get("images") != values["images"]:
@@ -123,30 +126,9 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def verify_release_record(record: Path, signature: Path, key: Path) -> None:
-    if not signature.is_file():
-        raise ValueError("release-record signature is missing")
-    run(
-        [
-            "cosign",
-            "verify-blob",
-            "--insecure-ignore-tlog",
-            "--key",
-            str(key),
-            "--signature",
-            str(signature),
-            str(record),
-        ]
-    )
-
-
-def verify_and_pull(images: dict[str, str], key: Path) -> None:
-    if not key.is_file():
-        raise ValueError("Cosign public key is missing")
+def verify_and_pull(images: dict[str, str]) -> None:
     for name in sorted(images):
-        image = images[name]
-        run(["cosign", "verify", "--key", str(key), image])
-        run(["podman", "pull", image])
+        run(["podman", "pull", images[name]])
 
 
 def verify_runtime_secrets(values: dict, config_root: Path) -> None:
@@ -449,8 +431,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--values", type=Path, required=True)
     parser.add_argument("--release-record", type=Path, required=True)
-    parser.add_argument("--release-signature", type=Path, required=True)
-    parser.add_argument("--cosign-key", type=Path, required=True)
     parser.add_argument(
         "--state-root", type=Path, default=Path.home() / ".local/state/makersbrain"
     )
@@ -466,9 +446,6 @@ def main() -> None:
     mode.add_argument("--start-staged", action="store_true")
     args = parser.parse_args()
 
-    if not args.cosign_key.is_file():
-        raise ValueError("Cosign public key is missing")
-    verify_release_record(args.release_record, args.release_signature, args.cosign_key)
     values = render.load_values(args.values)
     record = load_release(args.release_record, values)
     with tempfile.TemporaryDirectory(prefix="makersbrain-release-") as temporary:
@@ -479,7 +456,7 @@ def main() -> None:
         if changes_host:
             verify_runtime_secrets(values, args.config_root)
             verify_host_configuration(rendered, args.config_root)
-        verify_and_pull(values["images"], args.cosign_key)
+        verify_and_pull(values["images"])
         if args.activate:
             activate(rendered, record["release_id"], args.state_root, args.quadlet_root)
         elif args.stage_only:
@@ -487,7 +464,7 @@ def main() -> None:
         elif args.start_staged:
             start_staged(record["release_id"], args.state_root, args.quadlet_root, rendered)
         else:
-            print("release signatures, images, record and Quadlets are valid")
+            print("release image digests, record and Quadlets are valid")
 
 
 if __name__ == "__main__":

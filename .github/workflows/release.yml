@@ -17,7 +17,7 @@ on:
         required: false
         type: string
       staging_qualification_artifact:
-        description: Immutable signed OCI qualification artifact (promotion only)
+        description: Immutable OCI qualification artifact (promotion only)
         required: false
         type: string
 
@@ -31,10 +31,12 @@ concurrency:
 env:
   REGISTRY: ${{ vars.OCI_REGISTRY }}
   REPOSITORY_PREFIX: ${{ vars.OCI_REPOSITORY_PREFIX }}
+  COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/heads/main
 
 jobs:
   build:
-    if: inputs.operation == 'build'
+    if: inputs.operation == 'build' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -50,32 +52,6 @@ jobs:
       - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
-      - name: Verify GitHub OIDC claim contract
-        run: |
-          set -eu
-          separator='?'
-          case "$ACTIONS_ID_TOKEN_REQUEST_URL" in *\?*) separator='&' ;; esac
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
-            | jq -er .value \
-            | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" \
-                --repository-id "${{ github.repository_id }}" \
-                --repository-owner-id "${{ github.repository_owner_id }}" \
-                --environment release \
-                --audience makersbrain-release
-      - name: Fetch staging release secrets through Infisical OIDC
-        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
-        with:
-          method: oidc
-          domain: ${{ vars.INFISICAL_DOMAIN }}
-          identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
-          oidc-audience: makersbrain-release
-          project-slug: makersbrain-infra
-          env-slug: staging
-          secret-path: /image
-          recursive: false
       - name: Authenticate to the controlled registry
         run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
         env:
@@ -85,7 +61,6 @@ jobs:
           set -eu
           test -n "$REGISTRY"
           test -n "$REPOSITORY_PREFIX"
-          test -n "$COSIGN_PRIVATE_KEY"
           jq -e 'length == 6 and all(.[]; test("@sha256:[a-f0-9]{64}$"))' .github/release-third-party-images.json >/dev/null
       - name: Build once, mirror dependencies, scan and sign
         env:
@@ -122,7 +97,7 @@ jobs:
             syft "$immutable" -o "spdx-json=release/sbom/$name.spdx.json"
             trivy image --ignore-unfixed --format json --output "release/vulnerability/$name.json" "$immutable"
             trivy image --ignore-unfixed --exit-code 1 --severity CRITICAL "$immutable"
-            cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$immutable"
+            cosign sign --yes "$immutable"
             jq --arg name "$name" --arg image "$immutable" '. + {($name): $image}' \
               release/images.json > release/images.next.json
             mv release/images.next.json release/images.json
@@ -149,12 +124,11 @@ jobs:
           jq -n \
             --arg release_id "$release_id" \
             --arg source_commit "$GITHUB_SHA" \
+            --arg source_ref "$GITHUB_REF" \
             --arg ci_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --slurpfile images release/images.json \
-            '{release_id: $release_id, source_commit: $source_commit, ci_run_url: $ci_run_url, staging_qualification_ref: "", images: $images[0]}' \
+            '{release_id: $release_id, source_commit: $source_commit, source_ref: $source_ref, ci_run_url: $ci_run_url, staging_qualification_ref: "", images: $images[0]}' \
             > release/release-record.json
-          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
-            --output-signature release/release-record.json.sig release/release-record.json
           printf '%s\n' "$release_id" > release/release-id.txt
           tar -C release -czf release/sbom.tar.gz sbom
           tar -C release -czf release/vulnerability.tar.gz vulnerability
@@ -162,7 +136,6 @@ jobs:
           oras push "$artifact" \
             --artifact-type application/vnd.makersbrain.release.v1+json \
             release/release-record.json:application/json \
-            release/release-record.json.sig:application/vnd.dev.cosign.simplesigning.v1+json \
             release/images.json:application/json \
             release/sbom.tar.gz:application/vnd.makersbrain.sbom.layer.v1.tar+gzip \
             release/vulnerability.tar.gz:application/vnd.makersbrain.vulnerability.layer.v1.tar+gzip
@@ -176,50 +149,20 @@ jobs:
           retention-days: 30
 
   certify-staging:
-    if: inputs.operation == 'certify-staging'
+    if: inputs.operation == 'certify-staging' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
       contents: read
-      id-token: write
       packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-        with:
-          cosign-release: v3.0.6
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
-      - name: Verify GitHub OIDC claim contract
-        run: |
-          set -eu
-          separator='?'
-          case "$ACTIONS_ID_TOKEN_REQUEST_URL" in *\?*) separator='&' ;; esac
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
-            | jq -er .value \
-            | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" \
-                --repository-id "${{ github.repository_id }}" \
-                --repository-owner-id "${{ github.repository_owner_id }}" \
-                --environment staging \
-                --audience makersbrain-release
-      - name: Fetch staging certification secrets through Infisical OIDC
-        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
-        with:
-          method: oidc
-          domain: ${{ vars.INFISICAL_DOMAIN }}
-          identity-id: ${{ vars.INFISICAL_RELEASE_IDENTITY_ID }}
-          oidc-audience: makersbrain-release
-          project-slug: makersbrain-infra
-          env-slug: staging
-          secret-path: /image
-          recursive: false
       - name: Authenticate to the controlled registry
         run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Validate, sign and publish staging qualification
+      - name: Validate and publish staging qualification
         env:
           STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
           EVIDENCE_ARTIFACT: ${{ inputs.staging_evidence_artifact }}
@@ -233,40 +176,30 @@ jobs:
             "$REGISTRY/$REPOSITORY_PREFIX/staging-evidence@sha256:"*) ;;
             *) echo "staging evidence must be an immutable repository digest" >&2; exit 1 ;;
           esac
-          test -n "$COSIGN_PRIVATE_KEY"
-          test -n "$COSIGN_PUBLIC_KEY"
           mkdir release evidence-package qualification
           oras pull --output release "$STAGING_ARTIFACT"
           oras pull --output evidence-package "$EVIDENCE_ARTIFACT"
-          printf '%s\n' "$COSIGN_PUBLIC_KEY" > qualification/release-cosign.pub
-          cosign verify-blob --insecure-ignore-tlog --key qualification/release-cosign.pub \
-            --signature release/release-record.json.sig release/release-record.json
           test -d evidence-package/evidence
           python3 control-plane/deploy/podman/qualification.py create \
             --release-record release/release-record.json \
             --evidence-dir evidence-package/evidence \
             --output qualification/staging-qualification.json
           tar -C evidence-package -czf qualification/evidence.tar.gz evidence
-          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
-            --output-signature qualification/staging-qualification.json.sig \
-            qualification/staging-qualification.json
           qualification_id=$(jq -r .qualification_id qualification/staging-qualification.json)
           artifact="$REGISTRY/$REPOSITORY_PREFIX/qualifications:$qualification_id"
           oras push "$artifact" \
             --artifact-type application/vnd.makersbrain.staging-qualification.v1+json \
             qualification/staging-qualification.json:application/json \
-            qualification/staging-qualification.json.sig:application/vnd.dev.cosign.simplesigning.v1+json \
             qualification/evidence.tar.gz:application/vnd.makersbrain.staging-evidence.v1.tar+gzip
           digest=$(oras resolve "$artifact")
           printf '%s@%s\n' "$REGISTRY/$REPOSITORY_PREFIX/qualifications" "$digest"
 
   promote-production:
-    if: inputs.operation == 'promote-production'
+    if: inputs.operation == 'promote-production' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
     permissions:
       contents: read
-      id-token: write
       packages: write
     steps:
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
@@ -274,37 +207,11 @@ jobs:
           cosign-release: v3.0.6
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Verify GitHub OIDC claim contract
-        run: |
-          set -eu
-          separator='?'
-          case "$ACTIONS_ID_TOKEN_REQUEST_URL" in *\?*) separator='&' ;; esac
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=makersbrain-release" \
-            | jq -er .value \
-            | python3 control-plane/tools/verify_github_oidc_claims.py \
-                --repository "$GITHUB_REPOSITORY" \
-                --repository-id "${{ github.repository_id }}" \
-                --repository-owner-id "${{ github.repository_owner_id }}" \
-                --environment production \
-                --audience makersbrain-release
-      - name: Fetch production promotion secrets through Infisical OIDC
-        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
-        with:
-          method: oidc
-          domain: ${{ vars.INFISICAL_DOMAIN }}
-          identity-id: ${{ vars.INFISICAL_PRODUCTION_RELEASE_IDENTITY_ID }}
-          oidc-audience: makersbrain-release
-          project-slug: makersbrain-infra
-          env-slug: prod
-          secret-path: /image
-          recursive: false
       - name: Authenticate to the controlled registry
         run: printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Verify staging record and sign production promotion
+      - name: Verify staging record and publish production promotion
         env:
           STAGING_ARTIFACT: ${{ inputs.staging_release_artifact }}
           QUALIFICATION_ARTIFACT: ${{ inputs.staging_qualification_artifact }}
@@ -319,17 +226,9 @@ jobs:
             "$REGISTRY/$REPOSITORY_PREFIX/qualifications@sha256:"*) ;;
             *) echo "qualification must be an immutable repository digest" >&2; exit 1 ;;
           esac
-          test -n "$COSIGN_PRIVATE_KEY"
-          test -n "$COSIGN_PUBLIC_KEY"
           mkdir release qualification qualification-evidence
           oras pull --output release "$STAGING_ARTIFACT"
           oras pull --output qualification "$QUALIFICATION_ARTIFACT"
-          printf '%s\n' "$COSIGN_PUBLIC_KEY" > release/release-cosign.pub
-          cosign verify-blob --insecure-ignore-tlog --key release/release-cosign.pub \
-            --signature release/release-record.json.sig release/release-record.json
-          cosign verify-blob --insecure-ignore-tlog --key release/release-cosign.pub \
-            --signature qualification/staging-qualification.json.sig \
-            qualification/staging-qualification.json
           python3 control-plane/deploy/podman/qualification.py extract \
             --archive qualification/evidence.tar.gz \
             --output qualification-evidence
@@ -338,20 +237,22 @@ jobs:
             --release-record release/release-record.json \
             --evidence-dir qualification-evidence/evidence
           jq -e '.staging_qualification_ref == ""' release/release-record.json >/dev/null
+          source_ref=$(jq -er '.source_ref | select(test("^refs/(heads|tags)/"))' release/release-record.json)
           jq -r '.images[]' release/release-record.json |
           while IFS= read -r image; do
-            cosign verify --key release/release-cosign.pub "$image" >/dev/null
+            cosign verify \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-ref "$source_ref" \
+              "$image" >/dev/null
           done
           jq --arg qualification "$QUALIFICATION_ARTIFACT" \
             '.staging_qualification_ref = $qualification' \
             release/release-record.json > release/production-release-record.json
-          cosign sign-blob --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
-            --output-signature release/production-release-record.json.sig \
-            release/production-release-record.json
           release_id=$(jq -r .release_id release/production-release-record.json)
           artifact="$REGISTRY/$REPOSITORY_PREFIX/releases:production-$release_id"
           oras push "$artifact" \
             --artifact-type application/vnd.makersbrain.production-release.v1+json \
-            release/production-release-record.json:application/json \
-            release/production-release-record.json.sig:application/vnd.dev.cosign.simplesigning.v1+json
+            release/production-release-record.json:application/json
           printf '%s\n' "$artifact"

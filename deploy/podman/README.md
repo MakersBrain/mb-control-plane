@@ -40,11 +40,14 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   and path traversal are rejected, and prior generations remain available for
   rollback. Secret values remain file references under `/run/secrets`; they are
   not written into Quadlets or release records.
-- Images are pre-pulled and verified with the release Cosign public key before
-  the units are installed. Every image value must contain an OCI digest.
-- Third-party base images are mirrored into the controlled registry and signed
-  there with the same release key; activation never trusts an upstream mutable
-  tag or attempts to attach signatures to an upstream project.
+- Images are pre-pulled by exact OCI digest before the units are installed.
+  GitHub Actions signs built and mirrored images with keyless OIDC, and the
+  production promotion job verifies the Fulcio issuer plus repository,
+  workflow and source-ref certificate claims. No private signing key is stored
+  in Infisical or installed on a runtime host.
+- Third-party base images are mirrored into the controlled registry before
+  signing; activation never trusts an upstream mutable tag or attempts to
+  attach signatures to an upstream project.
 - The rootless `podman.socket` is enabled for `tenant-runtime` and is never
   exposed over TCP.
 - The digest-pinned `cloudflared` Quadlet uses only a file-scoped connector
@@ -154,7 +157,6 @@ python3 build_secret_stage.py \
   --postgres-host PRIVATE_DATABASE_HOST \
   --postgres-ca /var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt \
   --driver-ca-path /run/secrets/postgres-ca.crt \
-  --release-cosign-key /etc/makersbrain/release-cosign.pub \
   --member-origin https://app.staging.makersbrain.net
 python3 build_runtime_stage.py \
   --input /secure/release/makersbrain-runtime.json \
@@ -210,17 +212,14 @@ python3 validate.py /tmp/makersbrain-quadlets
 systemd-analyze --user verify /tmp/makersbrain-quadlets/*.service
 ```
 
-Verify a signed release without changing systemd, then activate it explicitly:
+Validate and pull a digest-pinned release without changing systemd, then
+activate it explicitly:
 
 ```sh
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub
+  --release-record /secure/release/release-record.json
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --activate
+  --release-record /secure/release/release-record.json --activate
 ```
 
 For an offline topology cutover, copy the verified release into the immutable
@@ -230,17 +229,13 @@ already-staged release only after restore/migration and read-only canaries pass:
 
 ```sh
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --stage-only
+  --release-record /secure/release/release-record.json --stage-only
 python3 database/write-fence.py enable
 python3 database/write-fence.py verify
 # Run migration and read-only canaries, then deliberately lower the fence once.
 python3 database/write-fence.py disable
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --start-staged
+  --release-record /secure/release/release-record.json --start-staged
 ```
 
 The fence changes every runtime database role, terminates existing sessions so
@@ -251,9 +246,10 @@ accepted writes; restoring the pre-cutover snapshot is no longer a valid rollbac
 Activation stores each rendered release separately and atomically changes the
 single `makersbrain` Quadlet search-path symlink. A failed systemd activation
 restores the prior symlink. Production records must include the successful
-staging qualification reference for the exact same image map. The release
-record itself is verified as a signed blob before any image is pulled or any
-systemd state is changed.
+staging qualification reference for the exact same image map. Release and
+qualification artifacts are consumed by immutable repository digest; the
+production promotion job verifies every image's keyless provenance before a
+production activation record is published.
 
 The renderer refuses mutable image tags, development environments, unresolved
 template values and production personal-data activation without an external

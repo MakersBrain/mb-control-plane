@@ -254,7 +254,6 @@ def build(
     postgres_port: int,
     postgres_ca: Path,
     driver_ca_path: str,
-    release_cosign_key: Path,
     members_origin: str,
 ) -> dict[str, object]:
     expected = required_sources()
@@ -420,13 +419,18 @@ def build(
     for name in ("roles.json", "scopes.json"):
         stage.write(Path("rauthy") / name, (public_rauthy / name).read_bytes())
 
-    materialize.regular_source(release_cosign_key.parent, Path(release_cosign_key.name))
-    stage.write(
-        Path("secrets/control-worker-release-adoption/release-cosign.pub"),
-        release_cosign_key.read_bytes(),
+    stage.direct(
+        "worker-release",
+        "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
+        "https://token.actions.githubusercontent.com",
     )
-    stage.file_reference(
-        "worker-release", "CONTROL_RELEASE_COSIGN_KEY_FILE", "release-cosign.pub"
+    stage.direct(
+        "worker-release",
+        "CONTROL_RELEASE_COSIGN_IDENTITY",
+        "https://github.com/MakersBrain/odoo/.github/workflows/release.yml@refs/heads/main",
+    )
+    stage.direct(
+        "worker-release", "CONTROL_RELEASE_COSIGN_REPOSITORY", "MakersBrain/odoo"
     )
 
     tunnel = source_file(source, "tunnel/CLOUDFLARE_TUNNEL_TOKEN")
@@ -502,7 +506,6 @@ def main() -> int:
     parser.add_argument("--postgres-port", type=int, default=5432)
     parser.add_argument("--postgres-ca", required=True, type=Path)
     parser.add_argument("--driver-ca-path", required=True)
-    parser.add_argument("--release-cosign-key", required=True, type=Path)
     parser.add_argument("--member-origin", required=True)
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
@@ -524,9 +527,6 @@ def main() -> int:
     if not 1 <= args.postgres_port <= 65535:
         materialize.fail("PostgreSQL port is invalid")
     materialize.regular_source(args.postgres_ca.parent, Path(args.postgres_ca.name))
-    materialize.regular_source(
-        args.release_cosign_key.parent, Path(args.release_cosign_key.name)
-    )
     document = build(
         source,
         Stage(args.staging_root),
@@ -535,7 +535,6 @@ def main() -> int:
         args.postgres_port,
         args.postgres_ca,
         args.driver_ca_path,
-        args.release_cosign_key,
         member_origin(args.member_origin),
     )
     write_json(args.references_output, document)

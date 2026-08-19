@@ -1,6 +1,7 @@
 {
   "release_id": "control-2026.08.15-0123456789abcdef",
   "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "source_ref": "refs/heads/main",
   "ci_run_url": "https://github.com/example/makersbrain/actions/runs/1",
   "staging_qualification_ref": "registry.example.test/makersbrain/qualifications@sha256:6666666666666666666666666666666666666666666666666666666666666666",
   "images": {
