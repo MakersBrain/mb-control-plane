@@ -337,7 +337,7 @@ class ReleaseTests(unittest.TestCase):
                 current.resolve(), root / "state/releases" / RECORD["release_id"]
             )
             run.assert_any_call(
-                ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
             )
 
     @mock.patch.object(RELEASE, "run")
@@ -367,7 +367,7 @@ class ReleaseTests(unittest.TestCase):
             RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
             self.assertEqual((quadlets / "makersbrain").resolve(), release)
             run.assert_any_call(
-                ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
             )
             with self.assertRaisesRegex(ValueError, "has not been staged"):
                 RELEASE.start_staged("control-2026.08.15-ffffffffffffffff", root / "state", quadlets)

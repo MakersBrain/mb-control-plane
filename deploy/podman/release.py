@@ -437,7 +437,11 @@ def start_staged(
     os.replace(temporary, current)
     try:
         run(["systemctl", "--user", "daemon-reload"])
-        run(["systemctl", "--user", "enable", "--now", *PERSISTENT_UNITS])
+        # Quadlet services are generated units. Their WantedBy relationships
+        # come from the source files' [Install] sections, and systemd refuses
+        # `enable` for generated units. Reload the generator output, then start
+        # the persistent set explicitly for this activation.
+        run(["systemctl", "--user", "start", *PERSISTENT_UNITS])
     except Exception:
         current.unlink(missing_ok=True)
         run(["systemctl", "--user", "daemon-reload"])
