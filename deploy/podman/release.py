@@ -131,22 +131,23 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def verify_and_pull(images: dict[str, str]) -> None:
+def verify_and_pull(images: dict[str, str], verify_keyless: bool) -> None:
     for name in sorted(images):
         image = images[name]
-        run(
-            [
-                "cosign",
-                "verify",
-                "--certificate-oidc-issuer",
-                COSIGN_OIDC_ISSUER,
-                "--certificate-identity",
-                COSIGN_IDENTITY,
-                "--certificate-github-workflow-repository",
-                "MakersBrain/odoo",
-                image,
-            ]
-        )
+        if verify_keyless:
+            run(
+                [
+                    "cosign",
+                    "verify",
+                    "--certificate-oidc-issuer",
+                    COSIGN_OIDC_ISSUER,
+                    "--certificate-identity",
+                    COSIGN_IDENTITY,
+                    "--certificate-github-workflow-repository",
+                    "MakersBrain/odoo",
+                    image,
+                ]
+            )
         run(["podman", "pull", image])
 
 
@@ -475,7 +476,9 @@ def main() -> None:
         if changes_host:
             verify_runtime_secrets(values, args.config_root)
             verify_host_configuration(rendered, args.config_root)
-        verify_and_pull(values["images"])
+        verify_and_pull(
+            values["images"], verify_keyless=values["environment"] == "production"
+        )
         if args.activate:
             activate(rendered, record["release_id"], args.state_root, args.quadlet_root)
         elif args.stage_only:

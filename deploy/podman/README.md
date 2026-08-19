@@ -40,7 +40,8 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   and path traversal are rejected, and prior generations remain available for
   rollback. Secret values remain file references under `/run/secrets`; they are
   not written into Quadlets or release records.
-- Images are pre-pulled by exact OCI digest before the units are installed.
+- Staging images are pre-pulled by exact OCI digest before the units are
+  installed. Production activation additionally verifies keyless provenance.
   GitHub Actions signs built and mirrored images with keyless OIDC, and the
   production promotion job verifies the Fulcio issuer plus repository,
   workflow and source-ref certificate claims. No private signing key is stored
