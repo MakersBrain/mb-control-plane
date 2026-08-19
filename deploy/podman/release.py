@@ -82,6 +82,12 @@ VENDOR_REQUIRED_ENVIRONMENT = {
     },
 }
 
+WRITABLE_STATE_FILES = {
+    "MAIL_GATEWAY_EVENT_JOURNAL_FILE": Path(
+        "/var/lib/makersbrain/mail-events/events.jsonl"
+    ),
+}
+
 
 def file_secret_value(name: str) -> bool:
     return (
@@ -331,6 +337,12 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                     seen.add(name)
                     environment_names.add(name)
                     reference = value.strip().strip('"').strip("'")
+                    if name in WRITABLE_STATE_FILES:
+                        if Path(reference) != WRITABLE_STATE_FILES[name]:
+                            raise ValueError(
+                                f"{name} in {environment_file} must use its approved state path"
+                            )
+                        continue
                     if file_secret_value(name) and not reference.startswith("@/run/"):
                         raise ValueError(
                             f"{name} in {environment_file} must use a scoped file secret"

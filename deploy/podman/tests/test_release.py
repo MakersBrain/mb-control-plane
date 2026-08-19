@@ -242,6 +242,32 @@ class ReleaseTests(unittest.TestCase):
             )
             RELEASE.verify_host_configuration(rendered, config)
 
+    def test_host_preflight_accepts_only_the_approved_writable_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            config = root / "config"
+            config.mkdir()
+            environment = config / "example.env"
+            environment.write_text(
+                "MAIL_GATEWAY_EVENT_JOURNAL_FILE="
+                "/var/lib/makersbrain/mail-events/events.jsonl\n",
+                encoding="utf-8",
+            )
+            environment.chmod(0o600)
+            (rendered / "example.container").write_text(
+                "[Container]\nEnvironmentFile=/etc/makersbrain/example.env\n",
+                encoding="utf-8",
+            )
+            RELEASE.verify_host_configuration(rendered, config)
+            environment.write_text(
+                "MAIL_GATEWAY_EVENT_JOURNAL_FILE=/tmp/events.jsonl\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "approved state path"):
+                RELEASE.verify_host_configuration(rendered, config)
+
     def test_host_preflight_rejects_missing_vendor_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
