@@ -101,13 +101,13 @@ class PodmanRendererTests(unittest.TestCase):
             )
             self.assertIn("/secrets/vmagent:/run/access:ro", vmagent)
             self.assertIn("-remoteWrite.forcePromProto=true", vmagent)
-            self.assertIn("-remoteWrite.maxDiskUsagePerURL=256MB", vmagent)
+            self.assertIn("-remoteWrite.maxDiskUsagePerURL=512MiB", vmagent)
             vmagent_config = (output / "vmagent.yml").read_text()
             self.assertIn("metrics_path: /internal/metrics/live", vmagent_config)
             self.assertIn("metrics_path: /internal/metrics", vmagent_config)
             self.assertIn("environment: 'staging'", vmagent_config)
-            self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
-            self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
+            self.assertNotIn("catalogue-control", vmagent_config)
+            self.assertNotIn("catalogue-service", vmagent_config)
             self.assertEqual(vmagent.count("Network="), 1)
             self.assertEqual(cloudflared.count("Network="), 1)
             for name in (
@@ -166,6 +166,9 @@ class PodmanRendererTests(unittest.TestCase):
                 self.assertIn(
                     "Network=catalogue.network", (output / name).read_text()
                 )
+            vmagent_config = (output / "vmagent.yml").read_text()
+            self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
+            self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
 
     def test_mutable_image_is_rejected(self):
         values = copy.deepcopy(EXAMPLE)

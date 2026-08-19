@@ -26,6 +26,16 @@ WORKERS = (
     "release-adoption",
     "privacy-operations",
 )
+CATALOGUE_SCRAPE_JOBS = """  - job_name: catalogue-control
+    metrics_path: /metrics
+    static_configs:
+      - targets: [catalogue-control:8687]
+
+  - job_name: catalogue-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: [catalogue-service:8686]
+"""
 
 
 def load_values(path: Path) -> dict:
@@ -97,6 +107,11 @@ def replacements(values: dict) -> dict[str, str]:
         "METRICS_REMOTE_WRITE_URL": values["metrics_remote_write_url"],
         "CATALOGUE_NETWORK": (
             "Network=catalogue.network"
+            if values["environment"] == "production"
+            else ""
+        ),
+        "CATALOGUE_SCRAPE_JOBS": (
+            CATALOGUE_SCRAPE_JOBS
             if values["environment"] == "production"
             else ""
         ),

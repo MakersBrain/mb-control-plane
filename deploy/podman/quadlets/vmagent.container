@@ -19,7 +19,7 @@ Volume=/etc/makersbrain/secrets/control-api/control_metrics_token:/run/secrets/c
 Volume=/etc/makersbrain/secrets/vmagent:/run/access:ro
 Volume=vmagent-data.volume:/vmagent-remotewrite-data
 Entrypoint=/usr/local/bin/makersbrain-vmagent-entrypoint
-Exec=-promscrape.config=/etc/vmagent/vmagent.yml -remoteWrite.url=@@METRICS_REMOTE_WRITE_URL@@ -remoteWrite.forcePromProto=true -remoteWrite.queues=1 -remoteWrite.tmpDataPath=/vmagent-remotewrite-data -remoteWrite.maxDiskUsagePerURL=256MB -remoteWrite.disableMetadata=true -httpListenAddr=0.0.0.0:8429
+Exec=-promscrape.config=/etc/vmagent/vmagent.yml -remoteWrite.url=@@METRICS_REMOTE_WRITE_URL@@ -remoteWrite.forcePromProto=true -remoteWrite.queues=1 -remoteWrite.tmpDataPath=/vmagent-remotewrite-data -remoteWrite.maxDiskUsagePerURL=512MiB -remoteWrite.disableMetadata=true -httpListenAddr=0.0.0.0:8429
 NoNewPrivileges=true
 DropCapability=all
 

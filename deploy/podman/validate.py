@@ -165,14 +165,22 @@ def validate(root: Path) -> None:
         not in vmagent_config
         or "/internal/metrics/live" not in vmagent_config
         or "/internal/metrics" not in vmagent_config
-        or "targets: [catalogue-control:8687]" not in vmagent_config
-        or "targets: [catalogue-service:8686]" not in vmagent_config
         or vmagent.count("Network=") != expected_networks
         or "environment: '@@" in vmagent_config
         or "-remoteWrite.forcePromProto=true" not in vmagent
-        or "-remoteWrite.maxDiskUsagePerURL=256MB" not in vmagent
+        or "-remoteWrite.maxDiskUsagePerURL=512MiB" not in vmagent
     ):
         raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
+
+    catalogue_targets = (
+        "targets: [catalogue-control:8687]",
+        "targets: [catalogue-service:8686]",
+    )
+    if values["environment"] == "production":
+        if any(target not in vmagent_config for target in catalogue_targets):
+            raise ValueError("production vmagent is missing catalogue scrape targets")
+    elif any(target in vmagent_config for target in catalogue_targets):
+        raise ValueError("staging vmagent contains unreachable catalogue scrape targets")
 
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
     if cloudflared.count("Network=") != expected_networks or (
