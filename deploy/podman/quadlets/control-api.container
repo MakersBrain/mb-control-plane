@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain control API
-Requires=control-migrate.service privacy-export-init.service
-After=control-migrate.service privacy-export-init.service
+Requires=control-migrate.service privacy-export-init.service rauthy-ready.service
+After=control-migrate.service privacy-export-init.service rauthy-ready.service
 
 [Container]
 Image=@@CONTROL_IMAGE@@

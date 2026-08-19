@@ -105,6 +105,9 @@ def validate(root: Path) -> None:
         raise ValueError("Rauthy readiness gate is missing")
     if "rauthy-ready.service" not in (root / "control-web.container").read_text():
         raise ValueError("web does not wait for Rauthy readiness")
+    control_api = (root / "control-api.container").read_text(encoding="utf-8")
+    if "rauthy-ready.service" not in control_api:
+        raise ValueError("control API does not wait for Rauthy readiness")
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")

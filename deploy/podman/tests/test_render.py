@@ -67,6 +67,9 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn(
                 "rauthy-ready.service", (output / "control-web.container").read_text()
             )
+            control_api = (output / "control-api.container").read_text()
+            self.assertIn("Requires=control-migrate.service privacy-export-init.service rauthy-ready.service", control_api)
+            self.assertIn("After=control-migrate.service privacy-export-init.service rauthy-ready.service", control_api)
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
             self.assertIn("Environment=HOST=postgres.internal.example.test", odoo)
