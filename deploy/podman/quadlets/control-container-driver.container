@@ -46,9 +46,11 @@ Exec=/usr/local/bin/control-container-driver
 HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/live
 HealthInterval=15s
 HealthRetries=12
+Notify=healthy
 SecurityLabelDisable=true
 NoNewPrivileges=true
 DropCapability=all
+AddCapability=CHOWN DAC_OVERRIDE FOWNER
 
 [Service]
 Restart=on-failure

@@ -13,6 +13,7 @@ Exec=redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noe
 HealthCmd=redis-cli ping
 HealthInterval=10s
 HealthRetries=12
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 

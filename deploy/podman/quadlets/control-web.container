@@ -15,6 +15,7 @@ Volume=./web-nginx.conf:/etc/nginx/nginx.conf:ro
 HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8080/health/live
 HealthInterval=15s
 HealthRetries=12
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 

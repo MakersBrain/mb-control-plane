@@ -11,6 +11,7 @@ UserNS=keep-id:uid=100,gid=101
 Network=makersbrain.network
 Environment=PGSSLMODE=verify-full
 Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt
+Environment=HOST=@@POSTGRES_HOST@@
 EnvironmentFile=/etc/makersbrain/odoo.env
 Volume=/etc/makersbrain/secrets/odoo:/run/secrets:ro
 Volume=odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro
@@ -21,6 +22,7 @@ Exec=/bin/sh /run/makersbrain/resolve-secret-env.sh /entrypoint.sh odoo --no-dat
 HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8069/web/health
 HealthInterval=15s
 HealthRetries=20
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 

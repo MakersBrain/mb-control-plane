@@ -44,6 +44,8 @@ class PodmanRendererTests(unittest.TestCase):
                 "/var/lib/makersbrain/tenant-recovery-secrets:/run/makersbrain-recovery-secrets:ro",
                 driver,
             )
+            self.assertIn("AddCapability=CHOWN DAC_OVERRIDE FOWNER", driver)
+            self.assertIn("Notify=healthy", driver)
             self.assertNotIn("/run/makersbrain-backup-secrets", driver)
             for name in (
                 "control-api.container",
@@ -67,6 +69,8 @@ class PodmanRendererTests(unittest.TestCase):
             )
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
+            self.assertIn("Environment=HOST=postgres.internal.example.test", odoo)
+            self.assertIn("Notify=healthy", odoo)
             self.assertIn("odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro", odoo)
             self.assertIn(
                 "paperless-client-secrets.volume",
@@ -103,6 +107,17 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
             self.assertEqual(vmagent.count("Network="), 1)
             self.assertEqual(cloudflared.count("Network="), 1)
+            for name in (
+                "control-api.container",
+                "control-container-driver.container",
+                "control-mail-gateway.container",
+                "control-web.container",
+                "document-extraction.container",
+                "odoo.container",
+                "redis.container",
+                "tenant-gateway.container",
+            ):
+                self.assertIn("Notify=healthy", (output / name).read_text())
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
             self.assertEqual(
                 (output / "reconcile-database-identities.sh").stat().st_mode & 0o777,

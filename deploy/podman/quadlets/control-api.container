@@ -24,6 +24,7 @@ HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/ready
 HealthInterval=15s
 HealthRetries=12
 HealthStartPeriod=20s
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 

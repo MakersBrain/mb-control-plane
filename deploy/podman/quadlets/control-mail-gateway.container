@@ -16,6 +16,7 @@ Exec=/usr/local/bin/control-mail-gateway
 HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/live
 HealthInterval=15s
 HealthRetries=12
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 
