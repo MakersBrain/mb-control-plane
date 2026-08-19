@@ -21,8 +21,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # This repository is private, so its runner minutes are billed. The single job
+  # below is ~9 minutes of Rust, npm and Podman work, and it ran on every push
+  # including documentation-only ones. This gate skips it when nothing but
+  # Markdown changed.
+  #
+  # The job is skipped with `if:` rather than the workflow filtered with
+  # `on.paths`: a filtered workflow never reports its check runs, and "Control
+  # plane" is a required status check on main, so a docs-only pull request would
+  # become unmergeable. A skipped job still reports and counts as satisfied.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {fetch-depth: 0}
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --quiet origin "${{ github.base_ref }}"
+            changed=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)
+          else
+            changed=$(git diff --name-only "${{ github.event.before }}" HEAD 2>/dev/null || echo FORCE_ALL)
+          fi
+          printf 'changed paths:\n%s\n' "$changed"
+          # Run unless every changed path is Markdown. Anything unrecognised
+          # errs toward running the suite.
+          if printf '%s\n' "$changed" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "documentation-only change; the control plane suite will skip" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   control-plane:
     name: Control plane
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     services:
       db:
