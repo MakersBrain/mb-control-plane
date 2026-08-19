@@ -133,6 +133,7 @@ def validate(root: Path) -> None:
         raise ValueError("Cloudflare Tunnel received unrelated application configuration")
     vmagent = (root / "vmagent.container").read_text(encoding="utf-8")
     vmagent_config = (root / "vmagent.yml").read_text(encoding="utf-8")
+    expected_networks = 2 if values["environment"] == "production" else 1
     if (
         "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro"
         not in vmagent
@@ -144,7 +145,7 @@ def validate(root: Path) -> None:
         or "/internal/metrics" not in vmagent_config
         or "targets: [catalogue-control:8687]" not in vmagent_config
         or "targets: [catalogue-service:8686]" not in vmagent_config
-        or vmagent.count("Network=") != 2
+        or vmagent.count("Network=") != expected_networks
         or "environment: '@@" in vmagent_config
         or "-remoteWrite.forcePromProto=true" not in vmagent
         or "-remoteWrite.maxDiskUsagePerURL=256MB" not in vmagent
@@ -152,8 +153,11 @@ def validate(root: Path) -> None:
         raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
 
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
-    if cloudflared.count("Network=") != 2 or "Network=catalogue.network" not in cloudflared:
-        raise ValueError("cloudflared must join the MakersBrain and catalogue networks")
+    if cloudflared.count("Network=") != expected_networks or (
+        values["environment"] == "production"
+        and "Network=catalogue.network" not in cloudflared
+    ):
+        raise ValueError("cloudflared does not join the required runtime networks")
     if "UserNS=keep-id:uid=999,gid=1000" not in (
         root / "redis.container"
     ).read_text(encoding="utf-8"):
