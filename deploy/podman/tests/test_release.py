@@ -33,21 +33,15 @@ class ReleaseTests(unittest.TestCase):
         control.chmod(0o700)
         (control / "control_metrics_token").write_text("m" * 48, encoding="utf-8")
         (control / "control_metrics_token").chmod(0o600)
-        alertmanager = config_root / "secrets/alertmanager"
-        alertmanager.mkdir(parents=True, exist_ok=True)
-        alertmanager.chmod(0o700)
-        (alertmanager / "webhook-url").write_text(
-            "https://alerts.example.test/makersbrain", encoding="utf-8"
-        )
-        (alertmanager / "webhook-token").write_text("a" * 48, encoding="utf-8")
-        (alertmanager / "access-client-id").write_text(
+        vmagent = config_root / "secrets/vmagent"
+        vmagent.mkdir(parents=True, exist_ok=True)
+        vmagent.chmod(0o700)
+        (vmagent / "access-client-id").write_text(
             "b" * 32 + ".access", encoding="utf-8"
         )
-        (alertmanager / "access-client-secret").write_text("c" * 48, encoding="utf-8")
-        (alertmanager / "webhook-url").chmod(0o600)
-        (alertmanager / "webhook-token").chmod(0o600)
-        (alertmanager / "access-client-id").chmod(0o600)
-        (alertmanager / "access-client-secret").chmod(0o600)
+        (vmagent / "access-client-secret").write_text("c" * 48, encoding="utf-8")
+        (vmagent / "access-client-id").chmod(0o600)
+        (vmagent / "access-client-secret").chmod(0o600)
 
     def test_release_record_signature_is_verified_as_a_blob(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -395,13 +389,8 @@ class ReleaseTests(unittest.TestCase):
             config_root = Path(temporary) / "config"
             config_root.mkdir()
             self.write_observability_secrets(config_root)
-            alertmanager = config_root / "secrets/alertmanager"
             control = config_root / "secrets/control-api"
             (control / "control_metrics_token").write_text("m" * 48 + "\n", encoding="utf-8")
-            (alertmanager / "webhook-url").write_text(
-                "https://alerts.example.test/makersbrain\n", encoding="utf-8"
-            )
-            (alertmanager / "webhook-token").write_text("a" * 48 + "\n", encoding="utf-8")
 
             RELEASE.verify_observability_secrets(config_root)
 

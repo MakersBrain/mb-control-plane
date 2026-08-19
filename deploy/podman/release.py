@@ -33,8 +33,7 @@ PERSISTENT_UNITS = [
     "control-mail-gateway.service",
     "control-container-driver.service",
     "control-backup-scheduler.service",
-    "alertmanager.service",
-    "prometheus.service",
+    "vmagent.service",
     "control-workers@tenant-provisioning.service",
     "control-workers@membership-provisioning.service",
     "control-workers@invoice-capture.service",
@@ -191,42 +190,26 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
 
 
 def verify_observability_secrets(config_root: Path) -> None:
-    """Check the credentials Prometheus and Alertmanager read off disk."""
+    """Check the credentials vmagent reads off disk."""
     metrics_token = config_root / "secrets/control-api/control_metrics_token"
     protected_path(metrics_token, directory=False)
     metrics_value = read_secret_line(metrics_token)
     if not 32 <= len(metrics_value) <= 512 or any(
         character in metrics_value for character in "\r\n\0"
     ):
-        raise ValueError("Prometheus metrics token must be a bounded single-line secret")
-    webhook_url = config_root / "secrets/alertmanager/webhook-url"
-    webhook_token = config_root / "secrets/alertmanager/webhook-token"
-    access_client_id = config_root / "secrets/alertmanager/access-client-id"
-    access_client_secret = config_root / "secrets/alertmanager/access-client-secret"
-    protected_path(webhook_url, directory=False)
-    protected_path(webhook_token, directory=False)
+        raise ValueError("vmagent metrics token must be a bounded single-line secret")
+    access_client_id = config_root / "secrets/vmagent/access-client-id"
+    access_client_secret = config_root / "secrets/vmagent/access-client-secret"
     protected_path(access_client_id, directory=False)
     protected_path(access_client_secret, directory=False)
-    url_value = read_secret_line(webhook_url)
-    token_value = read_secret_line(webhook_token)
     access_id_value = read_secret_line(access_client_id)
     access_secret_value = read_secret_line(access_client_secret)
-    if (
-        not url_value.startswith("https://")
-        or len(url_value) > 2048
-        or any(character.isspace() for character in url_value)
-    ):
-        raise ValueError("Alertmanager webhook URL must be a bounded HTTPS capability")
-    if not 32 <= len(token_value) <= 512 or any(
-        character in token_value for character in "\r\n\0"
-    ):
-        raise ValueError("Alertmanager webhook token must be a bounded single-line secret")
     if not re.fullmatch(r"[0-9a-f]{32}\.access", access_id_value):
-        raise ValueError("Alertmanager Access client ID is invalid")
+        raise ValueError("vmagent Access client ID is invalid")
     if not 32 <= len(access_secret_value) <= 512 or any(
         character in access_secret_value for character in "\r\n\0"
     ):
-        raise ValueError("Alertmanager Access client secret must be bounded")
+        raise ValueError("vmagent Access client secret must be bounded")
 
 
 def read_secret_line(path: Path) -> str:

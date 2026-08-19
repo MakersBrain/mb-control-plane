@@ -2,106 +2,93 @@ groups:
   - name: makersbrain-control-plane
     rules:
       - alert: MakersBrainApplicationUnavailable
-        expr: up{job="control-api-live"} == 0
+        expr: up{job="control-api-live",environment="staging"} == 0 or absent(up{job="control-api-live",environment="staging"})
         for: 2m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
           summary: "The control application process is unavailable"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainDatabaseUnavailable
-        expr: up{job="control-api-database"} == 0 and on() up{job="control-api-live"} == 1
+        expr: (up{job="control-api-database",environment="staging"} == 0 or absent(up{job="control-api-database",environment="staging"})) and on() up{job="control-api-live",environment="staging"} == 1
         for: 2m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
           summary: "The control database path is unavailable while the API process is live"
           runbook_url: "docs/runbooks/failed-restore.md"
-      # Always firing, on purpose. It is the only signal that survives the
-      # monitoring stack itself failing: the receiver treats a gap in these
-      # heartbeats as an outage, because nothing else can report one.
-      - alert: MakersBrainMonitoringHeartbeat
-        expr: vector(1)
-        labels: {severity: heartbeat}
-        annotations:
-          summary: "Monitoring is alive; alert on the absence of this signal"
-          runbook_url: "docs/runbooks/queue-and-worker-failure.md"
-      # Useful in the Prometheus console and for post-hoc analysis, but it
-      # cannot page anyone: its only delivery path is the Alertmanager it is
-      # reporting as unreachable. The heartbeat above is what actually catches
-      # this case.
-      - alert: MakersBrainAlertmanagerUnavailable
-        expr: up{job="alertmanager"} == 0
+      - alert: MakersBrainMonitoringPipelineUnavailable
+        expr: absent(up{job="vmagent",environment="staging"})
         for: 2m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
-          summary: "Prometheus cannot reach the private Alertmanager"
+          summary: "The staging metrics forwarding pipeline is unavailable"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainRequiredWorkerAbsent
-        expr: makersbrain_worker_fresh < 1
+        expr: makersbrain_worker_fresh{environment="staging"} < 1
         for: 2m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
           summary: "Required control-plane queue has no fresh worker"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainQueueDueTooLong
-        expr: makersbrain_queue_oldest_due_age_seconds > 300
+        expr: makersbrain_queue_oldest_due_age_seconds{environment="staging"} > 300
         for: 10m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "A durable-operation queue is not converging"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainDeadLettersPresent
-        expr: makersbrain_queue_dead_letters > 0
+        expr: makersbrain_queue_dead_letters{environment="staging"} > 0
         for: 5m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "A queue contains dead-lettered operations"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainAbandonedOperationLease
-        expr: makersbrain_abandoned_operation_leases > 0
+        expr: makersbrain_abandoned_operation_leases{environment="staging"} > 0
         for: 2m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "An in-flight operation lease has expired"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainVerifiedBackupStale
-        expr: makersbrain_backup_freshness_seconds < 0 or makersbrain_backup_freshness_seconds > 93600
+        expr: makersbrain_backup_freshness_seconds{environment="staging"} < 0 or makersbrain_backup_freshness_seconds{environment="staging"} > 93600
         for: 30m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
           summary: "No sufficiently recent verified workshop backup exists"
           runbook_url: "docs/runbooks/failed-restore.md"
       - alert: MakersBrainRestoreRehearsalStale
-        expr: makersbrain_restore_rehearsal_age_seconds < 0 or makersbrain_restore_rehearsal_age_seconds > 2678400
+        expr: makersbrain_restore_rehearsal_age_seconds{environment="staging"} < 0 or makersbrain_restore_rehearsal_age_seconds{environment="staging"} > 2678400
         for: 1h
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "Isolated restore evidence is missing or older than 31 days"
           runbook_url: "docs/runbooks/failed-restore.md"
       - alert: MakersBrainReleaseTenantFailed
-        expr: makersbrain_release_adoptions{state="failed"} > 0
+        expr: makersbrain_release_adoptions{environment="staging",state="failed"} > 0
         for: 2m
-        labels: {severity: critical}
+        labels: {severity: critical, environment: staging}
         annotations:
           summary: "At least one tenant release adoption failed"
           runbook_url: "docs/runbooks/failed-release-adoption.md"
       - alert: MakersBrainApiServerErrors
-        expr: sum(rate(makersbrain_http_requests_total{status_class="5xx"}[5m])) by (route) > 0.05
+        expr: sum(rate(makersbrain_http_requests_total{environment="staging",status_class="5xx"}[5m])) by (route) > 0.05
         for: 10m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "Sustained control API server errors"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainProviderFailures
-        expr: sum(rate(makersbrain_provider_requests_total{outcome="failure"}[10m])) by (provider, operation) > 0.05
+        expr: sum(rate(makersbrain_provider_requests_total{environment="staging",outcome="failure"}[10m])) by (provider, operation) > 0.05
         for: 10m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "A document or product provider has a sustained failure rate"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainIntegrationUnavailable
-        expr: sum(makersbrain_integration_instances{health=~"degraded|failed"}) by (integration) > 0
+        expr: sum(makersbrain_integration_instances{environment="staging",health=~"degraded|failed"}) by (integration) > 0
         for: 5m
-        labels: {severity: warning}
+        labels: {severity: warning, environment: staging}
         annotations:
           summary: "Odoo, Paperless, or Rauthy integration availability is degraded"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"

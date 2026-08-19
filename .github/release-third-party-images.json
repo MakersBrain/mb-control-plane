@@ -1,9 +1,8 @@
 {
   "alpine": "docker.io/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
-  "alertmanager": "docker.io/prom/alertmanager@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d",
   "cloudflared": "docker.io/cloudflare/cloudflared@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf",
   "nginx": "docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",
-  "prometheus": "docker.io/prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893",
   "rauthy": "ghcr.io/sebadob/rauthy@sha256:6f35e2e41753e973336d476c9593b4c1e41ac597803adf6ccaec08c7d8818cd0",
-  "redis": "docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"
+  "redis": "docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2",
+  "vmagent": "docker.io/victoriametrics/vmagent@sha256:658136a3dec376f2105e0d7147aa4a644ea3333d06a4c4a77d734a2cef6791b3"
 }

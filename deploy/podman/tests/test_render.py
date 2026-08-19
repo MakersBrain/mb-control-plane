@@ -81,24 +81,20 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
             self.assertNotIn("EnvironmentFile=", cloudflared)
             self.assertNotIn("podman.sock", cloudflared)
-            prometheus = (output / "prometheus.container").read_text()
-            self.assertIn("UserNS=keep-id:uid=65534,gid=65534", prometheus)
+            vmagent = (output / "vmagent.container").read_text()
+            self.assertIn("UserNS=keep-id:uid=65534,gid=65534", vmagent)
             self.assertIn(
                 "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro",
-                prometheus,
+                vmagent,
             )
-            prometheus_config = (output / "prometheus.yml").read_text()
-            self.assertIn("metrics_path: /internal/metrics/live", prometheus_config)
-            self.assertIn("metrics_path: /internal/metrics", prometheus_config)
-            self.assertIn("environment: 'staging'", prometheus_config)
-            alertmanager = (output / "alertmanager.container").read_text()
-            self.assertIn("UserNS=keep-id:uid=65534,gid=65534", alertmanager)
-            self.assertIn("/secrets/alertmanager:/run/secrets:ro", alertmanager)
-            alertmanager_config = (output / "alertmanager.yml").read_text()
-            self.assertIn("url_file: /run/secrets/webhook-url", alertmanager_config)
-            self.assertIn("credentials_file: /run/secrets/webhook-token", alertmanager_config)
-            self.assertIn("files: [/run/secrets/access-client-id]", alertmanager_config)
-            self.assertIn("files: [/run/secrets/access-client-secret]", alertmanager_config)
+            self.assertIn("/secrets/vmagent:/run/access:ro", vmagent)
+            self.assertIn("-remoteWrite.forcePromProto=true", vmagent)
+            self.assertIn("-remoteWrite.maxDiskUsagePerURL=256MB", vmagent)
+            vmagent_config = (output / "vmagent.yml").read_text()
+            self.assertIn("metrics_path: /internal/metrics/live", vmagent_config)
+            self.assertIn("metrics_path: /internal/metrics", vmagent_config)
+            self.assertIn("environment: 'staging'", vmagent_config)
+            self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",
                 (output / "redis.container").read_text(),
@@ -135,6 +131,13 @@ class PodmanRendererTests(unittest.TestCase):
         values["recovery_secret_source"] = values["runtime_secret_source"]
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(ValueError, "must be distinct"):
+                RENDER.load_values(self.write_values(Path(temporary), values))
+
+    def test_remote_write_must_be_an_exact_https_endpoint(self):
+        values = copy.deepcopy(EXAMPLE)
+        values["metrics_remote_write_url"] = "http://metrics.example.test/api/v1/write"
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "exact HTTPS"):
                 RENDER.load_values(self.write_values(Path(temporary), values))
 
     def test_staging_personal_data_is_rejected(self):

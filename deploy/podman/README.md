@@ -63,32 +63,31 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   authority; the latter has no general mail-sending authority. Both are file
   references in `/etc/makersbrain/control-worker-tenant-reconciliation.env` and
   are absent from the API, mail gateway, other workers and release records.
-- Prometheus and Alertmanager have no published host port. Prometheus receives
-  only the metrics-specific bearer mounted from
-  `/etc/makersbrain/secrets/control-api/control_metrics_token`; it cannot call
-  other internal APIs. Alertmanager reads the HTTPS receiver capability and
-  its exact bearer from `/etc/makersbrain/secrets/alertmanager/webhook-url` and
-  `webhook-token`. A receiver behind Cloudflare Access additionally receives
-  the independently scoped `CF-Access-Client-Id` and
-  `CF-Access-Client-Secret` headers from `access-client-id` and
-  `access-client-secret`. All four credential files are mode `0600` below a
-  mode `0700` directory; the receiver bearer remains required behind Access.
-  The receiver must retain trigger, acknowledgement, recovery and resolution
-  timestamps without storing tenant or provider payloads.
+- vmagent has no published host port. It receives only the metrics-specific
+  bearer mounted from `/etc/makersbrain/secrets/control-api/control_metrics_token`
+  and cannot call other internal APIs. It forwards the three bounded scrape
+  jobs to an exact HTTPS Prometheus remote-write endpoint protected by a
+  dedicated Cloudflare Access service token. The two token halves are mode
+  `0600` files below `/etc/makersbrain/secrets/vmagent`; an entrypoint reads
+  them only inside the container and vmagent masks the expanded header values.
+  A 256 MiB persistent queue absorbs a bounded receiver outage without bringing
+  a 30-day TSDB onto the application host.
 
-The two Prometheus jobs deliberately separate process liveness from the
+The two application scrape jobs deliberately separate process liveness from the
 database-backed metrics path. `MakersBrainApplicationUnavailable` fires when
 the private live-metrics endpoint disappears;
 `MakersBrainDatabaseUnavailable` fires only when that endpoint remains live
 while the database-backed scrape fails. Backup freshness and restore-rehearsal
-rules consume the normal control-plane metrics. Every rule is delivered to the
-private Alertmanager, which uses `url_file` and `credentials_file` so receiver
-capabilities never enter the signed bundle or release record.
+rules consume the normal control-plane metrics. Central Prometheus evaluates
+the signed rule set and its Alertmanager sends staging alerts both to the
+acknowledgement receiver and to independent email/ntfy delivery. Because rule
+evaluation is outside the application host,
+`MakersBrainMonitoringPipelineUnavailable` survives complete loss of vmagent or
+the host itself.
 
-The configuration is validator-tested with Prometheus `3.13.1` source digest
-`sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893`
-and Alertmanager `0.33.1` source digest
-`sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d`.
+The forwarding configuration is validator-tested with vmagent `1.148.0` amd64
+source digest
+`sha256:658136a3dec376f2105e0d7147aa4a644ea3333d06a4c4a77d734a2cef6791b3`.
 Those upstream images are inputs, not runtime references: CI mirrors, scans,
 SBOMs and signs them in the controlled registry, and the release values use
 the resulting controlled-registry digests.

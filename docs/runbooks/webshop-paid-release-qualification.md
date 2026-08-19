@@ -148,21 +148,21 @@ forbidden labels declared in `deploy/release-contract.json`. The privacy-safe
 evidence summary states only that all three alert lifecycles and the label review
 passed for the candidate release.
 
-Before the drill, confirm `prometheus.service` and `alertmanager.service` are
-the digest-pinned units in the candidate image map and that neither publishes a
-host port. Exercise the application rule by stopping the API process, then
-restore it; confirm as part of that step that `prometheus.service` stays running
+Before the drill, confirm `vmagent.service` uses the digest-pinned image in the
+candidate image map and does not publish a host port. Exercise the application
+rule by stopping the API process, then
+restore it; confirm as part of that step that `vmagent.service` stays running
 while the API is down, since a monitoring unit that stops with its target
-records a false pass. Confirm the receiver is still receiving
-`MakersBrainMonitoringHeartbeat` on its five-minute cadence, and that a gap in it
-raises an out-of-band alert on the receiver side: that gap is the only signal
-available when Alertmanager itself is the component that failed. Exercise the database rule by fencing or stopping the staging DB
+records a false pass. Then stop `vmagent.service` and confirm the central
+evaluator raises `MakersBrainMonitoringPipelineUnavailable`; this is the signal
+that survives loss of the complete staging host or its local monitoring
+process. Exercise the database rule by fencing or stopping the staging DB
 while leaving the API process running, then restore connectivity. Exercise the
 backup rule by stopping the staging backup scheduler only after a verified
 synthetic recovery point exists and allowing the normal 26-hour freshness
 threshold to expire. Budget that interval in the qualification window; never
 shorten or edit a live rule, alter recovery timestamps, or inject an
-Alertmanager event. Restart the scheduler, require a new verified backup, and
+notification event. Restart the scheduler, require a new verified backup, and
 capture Prometheus rule state plus the receiver's
 trigger/acknowledgement/resolution timestamps in protected evidence.
 

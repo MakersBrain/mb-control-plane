@@ -134,10 +134,8 @@ SPECIAL_SOURCES = {
     "database/RAUTHY_HQL_SECRET_API",
     "tunnel/CLOUDFLARE_TUNNEL_TOKEN",
     "mail/ALLOWED_RECIPIENTS",
-    "observability/ALERTMANAGER_WEBHOOK_URL",
-    "observability/ALERTMANAGER_WEBHOOK_TOKEN",
-    "observability/ALERTMANAGER_ACCESS_CLIENT_ID",
-    "observability/ALERTMANAGER_ACCESS_CLIENT_SECRET",
+    "observability/VMAGENT_ACCESS_CLIENT_ID",
+    "observability/VMAGENT_ACCESS_CLIENT_SECRET",
 }
 
 
@@ -457,26 +455,18 @@ def build(
     )
     stage.file_reference("control-mail-gateway", "MAIL_GATEWAY_ALLOWED_RECIPIENTS_FILE", "mail_allowed_recipients")
     for source_name, target in (
-        ("observability/ALERTMANAGER_WEBHOOK_URL", "webhook-url"),
-        ("observability/ALERTMANAGER_WEBHOOK_TOKEN", "webhook-token"),
-        ("observability/ALERTMANAGER_ACCESS_CLIENT_ID", "access-client-id"),
-        ("observability/ALERTMANAGER_ACCESS_CLIENT_SECRET", "access-client-secret"),
+        ("observability/VMAGENT_ACCESS_CLIENT_ID", "access-client-id"),
+        ("observability/VMAGENT_ACCESS_CLIENT_SECRET", "access-client-secret"),
     ):
         path = source_file(source, source_name)
         value = single_line(path, source_name)  # type: ignore[arg-type]
-        if target == "webhook-url" and (
-            not value.startswith("https://") or any(character.isspace() for character in value)
-        ):
-            materialize.fail("Alertmanager webhook URL must be an HTTPS capability")
-        if target == "webhook-token" and not 32 <= len(value) <= 512:
-            materialize.fail("Alertmanager webhook token must be bounded")
         if target == "access-client-id" and not re.fullmatch(
             r"[0-9a-f]{32}\.access", value
         ):
-            materialize.fail("Alertmanager Access client ID is invalid")
+            materialize.fail("vmagent Access client ID is invalid")
         if target == "access-client-secret" and not 32 <= len(value) <= 512:
-            materialize.fail("Alertmanager Access client secret must be bounded")
-        stage.write(Path("secrets/alertmanager") / target, path.read_bytes())  # type: ignore[union-attr]
+            materialize.fail("vmagent Access client secret must be bounded")
+        stage.write(Path("secrets/vmagent") / target, path.read_bytes())  # type: ignore[union-attr]
 
     return {"schema_version": 1, "shared": {}, "processes": stage.references}
 

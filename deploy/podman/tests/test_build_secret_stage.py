@@ -74,9 +74,7 @@ class BuildSecretStageTests(unittest.TestCase):
                 value = "age1" + "q" * 58
             elif relative.endswith("ALLOWED_RECIPIENTS"):
                 value = "synthetic@example.test\n"
-            elif relative.endswith("ALERTMANAGER_WEBHOOK_URL"):
-                value = "https://alerts.example.test/makersbrain"
-            elif relative.endswith("ALERTMANAGER_ACCESS_CLIENT_ID"):
+            elif relative.endswith("VMAGENT_ACCESS_CLIENT_ID"):
                 value = "a" * 32 + ".access"
             elif relative.endswith("CONTROL_RAUTHY_ADMIN_KEY"):
                 value = "makersbrain-runtime$" + "r" * 64
