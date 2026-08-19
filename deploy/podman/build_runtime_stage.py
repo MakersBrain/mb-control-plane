@@ -160,12 +160,29 @@ def unquoted(value: str) -> str:
     return value
 
 
+def validate_cross_process_contract(
+    process_values: dict[str, dict[str, str]],
+) -> None:
+    issuer = unquoted(
+        process_values.get("control-api", {}).get("CONTROL_OIDC_ISSUER", "")
+    )
+    listen_scheme = unquoted(
+        process_values.get("rauthy", {}).get("LISTEN_SCHEME", "")
+    )
+    if issuer.startswith("https://") and listen_scheme != "http_https":
+        fail(
+            "Rauthy LISTEN_SCHEME must be http_https when the control API "
+            "expects an HTTPS issuer and the internal readiness origin uses HTTP"
+        )
+
+
 def build(
     specification: dict,
     rendered: Path,
     shared: dict[str, str],
     process_values: dict[str, dict[str, str]],
 ) -> dict[Path, str]:
+    validate_cross_process_contract(process_values)
     runtime = definitions(specification)
     rendered_contract = rendered_environment_contract(rendered)
     if set(rendered_contract) != set(TARGETS.values()):
