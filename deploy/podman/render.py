@@ -95,6 +95,11 @@ def replacements(values: dict) -> dict[str, str]:
         "PUBLIC_BIND_IP": values["public_bind_ip"],
         "POSTGRES_HOST": values["postgres_host"],
         "METRICS_REMOTE_WRITE_URL": values["metrics_remote_write_url"],
+        "CATALOGUE_NETWORK": (
+            "Network=catalogue.network"
+            if values["environment"] == "production"
+            else ""
+        ),
     }
     result.update({f"{name.upper()}_IMAGE": value for name, value in values["images"].items()})
     return result

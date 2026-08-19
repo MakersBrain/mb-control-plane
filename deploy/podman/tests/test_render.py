@@ -96,9 +96,8 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("environment: 'staging'", vmagent_config)
             self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
             self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
-            self.assertEqual(vmagent.count("Network="), 2)
-            cloudflared = (output / "cloudflared.container").read_text()
-            self.assertEqual(cloudflared.count("Network="), 2)
+            self.assertEqual(vmagent.count("Network="), 1)
+            self.assertEqual(cloudflared.count("Network="), 1)
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",
@@ -123,6 +122,18 @@ class PodmanRendererTests(unittest.TestCase):
                 "@@",
                 "".join(path.read_text() for path in output.rglob("*") if path.is_file()),
             )
+
+    def test_production_edge_and_metrics_join_the_catalogue_network(self):
+        values = copy.deepcopy(EXAMPLE)
+        values["environment"] = "production"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            RENDER.render(self.write_values(root, values), output)
+            for name in ("cloudflared.container", "vmagent.container"):
+                self.assertIn(
+                    "Network=catalogue.network", (output / name).read_text()
+                )
 
     def test_mutable_image_is_rejected(self):
         values = copy.deepcopy(EXAMPLE)
