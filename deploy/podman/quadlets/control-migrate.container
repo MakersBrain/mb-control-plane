@@ -7,6 +7,7 @@ Before=control-api.container
 [Container]
 Image=@@CONTROL_IMAGE@@
 Pull=never
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
 Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@

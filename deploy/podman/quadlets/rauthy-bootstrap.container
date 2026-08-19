@@ -7,6 +7,7 @@ Image=@@ALPINE_IMAGE@@
 Pull=never
 Network=none
 User=0:0
+UserNS=keep-id:uid=10001,gid=10001
 Volume=/etc/makersbrain/rauthy:/source:ro
 Volume=@@RUNTIME_SECRET_SOURCE@@/rauthy-bootstrap:/bootstrap
 Exec=/bin/sh -ec "umask 077; cp /source/clients.json /bootstrap/clients.json; cp /source/api_keys.json /bootstrap/api_keys.json; cp /source/roles.json /bootstrap/roles.json; cp /source/scopes.json /bootstrap/scopes.json; chown -R 10001:10001 /bootstrap; chmod 0700 /bootstrap; chmod 0400 /bootstrap/*.json"

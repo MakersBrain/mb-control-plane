@@ -7,6 +7,7 @@ After=control-migrate.container control-container-driver.container
 Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=control-backup-scheduler
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@
 Environment=PGSSLMODE=verify-full

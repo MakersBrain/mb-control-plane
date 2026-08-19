@@ -133,6 +133,7 @@ def validate(root: Path) -> None:
     if (
         "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro"
         not in prometheus
+        or "UserNS=keep-id:uid=65534,gid=65534" not in prometheus
         or "credentials_file: /run/secrets/control-metrics-token"
         not in prometheus_config
         or "/internal/metrics/live" not in prometheus_config
@@ -143,6 +144,7 @@ def validate(root: Path) -> None:
     alertmanager_config = (root / "alertmanager.yml").read_text(encoding="utf-8")
     if (
         "/secrets/alertmanager:/run/secrets:ro" not in alertmanager
+        or "UserNS=keep-id:uid=65534,gid=65534" not in alertmanager
         or "url_file: /run/secrets/webhook-url" not in alertmanager_config
         or "credentials_file: /run/secrets/webhook-token" not in alertmanager_config
         or "files: [/run/secrets/access-client-id]" not in alertmanager_config
@@ -150,6 +152,13 @@ def validate(root: Path) -> None:
         or "send_resolved: true" not in alertmanager_config
     ):
         raise ValueError("Alertmanager trigger/recovery delivery is not secret-backed")
+    if "UserNS=keep-id:uid=999,gid=1000" not in (
+        root / "redis.container"
+    ).read_text(encoding="utf-8"):
+        raise ValueError("Redis does not run as its rootless image identity")
+    driver = (root / "control-container-driver.container").read_text(encoding="utf-8")
+    if "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro" not in driver:
+        raise ValueError("deployment driver has no mounted PostgreSQL CA")
     if values["environment"] == "production" and values["data_mode"] == "personal":
         if not values.get("production_personal_data_allowed"):
             raise ValueError("personal-data activation is not approved")

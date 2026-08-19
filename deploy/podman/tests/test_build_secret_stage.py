@@ -119,7 +119,7 @@ class BuildSecretStageTests(unittest.TestCase):
                 "--postgres-ca",
                 str(ca),
                 "--driver-ca-path",
-                "/var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt",
+                "/run/secrets/postgres-ca.crt",
                 "--release-cosign-key",
                 str(cosign),
                 "--member-origin",

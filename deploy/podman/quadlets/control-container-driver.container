@@ -32,6 +32,7 @@ Environment=DRIVER_GATEWAY_CONTAINER=tenant-gateway
 Environment=DRIVER_JOB_SECRET_ROOT=@@RUNTIME_SECRET_SOURCE@@/jobs
 EnvironmentFile=/etc/makersbrain/control-container-driver.env
 Volume=/etc/makersbrain/secrets/control-container-driver:/run/secrets:ro
+Volume=@@RUNTIME_SECRET_SOURCE@@/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro
 Volume=@@RUNTIME_SECRET_SOURCE@@:@@RUNTIME_SECRET_SOURCE@@
 Volume=@@RECOVERY_SECRET_SOURCE@@:/run/makersbrain-recovery-secrets:ro
 Volume=odoo-data.volume:/var/lib/odoo

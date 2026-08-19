@@ -154,7 +154,7 @@ python3 build_secret_stage.py \
   --references-output /run/makersbrain-secret-references.json \
   --postgres-host PRIVATE_DATABASE_HOST \
   --postgres-ca /var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt \
-  --driver-ca-path /var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt \
+  --driver-ca-path /run/secrets/postgres-ca.crt \
   --release-cosign-key /etc/makersbrain/release-cosign.pub \
   --member-origin https://app.staging.makersbrain.net
 python3 build_runtime_stage.py \

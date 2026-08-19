@@ -6,7 +6,7 @@ Image=@@ALERTMANAGER_IMAGE@@
 Pull=never
 ContainerName=alertmanager
 Network=makersbrain.network
-User=0
+UserNS=keep-id:uid=65534,gid=65534
 ReadOnly=true
 Volume=%h/.config/containers/systemd/makersbrain/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
 Volume=/etc/makersbrain/secrets/alertmanager:/run/secrets:ro

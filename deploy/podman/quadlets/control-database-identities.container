@@ -5,6 +5,7 @@ Before=control-migrate.container
 [Container]
 Image=@@POSTGRES_IMAGE@@
 Pull=never
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=PGSSLMODE=verify-full
 Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt

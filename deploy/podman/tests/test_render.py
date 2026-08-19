@@ -82,6 +82,7 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertNotIn("EnvironmentFile=", cloudflared)
             self.assertNotIn("podman.sock", cloudflared)
             prometheus = (output / "prometheus.container").read_text()
+            self.assertIn("UserNS=keep-id:uid=65534,gid=65534", prometheus)
             self.assertIn(
                 "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro",
                 prometheus,
@@ -91,12 +92,21 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("metrics_path: /internal/metrics", prometheus_config)
             self.assertIn("environment: 'staging'", prometheus_config)
             alertmanager = (output / "alertmanager.container").read_text()
+            self.assertIn("UserNS=keep-id:uid=65534,gid=65534", alertmanager)
             self.assertIn("/secrets/alertmanager:/run/secrets:ro", alertmanager)
             alertmanager_config = (output / "alertmanager.yml").read_text()
             self.assertIn("url_file: /run/secrets/webhook-url", alertmanager_config)
             self.assertIn("credentials_file: /run/secrets/webhook-token", alertmanager_config)
             self.assertIn("files: [/run/secrets/access-client-id]", alertmanager_config)
             self.assertIn("files: [/run/secrets/access-client-secret]", alertmanager_config)
+            self.assertIn(
+                "UserNS=keep-id:uid=999,gid=1000",
+                (output / "redis.container").read_text(),
+            )
+            self.assertIn(
+                "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro",
+                (output / "control-container-driver.container").read_text(),
+            )
             for path in output.glob("*.container"):
                 if path.name != "control-container-driver.container":
                     self.assertNotIn("podman.sock", path.read_text())
