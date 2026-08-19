@@ -4,4 +4,3 @@
 /web/build/
 /.env
 /deploy/secrets/
-/deploy/rauthy/*.json
