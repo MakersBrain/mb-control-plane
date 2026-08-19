@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain encrypted backup scheduler
-Requires=control-migrate.container control-container-driver.container
-After=control-migrate.container control-container-driver.container
+Requires=control-migrate.service control-container-driver.service
+After=control-migrate.service control-container-driver.service
 
 [Container]
 Image=@@CONTROL_IMAGE@@

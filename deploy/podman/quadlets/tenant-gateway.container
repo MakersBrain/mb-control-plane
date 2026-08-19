@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain exact-host tenant gateway
-Requires=odoo.container
-After=odoo.container
+Requires=odoo.service
+After=odoo.service
 
 [Container]
 Image=@@NGINX_IMAGE@@

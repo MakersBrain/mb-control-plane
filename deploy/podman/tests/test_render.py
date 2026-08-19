@@ -63,7 +63,7 @@ class PodmanRendererTests(unittest.TestCase):
             rauthy_ready = (output / "rauthy-ready.container").read_text()
             self.assertIn("http://rauthy:8092/auth/v1/health", rauthy_ready)
             self.assertIn(
-                "rauthy-ready.container", (output / "control-web.container").read_text()
+                "rauthy-ready.service", (output / "control-web.container").read_text()
             )
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
@@ -73,12 +73,13 @@ class PodmanRendererTests(unittest.TestCase):
                 (output / "control-workers@invoice-capture.container").read_text(),
             )
             self.assertIn(
-                "control-mail-gateway.container",
+                "control-mail-gateway.service",
                 (output / "control-workers@email-delivery.container").read_text(),
             )
             cloudflared = (output / "cloudflared.container").read_text()
             self.assertIn("--no-autoupdate", cloudflared)
             self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
+            self.assertIn("UserNS=keep-id:uid=65532,gid=65532", cloudflared)
             self.assertNotIn("EnvironmentFile=", cloudflared)
             self.assertNotIn("podman.sock", cloudflared)
             vmagent = (output / "vmagent.container").read_text()
@@ -99,6 +100,11 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertEqual(vmagent.count("Network="), 1)
             self.assertEqual(cloudflared.count("Network="), 1)
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
+            self.assertIn(
+                "./web-nginx.conf:/etc/nginx/nginx.conf:ro",
+                (output / "control-web.container").read_text(),
+            )
+            self.assertIn("pid /tmp/nginx.pid", (output / "web-nginx.conf").read_text())
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",
                 (output / "redis.container").read_text(),

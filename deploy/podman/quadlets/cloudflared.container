@@ -1,12 +1,13 @@
 [Unit]
 Description=MakersBrain outbound Cloudflare Tunnel connector
-Requires=control-api.container control-web.container rauthy-ready.container tenant-gateway.container
-After=control-api.container control-web.container rauthy-ready.container tenant-gateway.container
+Requires=control-api.service control-web.service rauthy-ready.service tenant-gateway.service
+After=control-api.service control-web.service rauthy-ready.service tenant-gateway.service
 
 [Container]
 Image=@@CLOUDFLARED_IMAGE@@
 Pull=never
 ContainerName=cloudflared
+UserNS=keep-id:uid=65532,gid=65532
 Network=makersbrain.network
 @@CATALOGUE_NETWORK@@
 Volume=/etc/makersbrain/secrets/cloudflared:/run/secrets:ro

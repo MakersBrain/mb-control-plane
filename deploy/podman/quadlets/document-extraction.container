@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain document extraction broker
-Requires=control-migrate.container
-After=control-migrate.container
+Requires=control-migrate.service
+After=control-migrate.service
 
 [Container]
 Image=@@CONTROL_IMAGE@@

@@ -1,6 +1,6 @@
 [Unit]
 Description=Reconcile MakersBrain PostgreSQL process identities
-Before=control-migrate.container
+Before=control-migrate.service
 
 [Container]
 Image=@@POSTGRES_IMAGE@@

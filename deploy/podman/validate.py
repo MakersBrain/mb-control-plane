@@ -43,6 +43,7 @@ def validate(root: Path) -> None:
         "vmagent.container",
         "vmagent.yml",
         "vmagent-entrypoint.sh",
+        "web-nginx.conf",
         "resolve-secret-env.sh",
     } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
@@ -60,6 +61,12 @@ def validate(root: Path) -> None:
         for marker in FORBIDDEN:
             if marker in content:
                 raise ValueError(f"forbidden marker {marker!r} in {path.name}")
+        for line in content.splitlines():
+            if line.startswith(("Requires=", "Wants=", "After=", "Before=")):
+                if any(unit.endswith(".container") for unit in line.split("=", 1)[1].split()):
+                    raise ValueError(
+                        f"Quadlet dependency in {path.name} must name the generated .service unit"
+                    )
     driver = (root / "control-container-driver.container").read_text(encoding="utf-8")
     if "%t/podman/podman.sock:/run/podman/podman.sock" not in driver:
         raise ValueError("driver does not use the private rootless Podman socket")
@@ -86,7 +93,7 @@ def validate(root: Path) -> None:
     rauthy_ready = (root / "rauthy-ready.container").read_text(encoding="utf-8")
     if "http://rauthy:8092/auth/v1/health" not in rauthy_ready:
         raise ValueError("Rauthy readiness gate is missing")
-    if "rauthy-ready.container" not in (root / "control-web.container").read_text():
+    if "rauthy-ready.service" not in (root / "control-web.container").read_text():
         raise ValueError("web does not wait for Rauthy readiness")
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
@@ -108,7 +115,7 @@ def validate(root: Path) -> None:
     ):
         raise ValueError("mail gateway is not isolated and environment-scoped")
     mail_worker = root / "control-workers@email-delivery.container"
-    if "Requires=control-mail-gateway.container" not in mail_worker.read_text():
+    if "Requires=control-mail-gateway.service" not in mail_worker.read_text():
         raise ValueError("email worker does not wait for the mail gateway")
     scoped_worker_markers = {
         "control-workers@membership-provisioning.container": "paperless-client-secrets.volume",
@@ -129,6 +136,8 @@ def validate(root: Path) -> None:
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
     if "--no-autoupdate" not in cloudflared or "--token-file /run/secrets/tunnel-token" not in cloudflared:
         raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")
+    if "UserNS=keep-id:uid=65532,gid=65532" not in cloudflared:
+        raise ValueError("Cloudflare Tunnel cannot read its rootless scoped token")
     if "EnvironmentFile=" in cloudflared or "postgres" in cloudflared.lower():
         raise ValueError("Cloudflare Tunnel received unrelated application configuration")
     vmagent = (root / "vmagent.container").read_text(encoding="utf-8")

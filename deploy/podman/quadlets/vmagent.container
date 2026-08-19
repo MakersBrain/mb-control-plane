@@ -2,8 +2,8 @@
 Description=MakersBrain private metrics forwarding agent
 # Deliberately Wants=, not Requires=: monitoring must remain alive when the API
 # fails so the central rule evaluator can observe and alert on that failure.
-Wants=control-api.container
-After=control-api.container
+Wants=control-api.service
+After=control-api.service
 
 [Container]
 Image=@@VMAGENT_IMAGE@@

@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain members web application
-Requires=control-api.container rauthy-ready.container
-After=control-api.container rauthy-ready.container
+Requires=control-api.service rauthy-ready.service
+After=control-api.service rauthy-ready.service
 
 [Container]
 Image=@@WEB_IMAGE@@
@@ -11,6 +11,7 @@ User=101:101
 UserNS=keep-id:uid=101,gid=101
 Network=makersbrain.network
 PublishPort=@@PUBLIC_BIND_IP@@:8080:8080
+Volume=./web-nginx.conf:/etc/nginx/nginx.conf:ro
 HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8080/health/live
 HealthInterval=15s
 HealthRetries=12

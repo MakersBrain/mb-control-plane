@@ -1,8 +1,8 @@
 [Unit]
 Description=Wait for Rauthy readiness
-Requires=rauthy.container
-After=rauthy.container
-Before=control-web.container cloudflared.container
+Requires=rauthy.service
+After=rauthy.service
+Before=control-web.service cloudflared.service
 
 [Container]
 Image=@@ALPINE_IMAGE@@

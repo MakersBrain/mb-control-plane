@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain authenticated Podman deployment driver
-Requires=control-migrate.container odoo.container redis.container tenant-gateway.container podman.socket
-After=control-migrate.container odoo.container redis.container tenant-gateway.container podman.socket
+Requires=control-migrate.service odoo.service redis.service tenant-gateway.service podman.socket
+After=control-migrate.service odoo.service redis.service tenant-gateway.service podman.socket
 
 [Container]
 Image=@@CONTROL_IMAGE@@

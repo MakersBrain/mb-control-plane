@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain shared Odoo runtime
-Requires=control-migrate.container
-After=control-migrate.container
+Requires=control-migrate.service
+After=control-migrate.service
 
 [Container]
 Image=@@ODOO_IMAGE@@

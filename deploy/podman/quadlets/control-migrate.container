@@ -1,8 +1,8 @@
 [Unit]
 Description=Apply MakersBrain control schema migrations
-Requires=control-database-identities.container
-After=control-database-identities.container
-Before=control-api.container
+Requires=control-database-identities.service
+After=control-database-identities.service
+Before=control-api.service
 
 [Container]
 Image=@@CONTROL_IMAGE@@

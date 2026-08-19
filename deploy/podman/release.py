@@ -382,7 +382,11 @@ def stage(
     releases.mkdir(parents=True, exist_ok=True, mode=0o700)
     shutil.copytree(rendered, release_root)
     for path in release_root.rglob("*"):
-        path.chmod(0o755 if path.is_dir() else 0o644)
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            source_mode = stat.S_IMODE((rendered / path.relative_to(release_root)).stat().st_mode)
+            path.chmod(0o555 if source_mode & 0o111 else 0o644)
 
 
 def tree_digest(root: Path) -> str:
@@ -426,14 +430,18 @@ def start_staged(
         # come from the source files' [Install] sections, and systemd refuses
         # `enable` for generated units. Reload the generator output, then start
         # the persistent set explicitly for this activation.
-        run(["systemctl", "--user", "start", *PERSISTENT_UNITS])
+        # `start` is a no-op for an already-running generated unit, leaving its
+        # old image and command alive after the symlink switch. Restart is the
+        # actual release boundary and also pulls in the one-shot migration and
+        # initialization dependencies of the new generation.
+        run(["systemctl", "--user", "restart", *PERSISTENT_UNITS])
     except Exception:
         current.unlink(missing_ok=True)
         run(["systemctl", "--user", "daemon-reload"])
         if previous is not None:
             os.symlink(previous, current, target_is_directory=True)
             run(["systemctl", "--user", "daemon-reload"])
-            run(["systemctl", "--user", "start", *PERSISTENT_UNITS])
+            run(["systemctl", "--user", "restart", *PERSISTENT_UNITS])
         raise
 
 
