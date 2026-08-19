@@ -68,7 +68,11 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   `/etc/makersbrain/secrets/control-api/control_metrics_token`; it cannot call
   other internal APIs. Alertmanager reads the HTTPS receiver capability and
   its exact bearer from `/etc/makersbrain/secrets/alertmanager/webhook-url` and
-  `webhook-token`. Both files are mode `0600` below a mode `0700` directory.
+  `webhook-token`. A receiver behind Cloudflare Access additionally receives
+  the independently scoped `CF-Access-Client-Id` and
+  `CF-Access-Client-Secret` headers from `access-client-id` and
+  `access-client-secret`. All four credential files are mode `0600` below a
+  mode `0700` directory; the receiver bearer remains required behind Access.
   The receiver must retain trigger, acknowledgement, recovery and resolution
   timestamps without storing tenant or provider payloads.
 

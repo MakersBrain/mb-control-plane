@@ -95,6 +95,8 @@ class PodmanRendererTests(unittest.TestCase):
             alertmanager_config = (output / "alertmanager.yml").read_text()
             self.assertIn("url_file: /run/secrets/webhook-url", alertmanager_config)
             self.assertIn("credentials_file: /run/secrets/webhook-token", alertmanager_config)
+            self.assertIn("files: [/run/secrets/access-client-id]", alertmanager_config)
+            self.assertIn("files: [/run/secrets/access-client-secret]", alertmanager_config)
             for path in output.glob("*.container"):
                 if path.name != "control-container-driver.container":
                     self.assertNotIn("podman.sock", path.read_text())

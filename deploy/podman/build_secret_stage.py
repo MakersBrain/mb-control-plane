@@ -135,6 +135,8 @@ SPECIAL_SOURCES = {
     "mail/ALLOWED_RECIPIENTS",
     "observability/ALERTMANAGER_WEBHOOK_URL",
     "observability/ALERTMANAGER_WEBHOOK_TOKEN",
+    "observability/ALERTMANAGER_ACCESS_CLIENT_ID",
+    "observability/ALERTMANAGER_ACCESS_CLIENT_SECRET",
 }
 
 
@@ -167,8 +169,14 @@ def source_file(
 
 def single_line(path: Path, label: str) -> str:
     data = path.read_text(encoding="utf-8")
+    if data.endswith("\n"):
+        data = data[:-1]
+    if data.endswith("\r"):
+        data = data[:-1]
     if any(character in data for character in "\r\n\0"):
         materialize.fail(f"canonical source must be a single line: {label}")
+    if not data:
+        materialize.fail(f"canonical source must not be empty: {label}")
     return data
 
 
@@ -383,6 +391,8 @@ def build(
     for source_name, target in (
         ("observability/ALERTMANAGER_WEBHOOK_URL", "webhook-url"),
         ("observability/ALERTMANAGER_WEBHOOK_TOKEN", "webhook-token"),
+        ("observability/ALERTMANAGER_ACCESS_CLIENT_ID", "access-client-id"),
+        ("observability/ALERTMANAGER_ACCESS_CLIENT_SECRET", "access-client-secret"),
     ):
         path = source_file(source, source_name)
         value = single_line(path, source_name)  # type: ignore[arg-type]
@@ -392,6 +402,12 @@ def build(
             materialize.fail("Alertmanager webhook URL must be an HTTPS capability")
         if target == "webhook-token" and not 32 <= len(value) <= 512:
             materialize.fail("Alertmanager webhook token must be bounded")
+        if target == "access-client-id" and not re.fullmatch(
+            r"[0-9a-f]{32}\.access", value
+        ):
+            materialize.fail("Alertmanager Access client ID is invalid")
+        if target == "access-client-secret" and not 32 <= len(value) <= 512:
+            materialize.fail("Alertmanager Access client secret must be bounded")
         stage.write(Path("secrets/alertmanager") / target, path.read_bytes())  # type: ignore[union-attr]
 
     return {"schema_version": 1, "shared": {}, "processes": stage.references}

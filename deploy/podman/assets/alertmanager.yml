@@ -22,3 +22,8 @@ receivers:
           authorization:
             type: Bearer
             credentials_file: /run/secrets/webhook-token
+          http_headers:
+            CF-Access-Client-Id:
+              files: [/run/secrets/access-client-id]
+            CF-Access-Client-Secret:
+              files: [/run/secrets/access-client-secret]

@@ -40,6 +40,15 @@ VALUES = PODMAN / "values.example.json"
 
 
 class BuildSecretStageTests(unittest.TestCase):
+    def test_single_line_accepts_one_terminal_newline_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "value"
+            path.write_text("value\r\n")
+            self.assertEqual(SECRETS.single_line(path, "fixture"), "value")
+            path.write_text("embedded\nnewline\n")
+            with self.assertRaisesRegex(ValueError, "single line"):
+                SECRETS.single_line(path, "fixture")
+
     def canonical(self, root: Path) -> tuple[Path, Path, Path]:
         source = root / "canonical"
         source.mkdir(mode=0o700)
@@ -67,6 +76,8 @@ class BuildSecretStageTests(unittest.TestCase):
                 value = "synthetic@example.test\n"
             elif relative.endswith("ALERTMANAGER_WEBHOOK_URL"):
                 value = "https://alerts.example.test/makersbrain"
+            elif relative.endswith("ALERTMANAGER_ACCESS_CLIENT_ID"):
+                value = "a" * 32 + ".access"
             path.write_text(value)
             path.chmod(0o600)
         ca = root / "postgres-ca.crt"

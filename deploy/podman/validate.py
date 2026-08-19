@@ -145,6 +145,8 @@ def validate(root: Path) -> None:
         "/secrets/alertmanager:/run/secrets:ro" not in alertmanager
         or "url_file: /run/secrets/webhook-url" not in alertmanager_config
         or "credentials_file: /run/secrets/webhook-token" not in alertmanager_config
+        or "files: [/run/secrets/access-client-id]" not in alertmanager_config
+        or "files: [/run/secrets/access-client-secret]" not in alertmanager_config
         or "send_resolved: true" not in alertmanager_config
     ):
         raise ValueError("Alertmanager trigger/recovery delivery is not secret-backed")

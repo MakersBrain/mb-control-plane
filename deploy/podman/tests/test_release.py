@@ -40,8 +40,14 @@ class ReleaseTests(unittest.TestCase):
             "https://alerts.example.test/makersbrain", encoding="utf-8"
         )
         (alertmanager / "webhook-token").write_text("a" * 48, encoding="utf-8")
+        (alertmanager / "access-client-id").write_text(
+            "b" * 32 + ".access", encoding="utf-8"
+        )
+        (alertmanager / "access-client-secret").write_text("c" * 48, encoding="utf-8")
         (alertmanager / "webhook-url").chmod(0o600)
         (alertmanager / "webhook-token").chmod(0o600)
+        (alertmanager / "access-client-id").chmod(0o600)
+        (alertmanager / "access-client-secret").chmod(0o600)
 
     def test_release_record_signature_is_verified_as_a_blob(self):
         with tempfile.TemporaryDirectory() as temporary:
