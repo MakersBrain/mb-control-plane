@@ -15,6 +15,12 @@ from pathlib import Path
 import render
 import validate
 
+COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+COSIGN_IDENTITY = (
+    "https://github.com/MakersBrain/odoo/"
+    ".github/workflows/release.yml@refs/heads/main"
+)
+
 
 RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$")
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
@@ -68,6 +74,16 @@ def verify_database_secrets() -> None:
         run(["podman", "secret", "inspect", name])
 
 
+def ensure_data_directory(path: Path) -> None:
+    """Create the validated database data child without accepting a symlink."""
+    if path.is_symlink():
+        raise ValueError("database data directory must not be a symlink")
+    if path.exists() and not path.is_dir():
+        raise ValueError("database data path must be a directory")
+    path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    path.chmod(0o700)
+
+
 def activate(
     rendered: Path,
     release_id: str,
@@ -102,7 +118,10 @@ def activate(
         os.symlink(release_root, temporary, target_is_directory=True)
         os.replace(temporary, current)
         run(["systemctl", "--user", "daemon-reload"])
-        run(["systemctl", "--user", "enable", "--now", "postgres.service"])
+        # Quadlet generates postgres.service at daemon-reload time. Generated
+        # units cannot be enabled directly; the Quadlet [Install] section owns
+        # its default.target linkage, so activation only needs to start it.
+        run(["systemctl", "--user", "start", "postgres.service"])
         run(["systemctl", "--user", "start", "postgres-recovery-init.service"])
         run(
             [
@@ -137,8 +156,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--values", type=Path, required=True)
     parser.add_argument("--release-record", type=Path, required=True)
-    parser.add_argument("--release-signature", type=Path, required=True)
-    parser.add_argument("--cosign-key", type=Path, required=True)
     parser.add_argument("--state-root", type=Path, default=Path.home() / ".local/state/makersbrain")
     parser.add_argument(
         "--quadlet-root", type=Path, default=Path.home() / ".config/containers/systemd"
@@ -149,20 +166,6 @@ def main() -> None:
     parser.add_argument("--activate", action="store_true")
     args = parser.parse_args()
 
-    if not args.cosign_key.is_file() or not args.release_signature.is_file():
-        raise ValueError("Cosign public key or release signature is missing")
-    run(
-        [
-            "cosign",
-            "verify-blob",
-            "--insecure-ignore-tlog",
-            "--key",
-            str(args.cosign_key),
-            "--signature",
-            str(args.release_signature),
-            str(args.release_record),
-        ]
-    )
     with tempfile.TemporaryDirectory(prefix="makersbrain-database-release-") as temporary:
         rendered = Path(temporary)
         render.render(args.values, rendered)
@@ -172,9 +175,22 @@ def main() -> None:
         if args.activate:
             verify_database_secrets()
         image = values["postgres_image"]
-        run(["cosign", "verify", "--key", str(args.cosign_key), image])
+        run(
+            [
+                "cosign",
+                "verify",
+                "--certificate-oidc-issuer",
+                COSIGN_OIDC_ISSUER,
+                "--certificate-identity",
+                COSIGN_IDENTITY,
+                "--certificate-github-workflow-repository",
+                "MakersBrain/odoo",
+                image,
+            ]
+        )
         run(["podman", "pull", image])
         if args.activate:
+            ensure_data_directory(Path(values["data_directory"]))
             activate(
                 rendered,
                 record["release_id"],
@@ -183,7 +199,7 @@ def main() -> None:
                 args.systemd_root,
             )
         else:
-            print("database release signature, image and Quadlet are valid")
+            print("database release image, record and Quadlet are valid")
 
 
 if __name__ == "__main__":

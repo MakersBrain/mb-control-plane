@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 HERE = Path(__file__).resolve().parent
@@ -54,7 +55,7 @@ def load_values(path: Path) -> dict:
         raise ValueError("runtime and recovery secret sources must be distinct")
     required_images = {
         "control", "web", "odoo", "rauthy", "redis", "nginx", "alpine", "postgres",
-        "paperless", "backup", "cloudflared", "prometheus", "alertmanager"
+        "paperless", "backup", "cloudflared", "vmagent"
     }
     images = values.get("images", {})
     if set(images) != required_images:
@@ -67,6 +68,20 @@ def load_values(path: Path) -> dict:
         raise ValueError("public services must bind to a loopback edge origin")
     if not HOST.fullmatch(values.get("postgres_host", "")):
         raise ValueError("postgres_host is invalid")
+    remote_write = urlsplit(values.get("metrics_remote_write_url", ""))
+    if (
+        remote_write.scheme != "https"
+        or not remote_write.hostname
+        or remote_write.username
+        or remote_write.password
+        or remote_write.port not in (None, 443)
+        or remote_write.path != "/api/v1/write"
+        or remote_write.query
+        or remote_write.fragment
+    ):
+        raise ValueError(
+            "metrics_remote_write_url must be an exact HTTPS /api/v1/write endpoint"
+        )
     return values
 
 
@@ -79,6 +94,7 @@ def replacements(values: dict) -> dict[str, str]:
         "RECOVERY_SECRET_SOURCE": values["recovery_secret_source"],
         "PUBLIC_BIND_IP": values["public_bind_ip"],
         "POSTGRES_HOST": values["postgres_host"],
+        "METRICS_REMOTE_WRITE_URL": values["metrics_remote_write_url"],
     }
     result.update({f"{name.upper()}_IMAGE": value for name, value in values["images"].items()})
     return result
@@ -118,13 +134,11 @@ def render(values_path: Path, output: Path) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             content = rendered(source.read_text(encoding="utf-8"), source.name)
             target.write_text(content, encoding="utf-8")
-            target.chmod(0o644)
+            target.chmod(0o555 if target.name == "vmagent-entrypoint.sh" else 0o644)
     shutil.copy2(values_path, output / "rendered-values.json")
     (output / "rendered-values.json").chmod(0o600)
     shutil.copy2(HERE.parent / "resolve-secret-env.sh", output / "resolve-secret-env.sh")
     (output / "resolve-secret-env.sh").chmod(0o555)
-    shutil.copy2(HERE.parent / "prometheus-alerts.yml", output / "prometheus-alerts.yml")
-    (output / "prometheus-alerts.yml").chmod(0o644)
 
 
 def main() -> None:

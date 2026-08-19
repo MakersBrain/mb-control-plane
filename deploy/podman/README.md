@@ -40,11 +40,14 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   and path traversal are rejected, and prior generations remain available for
   rollback. Secret values remain file references under `/run/secrets`; they are
   not written into Quadlets or release records.
-- Images are pre-pulled and verified with the release Cosign public key before
-  the units are installed. Every image value must contain an OCI digest.
-- Third-party base images are mirrored into the controlled registry and signed
-  there with the same release key; activation never trusts an upstream mutable
-  tag or attempts to attach signatures to an upstream project.
+- Images are pre-pulled by exact OCI digest before the units are installed.
+  GitHub Actions signs built and mirrored images with keyless OIDC, and the
+  production promotion job verifies the Fulcio issuer plus repository,
+  workflow and source-ref certificate claims. No private signing key is stored
+  in Infisical or installed on a runtime host.
+- Third-party base images are mirrored into the controlled registry before
+  signing; activation never trusts an upstream mutable tag or attempts to
+  attach signatures to an upstream project.
 - The rootless `podman.socket` is enabled for `tenant-runtime` and is never
   exposed over TCP.
 - The digest-pinned `cloudflared` Quadlet uses only a file-scoped connector
@@ -63,28 +66,31 @@ the Podman Unix socket; the API, workers and tenant containers never receive it.
   authority; the latter has no general mail-sending authority. Both are file
   references in `/etc/makersbrain/control-worker-tenant-reconciliation.env` and
   are absent from the API, mail gateway, other workers and release records.
-- Prometheus and Alertmanager have no published host port. Prometheus receives
-  only the metrics-specific bearer mounted from
-  `/etc/makersbrain/secrets/control-api/control_metrics_token`; it cannot call
-  other internal APIs. Alertmanager reads the HTTPS receiver capability and
-  its exact bearer from `/etc/makersbrain/secrets/alertmanager/webhook-url` and
-  `webhook-token`. Both files are mode `0600` below a mode `0700` directory.
-  The receiver must retain trigger, acknowledgement, recovery and resolution
-  timestamps without storing tenant or provider payloads.
+- vmagent has no published host port. It receives only the metrics-specific
+  bearer mounted from `/etc/makersbrain/secrets/control-api/control_metrics_token`
+  and cannot call other internal APIs. It forwards the three bounded scrape
+  jobs to an exact HTTPS Prometheus remote-write endpoint protected by a
+  dedicated Cloudflare Access service token. The two token halves are mode
+  `0600` files below `/etc/makersbrain/secrets/vmagent`; an entrypoint reads
+  them only inside the container and vmagent masks the expanded header values.
+  A 256 MiB persistent queue absorbs a bounded receiver outage without bringing
+  a 30-day TSDB onto the application host.
 
-The two Prometheus jobs deliberately separate process liveness from the
+The two application scrape jobs deliberately separate process liveness from the
 database-backed metrics path. `MakersBrainApplicationUnavailable` fires when
 the private live-metrics endpoint disappears;
 `MakersBrainDatabaseUnavailable` fires only when that endpoint remains live
 while the database-backed scrape fails. Backup freshness and restore-rehearsal
-rules consume the normal control-plane metrics. Every rule is delivered to the
-private Alertmanager, which uses `url_file` and `credentials_file` so receiver
-capabilities never enter the signed bundle or release record.
+rules consume the normal control-plane metrics. Central Prometheus evaluates
+the signed rule set and its Alertmanager sends staging alerts both to the
+acknowledgement receiver and to independent email/ntfy delivery. Because rule
+evaluation is outside the application host,
+`MakersBrainMonitoringPipelineUnavailable` survives complete loss of vmagent or
+the host itself.
 
-The configuration is validator-tested with Prometheus `3.13.1` source digest
-`sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893`
-and Alertmanager `0.33.1` source digest
-`sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d`.
+The forwarding configuration is validator-tested with vmagent `1.148.0` amd64
+source digest
+`sha256:658136a3dec376f2105e0d7147aa4a644ea3333d06a4c4a77d734a2cef6791b3`.
 Those upstream images are inputs, not runtime references: CI mirrors, scans,
 SBOMs and signs them in the controlled registry, and the release values use
 the resulting controlled-registry digests.
@@ -119,7 +125,7 @@ to the control API delivery-event route.
 
 The public Scaleway `fr-par` SNS trust chain is pinned in the release bundle and
 mounted read-only by the Quadlet. Updating it therefore requires the same
-reviewed, signed release process as application code; it is not an operator
+reviewed, immutable release process as application code; it is not an operator
 download performed during activation.
 
 `POST /v1/mail/events` is the only public gateway route. It requires the exact
@@ -150,8 +156,8 @@ python3 build_secret_stage.py \
   --references-output /run/makersbrain-secret-references.json \
   --postgres-host PRIVATE_DATABASE_HOST \
   --postgres-ca /var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt \
-  --driver-ca-path /var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt \
-  --release-cosign-key /etc/makersbrain/release-cosign.pub
+  --driver-ca-path /run/secrets/postgres-ca.crt \
+  --member-origin https://app.staging.makersbrain.net
 python3 build_runtime_stage.py \
   --input /secure/release/makersbrain-runtime.json \
   --secret-input /run/makersbrain-secret-references.json \
@@ -206,17 +212,14 @@ python3 validate.py /tmp/makersbrain-quadlets
 systemd-analyze --user verify /tmp/makersbrain-quadlets/*.service
 ```
 
-Verify a signed release without changing systemd, then activate it explicitly:
+Validate and pull a digest-pinned release without changing systemd, then
+activate it explicitly:
 
 ```sh
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub
+  --release-record /secure/release/release-record.json
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --activate
+  --release-record /secure/release/release-record.json --activate
 ```
 
 For an offline topology cutover, copy the verified release into the immutable
@@ -226,30 +229,27 @@ already-staged release only after restore/migration and read-only canaries pass:
 
 ```sh
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --stage-only
+  --release-record /secure/release/release-record.json --stage-only
 python3 database/write-fence.py enable
 python3 database/write-fence.py verify
 # Run migration and read-only canaries, then deliberately lower the fence once.
 python3 database/write-fence.py disable
 python3 release.py --values /secure/release/podman-values.json \
-  --release-record /secure/release/release-record.json \
-  --release-signature /secure/release/release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --start-staged
+  --release-record /secure/release/release-record.json --start-staged
 ```
 
 The fence changes every runtime database role, terminates existing sessions so
 they cannot retain a writable session default, and deliberately leaves only the
-signed migration identity writable. After `disable`, recovery must preserve all
+scoped migration identity writable. After `disable`, recovery must preserve all
 accepted writes; restoring the pre-cutover snapshot is no longer a valid rollback.
 
 Activation stores each rendered release separately and atomically changes the
 single `makersbrain` Quadlet search-path symlink. A failed systemd activation
 restores the prior symlink. Production records must include the successful
-staging qualification reference for the exact same image map. The release
-record itself is verified as a signed blob before any image is pulled or any
-systemd state is changed.
+staging qualification reference for the exact same image map. Release and
+qualification artifacts are consumed by immutable repository digest; the
+production promotion job verifies every image's keyless provenance before a
+production activation record is published.
 
 The renderer refuses mutable image tags, development environments, unresolved
 template values and production personal-data activation without an external

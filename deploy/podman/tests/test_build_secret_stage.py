@@ -40,6 +40,15 @@ VALUES = PODMAN / "values.example.json"
 
 
 class BuildSecretStageTests(unittest.TestCase):
+    def test_single_line_accepts_one_terminal_newline_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "value"
+            path.write_text("value\r\n")
+            self.assertEqual(SECRETS.single_line(path, "fixture"), "value")
+            path.write_text("embedded\nnewline\n")
+            with self.assertRaisesRegex(ValueError, "single line"):
+                SECRETS.single_line(path, "fixture")
+
     def canonical(self, root: Path) -> tuple[Path, Path, Path]:
         source = root / "canonical"
         source.mkdir(mode=0o700)
@@ -65,8 +74,12 @@ class BuildSecretStageTests(unittest.TestCase):
                 value = "age1" + "q" * 58
             elif relative.endswith("ALLOWED_RECIPIENTS"):
                 value = "synthetic@example.test\n"
-            elif relative.endswith("ALERTMANAGER_WEBHOOK_URL"):
-                value = "https://alerts.example.test/makersbrain"
+            elif relative.endswith("VMAGENT_ACCESS_CLIENT_ID"):
+                value = "a" * 32 + ".access"
+            elif relative.endswith("CONTROL_RAUTHY_ADMIN_KEY"):
+                value = "makersbrain-runtime$" + "r" * 64
+            elif relative.endswith("CONTROL_RAUTHY_DEPLOYMENT_KEY"):
+                value = "makersbrain-deployment$" + "d" * 64
             path.write_text(value)
             path.chmod(0o600)
         ca = root / "postgres-ca.crt"
@@ -84,7 +97,6 @@ class BuildSecretStageTests(unittest.TestCase):
         root: Path,
         source: Path,
         ca: Path,
-        cosign: Path,
         environment: str = "staging",
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -104,9 +116,9 @@ class BuildSecretStageTests(unittest.TestCase):
                 "--postgres-ca",
                 str(ca),
                 "--driver-ca-path",
-                "/var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt",
-                "--release-cosign-key",
-                str(cosign),
+                "/run/secrets/postgres-ca.crt",
+                "--member-origin",
+                "https://app.staging.example.test",
             ],
             text=True,
             capture_output=True,
@@ -118,7 +130,7 @@ class BuildSecretStageTests(unittest.TestCase):
             source, ca, cosign = self.canonical(root)
             stage = root / "stage"
             stage.mkdir(mode=0o700)
-            result = self.run_secret_builder(root, source, ca, cosign)
+            result = self.run_secret_builder(root, source, ca)
             self.assertEqual(result.returncode, 0, result.stderr)
             references = json.loads((root / "secret-references.json").read_text())
             serialized_references = json.dumps(references)
@@ -127,6 +139,15 @@ class BuildSecretStageTests(unittest.TestCase):
                 references["processes"]["control-api"]["CONTROL_DATABASE_URL"],
                 references["processes"]["worker-email"]["CONTROL_DATABASE_URL"],
             )
+            clients = json.loads((stage / "rauthy/clients.json").read_text())
+            self.assertEqual(
+                clients[0]["redirect_uris"],
+                ["https://app.staging.example.test/oauth/callback"],
+            )
+            api_keys = json.loads((stage / "rauthy/api_keys.json").read_text())
+            self.assertEqual([item["name"] for item in api_keys], [
+                "makersbrain-runtime", "makersbrain-deployment"
+            ])
             for path in stage.rglob("*"):
                 if path.is_file():
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -218,7 +239,7 @@ class BuildSecretStageTests(unittest.TestCase):
             (root / "stage").mkdir(mode=0o700)
 
             result = self.run_secret_builder(
-                root, source, ca, cosign, environment="production"
+                root, source, ca, environment="production"
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -234,7 +255,7 @@ class BuildSecretStageTests(unittest.TestCase):
             (source / "mail/ALLOWED_RECIPIENTS").write_bytes(b"")
             (root / "stage").mkdir(mode=0o700)
 
-            result = self.run_secret_builder(root, source, ca, cosign)
+            result = self.run_secret_builder(root, source, ca)
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("canonical source is empty", result.stderr)
@@ -255,7 +276,7 @@ class BuildSecretStageTests(unittest.TestCase):
                     target.unlink()
                     target.symlink_to(source / "application/DEPLOYMENT_DRIVER_TOKEN")
                     expected = "symlink"
-                result = self.run_secret_builder(root, source, ca, cosign)
+                result = self.run_secret_builder(root, source, ca)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
 

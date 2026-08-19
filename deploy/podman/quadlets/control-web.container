@@ -7,6 +7,8 @@ After=control-api.container rauthy-ready.container
 Image=@@WEB_IMAGE@@
 Pull=never
 ContainerName=control-web
+User=101:101
+UserNS=keep-id:uid=101,gid=101
 Network=makersbrain.network
 PublishPort=@@PUBLIC_BIND_IP@@:8080:8080
 HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8080/health/live

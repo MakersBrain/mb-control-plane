@@ -5,6 +5,8 @@ Description=MakersBrain shared Redis
 Image=@@REDIS_IMAGE@@
 Pull=never
 ContainerName=redis
+User=999:1000
+UserNS=keep-id:uid=999,gid=1000
 Network=makersbrain.network
 Volume=redis-data.volume:/data
 Exec=redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction

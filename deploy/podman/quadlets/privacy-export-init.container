@@ -7,6 +7,7 @@ Image=@@ALPINE_IMAGE@@
 Pull=never
 Network=none
 User=0:0
+UserNS=keep-id:uid=10001,gid=10001
 Volume=privacy-exports.volume:/exports
 Exec=/bin/sh -ec "chown 10001:10001 /exports && chmod 0700 /exports"
 NoNewPrivileges=true

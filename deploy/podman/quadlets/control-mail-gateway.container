@@ -5,6 +5,7 @@ Description=MakersBrain authenticated Scaleway TEM mail gateway
 Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=control-mail-gateway
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=MAIL_GATEWAY_ENVIRONMENT=@@ENVIRONMENT@@
 EnvironmentFile=/etc/makersbrain/control-mail-gateway.env

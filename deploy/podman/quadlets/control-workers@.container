@@ -8,6 +8,7 @@ Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=control-worker-%i
 GroupAdd=0
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=CONTROL_DATA_MODE=@@DATA_MODE@@
 Environment=CONTROL_DEPLOYMENT_ENVIRONMENT=@@ENVIRONMENT@@

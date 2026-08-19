@@ -54,6 +54,19 @@ class DatabaseReleaseTests(unittest.TestCase):
             run.call_args_list,
         )
 
+    def test_data_directory_is_created_private_and_symlinks_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            RELEASE.ensure_data_directory(data)
+            self.assertTrue(data.is_dir())
+            self.assertEqual(data.stat().st_mode & 0o777, 0o700)
+
+            linked = root / "linked-data"
+            linked.symlink_to(data, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                RELEASE.ensure_data_directory(linked)
+
     @mock.patch.object(RELEASE, "run")
     def test_activation_initializes_recovery_and_enables_backup_timers(self, run):
         with tempfile.TemporaryDirectory() as temporary:
@@ -70,6 +83,7 @@ class DatabaseReleaseTests(unittest.TestCase):
             )
             for name in RELEASE.RECOVERY_UNITS:
                 self.assertTrue((root / "systemd" / name).is_symlink())
+        run.assert_any_call(["systemctl", "--user", "start", "postgres.service"])
         run.assert_any_call(
             ["systemctl", "--user", "start", "postgres-recovery-init.service"]
         )

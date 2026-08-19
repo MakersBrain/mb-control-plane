@@ -7,6 +7,7 @@ After=control-migrate.container rauthy-bootstrap.container
 Image=@@RAUTHY_IMAGE@@
 Pull=never
 ContainerName=rauthy
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=PG_TLS=require
 Environment=PG_TLS_NO_VERIFY=false

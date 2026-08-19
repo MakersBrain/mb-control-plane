@@ -33,39 +33,39 @@ class ReleaseTests(unittest.TestCase):
         control.chmod(0o700)
         (control / "control_metrics_token").write_text("m" * 48, encoding="utf-8")
         (control / "control_metrics_token").chmod(0o600)
-        alertmanager = config_root / "secrets/alertmanager"
-        alertmanager.mkdir(parents=True, exist_ok=True)
-        alertmanager.chmod(0o700)
-        (alertmanager / "webhook-url").write_text(
-            "https://alerts.example.test/makersbrain", encoding="utf-8"
+        vmagent = config_root / "secrets/vmagent"
+        vmagent.mkdir(parents=True, exist_ok=True)
+        vmagent.chmod(0o700)
+        (vmagent / "access-client-id").write_text(
+            "b" * 32 + ".access", encoding="utf-8"
         )
-        (alertmanager / "webhook-token").write_text("a" * 48, encoding="utf-8")
-        (alertmanager / "webhook-url").chmod(0o600)
-        (alertmanager / "webhook-token").chmod(0o600)
+        (vmagent / "access-client-secret").write_text("c" * 48, encoding="utf-8")
+        (vmagent / "access-client-id").chmod(0o600)
+        (vmagent / "access-client-secret").chmod(0o600)
 
-    def test_release_record_signature_is_verified_as_a_blob(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            record = root / "record.json"
-            signature = root / "record.json.sig"
-            key = root / "release.pub"
-            record.write_text("{}", encoding="utf-8")
-            signature.write_text("signature", encoding="utf-8")
-            key.write_text("key", encoding="utf-8")
-            with mock.patch.object(RELEASE, "run") as run:
-                RELEASE.verify_release_record(record, signature, key)
-            run.assert_called_once_with(
-                [
-                    "cosign",
-                    "verify-blob",
-                    "--insecure-ignore-tlog",
-                    "--key",
-                    str(key),
-                    "--signature",
-                    str(signature),
-                    str(record),
-                ]
-            )
+    def test_digest_pinned_images_require_the_exact_keyless_identity(self):
+        images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
+        with mock.patch.object(RELEASE, "run") as run:
+            RELEASE.verify_and_pull(images)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "cosign",
+                        "verify",
+                        "--certificate-oidc-issuer",
+                        RELEASE.COSIGN_OIDC_ISSUER,
+                        "--certificate-identity",
+                        RELEASE.COSIGN_IDENTITY,
+                        "--certificate-github-workflow-repository",
+                        "MakersBrain/odoo",
+                        images["control"],
+                    ]
+                ),
+                mock.call(["podman", "pull", images["control"]]),
+            ],
+        )
 
     def write_json(self, root: Path, name: str, value: dict) -> Path:
         path = root / name
@@ -79,6 +79,15 @@ class ReleaseTests(unittest.TestCase):
             record["images"]["control"] = record["images"]["web"]
             path = self.write_json(root, "record.json", record)
             with self.assertRaisesRegex(ValueError, "images differ"):
+                RELEASE.load_release(path, VALUES)
+
+    def test_release_record_requires_an_exact_source_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = copy.deepcopy(RECORD)
+            record["source_ref"] = "main"
+            path = self.write_json(root, "record.json", record)
+            with self.assertRaisesRegex(ValueError, "source_ref is invalid"):
                 RELEASE.load_release(path, VALUES)
 
     def test_production_requires_staging_qualification(self):
@@ -236,6 +245,63 @@ class ReleaseTests(unittest.TestCase):
             )
             RELEASE.verify_host_configuration(rendered, config)
 
+    def test_host_preflight_accepts_only_the_approved_writable_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            config = root / "config"
+            config.mkdir()
+            environment = config / "example.env"
+            environment.write_text(
+                "MAIL_GATEWAY_EVENT_JOURNAL_FILE="
+                "/var/lib/makersbrain/mail-events/events.jsonl\n",
+                encoding="utf-8",
+            )
+            environment.chmod(0o600)
+            (rendered / "example.container").write_text(
+                "[Container]\nEnvironmentFile=/etc/makersbrain/example.env\n",
+                encoding="utf-8",
+            )
+            RELEASE.verify_host_configuration(rendered, config)
+            environment.write_text(
+                "MAIL_GATEWAY_EVENT_JOURNAL_FILE=/tmp/events.jsonl\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "approved state path"):
+                RELEASE.verify_host_configuration(rendered, config)
+
+    def test_host_preflight_requires_the_pinned_release_trust_chain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            config = root / "config"
+            config.mkdir()
+            environment = config / "example.env"
+            environment.write_text(
+                "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE="
+                "/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem\n",
+                encoding="utf-8",
+            )
+            environment.chmod(0o600)
+            (rendered / "example.container").write_text(
+                "[Container]\nEnvironmentFile=/etc/makersbrain/example.env\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "immutable release asset is missing"):
+                RELEASE.verify_host_configuration(rendered, config)
+            (rendered / "scaleway-sns-fr-par-trust-chain.pem").write_text(
+                "fixture", encoding="utf-8"
+            )
+            RELEASE.verify_host_configuration(rendered, config)
+            environment.write_text(
+                "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE=/tmp/chain.pem\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "approved release path"):
+                RELEASE.verify_host_configuration(rendered, config)
+
     def test_host_preflight_rejects_missing_vendor_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -274,7 +340,7 @@ class ReleaseTests(unittest.TestCase):
                 current.resolve(), root / "state/releases" / RECORD["release_id"]
             )
             run.assert_any_call(
-                ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
             )
 
     @mock.patch.object(RELEASE, "run")
@@ -304,7 +370,7 @@ class ReleaseTests(unittest.TestCase):
             RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
             self.assertEqual((quadlets / "makersbrain").resolve(), release)
             run.assert_any_call(
-                ["systemctl", "--user", "enable", "--now", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
             )
             with self.assertRaisesRegex(ValueError, "has not been staged"):
                 RELEASE.start_staged("control-2026.08.15-ffffffffffffffff", root / "state", quadlets)
@@ -332,13 +398,8 @@ class ReleaseTests(unittest.TestCase):
             config_root = Path(temporary) / "config"
             config_root.mkdir()
             self.write_observability_secrets(config_root)
-            alertmanager = config_root / "secrets/alertmanager"
             control = config_root / "secrets/control-api"
             (control / "control_metrics_token").write_text("m" * 48 + "\n", encoding="utf-8")
-            (alertmanager / "webhook-url").write_text(
-                "https://alerts.example.test/makersbrain\n", encoding="utf-8"
-            )
-            (alertmanager / "webhook-token").write_text("a" * 48 + "\n", encoding="utf-8")
 
             RELEASE.verify_observability_secrets(config_root)
 

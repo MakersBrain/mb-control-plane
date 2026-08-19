@@ -2,6 +2,7 @@
 Description=Initialize and verify MakersBrain PostgreSQL recovery repository
 Requires=postgres.service
 After=postgres.service
+JobRunningTimeoutSec=180
 
 [Service]
 Type=oneshot

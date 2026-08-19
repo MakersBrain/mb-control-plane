@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -38,73 +37,42 @@ pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
 pub(crate) fn validate_configuration() -> anyhow::Result<()> {
     for name in [
         "CONTROL_RELEASE_COSIGN_EXECUTABLE",
-        "CONTROL_RELEASE_COSIGN_KEY_FILE",
-        "CONTROL_RELEASE_SLSA_BUILDER_ID",
+        "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
+        "CONTROL_RELEASE_COSIGN_IDENTITY",
+        "CONTROL_RELEASE_COSIGN_REPOSITORY",
         "CONTROL_DEPLOYMENT_DRIVER_URL",
         "CONTROL_DEPLOYMENT_DRIVER_TOKEN",
     ] {
-        let value = crate::runtime_secret::environment(name)
+        crate::runtime_secret::environment(name)
             .map_err(anyhow::Error::msg)?
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("{name} is required for release adoption"))?;
-        if name.ends_with("_FILE") && !std::path::Path::new(&value).is_file() {
-            anyhow::bail!("{name} does not identify a readable file");
-        }
     }
     Ok(())
 }
 
 async fn verify_release_provenance(
     manifest: &crate::release::ApplicationReleaseManifest,
-    manifest_digest: &str,
 ) -> Result<(), IntegrationError> {
     let executable = required_release_setting("CONTROL_RELEASE_COSIGN_EXECUTABLE")?;
-    let key = required_release_setting("CONTROL_RELEASE_COSIGN_KEY_FILE")?;
-    let builder = required_release_setting("CONTROL_RELEASE_SLSA_BUILDER_ID")?;
-    if !std::path::Path::new(&key).is_file() {
-        return Err(IntegrationError::ContractDrift);
-    }
+    let issuer = required_release_setting("CONTROL_RELEASE_COSIGN_OIDC_ISSUER")?;
+    let identity = required_release_setting("CONTROL_RELEASE_COSIGN_IDENTITY")?;
+    let repository = required_release_setting("CONTROL_RELEASE_COSIGN_REPOSITORY")?;
     run_cosign(
         &executable,
         &[
             "verify",
-            "--key",
-            &key,
+            "--certificate-oidc-issuer",
+            &issuer,
+            "--certificate-identity",
+            &identity,
+            "--certificate-github-workflow-repository",
+            &repository,
             "--output=json",
             &manifest.provenance.oci_ref,
         ],
     )
     .await?;
-    let attestation = run_cosign(
-        &executable,
-        &[
-            "verify-attestation",
-            "--key",
-            &key,
-            "--type=slsaprovenance",
-            "--output=json",
-            &manifest.provenance.oci_ref,
-        ],
-    )
-    .await?;
-    let rows: Value =
-        serde_json::from_slice(&attestation).map_err(|_| IntegrationError::ContractDrift)?;
-    let rows = rows.as_array().ok_or(IntegrationError::ContractDrift)?;
-    if !rows.iter().any(|row| {
-        row.get("payload")
-            .and_then(Value::as_str)
-            .and_then(|payload| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .ok()
-            })
-            .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
-            .is_some_and(|statement| {
-                slsa_statement_matches(&statement, manifest, manifest_digest, &builder)
-            })
-    }) {
-        return Err(IntegrationError::ContractDrift);
-    }
     Ok(())
 }
 
@@ -127,49 +95,6 @@ async fn run_cosign(executable: &str, arguments: &[&str]) -> Result<Vec<u8>, Int
         return Err(IntegrationError::Rejected);
     }
     Ok(output.stdout)
-}
-
-pub(crate) fn slsa_statement_matches(
-    statement: &Value,
-    manifest: &crate::release::ApplicationReleaseManifest,
-    manifest_digest: &str,
-    expected_builder: &str,
-) -> bool {
-    let image_hex = manifest.image_digest.strip_prefix("sha256:").unwrap_or("");
-    let manifest_hex = manifest_digest.strip_prefix("sha256:").unwrap_or("");
-    let subject_matches = statement
-        .get("subject")
-        .and_then(Value::as_array)
-        .is_some_and(|subjects| {
-            [image_hex, manifest_hex].iter().all(|expected| {
-                !expected.is_empty()
-                    && subjects.iter().any(|subject| {
-                        subject.pointer("/digest/sha256").and_then(Value::as_str) == Some(*expected)
-                    })
-            })
-        });
-    let builder_matches = statement
-        .pointer("/predicate/runDetails/builder/id")
-        .or_else(|| statement.pointer("/predicate/builder/id"))
-        .and_then(Value::as_str)
-        == Some(expected_builder);
-    let dependency_matches = statement
-        .pointer("/predicate/buildDefinition/resolvedDependencies")
-        .or_else(|| statement.pointer("/predicate/materials"))
-        .and_then(Value::as_array)
-        .is_some_and(|dependencies| {
-            dependencies.iter().any(|dependency| {
-                dependency
-                    .get("digest")
-                    .and_then(Value::as_object)
-                    .is_some_and(|digests| {
-                        digests
-                            .values()
-                            .any(|digest| digest.as_str() == Some(manifest.source_commit.as_str()))
-                    })
-            })
-        });
-    subject_matches && builder_matches && dependency_matches
 }
 
 pub(crate) async fn adopt(
@@ -230,7 +155,7 @@ async fn release_preflight(
     {
         return Err(IntegrationError::ContractDrift);
     }
-    verify_release_provenance(&manifest, &manifest_digest).await?;
+    verify_release_provenance(&manifest).await?;
     let sources = sqlx::query_scalar::<_, String>(
         "select distinct release_id from control.tenant_release_adoptions where state='active'",
     )

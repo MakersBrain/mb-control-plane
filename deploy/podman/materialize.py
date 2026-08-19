@@ -127,8 +127,12 @@ def rendered_contract(rendered: Path) -> tuple[set[Path], set[Path]]:
                     relative = source.relative_to("/etc/makersbrain")
                 except ValueError:
                     continue
-                if relative.parts and relative.parts[0] == "secrets":
-                    secret_mounts.add(relative)
+                # Every file or directory mounted from the immutable runtime
+                # generation must be covered by the manifest. Rauthy's
+                # bootstrap directory intentionally lives outside `secrets/`
+                # because it mixes public client metadata with API-key
+                # material, but the whole directory remains mode 0700/0600.
+                secret_mounts.add(relative)
     if not environment_files:
         fail("rendered bundle declares no /etc/makersbrain environment files")
     if not secret_mounts:

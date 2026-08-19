@@ -25,8 +25,7 @@
     "nginx": {"upstream_source": "docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "rauthy": {"upstream_source": "ghcr.io/sebadob/rauthy@sha256:6f35e2e41753e973336d476c9593b4c1e41ac597803adf6ccaec08c7d8818cd0", "tested_version": "0.36.1", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]},
     "redis": {"upstream_source": "docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]},
-    "prometheus": {"upstream_source": "docker.io/prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893", "tested_version": "3.13.1", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]},
-    "alertmanager": {"upstream_source": "docker.io/prom/alertmanager@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d", "tested_version": "0.33.1", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]}
+    "vmagent": {"upstream_source": "docker.io/victoriametrics/vmagent@sha256:658136a3dec376f2105e0d7147aa4a644ea3333d06a4c4a77d734a2cef6791b3", "tested_version": "1.148.0", "delivery": "mirror into the controlled registry, scan, generate SPDX SBOM and sign with the release key", "required_artifacts": ["oci_digest", "spdx_sbom"]}
   },
   "processes": {
     "migration": {"command": ["/usr/local/bin/control-migrate"], "run_before": ["api", "workers"]},
@@ -61,6 +60,7 @@
     "privacy_safe_labels": ["templated_route", "status_class", "queue", "release_adoption_state", "provider", "provider_operation", "provider_outcome", "integration", "integration_health"],
     "forbidden_labels": ["email", "subject", "workshop_id", "operation_id", "token", "provider_payload"],
     "prometheus_rules": "prometheus-alerts.yml",
+    "rule_evaluator": "central Prometheus reached through authenticated remote write",
     "runbooks": [
       "../docs/runbooks/queue-and-worker-failure.md",
       "../docs/runbooks/failed-release-adoption.md",
@@ -86,7 +86,7 @@
     "database_identities": ["POSTGRES_SUPERUSER_PASSWORD", "CONTROL_API_POSTGRES_PASSWORD", "CONTROL_MEMBERSHIP_POSTGRES_PASSWORD", "CONTROL_PROVISIONING_POSTGRES_PASSWORD", "CONTROL_INVOICE_POSTGRES_PASSWORD", "CONTROL_INVENTORY_POSTGRES_PASSWORD", "CONTROL_EMAIL_POSTGRES_PASSWORD", "CONTROL_RECONCILIATION_POSTGRES_PASSWORD", "CONTROL_LIFECYCLE_POSTGRES_PASSWORD", "CONTROL_BACKUP_POSTGRES_PASSWORD", "CONTROL_DRIVER_POSTGRES_PASSWORD", "CONTROL_RELEASE_POSTGRES_PASSWORD", "CONTROL_PRIVACY_POSTGRES_PASSWORD"]
     ,"reconciliation_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_TENANT_DOMAIN", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_SECRET_ROOT"]
     ,"lifecycle_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_PRIVACY_LOOKUP_KEY_ID", "CONTROL_PRIVACY_LOOKUP_KEY"]
-    ,"release_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_RELEASE_COSIGN_EXECUTABLE", "CONTROL_RELEASE_COSIGN_KEY_FILE", "CONTROL_RELEASE_SLSA_BUILDER_ID"]
+    ,"release_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_DEPLOYMENT_DRIVER_URL", "CONTROL_DEPLOYMENT_DRIVER_TOKEN", "CONTROL_RELEASE_COSIGN_EXECUTABLE", "CONTROL_RELEASE_COSIGN_OIDC_ISSUER", "CONTROL_RELEASE_COSIGN_IDENTITY", "CONTROL_RELEASE_COSIGN_REPOSITORY"]
     ,"privacy_worker": ["CONTROL_DATABASE_URL", "CONTROL_RELEASE_ID", "CONTROL_PRIVACY_LOOKUP_KEY_ID", "CONTROL_PRIVACY_LOOKUP_KEY", "CONTROL_PRIVACY_EXPORT_KEY_ID", "CONTROL_PRIVACY_EXPORT_KEY", "CONTROL_PRIVACY_EXPORT_ROOT", "CONTROL_PRIVACY_DRIVER_URL", "CONTROL_PRIVACY_DRIVER_TOKEN"]
   },
   "optional_environment": {

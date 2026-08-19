@@ -7,6 +7,7 @@ After=control-migrate.container
 Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=document-extraction
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 EnvironmentFile=/etc/makersbrain/document-extraction.env
 Volume=/etc/makersbrain/secrets/document-extraction:/run/secrets:ro

@@ -10,6 +10,7 @@ import re
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import urlsplit
 
 import materialize
 
@@ -133,8 +134,8 @@ SPECIAL_SOURCES = {
     "database/RAUTHY_HQL_SECRET_API",
     "tunnel/CLOUDFLARE_TUNNEL_TOKEN",
     "mail/ALLOWED_RECIPIENTS",
-    "observability/ALERTMANAGER_WEBHOOK_URL",
-    "observability/ALERTMANAGER_WEBHOOK_TOKEN",
+    "observability/VMAGENT_ACCESS_CLIENT_ID",
+    "observability/VMAGENT_ACCESS_CLIENT_SECRET",
 }
 
 
@@ -167,8 +168,14 @@ def source_file(
 
 def single_line(path: Path, label: str) -> str:
     data = path.read_text(encoding="utf-8")
+    if data.endswith("\n"):
+        data = data[:-1]
+    if data.endswith("\r"):
+        data = data[:-1]
     if any(character in data for character in "\r\n\0"):
         materialize.fail(f"canonical source must be a single line: {label}")
+    if not data:
+        materialize.fail(f"canonical source must not be empty: {label}")
     return data
 
 
@@ -213,6 +220,32 @@ def database_url(user: str, password: str, host: str, port: int, database: str, 
     ).encode()
 
 
+def rauthy_api_key(value: str, name: str) -> str:
+    prefix = f"{name}$"
+    if not value.startswith(prefix):
+        materialize.fail(f"{name} Rauthy API key has an invalid prefix")
+    secret = value.removeprefix(prefix)
+    if len(secret) < 64 or not secret.isalnum():
+        materialize.fail(f"{name} Rauthy API-key secret must be alphanumeric and at least 64 characters")
+    return secret
+
+
+def member_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 443)
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        materialize.fail("member origin must be an HTTPS origin without a path")
+    return f"https://{parsed.hostname}"
+
+
 def build(
     source: Path,
     stage: Stage,
@@ -221,7 +254,7 @@ def build(
     postgres_port: int,
     postgres_ca: Path,
     driver_ca_path: str,
-    release_cosign_key: Path,
+    members_origin: str,
 ) -> dict[str, object]:
     expected = required_sources()
     optional_sources = {item[0] for item in OPTIONAL_PROVIDERS}
@@ -346,13 +379,58 @@ def build(
     stage.write(Path("secrets/rauthy/config.toml"), toml.encode())
     stage.direct("rauthy", "ENC_KEY_ACTIVE", active)
 
-    materialize.regular_source(release_cosign_key.parent, Path(release_cosign_key.name))
-    stage.write(
-        Path("secrets/control-worker-release-adoption/release-cosign.pub"),
-        release_cosign_key.read_bytes(),
+    runtime_key = single_line(
+        source_file(source, "application/CONTROL_RAUTHY_ADMIN_KEY"),
+        "CONTROL_RAUTHY_ADMIN_KEY",
     )
-    stage.file_reference(
-        "worker-release", "CONTROL_RELEASE_COSIGN_KEY_FILE", "release-cosign.pub"
+    deployment_key = single_line(
+        source_file(source, "application/CONTROL_RAUTHY_DEPLOYMENT_KEY"),
+        "CONTROL_RAUTHY_DEPLOYMENT_KEY",
+    )
+    api_keys = [
+        {
+            "name": "makersbrain-runtime",
+            "secret": {"Plain": rauthy_api_key(runtime_key, "makersbrain-runtime")},
+            "access": [
+                {"group": "Users", "access_rights": ["read", "create", "update"]},
+                {"group": "Sessions", "access_rights": ["read", "delete"]},
+                {"group": "Events", "access_rights": ["read"]},
+            ],
+        },
+        {
+            "name": "makersbrain-deployment",
+            "secret": {"Plain": rauthy_api_key(deployment_key, "makersbrain-deployment")},
+            "access": [
+                {"group": "Clients", "access_rights": ["read", "create", "update", "delete"]},
+                {"group": "Secrets", "access_rights": ["read"]},
+            ],
+        },
+    ]
+    stage.write(Path("rauthy/api_keys.json"), json.dumps(api_keys).encode())
+    public_rauthy = Path(__file__).resolve().parents[1] / "rauthy"
+    clients = json.loads((public_rauthy / "clients.json").read_text(encoding="utf-8"))
+    for client in clients:
+        if client.get("id") == "makersbrain-members":
+            client["redirect_uris"] = [f"{members_origin}/oauth/callback"]
+            client["post_logout_redirect_uris"] = [f"{members_origin}/signed-out"]
+            client["allowed_origins"] = [members_origin]
+            client["client_uri"] = members_origin
+    stage.write(Path("rauthy/clients.json"), json.dumps(clients).encode())
+    for name in ("roles.json", "scopes.json"):
+        stage.write(Path("rauthy") / name, (public_rauthy / name).read_bytes())
+
+    stage.direct(
+        "worker-release",
+        "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
+        "https://token.actions.githubusercontent.com",
+    )
+    stage.direct(
+        "worker-release",
+        "CONTROL_RELEASE_COSIGN_IDENTITY",
+        "https://github.com/MakersBrain/odoo/.github/workflows/release.yml@refs/heads/main",
+    )
+    stage.direct(
+        "worker-release", "CONTROL_RELEASE_COSIGN_REPOSITORY", "MakersBrain/odoo"
     )
 
     tunnel = source_file(source, "tunnel/CLOUDFLARE_TUNNEL_TOKEN")
@@ -381,18 +459,18 @@ def build(
     )
     stage.file_reference("control-mail-gateway", "MAIL_GATEWAY_ALLOWED_RECIPIENTS_FILE", "mail_allowed_recipients")
     for source_name, target in (
-        ("observability/ALERTMANAGER_WEBHOOK_URL", "webhook-url"),
-        ("observability/ALERTMANAGER_WEBHOOK_TOKEN", "webhook-token"),
+        ("observability/VMAGENT_ACCESS_CLIENT_ID", "access-client-id"),
+        ("observability/VMAGENT_ACCESS_CLIENT_SECRET", "access-client-secret"),
     ):
         path = source_file(source, source_name)
         value = single_line(path, source_name)  # type: ignore[arg-type]
-        if target == "webhook-url" and (
-            not value.startswith("https://") or any(character.isspace() for character in value)
+        if target == "access-client-id" and not re.fullmatch(
+            r"[0-9a-f]{32}\.access", value
         ):
-            materialize.fail("Alertmanager webhook URL must be an HTTPS capability")
-        if target == "webhook-token" and not 32 <= len(value) <= 512:
-            materialize.fail("Alertmanager webhook token must be bounded")
-        stage.write(Path("secrets/alertmanager") / target, path.read_bytes())  # type: ignore[union-attr]
+            materialize.fail("vmagent Access client ID is invalid")
+        if target == "access-client-secret" and not 32 <= len(value) <= 512:
+            materialize.fail("vmagent Access client secret must be bounded")
+        stage.write(Path("secrets/vmagent") / target, path.read_bytes())  # type: ignore[union-attr]
 
     return {"schema_version": 1, "shared": {}, "processes": stage.references}
 
@@ -428,7 +506,7 @@ def main() -> int:
     parser.add_argument("--postgres-port", type=int, default=5432)
     parser.add_argument("--postgres-ca", required=True, type=Path)
     parser.add_argument("--driver-ca-path", required=True)
-    parser.add_argument("--release-cosign-key", required=True, type=Path)
+    parser.add_argument("--member-origin", required=True)
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
     if source.is_symlink() or not source.is_dir():
@@ -449,9 +527,6 @@ def main() -> int:
     if not 1 <= args.postgres_port <= 65535:
         materialize.fail("PostgreSQL port is invalid")
     materialize.regular_source(args.postgres_ca.parent, Path(args.postgres_ca.name))
-    materialize.regular_source(
-        args.release_cosign_key.parent, Path(args.release_cosign_key.name)
-    )
     document = build(
         source,
         Stage(args.staging_root),
@@ -460,7 +535,7 @@ def main() -> int:
         args.postgres_port,
         args.postgres_ca,
         args.driver_ca_path,
-        args.release_cosign_key,
+        member_origin(args.member_origin),
     )
     write_json(args.references_output, document)
     print(f"staged scoped secrets for {len(document['processes'])} processes")

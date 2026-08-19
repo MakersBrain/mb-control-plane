@@ -29,11 +29,27 @@ class DatabaseRendererTests(unittest.TestCase):
             hba = (output / "pg_hba.conf").read_text()
             self.assertIn("PublishPort=10.50.2.70:5432:5432", unit)
             self.assertIn("ssl=on", unit)
+            self.assertIn(
+                "Secret=postgres_superuser_password,target=postgres_superuser_password,"
+                "uid=70,gid=70,mode=0400",
+                unit,
+            )
             self.assertNotIn("podman.sock", unit)
             self.assertNotIn("docker.sock", unit)
+            self.assertIn("DropCapability=all", unit)
+            self.assertIn("User=70:70", unit)
+            self.assertIn("UserNS=keep-id:uid=70,gid=70", unit)
+            self.assertNotIn("AddCapability=", unit)
             self.assertIn("hostssl all all 10.50.2.0/26 scram-sha-256", hba)
+            self.assertTrue(
+                hba.startswith("local all postgres peer\nlocal all all scram-sha-256\n")
+            )
             self.assertIn("archive-push", unit)
             self.assertTrue((output / "postgres-recovery-init.service").is_file())
+            self.assertIn(
+                "JobRunningTimeoutSec=180",
+                (output / "postgres-recovery-init.service").read_text(),
+            )
             self.assertTrue((output / "postgres-backup.timer").is_file())
             self.assertTrue((output / "postgres-full-backup.timer").is_file())
             self.assertTrue((output / "restore.py").is_file())

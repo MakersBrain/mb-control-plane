@@ -20,7 +20,13 @@ import validate
 
 RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$")
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
+SOURCE_REF = re.compile(r"^refs/(heads|tags)/[^\s]+$")
 QUALIFICATION_REF = re.compile(r"^\S+/qualifications@sha256:[a-f0-9]{64}$")
+COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+COSIGN_IDENTITY = (
+    "https://github.com/MakersBrain/odoo/"
+    ".github/workflows/release.yml@refs/heads/main"
+)
 PERSISTENT_UNITS = [
     "cloudflared.service",
     "redis.service",
@@ -33,8 +39,7 @@ PERSISTENT_UNITS = [
     "control-mail-gateway.service",
     "control-container-driver.service",
     "control-backup-scheduler.service",
-    "alertmanager.service",
-    "prometheus.service",
+    "vmagent.service",
     "control-workers@tenant-provisioning.service",
     "control-workers@membership-provisioning.service",
     "control-workers@invoice-capture.service",
@@ -82,6 +87,18 @@ VENDOR_REQUIRED_ENVIRONMENT = {
     },
 }
 
+WRITABLE_STATE_FILES = {
+    "MAIL_GATEWAY_EVENT_JOURNAL_FILE": Path(
+        "/var/lib/makersbrain/mail-events/events.jsonl"
+    ),
+}
+
+PINNED_RELEASE_FILES = {
+    "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE": Path(
+        "/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem"
+    ),
+}
+
 
 def file_secret_value(name: str) -> bool:
     return (
@@ -97,6 +114,8 @@ def load_release(path: Path, values: dict) -> dict:
         raise ValueError("release_id is invalid")
     if not COMMIT.fullmatch(record.get("source_commit", "")):
         raise ValueError("source_commit is invalid")
+    if not SOURCE_REF.fullmatch(record.get("source_ref", "")):
+        raise ValueError("source_ref is invalid")
     if not record.get("ci_run_url", "").startswith("https://"):
         raise ValueError("ci_run_url must be HTTPS")
     if record.get("images") != values["images"]:
@@ -112,29 +131,22 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def verify_release_record(record: Path, signature: Path, key: Path) -> None:
-    if not signature.is_file():
-        raise ValueError("release-record signature is missing")
-    run(
-        [
-            "cosign",
-            "verify-blob",
-            "--insecure-ignore-tlog",
-            "--key",
-            str(key),
-            "--signature",
-            str(signature),
-            str(record),
-        ]
-    )
-
-
-def verify_and_pull(images: dict[str, str], key: Path) -> None:
-    if not key.is_file():
-        raise ValueError("Cosign public key is missing")
+def verify_and_pull(images: dict[str, str]) -> None:
     for name in sorted(images):
         image = images[name]
-        run(["cosign", "verify", "--key", str(key), image])
+        run(
+            [
+                "cosign",
+                "verify",
+                "--certificate-oidc-issuer",
+                COSIGN_OIDC_ISSUER,
+                "--certificate-identity",
+                COSIGN_IDENTITY,
+                "--certificate-github-workflow-repository",
+                "MakersBrain/odoo",
+                image,
+            ]
+        )
         run(["podman", "pull", image])
 
 
@@ -179,30 +191,26 @@ def verify_runtime_secrets(values: dict, config_root: Path) -> None:
 
 
 def verify_observability_secrets(config_root: Path) -> None:
-    """Check the credentials Prometheus and Alertmanager read off disk."""
+    """Check the credentials vmagent reads off disk."""
     metrics_token = config_root / "secrets/control-api/control_metrics_token"
     protected_path(metrics_token, directory=False)
     metrics_value = read_secret_line(metrics_token)
     if not 32 <= len(metrics_value) <= 512 or any(
         character in metrics_value for character in "\r\n\0"
     ):
-        raise ValueError("Prometheus metrics token must be a bounded single-line secret")
-    webhook_url = config_root / "secrets/alertmanager/webhook-url"
-    webhook_token = config_root / "secrets/alertmanager/webhook-token"
-    protected_path(webhook_url, directory=False)
-    protected_path(webhook_token, directory=False)
-    url_value = read_secret_line(webhook_url)
-    token_value = read_secret_line(webhook_token)
-    if (
-        not url_value.startswith("https://")
-        or len(url_value) > 2048
-        or any(character.isspace() for character in url_value)
+        raise ValueError("vmagent metrics token must be a bounded single-line secret")
+    access_client_id = config_root / "secrets/vmagent/access-client-id"
+    access_client_secret = config_root / "secrets/vmagent/access-client-secret"
+    protected_path(access_client_id, directory=False)
+    protected_path(access_client_secret, directory=False)
+    access_id_value = read_secret_line(access_client_id)
+    access_secret_value = read_secret_line(access_client_secret)
+    if not re.fullmatch(r"[0-9a-f]{32}\.access", access_id_value):
+        raise ValueError("vmagent Access client ID is invalid")
+    if not 32 <= len(access_secret_value) <= 512 or any(
+        character in access_secret_value for character in "\r\n\0"
     ):
-        raise ValueError("Alertmanager webhook URL must be a bounded HTTPS capability")
-    if not 32 <= len(token_value) <= 512 or any(
-        character in token_value for character in "\r\n\0"
-    ):
-        raise ValueError("Alertmanager webhook token must be a bounded single-line secret")
+        raise ValueError("vmagent Access client secret must be bounded")
 
 
 def read_secret_line(path: Path) -> str:
@@ -319,6 +327,21 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                     seen.add(name)
                     environment_names.add(name)
                     reference = value.strip().strip('"').strip("'")
+                    if name in WRITABLE_STATE_FILES:
+                        if Path(reference) != WRITABLE_STATE_FILES[name]:
+                            raise ValueError(
+                                f"{name} in {environment_file} must use its approved state path"
+                            )
+                        continue
+                    if name in PINNED_RELEASE_FILES:
+                        if Path(reference) != PINNED_RELEASE_FILES[name]:
+                            raise ValueError(
+                                f"{name} in {environment_file} must use its approved release path"
+                            )
+                        asset = rendered / Path(reference).name
+                        if not asset.is_file() or asset.is_symlink():
+                            raise ValueError(f"immutable release asset is missing: {asset.name}")
+                        continue
                     if file_secret_value(name) and not reference.startswith("@/run/"):
                         raise ValueError(
                             f"{name} in {environment_file} must use a scoped file secret"
@@ -398,7 +421,11 @@ def start_staged(
     os.replace(temporary, current)
     try:
         run(["systemctl", "--user", "daemon-reload"])
-        run(["systemctl", "--user", "enable", "--now", *PERSISTENT_UNITS])
+        # Quadlet services are generated units. Their WantedBy relationships
+        # come from the source files' [Install] sections, and systemd refuses
+        # `enable` for generated units. Reload the generator output, then start
+        # the persistent set explicitly for this activation.
+        run(["systemctl", "--user", "start", *PERSISTENT_UNITS])
     except Exception:
         current.unlink(missing_ok=True)
         run(["systemctl", "--user", "daemon-reload"])
@@ -423,8 +450,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--values", type=Path, required=True)
     parser.add_argument("--release-record", type=Path, required=True)
-    parser.add_argument("--release-signature", type=Path, required=True)
-    parser.add_argument("--cosign-key", type=Path, required=True)
     parser.add_argument(
         "--state-root", type=Path, default=Path.home() / ".local/state/makersbrain"
     )
@@ -440,9 +465,6 @@ def main() -> None:
     mode.add_argument("--start-staged", action="store_true")
     args = parser.parse_args()
 
-    if not args.cosign_key.is_file():
-        raise ValueError("Cosign public key is missing")
-    verify_release_record(args.release_record, args.release_signature, args.cosign_key)
     values = render.load_values(args.values)
     record = load_release(args.release_record, values)
     with tempfile.TemporaryDirectory(prefix="makersbrain-release-") as temporary:
@@ -453,7 +475,7 @@ def main() -> None:
         if changes_host:
             verify_runtime_secrets(values, args.config_root)
             verify_host_configuration(rendered, args.config_root)
-        verify_and_pull(values["images"], args.cosign_key)
+        verify_and_pull(values["images"])
         if args.activate:
             activate(rendered, record["release_id"], args.state_root, args.quadlet_root)
         elif args.stage_only:
@@ -461,7 +483,7 @@ def main() -> None:
         elif args.start_staged:
             start_staged(record["release_id"], args.state_root, args.quadlet_root, rendered)
         else:
-            print("release signatures, images, record and Quadlets are valid")
+            print("release image digests, record and Quadlets are valid")
 
 
 if __name__ == "__main__":

@@ -49,14 +49,13 @@ python3 render.py --values values.json --output /tmp/makersbrain-db
 python3 validate.py /tmp/makersbrain-db
 ```
 
-Use the same signed release record and Cosign public key as the application
-host. The database installer verifies every secret, the record and PostgreSQL
-image before pulling, then atomically activates PostgreSQL and its backup timers:
+Use the same immutable release record as the application host. The database
+installer verifies the PostgreSQL image's keyless GitHub Actions identity before
+pulling, then atomically activates PostgreSQL and its backup timers:
 
 ```sh
 python3 release.py --values values.json --release-record release-record.json \
-  --release-signature release-record.json.sig \
-  --cosign-key /etc/makersbrain/release-cosign.pub --activate
+  --activate
 ```
 
 Run a recovery drill into an empty, isolated directory. The tool never stops or

@@ -1,6 +1,7 @@
 {
   "release_id": "control-2026.08.15-0123456789abcdef",
   "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "source_ref": "refs/heads/main",
   "ci_run_url": "https://github.com/example/makersbrain/actions/runs/1",
   "staging_qualification_ref": "registry.example.test/makersbrain/qualifications@sha256:6666666666666666666666666666666666666666666666666666666666666666",
   "images": {
@@ -15,7 +16,6 @@
     "paperless": "registry.example.test/makersbrain/paperless@sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "backup": "registry.example.test/makersbrain/backup@sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "cloudflared": "registry.example.test/makersbrain/cloudflared@sha256:5555555555555555555555555555555555555555555555555555555555555555",
-    "prometheus": "registry.example.test/makersbrain/prometheus@sha256:6666666666666666666666666666666666666666666666666666666666666666",
-    "alertmanager": "registry.example.test/makersbrain/alertmanager@sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    "vmagent": "registry.example.test/makersbrain/vmagent@sha256:6666666666666666666666666666666666666666666666666666666666666666"
   }
 }

@@ -40,11 +40,9 @@ def validate(root: Path) -> None:
         "redis.container",
         "tenant-gateway.container",
         "control-web.container",
-        "alertmanager.container",
-        "prometheus.container",
-        "prometheus.yml",
-        "prometheus-alerts.yml",
-        "alertmanager.yml",
+        "vmagent.container",
+        "vmagent.yml",
+        "vmagent-entrypoint.sh",
         "resolve-secret-env.sh",
     } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
@@ -93,6 +91,8 @@ def validate(root: Path) -> None:
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
+    if "UserNS=keep-id:uid=100,gid=101" not in odoo:
+        raise ValueError("Odoo does not map its rootless runtime identity")
     if "odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro" not in odoo:
         raise ValueError("Odoo cannot authenticate tenant-scoped outbound bridge calls")
     mail = (root / "control-mail-gateway.container").read_text(encoding="utf-8")
@@ -123,31 +123,44 @@ def validate(root: Path) -> None:
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")
+    for name in ("control-web.container", "tenant-gateway.container"):
+        if "UserNS=keep-id:uid=101,gid=101" not in (root / name).read_text():
+            raise ValueError(f"nginx runtime identity is not mapped in {name}")
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
     if "--no-autoupdate" not in cloudflared or "--token-file /run/secrets/tunnel-token" not in cloudflared:
         raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")
     if "EnvironmentFile=" in cloudflared or "postgres" in cloudflared.lower():
         raise ValueError("Cloudflare Tunnel received unrelated application configuration")
-    prometheus = (root / "prometheus.container").read_text(encoding="utf-8")
-    prometheus_config = (root / "prometheus.yml").read_text(encoding="utf-8")
+    vmagent = (root / "vmagent.container").read_text(encoding="utf-8")
+    vmagent_config = (root / "vmagent.yml").read_text(encoding="utf-8")
     if (
         "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro"
-        not in prometheus
+        not in vmagent
+        or "/secrets/vmagent:/run/access:ro" not in vmagent
+        or "UserNS=keep-id:uid=65534,gid=65534" not in vmagent
         or "credentials_file: /run/secrets/control-metrics-token"
-        not in prometheus_config
-        or "/internal/metrics/live" not in prometheus_config
-        or "/internal/metrics" not in prometheus_config
+        not in vmagent_config
+        or "/internal/metrics/live" not in vmagent_config
+        or "/internal/metrics" not in vmagent_config
+        or "targets: [catalogue-control:8687]" not in vmagent_config
+        or "targets: [catalogue-service:8686]" not in vmagent_config
+        or vmagent.count("Network=") != 2
+        or "environment: '@@" in vmagent_config
+        or "-remoteWrite.forcePromProto=true" not in vmagent
+        or "-remoteWrite.maxDiskUsagePerURL=256MB" not in vmagent
     ):
-        raise ValueError("Prometheus does not use the isolated metrics credential and probes")
-    alertmanager = (root / "alertmanager.container").read_text(encoding="utf-8")
-    alertmanager_config = (root / "alertmanager.yml").read_text(encoding="utf-8")
-    if (
-        "/secrets/alertmanager:/run/secrets:ro" not in alertmanager
-        or "url_file: /run/secrets/webhook-url" not in alertmanager_config
-        or "credentials_file: /run/secrets/webhook-token" not in alertmanager_config
-        or "send_resolved: true" not in alertmanager_config
-    ):
-        raise ValueError("Alertmanager trigger/recovery delivery is not secret-backed")
+        raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
+
+    cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
+    if cloudflared.count("Network=") != 2 or "Network=catalogue.network" not in cloudflared:
+        raise ValueError("cloudflared must join the MakersBrain and catalogue networks")
+    if "UserNS=keep-id:uid=999,gid=1000" not in (
+        root / "redis.container"
+    ).read_text(encoding="utf-8"):
+        raise ValueError("Redis does not run as its rootless image identity")
+    driver = (root / "control-container-driver.container").read_text(encoding="utf-8")
+    if "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro" not in driver:
+        raise ValueError("deployment driver has no mounted PostgreSQL CA")
     if values["environment"] == "production" and values["data_mode"] == "personal":
         if not values.get("production_personal_data_allowed"):
             raise ValueError("personal-data activation is not approved")
