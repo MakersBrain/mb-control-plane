@@ -44,6 +44,8 @@ class PodmanRendererTests(unittest.TestCase):
                 "/var/lib/makersbrain/tenant-recovery-secrets:/run/makersbrain-recovery-secrets:ro",
                 driver,
             )
+            self.assertIn("AddCapability=CHOWN DAC_OVERRIDE FOWNER", driver)
+            self.assertIn("Notify=healthy", driver)
             self.assertNotIn("/run/makersbrain-backup-secrets", driver)
             for name in (
                 "control-api.container",
@@ -63,22 +65,32 @@ class PodmanRendererTests(unittest.TestCase):
             rauthy_ready = (output / "rauthy-ready.container").read_text()
             self.assertIn("http://rauthy:8092/auth/v1/health", rauthy_ready)
             self.assertIn(
-                "rauthy-ready.container", (output / "control-web.container").read_text()
+                "rauthy-ready.service", (output / "control-web.container").read_text()
             )
+            control_api = (output / "control-api.container").read_text()
+            self.assertIn("Requires=control-migrate.service privacy-export-init.service rauthy-ready.service", control_api)
+            self.assertIn("After=control-migrate.service privacy-export-init.service rauthy-ready.service", control_api)
             odoo = (output / "odoo.container").read_text()
             self.assertIn("resolve-secret-env.sh /entrypoint.sh odoo", odoo)
+            self.assertIn("Environment=HOST=postgres.internal.example.test", odoo)
+            self.assertIn("Notify=healthy", odoo)
             self.assertIn("odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro", odoo)
             self.assertIn(
                 "paperless-client-secrets.volume",
                 (output / "control-workers@invoice-capture.container").read_text(),
             )
             self.assertIn(
-                "control-mail-gateway.container",
+                "control-mail-gateway.service",
                 (output / "control-workers@email-delivery.container").read_text(),
             )
             cloudflared = (output / "cloudflared.container").read_text()
             self.assertIn("--no-autoupdate", cloudflared)
             self.assertIn("--token-file /run/secrets/tunnel-token", cloudflared)
+            self.assertIn("UserNS=keep-id:uid=65532,gid=65532", cloudflared)
+            self.assertNotIn("control-api.service", cloudflared)
+            self.assertNotIn("control-web.service", cloudflared)
+            self.assertNotIn("rauthy-ready.service", cloudflared)
+            self.assertNotIn("tenant-gateway.service", cloudflared)
             self.assertNotIn("EnvironmentFile=", cloudflared)
             self.assertNotIn("podman.sock", cloudflared)
             vmagent = (output / "vmagent.container").read_text()
@@ -89,17 +101,50 @@ class PodmanRendererTests(unittest.TestCase):
             )
             self.assertIn("/secrets/vmagent:/run/access:ro", vmagent)
             self.assertIn("-remoteWrite.forcePromProto=true", vmagent)
-            self.assertIn("-remoteWrite.maxDiskUsagePerURL=256MB", vmagent)
+            self.assertIn("-remoteWrite.maxDiskUsagePerURL=513MiB", vmagent)
             vmagent_config = (output / "vmagent.yml").read_text()
             self.assertIn("metrics_path: /internal/metrics/live", vmagent_config)
             self.assertIn("metrics_path: /internal/metrics", vmagent_config)
             self.assertIn("environment: 'staging'", vmagent_config)
-            self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
-            self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
-            self.assertEqual(vmagent.count("Network="), 2)
-            cloudflared = (output / "cloudflared.container").read_text()
-            self.assertEqual(cloudflared.count("Network="), 2)
+            self.assertNotIn("catalogue-control", vmagent_config)
+            self.assertNotIn("catalogue-service", vmagent_config)
+            self.assertEqual(vmagent.count("Network="), 1)
+            self.assertEqual(cloudflared.count("Network="), 1)
+            for name in (
+                "control-api.container",
+                "control-container-driver.container",
+                "control-mail-gateway.container",
+                "control-web.container",
+                "document-extraction.container",
+                "odoo.container",
+                "redis.container",
+                "tenant-gateway.container",
+            ):
+                self.assertIn("Notify=healthy", (output / name).read_text())
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
+            self.assertEqual(
+                (output / "reconcile-database-identities.sh").stat().st_mode & 0o777,
+                0o555,
+            )
+            self.assertIn(
+                "./web-nginx.conf:/etc/nginx/nginx.conf:ro",
+                (output / "control-web.container").read_text(),
+            )
+            self.assertIn(
+                "./runtime-config.js:/usr/share/nginx/html/runtime-config.js:ro",
+                (output / "control-web.container").read_text(),
+            )
+            runtime_config = (output / "runtime-config.js").read_text()
+            self.assertIn('api: "https://api.staging.makersbrain.net"', runtime_config)
+            self.assertIn(
+                'issuer: "https://auth.staging.makersbrain.net/auth/v1"',
+                runtime_config,
+            )
+            self.assertIn(
+                'redirectUri: "https://app.staging.makersbrain.net/oauth/callback"',
+                runtime_config,
+            )
+            self.assertIn("pid /tmp/nginx.pid", (output / "web-nginx.conf").read_text())
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",
                 (output / "redis.container").read_text(),
@@ -122,6 +167,26 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertNotIn(
                 "@@",
                 "".join(path.read_text() for path in output.rglob("*") if path.is_file()),
+            )
+
+    def test_production_edge_and_metrics_join_the_catalogue_network(self):
+        values = copy.deepcopy(EXAMPLE)
+        values["environment"] = "production"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            RENDER.render(self.write_values(root, values), output)
+            for name in ("cloudflared.container", "vmagent.container"):
+                self.assertIn(
+                    "Network=catalogue.network", (output / name).read_text()
+                )
+            vmagent_config = (output / "vmagent.yml").read_text()
+            self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
+            self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
+            runtime_config = (output / "runtime-config.js").read_text()
+            self.assertIn('api: "https://api.makersbrain.app"', runtime_config)
+            self.assertIn(
+                'issuer: "https://auth.makersbrain.app/auth/v1"', runtime_config
             )
 
     def test_mutable_image_is_rejected(self):

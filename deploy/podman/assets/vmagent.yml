@@ -24,12 +24,4 @@ scrape_configs:
     static_configs:
       - targets: [127.0.0.1:8429]
 
-  - job_name: catalogue-control
-    metrics_path: /metrics
-    static_configs:
-      - targets: [catalogue-control:8687]
-
-  - job_name: catalogue-service
-    metrics_path: /metrics
-    static_configs:
-      - targets: [catalogue-service:8686]
+@@CATALOGUE_SCRAPE_JOBS@@

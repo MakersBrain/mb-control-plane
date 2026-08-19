@@ -1,6 +1,6 @@
 [Unit]
 Description=Materialize Rauthy bootstrap configuration
-Before=rauthy.container
+Before=rauthy.service
 
 [Container]
 Image=@@ALPINE_IMAGE@@

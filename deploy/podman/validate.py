@@ -43,6 +43,9 @@ def validate(root: Path) -> None:
         "vmagent.container",
         "vmagent.yml",
         "vmagent-entrypoint.sh",
+        "runtime-config.js",
+        "web-nginx.conf",
+        "reconcile-database-identities.sh",
         "resolve-secret-env.sh",
     } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
@@ -60,11 +63,26 @@ def validate(root: Path) -> None:
         for marker in FORBIDDEN:
             if marker in content:
                 raise ValueError(f"forbidden marker {marker!r} in {path.name}")
+        for line in content.splitlines():
+            if line.startswith(("Requires=", "Wants=", "After=", "Before=")):
+                if any(unit.endswith(".container") for unit in line.split("=", 1)[1].split()):
+                    raise ValueError(
+                        f"Quadlet dependency in {path.name} must name the generated .service unit"
+                    )
     driver = (root / "control-container-driver.container").read_text(encoding="utf-8")
     if "%t/podman/podman.sock:/run/podman/podman.sock" not in driver:
         raise ValueError("driver does not use the private rootless Podman socket")
     if "DRIVER_POSTGRES_CA_SOURCE=" not in driver:
         raise ValueError("driver does not declare the PostgreSQL CA source")
+    identities = (root / "control-database-identities.container").read_text(
+        encoding="utf-8"
+    )
+    if (
+        "./reconcile-database-identities.sh:"
+        "/run/makersbrain/reconcile-database-identities.sh:ro"
+        not in identities
+    ):
+        raise ValueError("database identity initializer asset is not mounted")
     tls_clients = {
         "control-api.container",
         "control-backup-scheduler.container",
@@ -86,8 +104,32 @@ def validate(root: Path) -> None:
     rauthy_ready = (root / "rauthy-ready.container").read_text(encoding="utf-8")
     if "http://rauthy:8092/auth/v1/health" not in rauthy_ready:
         raise ValueError("Rauthy readiness gate is missing")
-    if "rauthy-ready.container" not in (root / "control-web.container").read_text():
+    if "rauthy-ready.service" not in (root / "control-web.container").read_text():
         raise ValueError("web does not wait for Rauthy readiness")
+    control_web = (root / "control-web.container").read_text(encoding="utf-8")
+    if (
+        "./runtime-config.js:/usr/share/nginx/html/runtime-config.js:ro"
+        not in control_web
+    ):
+        raise ValueError("web browser runtime configuration is not mounted")
+    runtime_config = (root / "runtime-config.js").read_text(encoding="utf-8")
+    if "@@" in runtime_config:
+        raise ValueError("web browser runtime configuration is unresolved")
+    expected_suffix = (
+        "makersbrain.app"
+        if values["environment"] == "production"
+        else "staging.makersbrain.net"
+    )
+    for host in (
+        f"api.{expected_suffix}",
+        f"auth.{expected_suffix}",
+        f"app.{expected_suffix}",
+    ):
+        if f"https://{host}" not in runtime_config:
+            raise ValueError(f"web browser runtime configuration is missing {host}")
+    control_api = (root / "control-api.container").read_text(encoding="utf-8")
+    if "rauthy-ready.service" not in control_api:
+        raise ValueError("control API does not wait for Rauthy readiness")
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
@@ -108,7 +150,7 @@ def validate(root: Path) -> None:
     ):
         raise ValueError("mail gateway is not isolated and environment-scoped")
     mail_worker = root / "control-workers@email-delivery.container"
-    if "Requires=control-mail-gateway.container" not in mail_worker.read_text():
+    if "Requires=control-mail-gateway.service" not in mail_worker.read_text():
         raise ValueError("email worker does not wait for the mail gateway")
     scoped_worker_markers = {
         "control-workers@membership-provisioning.container": "paperless-client-secrets.volume",
@@ -129,10 +171,13 @@ def validate(root: Path) -> None:
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
     if "--no-autoupdate" not in cloudflared or "--token-file /run/secrets/tunnel-token" not in cloudflared:
         raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")
+    if "UserNS=keep-id:uid=65532,gid=65532" not in cloudflared:
+        raise ValueError("Cloudflare Tunnel cannot read its rootless scoped token")
     if "EnvironmentFile=" in cloudflared or "postgres" in cloudflared.lower():
         raise ValueError("Cloudflare Tunnel received unrelated application configuration")
     vmagent = (root / "vmagent.container").read_text(encoding="utf-8")
     vmagent_config = (root / "vmagent.yml").read_text(encoding="utf-8")
+    expected_networks = 2 if values["environment"] == "production" else 1
     if (
         "/secrets/control-api/control_metrics_token:/run/secrets/control-metrics-token:ro"
         not in vmagent
@@ -142,18 +187,29 @@ def validate(root: Path) -> None:
         not in vmagent_config
         or "/internal/metrics/live" not in vmagent_config
         or "/internal/metrics" not in vmagent_config
-        or "targets: [catalogue-control:8687]" not in vmagent_config
-        or "targets: [catalogue-service:8686]" not in vmagent_config
-        or vmagent.count("Network=") != 2
+        or vmagent.count("Network=") != expected_networks
         or "environment: '@@" in vmagent_config
         or "-remoteWrite.forcePromProto=true" not in vmagent
-        or "-remoteWrite.maxDiskUsagePerURL=256MB" not in vmagent
+        or "-remoteWrite.maxDiskUsagePerURL=513MiB" not in vmagent
     ):
         raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
 
+    catalogue_targets = (
+        "targets: [catalogue-control:8687]",
+        "targets: [catalogue-service:8686]",
+    )
+    if values["environment"] == "production":
+        if any(target not in vmagent_config for target in catalogue_targets):
+            raise ValueError("production vmagent is missing catalogue scrape targets")
+    elif any(target in vmagent_config for target in catalogue_targets):
+        raise ValueError("staging vmagent contains unreachable catalogue scrape targets")
+
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
-    if cloudflared.count("Network=") != 2 or "Network=catalogue.network" not in cloudflared:
-        raise ValueError("cloudflared must join the MakersBrain and catalogue networks")
+    if cloudflared.count("Network=") != expected_networks or (
+        values["environment"] == "production"
+        and "Network=catalogue.network" not in cloudflared
+    ):
+        raise ValueError("cloudflared does not join the required runtime networks")
     if "UserNS=keep-id:uid=999,gid=1000" not in (
         root / "redis.container"
     ).read_text(encoding="utf-8"):

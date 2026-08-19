@@ -2,15 +2,15 @@
 Description=MakersBrain private metrics forwarding agent
 # Deliberately Wants=, not Requires=: monitoring must remain alive when the API
 # fails so the central rule evaluator can observe and alert on that failure.
-Wants=control-api.container
-After=control-api.container
+Wants=control-api.service
+After=control-api.service
 
 [Container]
 Image=@@VMAGENT_IMAGE@@
 Pull=never
 ContainerName=vmagent
 Network=makersbrain.network
-Network=catalogue.network
+@@CATALOGUE_NETWORK@@
 UserNS=keep-id:uid=65534,gid=65534
 ReadOnly=true
 Volume=%h/.config/containers/systemd/makersbrain/vmagent.yml:/etc/vmagent/vmagent.yml:ro
@@ -19,7 +19,7 @@ Volume=/etc/makersbrain/secrets/control-api/control_metrics_token:/run/secrets/c
 Volume=/etc/makersbrain/secrets/vmagent:/run/access:ro
 Volume=vmagent-data.volume:/vmagent-remotewrite-data
 Entrypoint=/usr/local/bin/makersbrain-vmagent-entrypoint
-Exec=-promscrape.config=/etc/vmagent/vmagent.yml -remoteWrite.url=@@METRICS_REMOTE_WRITE_URL@@ -remoteWrite.forcePromProto=true -remoteWrite.queues=1 -remoteWrite.tmpDataPath=/vmagent-remotewrite-data -remoteWrite.maxDiskUsagePerURL=256MB -remoteWrite.disableMetadata=true -httpListenAddr=0.0.0.0:8429
+Exec=-promscrape.config=/etc/vmagent/vmagent.yml -remoteWrite.url=@@METRICS_REMOTE_WRITE_URL@@ -remoteWrite.forcePromProto=true -remoteWrite.queues=1 -remoteWrite.tmpDataPath=/vmagent-remotewrite-data -remoteWrite.maxDiskUsagePerURL=513MiB -remoteWrite.disableMetadata=true -httpListenAddr=0.0.0.0:8429
 NoNewPrivileges=true
 DropCapability=all
 

@@ -51,6 +51,14 @@ class BuildRuntimeStageTests(unittest.TestCase):
                     values[name] = "@/run/secrets/test-value"
                 elif name.endswith("_FILE"):
                     values[name] = "/run/secrets/test-value"
+                elif name == "CONTROL_OIDC_ISSUER":
+                    values[name] = "https://auth.example.test/auth/v1/"
+                elif name == "CONTROL_OIDC_DISCOVERY_URL":
+                    values[name] = (
+                        "http://rauthy:8092/auth/v1/.well-known/openid-configuration"
+                    )
+                elif name == "LISTEN_SCHEME":
+                    values[name] = "http_https"
                 else:
                     values[name] = "test-value"
             process_values[key] = values
@@ -127,6 +135,30 @@ class BuildRuntimeStageTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn("refusing to overwrite", second.stderr)
+
+    def test_rejects_http_rauthy_issuer_for_https_control_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered, runtime_input, staging = self.prepare(root)
+            document = json.loads(runtime_input.read_text())
+            document["processes"]["rauthy"]["LISTEN_SCHEME"] = "http"
+            runtime_input.write_text(json.dumps(document))
+            result = self.run_tool(rendered, runtime_input, staging)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("LISTEN_SCHEME must be http_https", result.stderr)
+
+    def test_rejects_public_discovery_transport_for_https_control_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered, runtime_input, staging = self.prepare(root)
+            document = json.loads(runtime_input.read_text())
+            document["processes"]["control-api"]["CONTROL_OIDC_DISCOVERY_URL"] = (
+                "https://auth.example.test/auth/v1/.well-known/openid-configuration"
+            )
+            runtime_input.write_text(json.dumps(document))
+            result = self.run_tool(rendered, runtime_input, staging)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must use the private Rauthy origin", result.stderr)
 
 
 if __name__ == "__main__":

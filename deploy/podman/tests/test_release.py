@@ -346,7 +346,7 @@ class ReleaseTests(unittest.TestCase):
                 current.resolve(), root / "state/releases" / RECORD["release_id"]
             )
             run.assert_any_call(
-                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "restart", *RELEASE.PERSISTENT_UNITS]
             )
 
     @mock.patch.object(RELEASE, "run")
@@ -356,12 +356,17 @@ class ReleaseTests(unittest.TestCase):
             rendered = root / "rendered"
             rendered.mkdir()
             (rendered / "makersbrain.network").write_text("[Network]\n")
+            probe = rendered / "probe.sh"
+            probe.write_text("#!/bin/sh\n", encoding="utf-8")
+            probe.chmod(0o555)
             RELEASE.stage(
                 rendered,
                 RECORD["release_id"],
                 root / "state",
             )
             self.assertTrue((root / "state/releases" / RECORD["release_id"]).is_dir())
+            staged_script = root / "state/releases" / RECORD["release_id"] / "probe.sh"
+            self.assertEqual(staged_script.stat().st_mode & 0o777, 0o555)
             self.assertFalse((root / "quadlets/makersbrain").exists())
             run.assert_not_called()
 
@@ -376,7 +381,7 @@ class ReleaseTests(unittest.TestCase):
             RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
             self.assertEqual((quadlets / "makersbrain").resolve(), release)
             run.assert_any_call(
-                ["systemctl", "--user", "start", *RELEASE.PERSISTENT_UNITS]
+                ["systemctl", "--user", "restart", *RELEASE.PERSISTENT_UNITS]
             )
             with self.assertRaisesRegex(ValueError, "has not been staged"):
                 RELEASE.start_staged("control-2026.08.15-ffffffffffffffff", root / "state", quadlets)
@@ -416,6 +421,7 @@ class ReleaseTests(unittest.TestCase):
             previous = root / "state/releases/previous"
             candidate = root / "state/releases" / RECORD["release_id"]
             previous.mkdir(parents=True)
+            (previous / "redis.container").write_text("[Container]\n", encoding="utf-8")
             candidate.mkdir()
             quadlets = root / "quadlets"
             quadlets.mkdir()
@@ -425,6 +431,21 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unit failed"):
                 RELEASE.start_staged(RECORD["release_id"], root / "state", quadlets)
             self.assertEqual(current.resolve(), previous)
+            run.assert_called_with(
+                ["systemctl", "--user", "restart", "redis.service"]
+            )
+
+    def test_rollback_unit_set_matches_previous_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary)
+            (release / "redis.container").write_text("[Container]\n", encoding="utf-8")
+            (release / "control-workers@.container").write_text(
+                "[Container]\n", encoding="utf-8"
+            )
+            units = RELEASE.persistent_units_for_release(release)
+            self.assertIn("redis.service", units)
+            self.assertIn("control-workers@email-delivery.service", units)
+            self.assertNotIn("vmagent.service", units)
 
 
 if __name__ == "__main__":

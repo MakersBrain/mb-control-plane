@@ -26,6 +26,16 @@ WORKERS = (
     "release-adoption",
     "privacy-operations",
 )
+CATALOGUE_SCRAPE_JOBS = """  - job_name: catalogue-control
+    metrics_path: /metrics
+    static_configs:
+      - targets: [catalogue-control:8687]
+
+  - job_name: catalogue-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: [catalogue-service:8686]
+"""
 
 
 def load_values(path: Path) -> dict:
@@ -86,6 +96,14 @@ def load_values(path: Path) -> dict:
 
 
 def replacements(values: dict) -> dict[str, str]:
+    if values["environment"] == "production":
+        app_origin = "https://app.makersbrain.app"
+        api_origin = "https://api.makersbrain.app"
+        auth_origin = "https://auth.makersbrain.app"
+    else:
+        app_origin = "https://app.staging.makersbrain.net"
+        api_origin = "https://api.staging.makersbrain.net"
+        auth_origin = "https://auth.staging.makersbrain.net"
     result = {
         "ENVIRONMENT": values["environment"],
         "DATA_MODE": values["data_mode"],
@@ -95,6 +113,20 @@ def replacements(values: dict) -> dict[str, str]:
         "PUBLIC_BIND_IP": values["public_bind_ip"],
         "POSTGRES_HOST": values["postgres_host"],
         "METRICS_REMOTE_WRITE_URL": values["metrics_remote_write_url"],
+        "WEB_API_ORIGIN": api_origin,
+        "WEB_OIDC_ISSUER": f"{auth_origin}/auth/v1",
+        "WEB_OIDC_REDIRECT_URI": f"{app_origin}/oauth/callback",
+        "WEB_ACCOUNT_URL": auth_origin,
+        "CATALOGUE_NETWORK": (
+            "Network=catalogue.network"
+            if values["environment"] == "production"
+            else ""
+        ),
+        "CATALOGUE_SCRAPE_JOBS": (
+            CATALOGUE_SCRAPE_JOBS
+            if values["environment"] == "production"
+            else ""
+        ),
     }
     result.update({f"{name.upper()}_IMAGE": value for name, value in values["images"].items()})
     return result
@@ -139,6 +171,11 @@ def render(values_path: Path, output: Path) -> None:
     (output / "rendered-values.json").chmod(0o600)
     shutil.copy2(HERE.parent / "resolve-secret-env.sh", output / "resolve-secret-env.sh")
     (output / "resolve-secret-env.sh").chmod(0o555)
+    shutil.copy2(
+        HERE.parent / "reconcile-database-identities.sh",
+        output / "reconcile-database-identities.sh",
+    )
+    (output / "reconcile-database-identities.sh").chmod(0o555)
 
 
 def main() -> None:

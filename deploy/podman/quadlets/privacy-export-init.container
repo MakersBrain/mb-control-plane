@@ -1,6 +1,6 @@
 [Unit]
 Description=Initialize privacy export storage ownership
-Before=control-api.container
+Before=control-api.service
 
 [Container]
 Image=@@ALPINE_IMAGE@@

@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain Rauthy identity service
-Requires=control-migrate.container rauthy-bootstrap.container
-After=control-migrate.container rauthy-bootstrap.container
+Requires=control-migrate.service rauthy-bootstrap.service
+After=control-migrate.service rauthy-bootstrap.service
 
 [Container]
 Image=@@RAUTHY_IMAGE@@

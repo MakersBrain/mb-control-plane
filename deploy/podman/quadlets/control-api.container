@@ -1,7 +1,7 @@
 [Unit]
 Description=MakersBrain control API
-Requires=control-migrate.container privacy-export-init.container
-After=control-migrate.container privacy-export-init.container
+Requires=control-migrate.service privacy-export-init.service rauthy-ready.service
+After=control-migrate.service privacy-export-init.service rauthy-ready.service
 
 [Container]
 Image=@@CONTROL_IMAGE@@
@@ -24,6 +24,7 @@ HealthCmd=/usr/bin/curl --fail --silent http://127.0.0.1:8080/health/ready
 HealthInterval=15s
 HealthRetries=12
 HealthStartPeriod=20s
+Notify=healthy
 NoNewPrivileges=true
 DropCapability=all
 
