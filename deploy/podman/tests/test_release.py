@@ -43,11 +43,29 @@ class ReleaseTests(unittest.TestCase):
         (vmagent / "access-client-id").chmod(0o600)
         (vmagent / "access-client-secret").chmod(0o600)
 
-    def test_digest_pinned_images_are_pulled_without_host_signing_state(self):
+    def test_digest_pinned_images_require_the_exact_keyless_identity(self):
         images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
         with mock.patch.object(RELEASE, "run") as run:
             RELEASE.verify_and_pull(images)
-        run.assert_called_once_with(["podman", "pull", images["control"]])
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "cosign",
+                        "verify",
+                        "--certificate-oidc-issuer",
+                        RELEASE.COSIGN_OIDC_ISSUER,
+                        "--certificate-identity",
+                        RELEASE.COSIGN_IDENTITY,
+                        "--certificate-github-workflow-repository",
+                        "MakersBrain/odoo",
+                        images["control"],
+                    ]
+                ),
+                mock.call(["podman", "pull", images["control"]]),
+            ],
+        )
 
     def write_json(self, root: Path, name: str, value: dict) -> Path:
         path = root / name
@@ -271,7 +289,7 @@ class ReleaseTests(unittest.TestCase):
                 "[Container]\nEnvironmentFile=/etc/makersbrain/example.env\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "signed release asset is missing"):
+            with self.assertRaisesRegex(ValueError, "immutable release asset is missing"):
                 RELEASE.verify_host_configuration(rendered, config)
             (rendered / "scaleway-sns-fr-par-trust-chain.pem").write_text(
                 "fixture", encoding="utf-8"

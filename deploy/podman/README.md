@@ -125,7 +125,7 @@ to the control API delivery-event route.
 
 The public Scaleway `fr-par` SNS trust chain is pinned in the release bundle and
 mounted read-only by the Quadlet. Updating it therefore requires the same
-reviewed, signed release process as application code; it is not an operator
+reviewed, immutable release process as application code; it is not an operator
 download performed during activation.
 
 `POST /v1/mail/events` is the only public gateway route. It requires the exact
@@ -240,7 +240,7 @@ python3 release.py --values /secure/release/podman-values.json \
 
 The fence changes every runtime database role, terminates existing sessions so
 they cannot retain a writable session default, and deliberately leaves only the
-signed migration identity writable. After `disable`, recovery must preserve all
+scoped migration identity writable. After `disable`, recovery must preserve all
 accepted writes; restoring the pre-cutover snapshot is no longer a valid rollback.
 
 Activation stores each rendered release separately and atomically changes the

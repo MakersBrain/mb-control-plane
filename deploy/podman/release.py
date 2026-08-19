@@ -22,6 +22,11 @@ RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
 SOURCE_REF = re.compile(r"^refs/(heads|tags)/[^\s]+$")
 QUALIFICATION_REF = re.compile(r"^\S+/qualifications@sha256:[a-f0-9]{64}$")
+COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+COSIGN_IDENTITY = (
+    "https://github.com/MakersBrain/odoo/"
+    ".github/workflows/release.yml@refs/heads/main"
+)
 PERSISTENT_UNITS = [
     "cloudflared.service",
     "redis.service",
@@ -128,7 +133,21 @@ def run(command: list[str]) -> None:
 
 def verify_and_pull(images: dict[str, str]) -> None:
     for name in sorted(images):
-        run(["podman", "pull", images[name]])
+        image = images[name]
+        run(
+            [
+                "cosign",
+                "verify",
+                "--certificate-oidc-issuer",
+                COSIGN_OIDC_ISSUER,
+                "--certificate-identity",
+                COSIGN_IDENTITY,
+                "--certificate-github-workflow-repository",
+                "MakersBrain/odoo",
+                image,
+            ]
+        )
+        run(["podman", "pull", image])
 
 
 def verify_runtime_secrets(values: dict, config_root: Path) -> None:
@@ -321,7 +340,7 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                             )
                         asset = rendered / Path(reference).name
                         if not asset.is_file() or asset.is_symlink():
-                            raise ValueError(f"signed release asset is missing: {asset.name}")
+                            raise ValueError(f"immutable release asset is missing: {asset.name}")
                         continue
                     if file_secret_value(name) and not reference.startswith("@/run/"):
                         raise ValueError(
