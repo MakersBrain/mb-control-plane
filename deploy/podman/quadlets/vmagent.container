@@ -10,6 +10,7 @@ Image=@@VMAGENT_IMAGE@@
 Pull=never
 ContainerName=vmagent
 Network=makersbrain.network
+Network=catalogue.network
 UserNS=keep-id:uid=65534,gid=65534
 ReadOnly=true
 Volume=%h/.config/containers/systemd/makersbrain/vmagent.yml:/etc/vmagent/vmagent.yml:ro

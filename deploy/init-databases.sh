@@ -56,9 +56,11 @@ create role rauthy login password :'rauthy_password';
 create role odoo login createdb password :'odoo_password';
 create database makersbrain_control owner control;
 create database rauthy owner rauthy;
+create database ateliera;
 revoke all on database makersbrain_control from public;
 grant connect on database makersbrain_control to control_runtime_read;
 revoke all on database rauthy from public;
+revoke all on database ateliera from public;
 \connect makersbrain_control
 revoke create on schema public from public;
 SQL

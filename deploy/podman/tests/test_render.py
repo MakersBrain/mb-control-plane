@@ -94,6 +94,11 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertIn("metrics_path: /internal/metrics/live", vmagent_config)
             self.assertIn("metrics_path: /internal/metrics", vmagent_config)
             self.assertIn("environment: 'staging'", vmagent_config)
+            self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
+            self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
+            self.assertEqual(vmagent.count("Network="), 2)
+            cloudflared = (output / "cloudflared.container").read_text()
+            self.assertEqual(cloudflared.count("Network="), 2)
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",

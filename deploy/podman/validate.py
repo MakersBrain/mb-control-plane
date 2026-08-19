@@ -142,11 +142,18 @@ def validate(root: Path) -> None:
         not in vmagent_config
         or "/internal/metrics/live" not in vmagent_config
         or "/internal/metrics" not in vmagent_config
+        or "targets: [catalogue-control:8687]" not in vmagent_config
+        or "targets: [catalogue-service:8686]" not in vmagent_config
+        or vmagent.count("Network=") != 2
         or "environment: '@@" in vmagent_config
         or "-remoteWrite.forcePromProto=true" not in vmagent
         or "-remoteWrite.maxDiskUsagePerURL=256MB" not in vmagent
     ):
         raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
+
+    cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
+    if cloudflared.count("Network=") != 2 or "Network=catalogue.network" not in cloudflared:
+        raise ValueError("cloudflared must join the MakersBrain and catalogue networks")
     if "UserNS=keep-id:uid=999,gid=1000" not in (
         root / "redis.container"
     ).read_text(encoding="utf-8"):
