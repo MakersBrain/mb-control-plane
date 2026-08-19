@@ -130,6 +130,20 @@ class PodmanRendererTests(unittest.TestCase):
                 "./web-nginx.conf:/etc/nginx/nginx.conf:ro",
                 (output / "control-web.container").read_text(),
             )
+            self.assertIn(
+                "./runtime-config.js:/usr/share/nginx/html/runtime-config.js:ro",
+                (output / "control-web.container").read_text(),
+            )
+            runtime_config = (output / "runtime-config.js").read_text()
+            self.assertIn('api: "https://api.staging.makersbrain.net"', runtime_config)
+            self.assertIn(
+                'issuer: "https://auth.staging.makersbrain.net/auth/v1"',
+                runtime_config,
+            )
+            self.assertIn(
+                'redirectUri: "https://app.staging.makersbrain.net/oauth/callback"',
+                runtime_config,
+            )
             self.assertIn("pid /tmp/nginx.pid", (output / "web-nginx.conf").read_text())
             self.assertIn(
                 "UserNS=keep-id:uid=999,gid=1000",
@@ -169,6 +183,11 @@ class PodmanRendererTests(unittest.TestCase):
             vmagent_config = (output / "vmagent.yml").read_text()
             self.assertIn("targets: [catalogue-control:8687]", vmagent_config)
             self.assertIn("targets: [catalogue-service:8686]", vmagent_config)
+            runtime_config = (output / "runtime-config.js").read_text()
+            self.assertIn('api: "https://api.makersbrain.app"', runtime_config)
+            self.assertIn(
+                'issuer: "https://auth.makersbrain.app/auth/v1"', runtime_config
+            )
 
     def test_mutable_image_is_rejected(self):
         values = copy.deepcopy(EXAMPLE)

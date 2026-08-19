@@ -43,6 +43,7 @@ def validate(root: Path) -> None:
         "vmagent.container",
         "vmagent.yml",
         "vmagent-entrypoint.sh",
+        "runtime-config.js",
         "web-nginx.conf",
         "reconcile-database-identities.sh",
         "resolve-secret-env.sh",
@@ -105,6 +106,27 @@ def validate(root: Path) -> None:
         raise ValueError("Rauthy readiness gate is missing")
     if "rauthy-ready.service" not in (root / "control-web.container").read_text():
         raise ValueError("web does not wait for Rauthy readiness")
+    control_web = (root / "control-web.container").read_text(encoding="utf-8")
+    if (
+        "./runtime-config.js:/usr/share/nginx/html/runtime-config.js:ro"
+        not in control_web
+    ):
+        raise ValueError("web browser runtime configuration is not mounted")
+    runtime_config = (root / "runtime-config.js").read_text(encoding="utf-8")
+    if "@@" in runtime_config:
+        raise ValueError("web browser runtime configuration is unresolved")
+    expected_suffix = (
+        "makersbrain.app"
+        if values["environment"] == "production"
+        else "staging.makersbrain.net"
+    )
+    for host in (
+        f"api.{expected_suffix}",
+        f"auth.{expected_suffix}",
+        f"app.{expected_suffix}",
+    ):
+        if f"https://{host}" not in runtime_config:
+            raise ValueError(f"web browser runtime configuration is missing {host}")
     control_api = (root / "control-api.container").read_text(encoding="utf-8")
     if "rauthy-ready.service" not in control_api:
         raise ValueError("control API does not wait for Rauthy readiness")

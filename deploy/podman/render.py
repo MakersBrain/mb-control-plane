@@ -96,6 +96,14 @@ def load_values(path: Path) -> dict:
 
 
 def replacements(values: dict) -> dict[str, str]:
+    if values["environment"] == "production":
+        app_origin = "https://app.makersbrain.app"
+        api_origin = "https://api.makersbrain.app"
+        auth_origin = "https://auth.makersbrain.app"
+    else:
+        app_origin = "https://app.staging.makersbrain.net"
+        api_origin = "https://api.staging.makersbrain.net"
+        auth_origin = "https://auth.staging.makersbrain.net"
     result = {
         "ENVIRONMENT": values["environment"],
         "DATA_MODE": values["data_mode"],
@@ -105,6 +113,10 @@ def replacements(values: dict) -> dict[str, str]:
         "PUBLIC_BIND_IP": values["public_bind_ip"],
         "POSTGRES_HOST": values["postgres_host"],
         "METRICS_REMOTE_WRITE_URL": values["metrics_remote_write_url"],
+        "WEB_API_ORIGIN": api_origin,
+        "WEB_OIDC_ISSUER": f"{auth_origin}/auth/v1",
+        "WEB_OIDC_REDIRECT_URI": f"{app_origin}/oauth/callback",
+        "WEB_ACCOUNT_URL": auth_origin,
         "CATALOGUE_NETWORK": (
             "Network=catalogue.network"
             if values["environment"] == "production"
