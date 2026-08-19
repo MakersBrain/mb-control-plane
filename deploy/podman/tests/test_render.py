@@ -100,6 +100,10 @@ class PodmanRendererTests(unittest.TestCase):
             self.assertEqual(vmagent.count("Network="), 1)
             self.assertEqual(cloudflared.count("Network="), 1)
             self.assertEqual((output / "vmagent-entrypoint.sh").stat().st_mode & 0o777, 0o555)
+            self.assertEqual(
+                (output / "reconcile-database-identities.sh").stat().st_mode & 0o777,
+                0o555,
+            )
             self.assertIn(
                 "./web-nginx.conf:/etc/nginx/nginx.conf:ro",
                 (output / "control-web.container").read_text(),

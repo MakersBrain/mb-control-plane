@@ -144,6 +144,11 @@ def render(values_path: Path, output: Path) -> None:
     (output / "rendered-values.json").chmod(0o600)
     shutil.copy2(HERE.parent / "resolve-secret-env.sh", output / "resolve-secret-env.sh")
     (output / "resolve-secret-env.sh").chmod(0o555)
+    shutil.copy2(
+        HERE.parent / "reconcile-database-identities.sh",
+        output / "reconcile-database-identities.sh",
+    )
+    (output / "reconcile-database-identities.sh").chmod(0o555)
 
 
 def main() -> None:

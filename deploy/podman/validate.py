@@ -44,6 +44,7 @@ def validate(root: Path) -> None:
         "vmagent.yml",
         "vmagent-entrypoint.sh",
         "web-nginx.conf",
+        "reconcile-database-identities.sh",
         "resolve-secret-env.sh",
     } | workers
     missing = sorted(expected - {path.name for path in root.iterdir()})
@@ -72,6 +73,15 @@ def validate(root: Path) -> None:
         raise ValueError("driver does not use the private rootless Podman socket")
     if "DRIVER_POSTGRES_CA_SOURCE=" not in driver:
         raise ValueError("driver does not declare the PostgreSQL CA source")
+    identities = (root / "control-database-identities.container").read_text(
+        encoding="utf-8"
+    )
+    if (
+        "./reconcile-database-identities.sh:"
+        "/run/makersbrain/reconcile-database-identities.sh:ro"
+        not in identities
+    ):
+        raise ValueError("database identity initializer asset is not mounted")
     tls_clients = {
         "control-api.container",
         "control-backup-scheduler.container",
