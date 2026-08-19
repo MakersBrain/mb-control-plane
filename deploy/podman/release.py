@@ -131,6 +131,19 @@ def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def persistent_units_for_release(release_root: Path) -> list[str]:
+    """Return only persistent units defined by a release generation."""
+    units = []
+    for unit in PERSISTENT_UNITS:
+        if unit.startswith("control-workers@"):
+            source = release_root / "control-workers@.container"
+        else:
+            source = release_root / f"{unit.removesuffix('.service')}.container"
+        if source.is_file():
+            units.append(unit)
+    return units
+
+
 def verify_and_pull(images: dict[str, str], verify_keyless: bool) -> None:
     for name in sorted(images):
         image = images[name]
@@ -435,13 +448,21 @@ def start_staged(
         # actual release boundary and also pulls in the one-shot migration and
         # initialization dependencies of the new generation.
         run(["systemctl", "--user", "restart", *PERSISTENT_UNITS])
-    except Exception:
+    except Exception as activation_error:
         current.unlink(missing_ok=True)
         run(["systemctl", "--user", "daemon-reload"])
         if previous is not None:
             os.symlink(previous, current, target_is_directory=True)
             run(["systemctl", "--user", "daemon-reload"])
-            run(["systemctl", "--user", "restart", *PERSISTENT_UNITS])
+            restored_units = persistent_units_for_release(current.resolve())
+            if restored_units:
+                try:
+                    run(["systemctl", "--user", "restart", *restored_units])
+                except Exception as rollback_error:
+                    activation_error.add_note(
+                        f"restored the previous release selection, but restarting "
+                        f"its units also failed: {rollback_error}"
+                    )
         raise
 
 

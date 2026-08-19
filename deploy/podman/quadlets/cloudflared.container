@@ -1,7 +1,5 @@
 [Unit]
 Description=MakersBrain outbound Cloudflare Tunnel connector
-Requires=control-api.service control-web.service rauthy-ready.service tenant-gateway.service
-After=control-api.service control-web.service rauthy-ready.service tenant-gateway.service
 
 [Container]
 Image=@@CLOUDFLARED_IMAGE@@
