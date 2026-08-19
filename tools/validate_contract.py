@@ -11,8 +11,10 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
-CONTROL = ROOT / "control-plane"
+# This repository is the control plane; its root and CONTROL are the same
+# directory. Both names are kept so the contract paths below read unchanged.
+ROOT = Path(__file__).resolve().parents[1]
+CONTROL = ROOT
 DEPLOY = CONTROL / "deploy"
 
 
@@ -683,9 +685,18 @@ def validate() -> list[str]:
             missing = set(entry.get("dependencies", [])) - keys
             if missing:
                 errors.append(f"capability {entry.get('key')} has missing dependencies {sorted(missing)}")
-            for module in entry.get("odoo_modules", []):
-                if not (ROOT / "addons" / module / "__manifest__.py").is_file():
-                    errors.append(f"capability {entry.get('key')} references missing addon {module}")
+            # The Odoo modules a capability activates live in
+            # MakersBrain/mb-odoo-addons, not in this repository. Checking a
+            # local addons/ directory only works in a sibling-checkout
+            # development tree, so it is opportunistic here. The authoritative
+            # check is the cross-repository compatibility lane, which verifies
+            # these keys against the installed add-on versions published in the
+            # Odoo image's release metadata.
+            addons_root = ROOT / "addons"
+            if addons_root.is_dir():
+                for module in entry.get("odoo_modules", []):
+                    if not (addons_root / module / "__manifest__.py").is_file():
+                        errors.append(f"capability {entry.get('key')} references missing addon {module}")
 
     for document in (
         ROOT / "CONTROL-PLANE-ARCHITECTURE.md",

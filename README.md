@@ -6,8 +6,8 @@ schema, Rauthy verification, Paperless/Azure/Odoo adapters, container builds,
 and the machine-readable deployment contract. It does not import source code
 or runtime files from sibling repositories.
 
-See the [current architecture](../CONTROL-PLANE-ARCHITECTURE.md), the
-[gated roadmap](../CONTROL-PLANE-ROADMAP.md), and the
+See the [current architecture](CONTROL-PLANE-ARCHITECTURE.md), the
+[gated roadmap](CONTROL-PLANE-ROADMAP.md), and the
 [database identity runbook](docs/database-identities.md).
 
 ## Verify
@@ -92,7 +92,7 @@ email payloads, signed tokens, or credentials.
 
 ### HTTPS workspace through Cloudflare Tunnel
 
-`../../makersbrain-infra/environments/development/developer-tunnels` owns the
+`../mb-infra/environments/development/developer-tunnels` owns the
 remotely managed tunnel, DNS, exact service routes, and the development-only
 workshop wildcard. After that state
 has been applied, put only the allocated domain in the ignored `deploy/.env`
@@ -196,7 +196,7 @@ workshop enables `azure-invoice-extraction`. Enabling that module fails safely
 when `CONTROL_AZURE_ENDPOINT` or `CONTROL_AZURE_KEY` is absent. Infrastructure
 may publish the key to
 `makersbrain-runtime/dev/invoice-capture/AZURE_DOCUMENT_KEY` with
-`../../makersbrain-infra/scripts/azure-document-key.sh`; the key is never read
+`../mb-infra/scripts/azure-document-key.sh`; the key is never read
 from OpenTofu state by this package.
 
 The invoice worker protects the trial subscription at three layers:
@@ -218,7 +218,7 @@ Factur-X invoices continue to import locally. Unstructured documents remain in
 Paperless for manual handling and do not consume an Azure request.
 
 See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for paired recovery,
-[`../CONTROL-PLANE-ARCHITECTURE.md`](../CONTROL-PLANE-ARCHITECTURE.md) for
+[`CONTROL-PLANE-ARCHITECTURE.md`](CONTROL-PLANE-ARCHITECTURE.md) for
 verified current state and
-[`../CONTROL-PLANE-ROADMAP.md`](../CONTROL-PLANE-ROADMAP.md) for incomplete
+[`CONTROL-PLANE-ROADMAP.md`](CONTROL-PLANE-ROADMAP.md) for incomplete
 capabilities and release gates.
