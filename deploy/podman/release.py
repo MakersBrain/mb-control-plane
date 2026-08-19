@@ -88,6 +88,12 @@ WRITABLE_STATE_FILES = {
     ),
 }
 
+PINNED_RELEASE_FILES = {
+    "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE": Path(
+        "/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem"
+    ),
+}
+
 
 def file_secret_value(name: str) -> bool:
     return (
@@ -342,6 +348,15 @@ def verify_host_configuration(rendered: Path, config_root: Path) -> None:
                             raise ValueError(
                                 f"{name} in {environment_file} must use its approved state path"
                             )
+                        continue
+                    if name in PINNED_RELEASE_FILES:
+                        if Path(reference) != PINNED_RELEASE_FILES[name]:
+                            raise ValueError(
+                                f"{name} in {environment_file} must use its approved release path"
+                            )
+                        asset = rendered / Path(reference).name
+                        if not asset.is_file() or asset.is_symlink():
+                            raise ValueError(f"signed release asset is missing: {asset.name}")
                         continue
                     if file_secret_value(name) and not reference.startswith("@/run/"):
                         raise ValueError(

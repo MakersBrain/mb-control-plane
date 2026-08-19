@@ -268,6 +268,37 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "approved state path"):
                 RELEASE.verify_host_configuration(rendered, config)
 
+    def test_host_preflight_requires_the_pinned_release_trust_chain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rendered = root / "rendered"
+            rendered.mkdir()
+            config = root / "config"
+            config.mkdir()
+            environment = config / "example.env"
+            environment.write_text(
+                "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE="
+                "/etc/makersbrain/scaleway-sns-fr-par-trust-chain.pem\n",
+                encoding="utf-8",
+            )
+            environment.chmod(0o600)
+            (rendered / "example.container").write_text(
+                "[Container]\nEnvironmentFile=/etc/makersbrain/example.env\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "signed release asset is missing"):
+                RELEASE.verify_host_configuration(rendered, config)
+            (rendered / "scaleway-sns-fr-par-trust-chain.pem").write_text(
+                "fixture", encoding="utf-8"
+            )
+            RELEASE.verify_host_configuration(rendered, config)
+            environment.write_text(
+                "MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE=/tmp/chain.pem\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "approved release path"):
+                RELEASE.verify_host_configuration(rendered, config)
+
     def test_host_preflight_rejects_missing_vendor_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -78,6 +78,10 @@ class BuildSecretStageTests(unittest.TestCase):
                 value = "https://alerts.example.test/makersbrain"
             elif relative.endswith("ALERTMANAGER_ACCESS_CLIENT_ID"):
                 value = "a" * 32 + ".access"
+            elif relative.endswith("CONTROL_RAUTHY_ADMIN_KEY"):
+                value = "makersbrain-runtime$" + "r" * 64
+            elif relative.endswith("CONTROL_RAUTHY_DEPLOYMENT_KEY"):
+                value = "makersbrain-deployment$" + "d" * 64
             path.write_text(value)
             path.chmod(0o600)
         ca = root / "postgres-ca.crt"
@@ -118,6 +122,8 @@ class BuildSecretStageTests(unittest.TestCase):
                 "/var/lib/makersbrain/tenant-runtime-secrets/postgres-ca.crt",
                 "--release-cosign-key",
                 str(cosign),
+                "--member-origin",
+                "https://app.staging.example.test",
             ],
             text=True,
             capture_output=True,
@@ -138,6 +144,15 @@ class BuildSecretStageTests(unittest.TestCase):
                 references["processes"]["control-api"]["CONTROL_DATABASE_URL"],
                 references["processes"]["worker-email"]["CONTROL_DATABASE_URL"],
             )
+            clients = json.loads((stage / "rauthy/clients.json").read_text())
+            self.assertEqual(
+                clients[0]["redirect_uris"],
+                ["https://app.staging.example.test/oauth/callback"],
+            )
+            api_keys = json.loads((stage / "rauthy/api_keys.json").read_text())
+            self.assertEqual([item["name"] for item in api_keys], [
+                "makersbrain-runtime", "makersbrain-deployment"
+            ])
             for path in stage.rglob("*"):
                 if path.is_file():
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
