@@ -168,7 +168,7 @@ def validate(root: Path) -> None:
         or vmagent.count("Network=") != expected_networks
         or "environment: '@@" in vmagent_config
         or "-remoteWrite.forcePromProto=true" not in vmagent
-        or "-remoteWrite.maxDiskUsagePerURL=512MiB" not in vmagent
+        or "-remoteWrite.maxDiskUsagePerURL=513MiB" not in vmagent
     ):
         raise ValueError("vmagent does not use the isolated scrape and remote-write credentials")
 

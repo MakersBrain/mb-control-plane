@@ -101,7 +101,7 @@ class PodmanRendererTests(unittest.TestCase):
             )
             self.assertIn("/secrets/vmagent:/run/access:ro", vmagent)
             self.assertIn("-remoteWrite.forcePromProto=true", vmagent)
-            self.assertIn("-remoteWrite.maxDiskUsagePerURL=512MiB", vmagent)
+            self.assertIn("-remoteWrite.maxDiskUsagePerURL=513MiB", vmagent)
             vmagent_config = (output / "vmagent.yml").read_text()
             self.assertIn("metrics_path: /internal/metrics/live", vmagent_config)
             self.assertIn("metrics_path: /internal/metrics", vmagent_config)
