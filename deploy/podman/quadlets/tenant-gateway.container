@@ -7,6 +7,8 @@ After=odoo.container
 Image=@@NGINX_IMAGE@@
 Pull=never
 ContainerName=tenant-gateway
+User=101:101
+UserNS=keep-id:uid=101,gid=101
 Network=makersbrain.network
 PublishPort=@@PUBLIC_BIND_IP@@:8081:8080
 Volume=./gateway-podman.conf:/etc/nginx/nginx.conf:ro

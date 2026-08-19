@@ -7,7 +7,7 @@ After=control-migrate.container odoo.container redis.container tenant-gateway.co
 Image=@@CONTROL_IMAGE@@
 Pull=never
 ContainerName=control-container-driver
-User=0:0
+UserNS=keep-id:uid=10001,gid=10001
 Network=makersbrain.network
 Environment=DRIVER_ENVIRONMENT=@@ENVIRONMENT@@
 Environment=DRIVER_CONTAINER_RUNTIME=podman

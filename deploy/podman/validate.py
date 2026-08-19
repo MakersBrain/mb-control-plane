@@ -93,6 +93,8 @@ def validate(root: Path) -> None:
     odoo = (root / "odoo.container").read_text(encoding="utf-8")
     if "resolve-secret-env.sh /entrypoint.sh odoo" not in odoo:
         raise ValueError("Odoo does not resolve its scoped file secrets at runtime")
+    if "UserNS=keep-id:uid=100,gid=101" not in odoo:
+        raise ValueError("Odoo does not map its rootless runtime identity")
     if "odoo-client-secrets.volume:/run/makersbrain-odoo-client-secrets:ro" not in odoo:
         raise ValueError("Odoo cannot authenticate tenant-scoped outbound bridge calls")
     mail = (root / "control-mail-gateway.container").read_text(encoding="utf-8")
@@ -123,6 +125,9 @@ def validate(root: Path) -> None:
     for path in root.glob("*.container"):
         if path.name != "control-container-driver.container" and "podman.sock" in path.read_text():
             raise ValueError(f"Podman socket leaked to {path.name}")
+    for name in ("control-web.container", "tenant-gateway.container"):
+        if "UserNS=keep-id:uid=101,gid=101" not in (root / name).read_text():
+            raise ValueError(f"nginx runtime identity is not mapped in {name}")
     cloudflared = (root / "cloudflared.container").read_text(encoding="utf-8")
     if "--no-autoupdate" not in cloudflared or "--token-file /run/secrets/tunnel-token" not in cloudflared:
         raise ValueError("Cloudflare Tunnel is not pinned to a file-scoped connector token")

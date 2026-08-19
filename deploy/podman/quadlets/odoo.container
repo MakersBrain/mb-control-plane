@@ -7,6 +7,7 @@ After=control-migrate.container
 Image=@@ODOO_IMAGE@@
 Pull=never
 ContainerName=odoo
+UserNS=keep-id:uid=100,gid=101
 Network=makersbrain.network
 Environment=PGSSLMODE=verify-full
 Environment=PGSSLROOTCERT=/run/secrets/postgres-ca.crt

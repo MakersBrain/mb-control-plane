@@ -104,6 +104,14 @@ class PodmanRendererTests(unittest.TestCase):
                 (output / "redis.container").read_text(),
             )
             self.assertIn(
+                "UserNS=keep-id:uid=100,gid=101",
+                (output / "odoo.container").read_text(),
+            )
+            self.assertIn(
+                "UserNS=keep-id:uid=101,gid=101",
+                (output / "tenant-gateway.container").read_text(),
+            )
+            self.assertIn(
                 "/postgres-ca.crt:/run/secrets/postgres-ca.crt:ro",
                 (output / "control-container-driver.container").read_text(),
             )
