@@ -46,7 +46,7 @@ class ReleaseTests(unittest.TestCase):
     def test_digest_pinned_images_require_the_exact_keyless_identity(self):
         images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
         with mock.patch.object(RELEASE, "run") as run:
-            RELEASE.verify_and_pull(images)
+            RELEASE.verify_and_pull(images, verify_keyless=True)
         self.assertEqual(
             run.call_args_list,
             [
@@ -66,6 +66,12 @@ class ReleaseTests(unittest.TestCase):
                 mock.call(["podman", "pull", images["control"]]),
             ],
         )
+
+    def test_staging_pulls_exact_digests_without_local_signing_state(self):
+        images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
+        with mock.patch.object(RELEASE, "run") as run:
+            RELEASE.verify_and_pull(images, verify_keyless=False)
+        run.assert_called_once_with(["podman", "pull", images["control"]])
 
     def write_json(self, root: Path, name: str, value: dict) -> Path:
         path = root / name
