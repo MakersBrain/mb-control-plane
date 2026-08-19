@@ -19,7 +19,7 @@ services:
       CONTROL_PUBLIC_ORIGIN: https://control.${PUBLIC_DOMAIN}/
       CONTROL_CORS_ORIGIN: https://control.${PUBLIC_DOMAIN}/
       CONTROL_OIDC_ISSUER: https://auth.${PUBLIC_DOMAIN}/auth/v1/
-      CONTROL_OIDC_DISCOVERY_URL: https://auth.${PUBLIC_DOMAIN}/auth/v1/.well-known/openid-configuration
+      CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN}
 
   control-web:

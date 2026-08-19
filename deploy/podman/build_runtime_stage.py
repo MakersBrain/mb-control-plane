@@ -163,17 +163,26 @@ def unquoted(value: str) -> str:
 def validate_cross_process_contract(
     process_values: dict[str, dict[str, str]],
 ) -> None:
-    issuer = unquoted(
-        process_values.get("control-api", {}).get("CONTROL_OIDC_ISSUER", "")
-    )
+    control_api = process_values.get("control-api", {})
+    issuer = unquoted(control_api.get("CONTROL_OIDC_ISSUER", ""))
+    discovery_url = unquoted(control_api.get("CONTROL_OIDC_DISCOVERY_URL", ""))
     listen_scheme = unquoted(
         process_values.get("rauthy", {}).get("LISTEN_SCHEME", "")
     )
-    if issuer.startswith("https://") and listen_scheme != "http_https":
-        fail(
-            "Rauthy LISTEN_SCHEME must be http_https when the control API "
-            "expects an HTTPS issuer and the internal readiness origin uses HTTP"
+    if issuer.startswith("https://"):
+        if listen_scheme != "http_https":
+            fail(
+                "Rauthy LISTEN_SCHEME must be http_https when the control API "
+                "expects an HTTPS issuer and the internal readiness origin uses HTTP"
+            )
+        expected_discovery_url = (
+            "http://rauthy:8092/auth/v1/.well-known/openid-configuration"
         )
+        if discovery_url != expected_discovery_url:
+            fail(
+                "CONTROL_OIDC_DISCOVERY_URL must use the private Rauthy origin "
+                f"{expected_discovery_url} when the control API expects an HTTPS issuer"
+            )
 
 
 def build(
