@@ -18,12 +18,16 @@
 //!     MB_ODOO_BOOTSTRAP_TOKEN=... \
 //!     cargo test --test bridge_compatibility -- --ignored --test-threads=1
 //!
-//! `--test-threads=1` is not incidental. One Odoo database is one company is
-//! one tenant: the first bootstrap sets the company's credential verifier, and
-//! from then on the shared environment token is refused. So the suite
-//! bootstraps exactly once and every test shares that tenant, which is also how
-//! a real deployment works -- a database is provisioned for one workshop and
-//! never re-bootstrapped for another.
+//! `--test-threads=1` is not incidental. A database holds one company, and the
+//! first bootstrap sets that company's credential verifier -- from then on the
+//! shared environment token is refused. So the suite bootstraps exactly once
+//! and every test shares that tenant.
+//!
+//! Note the direction: one database serves one workshop, but a workshop is not
+//! limited to one database. `control.odoo_databases` allows exactly one
+//! `primary` per workshop and any number of `duplicate` rows for snapshots and
+//! restores, each with its own `source_database_id`. This lane exercises a
+//! single database, which is the unit the bridge authenticates against.
 
 use makersbrain_control_plane::domain::IntegrationError;
 use makersbrain_control_plane::integrations::odoo::{
@@ -72,7 +76,9 @@ fn harness() -> Harness {
     )
 }
 
-/// The one tenant this database will ever have.
+/// The one tenant this database serves. The workshop may have other databases
+/// -- duplicates taken for snapshots or restores -- but each is bootstrapped
+/// separately and holds its own credential verifier.
 struct Tenant {
     workshop_id: Uuid,
     token: String,
@@ -84,9 +90,9 @@ struct Tenant {
 
 static TENANT: tokio::sync::OnceCell<Tenant> = tokio::sync::OnceCell::const_new();
 
-/// Bootstrap once, then share. A second bootstrap with the environment token
-/// would be refused, because the company now has its own credential verifier --
-/// which is the behaviour, not a limitation of the test.
+/// Bootstrap once, then share. A second bootstrap of *this* database with the
+/// environment token would be refused, because its company now has its own
+/// credential verifier -- which is the behaviour, not a limitation of the test.
 async fn tenant(harness: &Harness) -> &'static Tenant {
     TENANT
         .get_or_init(|| async {
