@@ -22,11 +22,7 @@ RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$
 COMMIT = re.compile(r"^[a-f0-9]{40,64}$")
 SOURCE_REF = re.compile(r"^refs/(heads|tags)/[^\s]+$")
 QUALIFICATION_REF = re.compile(r"^\S+/qualifications@sha256:[a-f0-9]{64}$")
-COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
-COSIGN_IDENTITY = (
-    "https://github.com/MakersBrain/odoo/"
-    ".github/workflows/release.yml@refs/heads/main"
-)
+from provenance import COSIGN_OIDC_ISSUER, identity_for, undeclared
 PERSISTENT_UNITS = [
     "cloudflared.service",
     "redis.service",
@@ -145,9 +141,26 @@ def persistent_units_for_release(release_root: Path) -> list[str]:
 
 
 def verify_and_pull(images: dict[str, str], verify_keyless: bool) -> None:
+    if verify_keyless:
+        # Check the whole set before pulling anything, so an undeclared image is
+        # one clear error up front rather than a failure halfway through a
+        # deployment with some images already on the host.
+        missing = undeclared(images)
+        if missing:
+            raise ValueError(
+                "no signing repository is declared for: "
+                + ", ".join(missing)
+                + ". See deploy/podman/provenance.py."
+            )
+
     for name in sorted(images):
         image = images[name]
         if verify_keyless:
+            # Each image is verified against the one repository entitled to sign
+            # it, not against a single platform-wide identity: after the split
+            # the Odoo image, the control plane's images and the mirrored
+            # support images come from three different release workflows.
+            identity, repository = identity_for(name)
             run(
                 [
                     "cosign",
@@ -155,9 +168,9 @@ def verify_and_pull(images: dict[str, str], verify_keyless: bool) -> None:
                     "--certificate-oidc-issuer",
                     COSIGN_OIDC_ISSUER,
                     "--certificate-identity",
-                    COSIGN_IDENTITY,
+                    identity,
                     "--certificate-github-workflow-repository",
-                    "MakersBrain/odoo",
+                    repository,
                     image,
                 ]
             )

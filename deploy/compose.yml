@@ -550,8 +550,8 @@ services:
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       CONTROL_RELEASE_COSIGN_EXECUTABLE: /usr/local/bin/cosign
       CONTROL_RELEASE_COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
-      CONTROL_RELEASE_COSIGN_IDENTITY: https://github.com/MakersBrain/odoo/.github/workflows/release.yml@refs/heads/main
-      CONTROL_RELEASE_COSIGN_REPOSITORY: MakersBrain/odoo
+      CONTROL_RELEASE_COSIGN_IDENTITY: https://github.com/MakersBrain/mb-infra/.github/workflows/release.yml@refs/heads/main
+      CONTROL_RELEASE_COSIGN_REPOSITORY: MakersBrain/mb-infra
     secrets: [control_release_database_url, deployment_driver_token]
 
   worker-privacy:

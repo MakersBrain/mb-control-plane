@@ -44,7 +44,7 @@ class ReleaseTests(unittest.TestCase):
         (vmagent / "access-client-secret").chmod(0o600)
 
     def test_digest_pinned_images_require_the_exact_keyless_identity(self):
-        images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
+        images = {"control": "ghcr.io/makersbrain/control@sha256:" + "a" * 64}
         with mock.patch.object(RELEASE, "run") as run:
             RELEASE.verify_and_pull(images, verify_keyless=True)
         self.assertEqual(
@@ -57,15 +57,51 @@ class ReleaseTests(unittest.TestCase):
                         "--certificate-oidc-issuer",
                         RELEASE.COSIGN_OIDC_ISSUER,
                         "--certificate-identity",
-                        RELEASE.COSIGN_IDENTITY,
+                        "https://github.com/MakersBrain/mb-control-plane/"
+                        ".github/workflows/release.yml@refs/heads/main",
                         "--certificate-github-workflow-repository",
-                        "MakersBrain/odoo",
+                        "MakersBrain/mb-control-plane",
                         images["control"],
                     ]
                 ),
                 mock.call(["podman", "pull", images["control"]]),
             ],
         )
+
+    def test_each_image_is_verified_against_its_own_repository(self):
+        """One record holds images from three repositories; each needs its own."""
+        images = {
+            "odoo": "ghcr.io/makersbrain/mb-odoo@sha256:" + "a" * 64,
+            "control": "ghcr.io/makersbrain/control@sha256:" + "b" * 64,
+            "redis": "ghcr.io/makersbrain/redis@sha256:" + "c" * 64,
+        }
+        with mock.patch.object(RELEASE, "run") as run:
+            RELEASE.verify_and_pull(images, verify_keyless=True)
+        verified = {
+            call.args[0][-1]: call.args[0][-2]
+            for call in run.call_args_list
+            if call.args[0][0] == "cosign"
+        }
+        self.assertEqual(
+            verified,
+            {
+                images["odoo"]: "MakersBrain/mb-odoo-addons",
+                images["control"]: "MakersBrain/mb-control-plane",
+                images["redis"]: "MakersBrain/mb-infra",
+            },
+        )
+
+    def test_an_undeclared_image_is_refused_before_anything_is_pulled(self):
+        """An image nobody vouches for must not reach the host at all."""
+        images = {
+            "control": "ghcr.io/makersbrain/control@sha256:" + "a" * 64,
+            "mystery": "ghcr.io/makersbrain/mystery@sha256:" + "b" * 64,
+        }
+        with mock.patch.object(RELEASE, "run") as run:
+            with self.assertRaises(ValueError) as error:
+                RELEASE.verify_and_pull(images, verify_keyless=True)
+        self.assertIn("mystery", str(error.exception))
+        run.assert_not_called()
 
     def test_staging_pulls_exact_digests_without_local_signing_state(self):
         images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}

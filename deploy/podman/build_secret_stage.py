@@ -424,13 +424,17 @@ def build(
         "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
         "https://token.actions.githubusercontent.com",
     )
+    # This verifies the composed release record, not an image: mb-infra composes
+    # and signs it, so mb-infra is the identity. Per-image provenance is a
+    # separate map in deploy/podman/provenance.py, because the images inside one
+    # record come from three different release workflows.
     stage.direct(
         "worker-release",
         "CONTROL_RELEASE_COSIGN_IDENTITY",
-        "https://github.com/MakersBrain/odoo/.github/workflows/release.yml@refs/heads/main",
+        "https://github.com/MakersBrain/mb-infra/.github/workflows/release.yml@refs/heads/main",
     )
     stage.direct(
-        "worker-release", "CONTROL_RELEASE_COSIGN_REPOSITORY", "MakersBrain/odoo"
+        "worker-release", "CONTROL_RELEASE_COSIGN_REPOSITORY", "MakersBrain/mb-infra"
     )
 
     tunnel = source_file(source, "tunnel/CLOUDFLARE_TUNNEL_TOKEN")
