@@ -177,8 +177,10 @@ async fn a_replayed_operation_key_returns_the_first_result() {
     // The identical bootstrap, sent again with the same operation key. The
     // control plane retries on an unknown outcome, so if a replay did the work
     // twice a network blip would provision a tenant twice.
+    // Not the bootstrap token: it stopped working the moment the tenant got its
+    // own verifier. The tenant credential is accepted here for the same reason.
     let replayed = harness
-        .client(&harness.bootstrap_token)
+        .client(&tenant.token)
         .bootstrap_tenant(&tenant.command)
         .await
         .expect("replaying the original operation key was refused");
@@ -202,7 +204,7 @@ async fn membership_reconciliation_round_trips() {
         subject: Uuid::new_v4().to_string(),
         email: "compatibility@makersbrain.test".into(),
         name: "Compatibility Lane".into(),
-        role: "member".into(),
+        role: "artisan".into(),
         epoch: 1,
         active: true,
     };
@@ -218,46 +220,50 @@ async fn membership_reconciliation_round_trips() {
 
 #[tokio::test]
 #[ignore = "needs a running Odoo bridge"]
-async fn an_entitlement_is_applied_and_reports_whether_it_was_stale() {
+async fn an_entitlement_applies_once_and_refuses_to_go_backwards() {
     let harness = harness();
     let (client, workshop_id, _) = bootstrapped(&harness).await;
 
-    let command = EntitlementCommand {
-        operation_key: Uuid::new_v4().to_string(),
+    let entitlement = |key: String, version: i64| EntitlementCommand {
+        operation_key: key,
         workshop_id,
-        version: 2,
+        version,
         plan: "studio".into(),
         status: "active".into(),
         limits: json!({}),
         expires_at: None,
-        signature: String::new(),
+        // Stored rather than verified by the provider, but required to be
+        // present: an entitlement with no provenance is refused.
+        signature: "compatibility-lane-signature".into(),
     };
+
     let applied = client
-        .apply_entitlement(&command)
+        .apply_entitlement(&entitlement(Uuid::new_v4().to_string(), 2))
         .await
         .expect("entitlement application failed");
     assert!(applied.applied, "the bridge refused a first entitlement");
 
-    // An older version must be reported stale rather than silently applied:
-    // the control plane relies on that to detect out-of-order delivery.
-    let stale = EntitlementCommand {
-        operation_key: Uuid::new_v4().to_string(),
-        workshop_id,
-        version: 1,
-        plan: "studio".into(),
-        status: "active".into(),
-        limits: json!({}),
-        expires_at: None,
-        signature: String::new(),
-    };
-    let outcome = client
-        .apply_entitlement(&stale)
+    // The same version with identical data is idempotent, not an error: the
+    // control plane redelivers, and a redelivery must not look like a change.
+    let repeated = client
+        .apply_entitlement(&entitlement(Uuid::new_v4().to_string(), 2))
         .await
-        .expect("a stale entitlement should be answered, not refused");
+        .expect("re-applying an identical entitlement was refused");
     assert!(
-        outcome.stale || !outcome.applied,
-        "an older entitlement version was applied without being marked stale",
+        !repeated.applied,
+        "an identical redelivery was reported as a fresh application",
     );
+
+    // An older version is refused outright. That is what stops out-of-order
+    // delivery quietly downgrading a tenant.
+    match client
+        .apply_entitlement(&entitlement(Uuid::new_v4().to_string(), 1))
+        .await
+    {
+        Err(IntegrationError::Rejected) => {}
+        Err(other) => panic!("an older entitlement produced {other:?}, expected Rejected"),
+        Ok(outcome) => panic!("an older entitlement was accepted: {outcome:?}"),
+    }
 }
 
 #[tokio::test]
@@ -270,8 +276,11 @@ async fn module_activation_and_restriction_are_accepted() {
         .enable_modules(&ModuleEnableCommand {
             operation_key: Uuid::new_v4().to_string(),
             workshop_id,
-            module_key: "ceramics".into(),
-            modules: vec!["mb_ceramics_base".into()],
+            // The provider keeps an exact bundle registry: the key must exist
+            // and the member list must equal it, so this is a real contract
+            // assertion rather than an arbitrary payload.
+            module_key: "firings".into(),
+            modules: vec!["mb_ceramics_firing".into()],
         })
         .await
         .expect("module activation failed against the real bridge");
@@ -280,8 +289,8 @@ async fn module_activation_and_restriction_are_accepted() {
         .restrict_modules(&ModuleRestrictCommand {
             operation_key: Uuid::new_v4().to_string(),
             workshop_id,
-            module_key: "ceramics".into(),
-            modules: vec!["mb_ceramics_base".into()],
+            module_key: "firings".into(),
+            modules: vec!["mb_ceramics_firing".into()],
             reason: "compatibility lane".into(),
         })
         .await
