@@ -11,9 +11,9 @@ name: Control plane release
 # mirrored operational-support images are somebody else's to sign; deployment
 # verifies each against its own repository via deploy/podman/provenance.py.
 #
-# No SBOM or vulnerability scan yet, matching the deferral in mb-odoo-addons and
-# carrying the same debt: migration plan sections 4.1 and 4.3 require both
-# before Phase 5 staging qualification.
+# No SBOM or vulnerability scan, by decision rather than omission -- migration
+# plan section 4.4. The composed release record binds digests and provenance and
+# claims nothing about vulnerability posture.
 
 on:
   workflow_dispatch:
