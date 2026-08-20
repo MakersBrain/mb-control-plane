@@ -188,16 +188,53 @@ jobs:
               schema_compatibility: $schema_compatibility,
               image_count: ($images[0] | length),
               images: $images[0]}' > release/release-metadata.json
+          # Application-owned configuration that deployment needs but does not
+          # own. configuration-spec.json is include_str!'d into the control
+          # binary, so it cannot live anywhere but here -- yet the deployment
+          # renderer in mb-infra validates what it generates against it. Rather
+          # than have infra reach into this repository, or keep a copy that
+          # drifts, it is published with the release and consumed by digest.
+          # Migration plan section 3.3.
+          mkdir -p release/config/rauthy
+          cp deploy/configuration-spec.json release/config/
+          cp deploy/rauthy/*.json release/config/rauthy/
           cp deploy/release-contract.json release/
+
+          # A digest per file, so a consumer can prove it read what this release
+          # published rather than something edited afterwards. Same reason the
+          # bridge contract travels with its sha256.
+          config_digests=$(cd release/config && find . -type f -name '*.json' | sort \
+            | while read -r f; do
+                printf '%s\t%s\n' "${f#./}" "$(sha256sum "$f" | cut -d" " -f1)"
+              done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
+
+          jq --argjson config "$config_digests" \
+            '. + {application_config: $config}' \
+            release/release-metadata.json > release/release-metadata.next.json
+          mv release/release-metadata.next.json release/release-metadata.json
           cat release/release-metadata.json
 
           # Assemble the publish list here, in a step the dry run also executes.
           # The push itself is the one step a rehearsal can never exercise, so
           # nothing is decided inside it.
-          for file in release/release-metadata.json release/release-contract.json; do
-            test -s "$file" || { echo "::error::$file is missing or empty" >&2; exit 1; }
+          files="release/release-metadata.json:application/json release/release-contract.json:application/json"
+          for file in $(cd release && find config -type f -name '*.json' | sort); do
+            files="$files release/$file:application/json"
           done
-          echo "files=release/release-metadata.json:application/json release/release-contract.json:application/json" >> "$GITHUB_OUTPUT"
+          for entry in $files; do
+            path="${entry%%:*}"
+            test -s "$path" || { echo "::error::$path is missing or empty" >&2; exit 1; }
+          done
+
+          # Everything the metadata claims a digest for must actually ship.
+          claimed=$(jq -r '.application_config | keys | length' release/release-metadata.json)
+          shipped=$(cd release && find config -type f -name '*.json' | wc -l)
+          if [ "$claimed" -ne "$shipped" ]; then
+            echo "::error::metadata claims $claimed config files but $shipped ship" >&2
+            exit 1
+          fi
+          echo "publishing $shipped application config files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
 
       - name: Publish the component release record
         if: ${{ !inputs.dry_run }}
