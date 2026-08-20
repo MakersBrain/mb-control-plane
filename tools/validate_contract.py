@@ -528,13 +528,39 @@ def validate() -> list[str]:
     built_images = set(
         re.findall(r"(?m)^\s+build_image ([a-z0-9-]+)\s", workflow_text)
     )
-    expected_images = set(release_images) if isinstance(release_images, dict) else set()
-    delivered_images = built_images | set(third_party)
-    if delivered_images != expected_images:
+
+    # Every image must say which repository signs it. Deployment refuses an
+    # image whose provenance nobody declared (deploy/podman/provenance.py), so
+    # an undeclared entry here is a release that cannot be adopted.
+    OWN = "MakersBrain/mb-control-plane"
+    undeclared = sorted(
+        name for name, image in release_images.items()
+        if not isinstance(image, dict) or not image.get("source_repository")
+    )
+    if undeclared:
+        errors.append(f"images without a source_repository: {undeclared}")
+
+    # This repository's release workflow must build exactly the images the
+    # contract assigns to it -- no more, so it cannot claim another
+    # repository's provenance, and no fewer, so a release cannot quietly ship
+    # less than the contract promises.
+    owned = {
+        name for name, image in release_images.items()
+        if isinstance(image, dict) and image.get("source_repository") == OWN
+    }
+    if built_images != owned:
         errors.append(
             "release image delivery drift: "
-            f"missing={sorted(expected_images - delivered_images)} "
-            f"extra={sorted(delivered_images - expected_images)}"
+            f"missing={sorted(owned - built_images)} "
+            f"extra={sorted(built_images - owned)}"
+        )
+
+    # The mirrored operational-support images are still declared here as runtime
+    # requirements even though mb-infra builds them, so the set must stay whole.
+    if set(third_party) - set(release_images):
+        errors.append(
+            "third-party images not in the release contract: "
+            f"{sorted(set(third_party) - set(release_images))}"
         )
     for name, source in third_party.items():
         if not isinstance(source, str) or not re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", source):
