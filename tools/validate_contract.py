@@ -712,9 +712,9 @@ def validate() -> list[str]:
                         errors.append(f"capability {entry.get('key')} references missing addon {module}")
 
     for document in (
-        ROOT / "CONTROL-PLANE-ARCHITECTURE.md",
-        ROOT / "CONTROL-PLANE-ROADMAP.md",
-        ROOT / "CONTROL-PLANE-IMPROVEMENT-PLAN.md",
+        ROOT / "docs/CONTROL-PLANE-ARCHITECTURE.md",
+        ROOT / "docs/CONTROL-PLANE-ROADMAP.md",
+        ROOT / "docs/CONTROL-PLANE-IMPROVEMENT-PLAN.md",
         CONTROL / "README.md",
     ):
         for target in local_markdown_links(document):

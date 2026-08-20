@@ -11,7 +11,7 @@ that belongs in `CONTROL-PLANE-ROADMAP.md` and
 `CONTROL-PLANE-IMPROVEMENT-PLAN.md`.
 
 Accepted architecture decisions are recorded under
-`control-plane/docs/adr/`.
+`docs/adr/`.
 
 ## 1. Boundaries
 
@@ -49,7 +49,7 @@ The local Compose topology contains:
 - shared PostgreSQL, Rauthy, Redis, Odoo and exact-host tenant gateway services;
 - dynamically created Paperless containers and tenant resources.
 
-`control-plane/deploy/release-contract.json` is the machine-readable process,
+`deploy/release-contract.json` is the machine-readable process,
 queue, image and environment contract. Compose is a local development
 implementation, not the production runtime design.
 
@@ -157,7 +157,7 @@ bounded `@/run/secrets/...` references and mounts each provider/database secret
 into the processes named by the exact runtime-environment matrix; a rendered
 configuration canary gate detects value interpolation. The email and lifecycle
 workers do not mount tenant secrets. Credential issuance and rotation are
-defined in `control-plane/docs/database-identities.md`.
+defined in `docs/database-identities.md`.
 
 Dynamic Docker jobs receive per-job UUID volume subpaths. PostgreSQL password
 files, Odoo bridge/runtime credentials, S3 access keys, age recipients and
@@ -356,10 +356,10 @@ adapters and retained live-topology evidence remain deployment gates.
 
 ## 13. Normative references
 
-- `control-plane/deploy/release-contract.json`: executable release contract;
-- `control-plane/deploy/compose.yml`: local topology;
-- `control-plane/migrations/`: current control schema;
-- `control-plane/src/domain.rs`: operation kinds and queues;
-- `control-plane/BACKUP-RESTORE.md`: current recovery procedure;
+- `deploy/release-contract.json`: executable release contract;
+- `deploy/compose.yml`: local topology;
+- `migrations/`: current control schema;
+- `src/domain.rs`: operation kinds and queues;
+- `BACKUP-RESTORE.md`: current recovery procedure;
 - `CONTROL-PLANE-ROADMAP.md`: status and future gates;
 - `CONTROL-PLANE-IMPROVEMENT-PLAN.md`: ordered implementation programme.

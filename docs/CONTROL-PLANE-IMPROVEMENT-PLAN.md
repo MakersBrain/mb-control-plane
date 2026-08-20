@@ -182,7 +182,7 @@ Create:
 - `CONTROL-PLANE-ARCHITECTURE.md`: the system that exists now;
 - `CONTROL-PLANE-ROADMAP.md`: incomplete work, decisions and gates;
 - `CONTROL-PLANE-IMPROVEMENT-PLAN.md`: this implementation sequence;
-- `control-plane/deploy/release-contract.json`: the machine-readable runtime
+- `deploy/release-contract.json`: the machine-readable runtime
   contract.
 
 After the new architecture document is accepted, replace

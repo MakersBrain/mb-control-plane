@@ -11,7 +11,7 @@ Use:
 - `CONTROL-PLANE-ARCHITECTURE.md` for verified current state;
 - `CONTROL-PLANE-ROADMAP.md` for capability status and deferred triggers;
 - `CONTROL-PLANE-IMPROVEMENT-PLAN.md` for the active implementation sequence;
-- `control-plane/deploy/release-contract.json` for the machine-readable runtime
+- `deploy/release-contract.json` for the machine-readable runtime
   and release contract.
 
 Historical details remain available in Git history.

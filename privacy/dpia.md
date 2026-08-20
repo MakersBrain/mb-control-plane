@@ -31,7 +31,7 @@ encrypted recovery sets and data-subject request orchestration.
 
 ## Required controls before approval
 
-The P0/P1/P2 gates in `CONTROL-PLANE-IMPROVEMENT-PLAN.md`, the field inventory,
+The P0/P1/P2 gates in `docs/CONTROL-PLANE-IMPROVEMENT-PLAN.md`, the field inventory,
 approved retention policy, two-workshop isolation suite, secret canaries,
 human review of extraction and rights-export scope, processor register,
 transfer assessment, breach rehearsal and data-subject workflow evidence are

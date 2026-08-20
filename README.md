@@ -6,8 +6,8 @@ schema, Rauthy verification, Paperless/Azure/Odoo adapters, container builds,
 and the machine-readable deployment contract. It does not import source code
 or runtime files from sibling repositories.
 
-See the [current architecture](CONTROL-PLANE-ARCHITECTURE.md), the
-[gated roadmap](CONTROL-PLANE-ROADMAP.md), and the
+See the [current architecture](docs/CONTROL-PLANE-ARCHITECTURE.md), the
+[gated roadmap](docs/CONTROL-PLANE-ROADMAP.md), and the
 [database identity runbook](docs/database-identities.md).
 
 ## Verify
@@ -217,8 +217,8 @@ With invoice capture enabled but Azure disabled, structured UBL, CII, and
 Factur-X invoices continue to import locally. Unstructured documents remain in
 Paperless for manual handling and do not consume an Azure request.
 
-See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for paired recovery,
-[`CONTROL-PLANE-ARCHITECTURE.md`](CONTROL-PLANE-ARCHITECTURE.md) for
+See [BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) for paired recovery,
+[`CONTROL-PLANE-ARCHITECTURE.md`](docs/CONTROL-PLANE-ARCHITECTURE.md) for
 verified current state and
-[`CONTROL-PLANE-ROADMAP.md`](CONTROL-PLANE-ROADMAP.md) for incomplete
+[`CONTROL-PLANE-ROADMAP.md`](docs/CONTROL-PLANE-ROADMAP.md) for incomplete
 capabilities and release gates.
