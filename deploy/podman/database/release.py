@@ -15,11 +15,14 @@ from pathlib import Path
 import render
 import validate
 
-COSIGN_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
-COSIGN_IDENTITY = (
-    "https://github.com/MakersBrain/odoo/"
-    ".github/workflows/release.yml@refs/heads/main"
-)
+# The database host deploys postgres and backup, which the control plane builds
+# and signs -- not the archived MakersBrain/odoo workflow that used to sign
+# everything. The map lives one directory up so both release paths agree.
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from provenance import COSIGN_OIDC_ISSUER, identity_for, undeclared  # noqa: E402
 
 
 RELEASE_ID = re.compile(r"^control-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{16,64}$")
@@ -175,6 +178,7 @@ def main() -> None:
         if args.activate:
             verify_database_secrets()
         image = values["postgres_image"]
+        identity, repository = identity_for("postgres")
         run(
             [
                 "cosign",
@@ -182,9 +186,9 @@ def main() -> None:
                 "--certificate-oidc-issuer",
                 COSIGN_OIDC_ISSUER,
                 "--certificate-identity",
-                COSIGN_IDENTITY,
+                identity,
                 "--certificate-github-workflow-repository",
-                "MakersBrain/odoo",
+                repository,
                 image,
             ]
         )
