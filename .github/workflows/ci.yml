@@ -178,7 +178,10 @@ jobs:
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
 
-          addons=/mnt/makersbrain-addons,/mnt/oca-addons/auth_oidc,/usr/lib/python3/dist-packages/odoo/addons
+          # /mnt/oca-addons, not /mnt/oca-addons/auth_oidc: Odoo looks for modules
+          # *inside* each addons-path entry, so naming the module directory hides
+          # it. This is the path the real deployment uses.
+          addons=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons
 
           # Install the bridge and its dependencies into a fresh database. The
           # OCA auth_oidc module is required: tenant bootstrap refuses without
@@ -192,7 +195,8 @@ jobs:
           docker run --rm --network host $db_env \
             -e MB_CONTROL_BRIDGE_TOKEN="$token" \
             "$image" \
-            odoo -d bridge --init mb_control_bridge,auth_oidc \
+            odoo -d bridge \
+                 --init auth_oidc,mb_control_bridge,mb_email_bridge,mb_inventory_capture,mb_invoice_capture \
                  --without-demo=all --stop-after-init --no-http \
                  --addons-path="$addons"
 
@@ -220,6 +224,17 @@ jobs:
           MB_ODOO_BOOTSTRAP_TOKEN: ${{ steps.bridge.outputs.token }}
         run: cargo test --locked --test bridge_compatibility -- --ignored --test-threads=1
 
-      - name: Bridge logs on failure
+      - name: Bridge logs and a raw probe on failure
         if: failure()
-        run: docker logs odoo-bridge | tail -80
+        run: |
+          # The client maps 4xx to Rejected and drops the body, which is right
+          # for production and useless for diagnosis. Ask the bridge directly.
+          echo "--- raw health ---"
+          curl -si -H "Authorization: Bearer ${{ steps.bridge.outputs.token }}" \
+            http://127.0.0.1:8069/mb_control/v1/health | head -20 || true
+          echo "--- installed modules ---"
+          docker exec odoo-bridge odoo shell -d bridge --no-http 2>/dev/null <<'PY' || true
+          print([m.name for m in env['ir.module.module'].search([('state','=','installed'),('name','in',['auth_oidc','mb_control_bridge'])])])
+          PY
+          echo "--- bridge log ---"
+          docker logs odoo-bridge 2>&1 | tail -60
