@@ -66,20 +66,6 @@ def compose_worker_queues() -> set[str]:
     return set(re.findall(r'"/usr/local/bin/control-worker", "([a-z-]+)"', text))
 
 
-def staging_qualification_checks() -> list[str]:
-    path = DEPLOY / "podman/qualification.py"
-    module = ast.parse(path.read_text(), filename=str(path))
-    for statement in module.body:
-        if not isinstance(statement, ast.Assign):
-            continue
-        if any(isinstance(target, ast.Name) and target.id == "CHECKS" for target in statement.targets):
-            value = ast.literal_eval(statement.value)
-            if not isinstance(value, tuple) or not all(isinstance(item, str) for item in value):
-                break
-            return list(value)
-    raise ValueError("deploy/podman/qualification.py: CHECKS tuple not found")
-
-
 def compose_service_block(name: str) -> str:
     text = (DEPLOY / "compose.yml").read_text()
     match = re.search(
@@ -530,7 +516,7 @@ def validate() -> list[str]:
     )
 
     # Every image must say which repository signs it. Deployment refuses an
-    # image whose provenance nobody declared (deploy/podman/provenance.py), so
+    # image whose provenance the composed release record does not declare, so
     # an undeclared entry here is a release that cannot be adopted.
     OWN = "MakersBrain/mb-control-plane"
     undeclared = sorted(
@@ -575,18 +561,19 @@ def validate() -> list[str]:
         if contract_source != source:
             errors.append(f"third-party image {name} drifts from the release contract")
 
-    try:
-        implemented_checks = staging_qualification_checks()
-    except (SyntaxError, ValueError) as error:
-        errors.append(str(error))
-    else:
-        contracted_checks = contract.get("staging_qualification", {}).get(
-            "mandatory_checks"
-        )
-        if contracted_checks != implemented_checks:
-            errors.append(
-                "staging qualification checks drift between release contract and builder"
-            )
+    # The qualification builder lives in mb-infra now, so this can no longer
+    # read it. The direction inverts: this repository *declares* the mandatory
+    # checks and infra proves its implementation matches, against the contract
+    # published with the release. All that can be checked here is that the
+    # declaration is well formed -- a promise nobody can act on is worse than
+    # no promise.
+    contracted_checks = contract.get("staging_qualification", {}).get("mandatory_checks")
+    if not isinstance(contracted_checks, list) or not contracted_checks:
+        errors.append("staging_qualification.mandatory_checks must be a non-empty list")
+    elif not all(isinstance(check, str) and check for check in contracted_checks):
+        errors.append("staging_qualification.mandatory_checks must be non-empty strings")
+    elif len(set(contracted_checks)) != len(contracted_checks):
+        errors.append("staging_qualification.mandatory_checks contains duplicates")
 
     startup_entrypoints = {
         "src/bin/control-api.rs": ["api"],

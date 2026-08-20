@@ -9,7 +9,8 @@ name: Control plane release
 # Five images, exactly the ones deploy/release-contract.json declares with
 # source_repository MakersBrain/mb-control-plane. The Odoo image and the
 # mirrored operational-support images are somebody else's to sign; deployment
-# verifies each against its own repository via deploy/podman/provenance.py.
+# verifies each against its own repository, using the provenance the composed
+# release record carries.
 #
 # No SBOM or vulnerability scan, by decision rather than omission -- migration
 # plan section 4.4. The composed release record binds digests and provenance and
@@ -198,12 +199,17 @@ jobs:
           mkdir -p release/config/rauthy
           cp deploy/configuration-spec.json release/config/
           cp deploy/rauthy/*.json release/config/rauthy/
+          # Deployment scripts the production Quadlets mount and the local
+          # compose stack runs. Authored here because local development needs
+          # them; published so mb-infra does not keep a copy that drifts.
+          cp deploy/resolve-secret-env.sh deploy/init-databases.sh \
+             deploy/reconcile-database-identities.sh release/config/
           cp deploy/release-contract.json release/
 
           # A digest per file, so a consumer can prove it read what this release
           # published rather than something edited afterwards. Same reason the
           # bridge contract travels with its sha256.
-          config_digests=$(cd release/config && find . -type f -name '*.json' | sort \
+          config_digests=$(cd release/config && find . -type f | sort \
             | while read -r f; do
                 printf '%s\t%s\n' "${f#./}" "$(sha256sum "$f" | cut -d" " -f1)"
               done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
@@ -218,8 +224,13 @@ jobs:
           # The push itself is the one step a rehearsal can never exercise, so
           # nothing is decided inside it.
           files="release/release-metadata.json:application/json release/release-contract.json:application/json"
-          for file in $(cd release && find config -type f -name '*.json' | sort); do
-            files="$files release/$file:application/json"
+          for file in $(cd release && find config -type f | sort); do
+            case "$file" in
+              *.json) type=application/json ;;
+              *.sh)   type=application/x-shellscript ;;
+              *)      type=application/octet-stream ;;
+            esac
+            files="$files release/$file:$type"
           done
           for entry in $files; do
             path="${entry%%:*}"
@@ -228,7 +239,7 @@ jobs:
 
           # Everything the metadata claims a digest for must actually ship.
           claimed=$(jq -r '.application_config | keys | length' release/release-metadata.json)
-          shipped=$(cd release && find config -type f -name '*.json' | wc -l)
+          shipped=$(cd release && find config -type f | wc -l)
           if [ "$claimed" -ne "$shipped" ]; then
             echo "::error::metadata claims $claimed config files but $shipped ship" >&2
             exit 1
