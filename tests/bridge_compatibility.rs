@@ -268,10 +268,14 @@ async fn an_entitlement_applies_once_and_refuses_to_go_backwards() {
 
 #[tokio::test]
 #[ignore = "needs a running Odoo bridge"]
-async fn module_activation_and_restriction_are_accepted() {
+async fn a_bundle_is_scheduled_for_install_and_an_installed_one_can_be_restricted() {
     let harness = harness();
     let (client, workshop_id, _) = bootstrapped(&harness).await;
 
+    // Enabling only *schedules* the install. The provider says why in its own
+    // comment: installing immediately would commit and rebuild the registry in
+    // the middle of the request, before the idempotency receipt is stored. The
+    // deployment worker applies "to install" modules afterwards.
     client
         .enable_modules(&ModuleEnableCommand {
             operation_key: Uuid::new_v4().to_string(),
@@ -285,12 +289,17 @@ async fn module_activation_and_restriction_are_accepted() {
         .await
         .expect("module activation failed against the real bridge");
 
+    // Restriction is a different bundle on purpose. It writes record rules
+    // against the models a capability *owns*, so it needs one that is actually
+    // installed -- and a bundle merely scheduled above has no models yet. The
+    // lane installs mb_invoice_capture, so this exercises real enforcement
+    // rather than the same scheduling path twice.
     client
         .restrict_modules(&ModuleRestrictCommand {
             operation_key: Uuid::new_v4().to_string(),
             workshop_id,
-            module_key: "firings".into(),
-            modules: vec!["mb_ceramics_firing".into()],
+            module_key: "invoice-capture".into(),
+            modules: vec!["mb_invoice_capture".into()],
             reason: "compatibility lane".into(),
         })
         .await
