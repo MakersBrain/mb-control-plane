@@ -1294,8 +1294,12 @@ mod tests {
 
     #[test]
     fn bundled_scaleway_paris_trust_chain_is_parseable() {
+        // A fixture, not the deployed file: the trust chain is mounted by the
+        // Quadlet in mb-infra and its path comes from
+        // MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE. This asserts the parser handles a
+        // real Scaleway chain, which is this repository's concern.
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("deploy/podman/assets/scaleway-sns-fr-par-trust-chain.pem");
+            .join("test-fixtures/scaleway-sns-fr-par-trust-chain.pem");
         let (root, intermediate) = load_sns_trust_chain(&path).unwrap();
         assert!(anchor_from_trusted_cert(&CertificateDer::from(root)).is_ok());
         assert!(EndEntityCert::try_from(&CertificateDer::from(intermediate)).is_ok());

@@ -1,9 +1,0 @@
-[Unit]
-Description=Create an encrypted incremental MakersBrain PostgreSQL backup
-Requires=postgres-recovery-init.service
-After=postgres-recovery-init.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/podman exec --user 70:70 makersbrain-postgres pgbackrest --stanza=makersbrain --type=incr backup
-TimeoutStartSec=21600
