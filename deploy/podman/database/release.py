@@ -178,7 +178,14 @@ def main() -> None:
         if args.activate:
             verify_database_secrets()
         image = values["postgres_image"]
-        identity, repository = identity_for("postgres")
+        # The record says who signed postgres, the same as on the platform host.
+        signer = identity_for(record, "postgres")
+        if signer is None:
+            raise ValueError(
+                "the release record marks postgres unsigned; the database host "
+                "will not deploy an unverified image"
+            )
+        identity, repository = signer
         run(
             [
                 "cosign",

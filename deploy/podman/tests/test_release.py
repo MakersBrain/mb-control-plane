@@ -4,6 +4,15 @@ import json
 import sys
 import tempfile
 import unittest
+SIGNED_RECORD = {
+    "provenance": {
+        "odoo": {"signed_by": "MakersBrain/mb-odoo-addons", "signed": True},
+        "control": {"signed_by": "MakersBrain/mb-control-plane", "signed": True},
+        "redis": {"signed_by": "upstream", "signed": False},
+        "mystery": None,
+    }
+}
+
 from pathlib import Path
 from unittest import mock
 
@@ -43,10 +52,10 @@ class ReleaseTests(unittest.TestCase):
         (vmagent / "access-client-id").chmod(0o600)
         (vmagent / "access-client-secret").chmod(0o600)
 
-    def test_digest_pinned_images_require_the_exact_keyless_identity(self):
-        images = {"control": "ghcr.io/makersbrain/control@sha256:" + "a" * 64}
+    def test_a_signed_image_is_verified_against_the_repository_that_signed_it(self):
+        images = {"control": "ghcr.io/makersbrain/mb-control@sha256:" + "a" * 64}
         with mock.patch.object(RELEASE, "run") as run:
-            RELEASE.verify_and_pull(images, verify_keyless=True)
+            RELEASE.verify_and_pull(SIGNED_RECORD, images, verify_keyless=True)
         self.assertEqual(
             run.call_args_list,
             [
@@ -68,15 +77,14 @@ class ReleaseTests(unittest.TestCase):
             ],
         )
 
-    def test_each_image_is_verified_against_its_own_repository(self):
-        """One record holds images from three repositories; each needs its own."""
+    def test_each_image_follows_the_record_rather_than_one_platform_identity(self):
+        """Images in one record come from different repositories."""
         images = {
             "odoo": "ghcr.io/makersbrain/mb-odoo@sha256:" + "a" * 64,
-            "control": "ghcr.io/makersbrain/control@sha256:" + "b" * 64,
-            "redis": "ghcr.io/makersbrain/redis@sha256:" + "c" * 64,
+            "control": "ghcr.io/makersbrain/mb-control@sha256:" + "b" * 64,
         }
         with mock.patch.object(RELEASE, "run") as run:
-            RELEASE.verify_and_pull(images, verify_keyless=True)
+            RELEASE.verify_and_pull(SIGNED_RECORD, images, verify_keyless=True)
         verified = {
             call.args[0][-1]: call.args[0][-2]
             for call in run.call_args_list
@@ -87,26 +95,32 @@ class ReleaseTests(unittest.TestCase):
             {
                 images["odoo"]: "MakersBrain/mb-odoo-addons",
                 images["control"]: "MakersBrain/mb-control-plane",
-                images["redis"]: "MakersBrain/mb-infra",
             },
         )
 
-    def test_an_undeclared_image_is_refused_before_anything_is_pulled(self):
-        """An image nobody vouches for must not reach the host at all."""
+    def test_an_unsigned_upstream_image_is_pulled_without_a_signature_check(self):
+        """Signed by nobody, trusted on its digest, and said out loud."""
+        images = {"redis": "ghcr.io/upstream/redis@sha256:" + "c" * 64}
+        with mock.patch.object(RELEASE, "run") as run:
+            RELEASE.verify_and_pull(SIGNED_RECORD, images, verify_keyless=True)
+        run.assert_called_once_with(["podman", "pull", images["redis"]])
+
+    def test_an_image_the_record_omits_is_refused_before_anything_is_pulled(self):
+        """An image the record says nothing about must not reach the host."""
         images = {
-            "control": "ghcr.io/makersbrain/control@sha256:" + "a" * 64,
-            "mystery": "ghcr.io/makersbrain/mystery@sha256:" + "b" * 64,
+            "control": "ghcr.io/makersbrain/mb-control@sha256:" + "a" * 64,
+            "unknown": "ghcr.io/makersbrain/mb-unknown@sha256:" + "b" * 64,
         }
         with mock.patch.object(RELEASE, "run") as run:
             with self.assertRaises(ValueError) as error:
-                RELEASE.verify_and_pull(images, verify_keyless=True)
-        self.assertIn("mystery", str(error.exception))
+                RELEASE.verify_and_pull(SIGNED_RECORD, images, verify_keyless=True)
+        self.assertIn("unknown", str(error.exception))
         run.assert_not_called()
 
     def test_staging_pulls_exact_digests_without_local_signing_state(self):
-        images = {"control": "ghcr.io/makersbrain/odoo/control@sha256:" + "a" * 64}
+        images = {"control": "ghcr.io/makersbrain/mb-control@sha256:" + "a" * 64}
         with mock.patch.object(RELEASE, "run") as run:
-            RELEASE.verify_and_pull(images, verify_keyless=False)
+            RELEASE.verify_and_pull(SIGNED_RECORD, images, verify_keyless=False)
         run.assert_called_once_with(["podman", "pull", images["control"]])
 
     def write_json(self, root: Path, name: str, value: dict) -> Path:
