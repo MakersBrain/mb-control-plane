@@ -42,6 +42,13 @@ jobs:
   # what main has already proven.
   verify-ci:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Listing workflow runs needs this explicitly on a private repository.
+      # The same job in mb-odoo-addons works without it only because that
+      # repository is public, which makes its runs readable anyway -- so this is
+      # latent breakage there too, not a difference in what the job needs.
+      actions: read
     steps:
       - name: The CI suite passed for this exact commit
         env:
