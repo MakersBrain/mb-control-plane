@@ -175,6 +175,21 @@ pub struct CarrierSecretBindingCommand {
     pub credentials: Option<Value>,
 }
 
+/// The bridge's readiness and the tenant identity it believes it serves.
+///
+/// Typed rather than `Value` on purpose: the cross-repository compatibility
+/// lane asserts against these fields, so a provider that stops sending one
+/// fails to parse here rather than yielding a `None` that reads as healthy.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BridgeHealth {
+    pub status: String,
+    pub database: String,
+    #[serde(default)]
+    pub workshop_id: Option<String>,
+    #[serde(default)]
+    pub entitlement_version: Option<i64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 pub struct CarrierTarget {
     pub company_id: i64,
@@ -304,6 +319,15 @@ impl OdooClient {
             return Err(classify_status(status));
         }
         serde_json::from_slice(&bytes).map_err(|_| IntegrationError::ContractDrift)
+    }
+
+    /// The bridge's own health and tenant view.
+    ///
+    /// Authenticated like every other bridge call: an unauthenticated liveness
+    /// probe answers a different question from the one the control plane needs,
+    /// which is whether *this credential* still reaches *this tenant*.
+    pub async fn health(&self) -> Result<BridgeHealth, IntegrationError> {
+        self.get("/mb_control/v1/health").await
     }
 
     pub async fn replay_erasure(
