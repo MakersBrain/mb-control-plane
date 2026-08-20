@@ -183,19 +183,23 @@ jobs:
           # Install the bridge and its dependencies into a fresh database. The
           # OCA auth_oidc module is required: tenant bootstrap refuses without
           # an authorization-code OIDC provider model.
-          docker run --rm --network host \
+          # HOST/PORT/USER/PASSWORD, not --db_host: the official Odoo entrypoint
+          # builds its own connection arguments from these and defaults HOST to
+          # "db", which wins over the flag. deploy/compose.yml uses the same
+          # contract.
+          db_env="-e HOST=127.0.0.1 -e PORT=5432 -e USER=odoo -e PASSWORD=odoo"
+
+          docker run --rm --network host $db_env \
             -e MB_CONTROL_BRIDGE_TOKEN="$token" \
             "$image" \
             odoo -d bridge --init mb_control_bridge,auth_oidc \
                  --without-demo=all --stop-after-init --no-http \
-                 --db_host=127.0.0.1 --db_user=odoo --db_password=odoo \
                  --addons-path="$addons"
 
-          docker run -d --name odoo-bridge --network host \
+          docker run -d --name odoo-bridge --network host $db_env \
             -e MB_CONTROL_BRIDGE_TOKEN="$token" \
             "$image" \
             odoo -d bridge --db-filter='^bridge$' \
-                 --db_host=127.0.0.1 --db_user=odoo --db_password=odoo \
                  --addons-path="$addons" --workers=0
 
           for attempt in $(seq 1 60); do
