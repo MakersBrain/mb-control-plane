@@ -18,9 +18,12 @@
 //!     MB_ODOO_BOOTSTRAP_TOKEN=... \
 //!     cargo test --test bridge_compatibility -- --ignored --test-threads=1
 //!
-//! `--test-threads=1` is not incidental: these share one tenant and run in
-//! sequence, because bootstrap must precede everything and the replay
-//! assertions depend on what ran before them.
+//! `--test-threads=1` is not incidental. One Odoo database is one company is
+//! one tenant: the first bootstrap sets the company's credential verifier, and
+//! from then on the shared environment token is refused. So the suite
+//! bootstraps exactly once and every test shares that tenant, which is also how
+//! a real deployment works -- a database is provisioned for one workshop and
+//! never re-bootstrapped for another.
 
 use makersbrain_control_plane::domain::IntegrationError;
 use makersbrain_control_plane::integrations::odoo::{
@@ -69,29 +72,59 @@ fn harness() -> Harness {
     )
 }
 
-/// One bootstrapped tenant, shared by the tests that follow.
-async fn bootstrapped(harness: &Harness) -> (OdooClient, Uuid, String) {
-    let workshop_id = Uuid::new_v4();
-    let token = tenant_token();
-    let bootstrap = harness.client(&harness.bootstrap_token);
+/// The one tenant this database will ever have.
+struct Tenant {
+    workshop_id: Uuid,
+    token: String,
+    /// The bootstrap command that created it, kept so the replay test can send
+    /// the identical request again.
+    command: TenantBootstrapCommand,
+    first_response: serde_json::Value,
+}
 
-    let command = TenantBootstrapCommand {
-        operation_key: Uuid::new_v4().to_string(),
-        workshop_id,
-        oidc_client_id: format!("mb-{}", workshop_id.simple()),
-        // The provider accepts this scheme specifically so a bridge can be
-        // exercised without terminating TLS.
-        oidc_issuer: "http://rauthy.localhost:8080".into(),
-        bridge_token: token.clone(),
-        public_hostname: format!("w{}.makersbrain.test", workshop_id.simple()),
-    };
+static TENANT: tokio::sync::OnceCell<Tenant> = tokio::sync::OnceCell::const_new();
 
-    bootstrap
-        .bootstrap_tenant(&command)
+/// Bootstrap once, then share. A second bootstrap with the environment token
+/// would be refused, because the company now has its own credential verifier --
+/// which is the behaviour, not a limitation of the test.
+async fn tenant(harness: &Harness) -> &'static Tenant {
+    TENANT
+        .get_or_init(|| async {
+            let workshop_id = Uuid::new_v4();
+            let token = tenant_token();
+            let command = TenantBootstrapCommand {
+                operation_key: Uuid::new_v4().to_string(),
+                workshop_id,
+                oidc_client_id: format!("mb-{}", workshop_id.simple()),
+                // The provider accepts this scheme specifically so a bridge can
+                // be exercised without terminating TLS.
+                oidc_issuer: "http://rauthy.localhost:8080".into(),
+                bridge_token: token.clone(),
+                public_hostname: format!("w{}.makersbrain.test", workshop_id.simple()),
+            };
+            let first_response = harness
+                .client(&harness.bootstrap_token)
+                .bootstrap_tenant(&command)
+                .await
+                .expect("tenant bootstrap failed against the real bridge");
+            Tenant {
+                workshop_id,
+                token,
+                command,
+                first_response,
+            }
+        })
         .await
-        .expect("tenant bootstrap failed against the real bridge");
+}
 
-    (harness.client(&token), workshop_id, token)
+/// A client holding the tenant credential, and the workshop it speaks for.
+async fn bootstrapped(harness: &Harness) -> (OdooClient, Uuid, String) {
+    let tenant = tenant(harness).await;
+    (
+        harness.client(&tenant.token),
+        tenant.workshop_id,
+        tenant.token.clone(),
+    )
 }
 
 #[tokio::test]
@@ -119,9 +152,19 @@ async fn a_wrong_credential_is_rejected_rather_than_ignored() {
     // Well-formed and of the right shape, but not the tenant's.
     let impostor = harness.client(&tenant_token());
     match impostor.health().await {
-        Err(IntegrationError::Rejected) => {}
-        Err(other) => panic!("a wrong credential produced {other:?}, expected Rejected"),
+        Err(IntegrationError::Unauthorized) => {}
+        Err(other) => panic!("a wrong credential produced {other:?}, expected Unauthorized"),
         Ok(health) => panic!("a wrong credential was accepted: {health:?}"),
+    }
+
+    // The shared bootstrap credential must also stop working once the tenant
+    // has its own. Otherwise one leaked environment value would reopen every
+    // database that ever used it.
+    let stale_bootstrap = harness.client(&harness.bootstrap_token);
+    match stale_bootstrap.health().await {
+        Err(IntegrationError::Unauthorized) => {}
+        Err(other) => panic!("the bootstrap credential produced {other:?}"),
+        Ok(health) => panic!("the bootstrap credential still works after bootstrap: {health:?}"),
     }
 }
 
@@ -129,31 +172,19 @@ async fn a_wrong_credential_is_rejected_rather_than_ignored() {
 #[ignore = "needs a running Odoo bridge"]
 async fn a_replayed_operation_key_returns_the_first_result() {
     let harness = harness();
-    let workshop_id = Uuid::new_v4();
-    let token = tenant_token();
-    let bootstrap = harness.client(&harness.bootstrap_token);
+    let tenant = tenant(&harness).await;
 
-    let command = TenantBootstrapCommand {
-        operation_key: Uuid::new_v4().to_string(),
-        workshop_id,
-        oidc_client_id: format!("mb-{}", workshop_id.simple()),
-        oidc_issuer: "http://rauthy.localhost:8080".into(),
-        bridge_token: token,
-        public_hostname: format!("w{}.makersbrain.test", workshop_id.simple()),
-    };
+    // The identical bootstrap, sent again with the same operation key. The
+    // control plane retries on an unknown outcome, so if a replay did the work
+    // twice a network blip would provision a tenant twice.
+    let replayed = harness
+        .client(&harness.bootstrap_token)
+        .bootstrap_tenant(&tenant.command)
+        .await
+        .expect("replaying the original operation key was refused");
 
-    let first = bootstrap
-        .bootstrap_tenant(&command)
-        .await
-        .expect("bootstrap");
-    // The control plane retries on an unknown outcome. If a replay did work
-    // twice, a network blip would silently provision a tenant twice.
-    let replayed = bootstrap
-        .bootstrap_tenant(&command)
-        .await
-        .expect("replaying the same operation key failed");
     assert_eq!(
-        first, replayed,
+        tenant.first_response, replayed,
         "the same operation key produced a different result on replay",
     );
 }
