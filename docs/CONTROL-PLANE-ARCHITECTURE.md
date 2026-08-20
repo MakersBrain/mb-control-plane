@@ -7,8 +7,7 @@ deployment contract consumed by `makersbrain-infra`
 
 This document describes the implementation that exists in this repository. It
 does not describe intended release-management or production-hardening work;
-that belongs in `CONTROL-PLANE-ROADMAP.md` and
-`CONTROL-PLANE-IMPROVEMENT-PLAN.md`.
+that belongs in `CONTROL-PLANE-ROADMAP.md`.
 
 Accepted architecture decisions are recorded under
 `docs/adr/`.
@@ -361,5 +360,12 @@ adapters and retained live-topology evidence remain deployment gates.
 - `migrations/`: current control schema;
 - `src/domain.rs`: operation kinds and queues;
 - `BACKUP-RESTORE.md`: current recovery procedure;
-- `CONTROL-PLANE-ROADMAP.md`: status and future gates;
-- `CONTROL-PLANE-IMPROVEMENT-PLAN.md`: ordered implementation programme.
+- `CONTROL-PLANE-ROADMAP.md`: status, gates, principles and open decisions.
+
+## History
+
+The control plane was extracted from `../makersbrain` into this repository; the
+proposal that described that extraction, and the improvement programme that
+turned the result into a release-managed platform, are both complete. Their
+remaining gates live in `CONTROL-PLANE-ROADMAP.md` and their superseded
+specifications remain available in Git history.

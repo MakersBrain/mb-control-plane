@@ -1,10 +1,19 @@
 # MakersBrain control-plane roadmap
 
 Status: active
-Source of implementation order: `CONTROL-PLANE-IMPROVEMENT-PLAN.md`
 
-This roadmap records the status of incomplete control-plane capabilities. The
-current system is described only by `CONTROL-PLANE-ARCHITECTURE.md`.
+This roadmap is the single record of incomplete control-plane work: capability
+status, the rules that constrain how it is finished, the release gates, and the
+governance decisions that block production. The system that exists today is
+described only by `CONTROL-PLANE-ARCHITECTURE.md`.
+
+Delivery phases 0 to 4 -- documentation and characterization, command and secret
+safety, Odoo release adoption, product capability correction, and modularization
+with typed contracts -- are delivered; their implementation specifications were
+retired with the improvement plan and the resulting system is described in the
+architecture document. The remaining phase is below.
+
+## Capability status
 
 | Capability | Status | Gate or limitation |
 | --- | --- | --- |
@@ -48,5 +57,168 @@ expired credentials, worker crashes, scope mismatches and rollback failures.
   exposed through the API, operation payloads or logs.
 
 Progress is accepted only when the tests and evidence named by the corresponding
-gate in `CONTROL-PLANE-IMPROVEMENT-PLAN.md` pass. Calendar dates do not replace
-those gates.
+gate below pass. Calendar dates do not replace those gates.
+
+## Principles and non-negotiable rules
+
+1. **Desired state is recorded before external mutation.** APIs validate,
+   authorize and enqueue. Workers or deployment jobs perform external changes.
+2. **Observe before create or retry.** An unknown provider outcome is reconciled
+   before another create is attempted.
+3. **One release identity means one immutable artifact set.** Mutable tags and
+   process package versions are not release identities.
+4. **No shared-runtime swap before database compatibility is proven.** A failed
+   tenant upgrade blocks that release or leaves the tenant on a compatible
+   runtime pool.
+5. **No destructive compensation.** A failed provisioning or release operation
+   does not delete a working database, filestore or document archive.
+6. **Secrets are capabilities.** A process receives only the capabilities its
+   current queue needs.
+7. **Product capabilities are stable; Odoo module lists are internal.** Users
+   enable workshop features, not implementation packages.
+8. **Recovery precedes destructive or schema-changing work.** A verified
+   recovery point is a gate, not a best-effort side effect.
+9. **Contracts are generated or validated from one source.** Environment
+   requirements, routes, schemas and capability dependencies must not drift
+   between Rust, Compose, JSON and documentation.
+10. **Do not generalize before a second real consumer.** Multi-shard placement,
+    custom domains and a generic workflow engine remain deferred.
+11. **Privacy is enforced by design and by default.** Personal data is
+    collected only for a documented purpose, retained for a bounded period,
+    excluded from telemetry by default and accessible only to roles that need
+    it. GDPR evidence is part of the release contract, not a policy document
+    detached from implementation.
+
+### Scope exclusions
+
+The control-plane programme does not change, redesign or deploy:
+
+- `mb_catalogue_sync`;
+- the sibling catalogue scraper or its webservice;
+- Decodo proxy pools, credentials, regional routing or sticky sessions;
+- supplier-site acquisition, scraping policy or catalogue normalization.
+
+Those systems may continue to integrate through their existing contracts, but
+their internals and operations are outside this control-plane improvement
+programme. Control-plane work must not create a dependency on their source,
+configuration or proxy credentials.
+
+## Priority and release gates
+
+### Gate P0 — required before non-synthetic data
+
+- tenant Odoo release manifest and adoption workflow;
+- per-process database roles and secret sets;
+- invitation capability redesign;
+- complete startup configuration validation;
+- consistent idempotency and optimistic concurrency;
+- database-enforced audit immutability for application roles;
+- GDPR data inventory, retention jobs, data-subject request workflow and
+  privacy-safe telemetry defaults;
+- negative tenant-isolation and secret-leak tests.
+
+### Gate P1 — required before a second live workshop
+
+- capability registry redesign and `mb_ceramics_workflow` activation path;
+- API, worker and driver modularization;
+- typed OpenAPI and generated web client;
+- release, queue, backup and drift metrics;
+- canary and full-fleet Odoo release rehearsal;
+- operator runbooks for failed upgrade, failed restore and credential rotation.
+
+### Gate P2 — required before paid production
+
+- staging deployment through the infrastructure release contract;
+- operator identity separated from an email allowlist;
+- step-up authentication for destructive platform actions;
+- production object-lock, PITR and quarterly disaster-recovery evidence;
+- load, provider-outage and worker-termination tests;
+- signed release provenance, SBOM retention and previous-image availability.
+
+## Remaining delivery phase — operations and production rehearsal
+
+1. Add heartbeats, metrics, tracing and alert rules.
+2. Add platform roles and step-up operator actions.
+3. Deploy through staging infrastructure identities and Podman driver.
+4. Run full isolation, failure and recovery tests.
+5. Rehearse class A/B rollback and class C recovery.
+6. Exercise data-subject requests, retention, backup erasure replay and breach
+   response; retain the reviewed DPIA and processing records.
+
+Gate: retained evidence satisfies every acceptance criterion below.
+
+## Final acceptance criteria
+
+The programme is complete when:
+
+- a signed immutable release can upgrade and verify all tenant databases
+  without shell access;
+- replacing the shared Odoo runtime is impossible until every routed tenant is
+  compatible;
+- every tenant records its exact image digest, source commit and addon versions;
+- a failed tenant upgrade leaves other tenants available and prevents unsafe
+  activation;
+- each worker has a distinct database role and only its documented secrets;
+- no plaintext invitation capability exists in PostgreSQL, logs or operation
+  payloads;
+- every mutating API operation has correct identical replay, payload-mismatch
+  rejection and stale-write behavior;
+- audit rows are immutable to application runtime roles;
+- `mb_ceramics_workflow` and other workshop capabilities have complete,
+  entitlement-aware activation paths;
+- the OpenAPI document and web client are generated from typed contracts;
+- no provider network call holds an open database transaction;
+- queue age, worker freshness, release drift, backup freshness and restore
+  rehearsal status are observable and alerted;
+- two-workshop negative isolation tests pass for Odoo, Paperless, Redis,
+  secrets, backups and routes;
+- production deployment uses the infrastructure driver rather than a mounted
+  Docker socket;
+- recovery and rollback exercises have retained evidence and named owners;
+- the personal-data inventory covers every schema/API/event/telemetry field;
+  controller-approved retention and erasure jobs run with evidence;
+- access, rectification, restriction, portability and erasure workflows pass
+  tenant-isolation tests, including erasure replay after backup restore;
+- production has reviewed processing records, processor/transfer safeguards,
+  a DPIA and a rehearsed 72-hour breach-decision workflow.
+
+## Explicit non-goals
+
+Do not include these without a new trigger:
+
+- Kubernetes;
+- a generic BPM/workflow engine;
+- event sourcing or CQRS for control-plane state;
+- automatic Odoo module uninstall;
+- custom tenant domains before a real customer requires one;
+- multiple runtime clusters before a second shard is operated;
+- any change to catalogue sync, the scraper webservice, Decodo configuration or
+  proxy policy;
+- storing invoice/document bodies in control PostgreSQL;
+- replacing Rauthy, Odoo or Paperless functionality already owned by those
+  systems.
+
+## Decisions required before gated production
+
+Known interim governance state:
+
+- the project owner is the initial technical platform administrator;
+- no legal entity/data controller has been designated yet;
+- no DPO has been appointed yet;
+- Paris is the preferred processing region and Azure West Europe is the EEA
+  fallback;
+- production processing of customer personal data is blocked until the
+  controller and applicable processor agreements are formally recorded.
+
+The implementation fails closed without these decisions. They are still
+required before their corresponding production gate can be approved:
+
+1. Which product plans permit each capability? The entitlement path is shipped
+   and requires an explicit per-workshop capability list, but the commercial
+   authority still has to approve the plan-to-capability matrix before live
+   entitlements are issued.
+2. Which legal entity will become the GDPR controller, whether appointment of a
+   DPO is required or chosen, which lawful basis applies to each processing
+   purpose, and which retention periods receive legal approval.
+3. Which Paris/West Europe providers and subprocessors are approved under
+   Article 28 processor terms?

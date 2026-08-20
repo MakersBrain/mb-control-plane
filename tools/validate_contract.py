@@ -714,7 +714,6 @@ def validate() -> list[str]:
     for document in (
         ROOT / "docs/CONTROL-PLANE-ARCHITECTURE.md",
         ROOT / "docs/CONTROL-PLANE-ROADMAP.md",
-        ROOT / "docs/CONTROL-PLANE-IMPROVEMENT-PLAN.md",
         CONTROL / "README.md",
     ):
         for target in local_markdown_links(document):
