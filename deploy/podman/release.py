@@ -140,40 +140,44 @@ def persistent_units_for_release(release_root: Path) -> list[str]:
     return units
 
 
-def verify_and_pull(images: dict[str, str], verify_keyless: bool) -> None:
+def verify_and_pull(record: dict, images: dict[str, str], verify_keyless: bool) -> None:
     if verify_keyless:
-        # Check the whole set before pulling anything, so an undeclared image is
-        # one clear error up front rather than a failure halfway through a
-        # deployment with some images already on the host.
-        missing = undeclared(images)
+        # Check the whole set before pulling anything, so an image the record
+        # says nothing about is one clear error up front rather than a failure
+        # halfway through a deployment with some images already on the host.
+        missing = undeclared(record, images)
         if missing:
             raise ValueError(
-                "no signing repository is declared for: "
+                "the release record carries no provenance for: "
                 + ", ".join(missing)
-                + ". See deploy/podman/provenance.py."
+                + ". They will not be pulled."
             )
 
     for name in sorted(images):
         image = images[name]
         if verify_keyless:
-            # Each image is verified against the one repository entitled to sign
-            # it, not against a single platform-wide identity: after the split
-            # the Odoo image, the control plane's images and the mirrored
-            # support images come from three different release workflows.
-            identity, repository = identity_for(name)
-            run(
-                [
-                    "cosign",
-                    "verify",
-                    "--certificate-oidc-issuer",
-                    COSIGN_OIDC_ISSUER,
-                    "--certificate-identity",
-                    identity,
-                    "--certificate-github-workflow-repository",
-                    repository,
-                    image,
-                ]
-            )
+            # Whoever the record says signed it, verified against that exact
+            # repository. Upstream images are signed by nobody and the record
+            # says so; they are pulled on the strength of their digest, which is
+            # stated here rather than quietly skipped.
+            signer = identity_for(record, name)
+            if signer is None:
+                print(f"{name}: upstream, digest-pinned, not signed", flush=True)
+            else:
+                identity, repository = signer
+                run(
+                    [
+                        "cosign",
+                        "verify",
+                        "--certificate-oidc-issuer",
+                        COSIGN_OIDC_ISSUER,
+                        "--certificate-identity",
+                        identity,
+                        "--certificate-github-workflow-repository",
+                        repository,
+                        image,
+                    ]
+                )
         run(["podman", "pull", image])
 
 
@@ -519,7 +523,8 @@ def main() -> None:
             verify_runtime_secrets(values, args.config_root)
             verify_host_configuration(rendered, args.config_root)
         verify_and_pull(
-            values["images"], verify_keyless=values["environment"] == "production"
+            record, values["images"],
+            verify_keyless=values["environment"] == "production",
         )
         if args.activate:
             activate(rendered, record["release_id"], args.state_root, args.quadlet_root)
