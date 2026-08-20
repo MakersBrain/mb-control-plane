@@ -11,7 +11,7 @@ current system is described only by `CONTROL-PLANE-ARCHITECTURE.md`.
 | Durable queued external operations | Implemented with a named evidence gap | Central retry/safety classification and critical Rauthy, Odoo and Paperless adapter outcomes are unit-tested; full-topology provider termination and unknown-outcome injection remain a Phase 5 gate. |
 | Exact-host Odoo tenant routing | Implemented and verified | Exact-host/header replacement, opaque database selection and distinct per-workshop bridge credentials with tenant-database verifiers are implemented; a retained negative full-topology suite must become a production gate. |
 | Opaque database-per-workshop isolation | Implemented and verified | Full-topology negative rehearsal remains a production evidence gate. |
-| Odoo/Paperless paired recovery | Implemented with limitation | Pre-erasure restores remain in maintenance until encrypted tombstone lookup and Odoo/Paperless replay evidence complete; production object lock/PITR and a retained full-topology replay rehearsal remain P2. |
+| Odoo/Paperless paired recovery | Implemented with limitation | Pre-erasure restores remain in maintenance until encrypted tombstone lookup and Odoo/Paperless replay evidence complete; production object lock/PITR and a retained full-topology replay rehearsal remain P2, against the acceptance criteria below. |
 | Tenant Odoo release adoption | Implemented with named limitation | Signed manifests, state machines, fleet fencing, per-tenant recovery, activation intent and operator flows exist; two-image canary/failure rehearsals and production driver evidence remain P1/P2. |
 | Per-process database roles/secrets | Implemented with named limitation | Local role grants, exact environment ownership, mounted secret-file references, fail-fast resolution, rendered-Compose canaries, separately mounted Odoo/Paperless integration-token volumes, driver-only versioned long-lived subpaths and UUID-scoped short-job mounts are present. A live Docker canary proves read-only subpath isolation; production secret-manager issuance and retained infrastructure-driver process evidence remain P0. |
 | Invitation capabilities outside PostgreSQL/logs | Implemented and verified | Ed25519 rotation, generation invalidation, database migration and no-plaintext checks pass. |
@@ -27,6 +27,25 @@ current system is described only by `CONTROL-PLANE-ARCHITECTURE.md`.
 | Multiple runtime clusters | Deliberately deferred | Trigger: operation of a second real shard. |
 | Custom tenant domains | Deliberately deferred | Trigger: a contracted customer requirement. |
 | Generic workflow engine | Deliberately deferred | Trigger: a second real workflow consumer not expressible by current operations. |
+
+## P2 recovery rehearsal acceptance criteria
+
+The backup and restore implementation is delivered; these criteria are what the
+outstanding full-topology rehearsal must demonstrate before scheduled backups
+are enabled in production. Rehearse with `documents` both off and on, under
+active invoice ingestion, and against corrupt or truncated objects, wrong keys,
+expired credentials, worker crashes, scope mismatches and rollback failures.
+
+- A workshop without Paperless produces and restores an Odoo-only recovery set.
+- A workshop with Paperless restores Odoo, all documents, metadata, unconsumed
+  files and stable document IDs from one recovery point.
+- No recovery point reaches `ready` without complete remote verification.
+- A partial, modified or wrongly encrypted object cannot be restored.
+- Restore failure leaves the original workshop recoverable and closed to users
+  until rollback or operator intervention succeeds.
+- Backup-writer credentials cannot delete immutable production backups.
+- No plaintext document, database dump, S3 credential or private restore key is
+  exposed through the API, operation payloads or logs.
 
 Progress is accepted only when the tests and evidence named by the corresponding
 gate in `CONTROL-PLANE-IMPROVEMENT-PLAN.md` pass. Calendar dates do not replace

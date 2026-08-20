@@ -142,5 +142,5 @@ A restore is successful only when:
 5. A Rauthy subject can sign in to the control UI, Odoo, and enabled Paperless,
    while a subject from another workshop is denied.
 
-The complete implementation and rehearsal matrix are maintained in
-[BACKUP-RESTORE-PLAN.md](BACKUP-RESTORE-PLAN.md).
+The remaining rehearsal matrix is the P2 recovery gate in
+[CONTROL-PLANE-ROADMAP.md](CONTROL-PLANE-ROADMAP.md).
