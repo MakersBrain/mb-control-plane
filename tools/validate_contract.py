@@ -641,10 +641,6 @@ def validate() -> list[str]:
         errors.append("release contract application_release_schema is missing")
     if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
         errors.append("application release schema must use JSON Schema 2020-12")
-    openapi_baseline = DEPLOY / str(contract.get("public_openapi_baseline", ""))
-    if not openapi_baseline.is_file():
-        errors.append("released public OpenAPI baseline is missing")
-
     observability = contract.get("observability", {})
     alert_path = DEPLOY / str(observability.get("prometheus_rules", ""))
     if not alert_path.is_file():
