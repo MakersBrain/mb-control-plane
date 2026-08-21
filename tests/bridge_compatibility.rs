@@ -1,6 +1,6 @@
 //! Cross-repository compatibility: this client against a real Odoo bridge.
 //!
-//! Migration plan section 4.6. The `/mb_control/v1` provider lives in
+//! The retained `/mb_control/v1` provider contract lives in
 //! `MakersBrain/mb-odoo-addons` and this is its only client. Since the split,
 //! each repository's CI can be entirely green while the two disagree: the
 //! generated contract in the provider catches a route being renamed or losing
