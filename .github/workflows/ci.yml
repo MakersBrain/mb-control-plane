@@ -93,19 +93,18 @@ jobs:
       - run: python3 tools/test_dynamic_secret_boundary.py
       - run: python3 tools/test_verify_github_oidc_claims.py
       - run: python3 tools/test_topology_odoo_isolation.py --self-test
-      - run: python3 tools/test_openapi_compatibility.py
       - run: cargo clippy --locked --all-targets --manifest-path Cargo.toml -- -D warnings
       - run: cargo test --locked --manifest-path Cargo.toml
       - name: PostgreSQL integration tests
         run: cargo test --locked --manifest-path Cargo.toml --test postgres -- --ignored --test-threads=1
+      - name: PostgreSQL schema epoch tests
+        run: cargo test --locked --manifest-path Cargo.toml --test schema_epoch -- --ignored --test-threads=1
       - name: Runtime database role matrix
         run: sh tools/test-role-matrix.sh
       - name: Generated browser API client is current
         run: |
           npm run generate:api
           git diff --exit-code -- src/lib/generated/control-api.ts
-          cargo run --quiet --manifest-path ../Cargo.toml --bin control-openapi -- --json /tmp/control-openapi-current.json
-          python3 ../tools/check_openapi_compatibility.py ../deploy/openapi-v1-baseline.json /tmp/control-openapi-current.json
         working-directory: web
       # The design system is @makersbrain/brand on GitHub Packages, which npm
       # cannot reach anonymously even for a package in this same org. The
@@ -119,7 +118,8 @@ jobs:
       - run: npm run check && npm run build
         working-directory: web
 
-  # Cross-repository compatibility, migration plan section 4.6.
+  # Cross-repository compatibility verifies the current bridge client against
+  # the current external provider.
   #
   # The /mb_control/v1 provider lives in mb-odoo-addons and this repository is
   # its only client. Since the split each side's CI can be entirely green while

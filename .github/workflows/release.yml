@@ -202,7 +202,7 @@ jobs:
           # Deployment scripts the production Quadlets mount and the local
           # compose stack runs. Authored here because local development needs
           # them; published so mb-infra does not keep a copy that drifts.
-          cp deploy/resolve-secret-env.sh deploy/init-databases.sh \
+          cp deploy/odoo-secret-entrypoint.sh deploy/init-databases.sh \
              deploy/reconcile-database-identities.sh release/config/
           cp deploy/release-contract.json release/
 

@@ -19,7 +19,6 @@ pub enum VisionProviderKind {
     Azure,
     Gemini,
     Claude,
-    OpenAiCompatible,
 }
 
 impl VisionProviderKind {
@@ -29,7 +28,6 @@ impl VisionProviderKind {
             Self::Azure => "azure",
             Self::Gemini => "gemini",
             Self::Claude => "claude",
-            Self::OpenAiCompatible => "openai-compatible",
         }
     }
 }
@@ -43,7 +41,6 @@ impl FromStr for VisionProviderKind {
             "azure" | "azure-openai" | "azure-foundry" => Ok(Self::Azure),
             "gemini" | "google" => Ok(Self::Gemini),
             "claude" | "anthropic" => Ok(Self::Claude),
-            "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
             _ => anyhow::bail!("unknown inventory vision provider"),
         }
     }
@@ -79,16 +76,14 @@ impl InventoryVisionClient {
             anyhow::bail!("inventory vision key and model are required");
         }
         let secret_value = match provider {
-            VisionProviderKind::OpenAi | VisionProviderKind::OpenAiCompatible => {
-                format!("Bearer {key}")
-            }
+            VisionProviderKind::OpenAi => format!("Bearer {key}"),
             _ => key.to_owned(),
         };
         let mut secret = reqwest::header::HeaderValue::from_str(&secret_value)?;
         secret.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         match provider {
-            VisionProviderKind::OpenAi | VisionProviderKind::OpenAiCompatible => {
+            VisionProviderKind::OpenAi => {
                 headers.insert(reqwest::header::AUTHORIZATION, secret);
             }
             VisionProviderKind::Azure => {
@@ -182,7 +177,6 @@ impl InventoryVisionClient {
             }
             VisionProviderKind::Gemini => self.gemini_request(assets, ocr_tokens),
             VisionProviderKind::Claude => self.claude_request(assets, ocr_tokens),
-            VisionProviderKind::OpenAiCompatible => self.openai_chat_request(assets, ocr_tokens),
         }
     }
 
@@ -202,24 +196,6 @@ impl InventoryVisionClient {
             "model": self.model,
             "input": [{"role":"user","content":content}],
             "text": {"format": schema_format()}
-        })
-    }
-
-    fn openai_chat_request(
-        &self,
-        assets: &[(String, String, Vec<u8>)],
-        ocr_tokens: &Value,
-    ) -> Value {
-        let mut content = vec![json!({"type":"text","text":prompt(ocr_tokens)})];
-        for (asset_id, mimetype, bytes) in assets {
-            content.push(json!({"type":"text","text":format!("asset_id={asset_id}")}));
-            content.push(json!({"type":"image_url","image_url":{"url":data_url(mimetype, bytes),"detail":"high"}}));
-        }
-        json!({
-            "model":self.model,
-            "messages":[{"role":"user","content":content}],
-            "temperature":0,
-            "response_format":{"type":"json_schema","json_schema":schema_descriptor()}
         })
     }
 
@@ -284,9 +260,6 @@ impl InventoryVisionClient {
                 .flatten()
                 .find(|content| content.get("type").and_then(Value::as_str) == Some("text"))
                 .and_then(|content| content.get("text"))
-                .and_then(Value::as_str),
-            VisionProviderKind::OpenAiCompatible => envelope
-                .pointer("/choices/0/message/content")
                 .and_then(Value::as_str),
         }
         .ok_or(IntegrationError::ContractDrift)?;
@@ -358,10 +331,6 @@ fn schema_format() -> Value {
         "type":"json_schema",
         "name":"inventory_label_candidates","strict":true,"schema":schema_body()
     })
-}
-
-fn schema_descriptor() -> Value {
-    json!({"name":"inventory_label_candidates","strict":true,"schema":schema_body()})
 }
 
 fn schema_body() -> Value {
@@ -448,10 +417,6 @@ mod tests {
             (
                 VisionProviderKind::Claude,
                 json!({"content":[{"type":"text","text":text}]}),
-            ),
-            (
-                VisionProviderKind::OpenAiCompatible,
-                json!({"choices":[{"message":{"content":text}}]}),
             ),
         ];
         for (provider, envelope) in fixtures {

@@ -25,5 +25,5 @@ The workshop-scoped Paperless API credential used by control-plane integrations
 lives in a separate read-only client volume mounted only by the membership and
 invoice workers. It is not stored with either tenant Odoo credentials or the
 Paperless infrastructure secrets. The container configuration digest includes
-the driver-only source volume and a boundary version so migration recreates an
-older container before removing its legacy files.
+the driver-only source volume and a boundary version so a mount-layout change
+recreates an obsolete container before its old runtime path is discarded.

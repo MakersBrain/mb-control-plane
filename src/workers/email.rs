@@ -7,11 +7,15 @@ use crate::domain::IntegrationError;
 use crate::invitation::InvitationSigner;
 use crate::persistence::{LeasedOperation, Store};
 
-fn required(name: &str) -> Result<String, IntegrationError> {
+fn secret(name: &str) -> Result<String, IntegrationError> {
     crate::runtime_secret::environment(name)
         .map_err(|_| IntegrationError::Unauthorized)?
         .filter(|value| !value.trim().is_empty())
         .ok_or(IntegrationError::Unauthorized)
+}
+
+fn configured(name: &str) -> Result<String, IntegrationError> {
+    crate::runtime_secret::required_configuration(name).map_err(|_| IntegrationError::Unauthorized)
 }
 
 fn client(token: &str) -> Result<reqwest::Client, IntegrationError> {
@@ -56,8 +60,8 @@ pub(crate) async fn deliver(
     }
     // Validate the gateway before claiming the row. Broken secret mounts must
     // not strand durable mail in `sending`.
-    let client = client(&required("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
-    let webhook_url = required("CONTROL_MAIL_WEBHOOK_URL")?;
+    let client = client(&secret("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
+    let webhook_url = configured("CONTROL_MAIL_WEBHOOK_URL")?;
     let row = sqlx::query_as::<
         _,
         (
@@ -114,11 +118,11 @@ pub(crate) async fn deliver(
     };
     let (sender_name, reply_to, attachments) = if kind == "invitation" {
         let signer = InvitationSigner::from_json_file(
-            required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
-            std::path::Path::new(&required("CONTROL_INVITATION_SIGNING_KEYS_FILE")?),
+            configured("CONTROL_INVITATION_SIGNING_KEY_ID")?,
+            std::path::Path::new(&configured("CONTROL_INVITATION_SIGNING_KEYS_FILE")?),
         )
         .map_err(|_| IntegrationError::ContractDrift)?;
-        let mut invitation_origin = url::Url::parse(&required("CONTROL_PUBLIC_ORIGIN")?)
+        let mut invitation_origin = url::Url::parse(&configured("CONTROL_PUBLIC_ORIGIN")?)
             .and_then(|origin| origin.join("invitations/accept"))
             .map_err(|_| IntegrationError::ContractDrift)?;
         let token = signer

@@ -196,6 +196,40 @@ fn operation_id(method: &str, path: &str) -> String {
     result
 }
 
+fn success_statuses(path: &str, method: &str) -> &'static [&'static str] {
+    if method == "get" {
+        return &["200"];
+    }
+    match (path, method) {
+        ("/v1/privacy/requests/{id}/export", "post")
+        | ("/v1/workshops/{id}/database/backups/{recovery_id}/download", "post")
+        | ("/v1/invitations/validate", "post")
+        | ("/v1/workshops/{id}/email/smtp", "post")
+        | ("/v1/workshops/{id}/email/smtp", "delete") => &["200"],
+        ("/v1/invitations/{id}", "delete") => &["202", "204"],
+        ("/v1/platform/releases/{id}/retry-failed-tenants", "post") => &[],
+        ("/v1/identity/link", "post") => &["200", "201", "202"],
+        ("/v1/platform/roles", "post")
+        | ("/v1/privacy/requests", "post")
+        | ("/v1/platform/privacy/incidents", "post")
+        | ("/v1/platform/privacy/legal-holds", "post")
+        | ("/v1/workshops/{id}/domains", "post") => &["201", "202"],
+        ("/v1/platform/roles/{id}", "delete")
+        | ("/v1/platform/privacy/requests/{id}/decision", "post")
+        | ("/v1/platform/privacy/processor-tasks/{id}/acknowledge", "post")
+        | ("/v1/platform/privacy/incidents/{id}/assessment", "post")
+        | ("/v1/platform/privacy/legal-holds/{id}/release", "post")
+        | ("/v1/workshops/{id}/modules/{module_key}/enable", "post")
+        | ("/v1/ownership-transfers/{id}/accept", "post")
+        | ("/v1/workshops/{id}/webshop/onboarding/complete", "post")
+        | ("/v1/workshops/{id}/webshop/deactivate", "post")
+        | ("/v1/workshops/{id}/carrier-secrets", "post")
+        | ("/v1/workshops/{id}/carrier-secrets/{secret_id}", "delete")
+        | ("/v1/workshops/{id}/domains/{domain_id}/verify", "post") => &["200", "202"],
+        _ => &["202"],
+    }
+}
+
 /// The public contract is emitted from the executable so deployments and
 /// generated clients can inspect the exact route release they are running.
 pub fn document() -> Value {
@@ -532,23 +566,49 @@ pub fn document() -> Value {
             ("/v1/workshops/{id}/email/smtp", "post") => Some("WebshopSmtpBody"),
             _ => None,
         };
+        let mut responses = json!({
+            "400":{"$ref":"#/components/responses/ValidationError"},
+            "401":{"$ref":"#/components/responses/AuthenticationError"},
+            "403":{"$ref":"#/components/responses/AuthorityError"},
+            "409":{"$ref":"#/components/responses/ConflictError"},
+            "410":{"$ref":"#/components/responses/GoneError"},
+            "412":{"$ref":"#/components/responses/StaleWriteError"},
+            "428":{"$ref":"#/components/responses/PreconditionError"},
+            "503":{"$ref":"#/components/responses/PrivacyGateError"}
+        });
+        for status in success_statuses(path, method) {
+            let response = match (*status, path, method) {
+                ("202" | "204", "/v1/invitations/{id}", "delete") => {
+                    json!({"description":"Successful response with no content"})
+                }
+                (
+                    "200",
+                    "/v1/privacy/requests/{id}/export"
+                    | "/v1/workshops/{id}/database/backups/{recovery_id}/download",
+                    "post",
+                ) => {
+                    json!({"description":"Successful binary response","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}}})
+                }
+                ("201", _, _) => {
+                    json!({"description":"Resource created","content":{"application/json":{"schema":success_schema.clone()}}})
+                }
+                ("202", _, _) => {
+                    json!({"description":"Durable operation accepted","content":{"application/json":{"schema":success_schema.clone()}}})
+                }
+                _ => {
+                    json!({"description":"Successful response","content":{"application/json":{"schema":success_schema.clone()}}})
+                }
+            };
+            responses
+                .as_object_mut()
+                .expect("responses")
+                .insert((*status).into(), response);
+        }
         let mut operation = json!({
             "operationId":operation_id(method,path),
             "tags":[tag],
             "parameters":parameters,
-            "responses":{
-                "200":{"description":"Successful response","content":{"application/json":{"schema":success_schema.clone()}}},
-                "201":{"description":"Resource created","content":{"application/json":{"schema":success_schema.clone()}}},
-                "202":{"description":"Durable operation accepted","content":{"application/json":{"schema":success_schema}}},
-                "400":{"$ref":"#/components/responses/ValidationError"},
-                "401":{"$ref":"#/components/responses/AuthenticationError"},
-                "403":{"$ref":"#/components/responses/AuthorityError"},
-                "409":{"$ref":"#/components/responses/ConflictError"},
-                "410":{"$ref":"#/components/responses/GoneError"},
-                "412":{"$ref":"#/components/responses/StaleWriteError"},
-                "428":{"$ref":"#/components/responses/PreconditionError"},
-                "503":{"$ref":"#/components/responses/PrivacyGateError"}
-            },
+            "responses":responses,
             "security":security
         });
         if let Some(schema) = request_schema {
@@ -557,46 +617,12 @@ pub fn document() -> Value {
                 json!({"required":true,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}}),
             );
         }
-        if matches!(
-            (path, method),
-            ("/v1/privacy/requests/{id}/export", "post")
-                | (
-                    "/v1/workshops/{id}/database/backups/{recovery_id}/download",
-                    "post"
-                )
-        ) {
-            let responses = operation["responses"].as_object_mut().expect("responses");
-            for status in ["200", "201", "202"] {
-                responses.insert(
-                    status.into(),
-                    json!({"description":"Successful binary response","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}}}),
-                );
-            }
-        }
-        if method == "get" {
-            for status in ["201", "202"] {
-                operation["responses"][status] = json!({
-                    "description":"Reserved compatibility response; this read operation returns 200."
-                });
-            }
-        }
-        if matches!(
-            (path, method),
-            ("/v1/invitations/{id}", "delete")
-                | ("/v1/platform/releases/{id}/retry-failed-tenants", "post")
-        ) {
-            for status in ["200", "201", "202"] {
-                operation["responses"][status] = json!({
-                    "description":"Reserved compatibility response with no representation."
-                });
-            }
-        }
-        if path == "/v1/invitations/{id}" && method == "delete" {
-            operation["responses"]["204"] = json!({"description":"Invitation revoked"});
-        }
         if versioned_mutations.contains(&path) {
-            for status in ["200", "201", "202"] {
-                operation["responses"][status]["headers"] = json!({
+            for status in success_statuses(path, method) {
+                if *status == "204" {
+                    continue;
+                }
+                operation["responses"][*status]["headers"] = json!({
                     "ETag": {
                         "description":"Strong resource version returned after the command.",
                         "schema":{"type":"string"}
@@ -860,6 +886,32 @@ mod tests {
                 .iter()
                 .all(|parameter| parameter["name"] != "If-Match")
         );
+    }
+
+    #[test]
+    fn success_responses_match_executable_statuses() {
+        let contract = document();
+        let statuses = |path: &str, method: &str| {
+            contract["paths"][path][method]["responses"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|status| status.starts_with('2'))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(statuses("/v1/me", "get"), BTreeSet::from(["200".into()]));
+        assert_eq!(
+            statuses("/v1/identity/link", "post"),
+            BTreeSet::from(["200".into(), "201".into(), "202".into()])
+        );
+        assert_eq!(
+            statuses("/v1/invitations/{id}", "delete"),
+            BTreeSet::from(["202".into(), "204".into()])
+        );
+        assert!(statuses("/v1/platform/releases/{id}/retry-failed-tenants", "post").is_empty());
+        let serialized = serde_json::to_string(&contract).unwrap();
+        assert!(!serialized.contains("Reserved compatibility response"));
     }
 
     #[test]

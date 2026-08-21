@@ -74,7 +74,8 @@ begin
     raise exception 'API privacy export boundary is unsafe';
   end if;
   if not has_table_privilege('control_driver_ledger','control.deployment_driver_operations','UPDATE')
-     or has_table_privilege('control_driver_ledger','control.workshops','SELECT') then
+     or has_table_privilege('control_driver_ledger','control.workshops','SELECT')
+     or not has_function_privilege('control_driver_ledger','control.initial_release_preparable(text,integer)','EXECUTE') then
     raise exception 'driver ledger privileges are unsafe';
   end if;
   if not has_table_privilege('control_api','control.capability_registry_entries','SELECT')

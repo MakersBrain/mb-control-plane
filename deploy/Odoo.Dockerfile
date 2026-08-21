@@ -14,4 +14,5 @@ RUN --mount=type=cache,id=odoo-apt-lists,target=/var/lib/apt/lists,sharing=locke
     apt-get install -y --no-install-recommends python3-jose
 COPY --chown=odoo:odoo addons /mnt/makersbrain-addons
 COPY --chown=odoo:odoo --from=oca /server-auth/auth_oidc /mnt/oca-addons/auth_oidc
+COPY --chmod=0555 control-plane/deploy/odoo-secret-entrypoint.sh /usr/local/bin/odoo-secret-entrypoint
 USER odoo

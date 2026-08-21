@@ -1,0 +1,33 @@
+{
+  "postgres_major": 17,
+  "relations": [
+    "application_releases", "audit_events", "capability_registry_entries",
+    "capability_registry_versions", "carrier_secrets", "commands",
+    "data_subject_export_status", "data_subject_exports",
+    "data_subject_processor_tasks", "data_subject_requests",
+    "deployment_driver_operations", "email_delivery_events", "email_suppressions",
+    "entitlements", "erasure_restore_replays", "erasure_subject_lookups",
+    "erasure_tombstones", "external_identities", "fleet_activation_intents",
+    "invitations", "legal_holds", "membership_targets", "memberships",
+    "odoo_databases", "operations", "outbox", "ownership_transfers",
+    "platform_authority_state", "platform_role_assignments", "privacy_incidents",
+    "privacy_platform_state", "processing_holds", "processing_register_versions",
+    "processor_approvals", "product_lookup_cache", "product_lookup_fills",
+    "provider_rate_limits", "release_fleet_runs", "retention_policy_versions",
+    "retention_runs", "runtime_release_slots", "service_instances",
+    "tenant_release_adoptions", "usage_counters", "usage_reservations", "users",
+    "webshop_domains", "webshop_email_domains", "webshop_onboarding",
+    "worker_heartbeats", "workshop_deletions", "workshop_modules",
+    "workshop_recovery_components", "workshop_recovery_points",
+    "workshop_recovery_rehearsals", "workshops"
+  ],
+  "catalog": {
+    "columns": {"count": 633, "digest": "283b4db7dcd423a9ad6ca9709b20d85c"},
+    "constraints": {"count": 498, "digest": "015252aa5976a0347295a40e295f6620"},
+    "indexes": {"count": 125, "digest": "b324de80bd84fa6b665e85b6e8549ba5"},
+    "functions": {"count": 20, "digest": "e2f89e8f22d849f30409fd009f25c0bf"},
+    "triggers": {"count": 15, "digest": "df70a96b4fdf587e336ce7ec19e653da"},
+    "privileges": {"count": 931, "digest": "19388facd0e7adc1a3c5cdf001c98815"},
+    "default_privileges": {"count": 3, "digest": "0c6219b31f278a51ab29c7f4446032a4"}
+  }
+}

@@ -9,7 +9,7 @@ use crate::domain::IntegrationError;
 use crate::integrations::odoo::OdooClient;
 use crate::integrations::paperless::PaperlessClient;
 use crate::persistence::{LeasedOperation, Store};
-use crate::worker::{env, extraction_broker, secret, service};
+use crate::worker::{extraction_broker, secret, service};
 
 pub(crate) async fn invoice(
     store: &Store,
@@ -50,7 +50,7 @@ pub(crate) async fn invoice(
         .ok_or(IntegrationError::NotFound)?;
     let paperless_public_url = format!(
         "https://docs-{slug}.{}/documents/{document_id}/details",
-        env("CONTROL_TENANT_DOMAIN")?
+        crate::worker::configuration("CONTROL_TENANT_DOMAIN")?
     );
     let digest = format!("{:x}", Sha256::digest(&source));
     let (provider, invoice, confidence, pages) = if let Some(invoice) =

@@ -12,7 +12,7 @@ use crate::persistence::{LeasedOperation, Store};
 fn client() -> Result<CloudflareCustomHostnameClient, IntegrationError> {
     let token = crate::runtime_secret::required("CONTROL_CLOUDFLARE_API_TOKEN")
         .map_err(|_| IntegrationError::ContractDrift)?;
-    let zone_id = crate::runtime_secret::required("CONTROL_CLOUDFLARE_ZONE_ID")
+    let zone_id = crate::runtime_secret::required_configuration("CONTROL_CLOUDFLARE_ZONE_ID")
         .map_err(|_| IntegrationError::ContractDrift)?;
     CloudflareCustomHostnameClient::new(token, zone_id, Duration::from_secs(20))
 }
@@ -125,7 +125,7 @@ pub(crate) async fn run(
         .map_err(|_| IntegrationError::Unavailable)?;
         let payload = json!({
             "database_id":tenant.0,"database_ref":tenant.2,"public_hostname":tenant.3,
-            "paperless_hostname":format!("docs-{}.{}",tenant.1,crate::worker::env("CONTROL_TENANT_DOMAIN")?),
+            "paperless_hostname":format!("docs-{}.{}",tenant.1,crate::worker::configuration("CONTROL_TENANT_DOMAIN")?),
             "paperless_enabled":tenant.4,
             "custom_hostnames":crate::worker::routable_custom_hostnames(store,workshop)
                 .await.map_err(|_| IntegrationError::Unavailable)?
@@ -232,7 +232,7 @@ pub(crate) async fn run(
     .map_err(|_| IntegrationError::Unavailable)?;
     let payload = json!({
         "database_id":tenant.0,"database_ref":tenant.2,"public_hostname":tenant.3,
-        "paperless_hostname":format!("docs-{}.{}",tenant.1,crate::worker::env("CONTROL_TENANT_DOMAIN")?),
+        "paperless_hostname":format!("docs-{}.{}",tenant.1,crate::worker::configuration("CONTROL_TENANT_DOMAIN")?),
         "paperless_enabled":tenant.4,
         "custom_hostnames":crate::worker::routable_custom_hostnames(store,workshop)
             .await.map_err(|_| IntegrationError::Unavailable)?

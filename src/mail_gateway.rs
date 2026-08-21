@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY, UnparsedPublicKey};
+use aws_lc_rs::signature::{
+    RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY, RSA_PKCS1_2048_8192_SHA256, RsaParameters,
+    UnparsedPublicKey,
+};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -191,19 +194,21 @@ struct JournalRecord {
 
 impl MailGatewayState {
     pub fn from_env() -> anyhow::Result<Self> {
-        let required = |name| crate::runtime_secret::required(name).map_err(anyhow::Error::msg);
-        let listen = required("MAIL_GATEWAY_LISTEN")?.parse()?;
-        let environment = required("MAIL_GATEWAY_ENVIRONMENT")?;
+        let configured =
+            |name| crate::runtime_secret::required_configuration(name).map_err(anyhow::Error::msg);
+        let secret = |name| crate::runtime_secret::required(name).map_err(anyhow::Error::msg);
+        let listen = configured("MAIL_GATEWAY_LISTEN")?.parse()?;
+        let environment = configured("MAIL_GATEWAY_ENVIRONMENT")?;
         if !matches!(environment.as_str(), "staging" | "production") {
             anyhow::bail!("MAIL_GATEWAY_ENVIRONMENT must be staging or production");
         }
-        let endpoint = Url::parse(&required("MAIL_GATEWAY_SCW_ENDPOINT")?)?;
+        let endpoint = Url::parse(&configured("MAIL_GATEWAY_SCW_ENDPOINT")?)?;
         if endpoint.as_str() != SCALEWAY_ENDPOINT {
             anyhow::bail!("MAIL_GATEWAY_SCW_ENDPOINT must use the Scaleway Paris TEM endpoint");
         }
-        let project_id = required("MAIL_GATEWAY_SCW_PROJECT_ID")?.parse()?;
-        let domain_id = required("MAIL_GATEWAY_SCW_DOMAIN_ID")?.parse()?;
-        let from_email = required("MAIL_GATEWAY_FROM_EMAIL")?.to_ascii_lowercase();
+        let project_id = configured("MAIL_GATEWAY_SCW_PROJECT_ID")?.parse()?;
+        let domain_id = configured("MAIL_GATEWAY_SCW_DOMAIN_ID")?.parse()?;
+        let from_email = configured("MAIL_GATEWAY_FROM_EMAIL")?.to_ascii_lowercase();
         validate_email(&from_email)?;
         let from_domain = from_email
             .rsplit_once('@')
@@ -217,17 +222,17 @@ impl MailGatewayState {
         if !valid_sender {
             anyhow::bail!("mail sender does not belong to the environment TEM domain");
         }
-        let from_name = required("MAIL_GATEWAY_FROM_NAME")?;
+        let from_name = configured("MAIL_GATEWAY_FROM_NAME")?;
         if from_name.len() > 100 || from_name.chars().any(char::is_control) {
             anyhow::bail!("MAIL_GATEWAY_FROM_NAME is invalid");
         }
-        let allowed_recipients = load_recipients(Path::new(&required(
+        let allowed_recipients = load_recipients(Path::new(&configured(
             "MAIL_GATEWAY_ALLOWED_RECIPIENTS_FILE",
         )?))?;
         if environment == "staging" && allowed_recipients.is_empty() {
             anyhow::bail!("staging requires at least one explicitly allowed synthetic recipient");
         }
-        let mut provider_token = HeaderValue::from_str(&required("MAIL_GATEWAY_SCW_SECRET_KEY")?)?;
+        let mut provider_token = HeaderValue::from_str(&secret("MAIL_GATEWAY_SCW_SECRET_KEY")?)?;
         provider_token.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("X-Auth-Token", provider_token);
@@ -245,7 +250,7 @@ impl MailGatewayState {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("makersbrain-mail-gateway/1")
             .build()?;
-        let control_event_url = Url::parse(&required("MAIL_GATEWAY_CONTROL_EVENT_URL")?)?;
+        let control_event_url = Url::parse(&configured("MAIL_GATEWAY_CONTROL_EVENT_URL")?)?;
         if !matches!(control_event_url.scheme(), "http" | "https")
             || control_event_url.path() != "/internal/v1/mail-events"
             || control_event_url.query().is_some()
@@ -255,20 +260,21 @@ impl MailGatewayState {
                 "MAIL_GATEWAY_CONTROL_EVENT_URL must select the exact control event route"
             );
         }
-        let sns_topic_arn = required("MAIL_GATEWAY_SNS_TOPIC_ARN")?;
+        let sns_topic_arn = configured("MAIL_GATEWAY_SNS_TOPIC_ARN")?;
         validate_topic_arn(&sns_topic_arn)?;
         let (sns_root_ca, sns_intermediate_ca) =
-            load_sns_trust_chain(Path::new(&required("MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE")?))?;
-        let event_journal =
-            EventJournal::load(PathBuf::from(required("MAIL_GATEWAY_EVENT_JOURNAL_FILE")?))?;
+            load_sns_trust_chain(Path::new(&configured("MAIL_GATEWAY_SNS_TRUST_CHAIN_FILE")?))?;
+        let event_journal = EventJournal::load(PathBuf::from(configured(
+            "MAIL_GATEWAY_EVENT_JOURNAL_FILE",
+        )?))?;
         Ok(Self {
             listen,
             environment,
-            internal_token: required("MAIL_GATEWAY_INTERNAL_TOKEN")?,
+            internal_token: secret("MAIL_GATEWAY_INTERNAL_TOKEN")?,
             provider_client,
             public_client,
             control_event_url,
-            control_event_token: required("MAIL_GATEWAY_CONTROL_EVENT_TOKEN")?,
+            control_event_token: secret("MAIL_GATEWAY_CONTROL_EVENT_TOKEN")?,
             endpoint,
             project_id,
             domain_id,
@@ -643,7 +649,7 @@ fn validate_sns_envelope(envelope: &SnsEnvelope, expected_topic: &str) -> Result
     if !matches!(
         envelope.kind.as_str(),
         "Notification" | "SubscriptionConfirmation"
-    ) || envelope.signature_version != "1"
+    ) || !matches!(envelope.signature_version.as_str(), "1" | "2")
         || envelope.topic_arn != expected_topic
         || envelope.message.len() > 256 * 1024
         || envelope
@@ -795,24 +801,32 @@ fn verify_sns_signature(envelope: &SnsEnvelope, certificate: &[u8]) -> Result<()
     }
     let end_der = CertificateDer::from(certificate);
     let end = EndEntityCert::try_from(&end_der).map_err(|_| StatusCode::BAD_REQUEST)?;
-    verify_rsa_sha1(
+    verify_rsa(
+        sns_signature_algorithm(&envelope.signature_version)?,
         end.subject_public_key_info().as_ref(),
         canonical_sns_message(envelope)?.as_bytes(),
         &signature,
     )
 }
 
-fn verify_rsa_sha1(
+fn sns_signature_algorithm(version: &str) -> Result<&'static RsaParameters, StatusCode> {
+    match version {
+        // Scaleway currently documents and emits SNS SignatureVersion 1.
+        "1" => Ok(&RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
+        "2" => Ok(&RSA_PKCS1_2048_8192_SHA256),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn verify_rsa(
+    algorithm: &'static RsaParameters,
     subject_public_key_info: &[u8],
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), StatusCode> {
-    UnparsedPublicKey::new(
-        &RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
-        subject_public_key_info,
-    )
-    .verify(message, signature)
-    .map_err(|_| StatusCode::UNAUTHORIZED)
+    UnparsedPublicKey::new(algorithm, subject_public_key_info)
+        .verify(message, signature)
+        .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
 fn canonical_sns_message(envelope: &SnsEnvelope) -> Result<String, StatusCode> {
@@ -1322,6 +1336,48 @@ mod tests {
     }
 
     #[test]
+    fn sns_signature_versions_dispatch_explicitly() {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::rsa::KeySize;
+        use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_SHA256, RsaKeyPair};
+
+        let key_pair = RsaKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let message = canonical_sns_message(&notification_envelope()).unwrap();
+        let mut signature = vec![0; key_pair.public_modulus_len()];
+        key_pair
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                message.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        assert!(
+            verify_rsa(
+                sns_signature_algorithm("2").unwrap(),
+                key_pair.public_key().as_ref(),
+                message.as_bytes(),
+                &signature,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            verify_rsa(
+                sns_signature_algorithm("1").unwrap(),
+                key_pair.public_key().as_ref(),
+                message.as_bytes(),
+                &signature,
+            )
+            .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            sns_signature_algorithm("3").unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn sns_rsa_sha1_signature_is_verified_and_tampering_is_rejected() {
         // Fixed test-only RSA material generated for this canonical SNS fixture.
         let subject_public_key_info = base64::engine::general_purpose::STANDARD
@@ -1332,10 +1388,22 @@ mod tests {
             .unwrap();
         let canonical = canonical_sns_message(&notification_envelope()).unwrap();
         assert!(
-            verify_rsa_sha1(&subject_public_key_info, canonical.as_bytes(), &signature).is_ok()
+            verify_rsa(
+                sns_signature_algorithm("1").unwrap(),
+                &subject_public_key_info,
+                canonical.as_bytes(),
+                &signature,
+            )
+            .is_ok()
         );
         assert_eq!(
-            verify_rsa_sha1(&subject_public_key_info, b"tampered", &signature).unwrap_err(),
+            verify_rsa(
+                sns_signature_algorithm("1").unwrap(),
+                &subject_public_key_info,
+                b"tampered",
+                &signature,
+            )
+            .unwrap_err(),
             StatusCode::UNAUTHORIZED
         );
     }

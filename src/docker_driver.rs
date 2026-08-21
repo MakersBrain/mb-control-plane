@@ -171,7 +171,7 @@ impl DockerDriverConfig {
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.parse())
             .transpose()?;
-        let postgres_admin_url = required("DRIVER_POSTGRES_ADMIN_URL")?;
+        let postgres_admin_url = required_secret("DRIVER_POSTGRES_ADMIN_URL")?;
         let parsed_admin_url = Url::parse(&postgres_admin_url)?;
         let postgres_admin_user = parsed_admin_url.username().to_owned();
         let postgres_admin_password = parsed_admin_url
@@ -186,11 +186,11 @@ impl DockerDriverConfig {
             optional("BACKUP_S3_BUCKET")?,
             optional("BACKUP_S3_ENDPOINT")?,
             optional("BACKUP_S3_REGION")?,
-            optional("BACKUP_S3_ACCESS_KEY_ID")?,
-            optional("BACKUP_S3_SECRET_ACCESS_KEY")?,
-            optional("RESTORE_S3_ACCESS_KEY_ID")?,
-            optional("RESTORE_S3_SECRET_ACCESS_KEY")?,
-            optional("BACKUP_AGE_RECIPIENT")?,
+            optional_secret("BACKUP_S3_ACCESS_KEY_ID")?,
+            optional_secret("BACKUP_S3_SECRET_ACCESS_KEY")?,
+            optional_secret("RESTORE_S3_ACCESS_KEY_ID")?,
+            optional_secret("RESTORE_S3_SECRET_ACCESS_KEY")?,
+            optional_secret("BACKUP_AGE_RECIPIENT")?,
             optional("BACKUP_AGE_IDENTITY_FILE")?,
             optional("BACKUP_ENCRYPTION_KEY_ID")?,
             optional("BACKUP_RETENTION_DAYS")?,
@@ -244,8 +244,8 @@ impl DockerDriverConfig {
         } else {
             anyhow::bail!("all S3 backup, restore, and age settings must be configured together");
         };
-        let token = required("DRIVER_TOKEN")?;
-        let privacy_token = required("DRIVER_PRIVACY_TOKEN")?;
+        let token = required_secret("DRIVER_TOKEN")?;
+        let privacy_token = required_secret("DRIVER_PRIVACY_TOKEN")?;
         if token == privacy_token {
             anyhow::bail!("DRIVER_TOKEN and DRIVER_PRIVACY_TOKEN must be distinct");
         }
@@ -279,15 +279,15 @@ impl DockerDriverConfig {
             privacy_token,
             container_runtime,
             runtime_socket,
-            database_url: required("DRIVER_DATABASE_URL")?,
+            database_url: required_secret("DRIVER_DATABASE_URL")?,
             postgres_admin_url,
             postgres_admin_user,
             postgres_admin_password,
             postgres_host: required("DRIVER_POSTGRES_HOST")?,
             postgres_port: required("DRIVER_POSTGRES_PORT")?.parse()?,
             postgres_ca_source,
-            odoo_postgres_password: required("DRIVER_ODOO_POSTGRES_PASSWORD")?,
-            odoo_bridge_token: required("DRIVER_ODOO_BRIDGE_TOKEN")?,
+            odoo_postgres_password: required_secret("DRIVER_ODOO_POSTGRES_PASSWORD")?,
+            odoo_bridge_token: required_secret("DRIVER_ODOO_BRIDGE_TOKEN")?,
             odoo_image: required("DRIVER_ODOO_IMAGE")?,
             postgres_image: required("DRIVER_POSTGRES_IMAGE")?,
             paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
@@ -314,7 +314,7 @@ impl DockerDriverConfig {
             odoo_base_url: absolute_http("DRIVER_ODOO_BASE_URL")?,
             control_internal_url: absolute_http("DRIVER_CONTROL_INTERNAL_URL")?,
             rauthy_admin_url: absolute_http("DRIVER_RAUTHY_ADMIN_URL")?,
-            rauthy_admin_key: required("DRIVER_RAUTHY_ADMIN_KEY")?,
+            rauthy_admin_key: required_secret("DRIVER_RAUTHY_ADMIN_KEY")?,
             oidc_issuer: absolute_http("DRIVER_OIDC_ISSUER")?,
             public_scheme,
             public_port,
@@ -330,10 +330,20 @@ impl DockerDriverConfig {
 }
 
 fn required(name: &'static str) -> anyhow::Result<String> {
-    crate::runtime_secret::required(name).map_err(anyhow::Error::msg)
+    crate::runtime_secret::required_configuration(name).map_err(anyhow::Error::msg)
 }
 
 fn optional(name: &'static str) -> anyhow::Result<Option<String>> {
+    crate::runtime_secret::configuration(name)
+        .map(|value| value.filter(|value| !value.trim().is_empty()))
+        .map_err(anyhow::Error::msg)
+}
+
+fn required_secret(name: &'static str) -> anyhow::Result<String> {
+    crate::runtime_secret::required(name).map_err(anyhow::Error::msg)
+}
+
+fn optional_secret(name: &'static str) -> anyhow::Result<Option<String>> {
     crate::runtime_secret::environment(name)
         .map(|value| value.filter(|value| !value.trim().is_empty()))
         .map_err(anyhow::Error::msg)
@@ -828,22 +838,14 @@ async fn provision(
         .join("odoo")
         .join(workshop.to_string());
     secure_directory(&odoo_runtime).map_err(DriverError::internal)?;
-    seed_runtime_secret(
-        &odoo_runtime.join("admin-password"),
-        &[tenant_secret_dir.join("odoo-admin")],
-    )
-    .map_err(DriverError::internal)?;
     let _odoo_admin =
         secret_value(&odoo_runtime.join("admin-password"), 64).map_err(DriverError::internal)?;
     ensure_database(&state.postgres, database_ref, "odoo", None).await?;
     let (odoo_client_id, paperless_oidc) =
         ensure_oidc_clients(state, &compact, odoo_hostname, paperless_hostname).await?;
     ensure_odoo_database(state, database_ref, &compact).await?;
-    let tenant_bridge_token = tenant_bridge_secret(
-        &tenant_secret_dir.join("odoo"),
-        &state.config.odoo_bridge_token,
-    )
-    .map_err(DriverError::internal)?;
+    let (tenant_bridge_token, tenant_credential_created) =
+        tenant_bridge_secret(&tenant_secret_dir.join("odoo")).map_err(DriverError::internal)?;
     write_secret(
         &state
             .config
@@ -874,9 +876,18 @@ async fn provision(
         Some(state.config.odoo_gid),
     )
     .map_err(DriverError::internal)?;
-    let tenant_odoo = OdooClient::new(
+    // A newly created database has no tenant verifier yet, so its one initial
+    // bootstrap is authenticated by the process bootstrap credential. On
+    // retries the persisted tenant credential is used directly; an
+    // Unauthorized response is never retried with the shared credential.
+    let bootstrap_token = if tenant_credential_created {
+        &state.config.odoo_bridge_token
+    } else {
+        &tenant_bridge_token
+    };
+    let bootstrap_client = OdooClient::new(
         &state.config.odoo_base_url,
-        &tenant_bridge_token,
+        bootstrap_token,
         Some(database_ref),
         Duration::from_secs(30),
     )
@@ -889,27 +900,11 @@ async fn provision(
         bridge_token: tenant_bridge_token.clone(),
         public_hostname: odoo_hostname.to_owned(),
     };
-    match tenant_odoo.bootstrap_tenant(&bootstrap).await {
-        Ok(_) => {}
-        Err(IntegrationError::Unauthorized) => {
-            OdooClient::new(
-                &state.config.odoo_base_url,
-                &state.config.odoo_bridge_token,
-                Some(database_ref),
-                Duration::from_secs(30),
-            )
-            .map_err(DriverError::internal)?
-            .bootstrap_tenant(&bootstrap)
-            .await
-            .map_err(DriverError::internal)?;
-        }
-        Err(error) => return Err(DriverError::internal(error)),
-    }
+    bootstrap_client
+        .bootstrap_tenant(&bootstrap)
+        .await
+        .map_err(DriverError::internal)?;
     ensure_odoo_break_glass(state, workshop, database_ref, &compact).await?;
-    let legacy_odoo_admin = tenant_secret_dir.join("odoo-admin");
-    if legacy_odoo_admin.is_file() {
-        std::fs::remove_file(legacy_odoo_admin).map_err(DriverError::internal)?;
-    }
     let mut response = json!({
         "workshop_id": workshop,
         "action": "provision",
@@ -917,7 +912,7 @@ async fn provision(
         "odoo": {
             "base_url": state.config.odoo_base_url,
             "secret_ref": format!("docker/{workshop}/odoo"),
-            "break_glass_secret_ref": format!("docker/{workshop}/odoo-admin"),
+            "break_glass_secret_ref": format!("driver-runtime/odoo/{workshop}/admin-password"),
             "database": {"database_ref": database_ref, "public_hostname": odoo_hostname}
         },
         "odoo_oidc": {"client_id": odoo_client_id, "issuer": state.config.oidc_issuer},
@@ -936,40 +931,6 @@ async fn provision(
                 .join("paperless")
                 .join(workshop.to_string());
             secure_directory(&paperless_runtime).map_err(DriverError::internal)?;
-            let legacy_runtime = tenant_secret_dir.join("paperless-runtime");
-            for (target, legacy) in [
-                (
-                    "admin-password",
-                    [
-                        tenant_secret_dir.join("paperless-admin"),
-                        legacy_runtime.join("admin-password"),
-                    ],
-                ),
-                (
-                    "database-password",
-                    [
-                        tenant_secret_dir.join("paperless-db"),
-                        legacy_runtime.join("database-password"),
-                    ],
-                ),
-                (
-                    "secret-key",
-                    [
-                        tenant_secret_dir.join("paperless-secret-key"),
-                        legacy_runtime.join("secret-key"),
-                    ],
-                ),
-                (
-                    "redis-password",
-                    [
-                        tenant_secret_dir.join("redis"),
-                        legacy_runtime.join("redis-password"),
-                    ],
-                ),
-            ] {
-                seed_runtime_secret(&paperless_runtime.join(target), &legacy)
-                    .map_err(DriverError::internal)?;
-            }
             write_secret(
                 &paperless_runtime.join("oidc-secret"),
                 &paperless_oidc_secret,
@@ -1027,8 +988,6 @@ async fn provision(
                 paperless_hostname,
             )
             .await?;
-            remove_legacy_paperless_runtime_secrets(&tenant_secret_dir)
-                .map_err(DriverError::internal)?;
             response["paperless"] = json!({
                 "base_url": format!("http://{paperless_container}:8000"),
                 "public_hostname": paperless_hostname,
@@ -1359,56 +1318,22 @@ fn secret_value(path: &Path, length: usize) -> std::io::Result<String> {
     Ok(value)
 }
 
-fn tenant_bridge_secret(path: &Path, bootstrap_token: &str) -> std::io::Result<String> {
+fn tenant_bridge_secret(path: &Path) -> std::io::Result<(String, bool)> {
     if path.exists() {
         let value = std::fs::read_to_string(path)?.trim().to_owned();
-        if value != bootstrap_token {
-            if (48..=128).contains(&value.len())
-                && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            {
-                return Ok(value);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "tenant bridge credential has an invalid format",
-            ));
+        if (48..=128).contains(&value.len())
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Ok((value, false));
         }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tenant bridge credential has an invalid format",
+        ));
     }
     let value = Alphanumeric.sample_string(&mut rand::rng(), 64);
     write_secret(path, &value)?;
-    Ok(value)
-}
-
-fn seed_runtime_secret(target: &Path, legacy: &[PathBuf]) -> std::io::Result<()> {
-    if target.is_file() {
-        return Ok(());
-    }
-    if let Some(source) = legacy.iter().find(|candidate| candidate.is_file()) {
-        let value = std::fs::read_to_string(source)?;
-        return write_secret(target, value.trim_end_matches(['\r', '\n']));
-    }
-    Ok(())
-}
-
-fn remove_legacy_paperless_runtime_secrets(tenant: &Path) -> std::io::Result<()> {
-    for name in [
-        "paperless-admin",
-        "paperless-db",
-        "paperless-secret-key",
-        "paperless-oidc",
-        "paperless",
-        "redis",
-    ] {
-        let path = tenant.join(name);
-        if path.is_file() {
-            std::fs::remove_file(path)?;
-        }
-    }
-    let nested = tenant.join("paperless-runtime");
-    if nested.is_dir() {
-        std::fs::remove_dir_all(nested)?;
-    }
-    Ok(())
+    Ok((value, true))
 }
 
 async fn run_docker_job(
@@ -1707,22 +1632,22 @@ mod tests {
     }
 
     #[test]
-    fn tenant_bridge_credentials_are_unique_and_rotate_the_legacy_global_value() {
+    fn tenant_bridge_credentials_are_unique_and_invalid_values_fail_closed() {
         let root = std::env::temp_dir().join(format!("mb-tenant-token-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let legacy = "legacyGlobalBootstrapCredential012345678901234567890123";
         let first_path = root.join("first");
         let second_path = root.join("second");
-        write_secret(&first_path, legacy).unwrap();
 
-        let first = tenant_bridge_secret(&first_path, legacy).unwrap();
-        let second = tenant_bridge_secret(&second_path, legacy).unwrap();
+        let (first, first_created) = tenant_bridge_secret(&first_path).unwrap();
+        let (second, second_created) = tenant_bridge_secret(&second_path).unwrap();
 
-        assert_ne!(first, legacy);
+        assert!(first_created && second_created);
         assert_ne!(first, second);
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_alphanumeric()));
-        assert_eq!(tenant_bridge_secret(&first_path, legacy).unwrap(), first);
+        assert_eq!(tenant_bridge_secret(&first_path).unwrap(), (first, false));
+        write_secret(&first_path, "invalid").unwrap();
+        assert!(tenant_bridge_secret(&first_path).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1763,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_tenant_secrets_are_migrated_to_worker_readable_modes() {
+    fn tenant_secret_permissions_are_normalized_for_worker_access() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!("mb-secrets-{}", Uuid::new_v4()));
@@ -1842,50 +1767,6 @@ mod tests {
         std::fs::write(root.join("operator-material"), "preserve").unwrap();
         assert!(clear_stale_job_secrets(&root).is_err());
         assert!(root.join("operator-material").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_paperless_infrastructure_secrets_move_out_of_the_worker_volume() {
-        let root = std::env::temp_dir().join(format!("mb-paperless-move-{}", Uuid::new_v4()));
-        let tenant = root.join("tenant");
-        let runtime = root.join("driver-runtime");
-        let client = root.join("paperless-client");
-        std::fs::create_dir_all(tenant.join("paperless-runtime")).unwrap();
-        std::fs::create_dir(&runtime).unwrap();
-        std::fs::create_dir(&client).unwrap();
-        std::fs::write(tenant.join("paperless-db"), "database-secret").unwrap();
-        std::fs::write(tenant.join("paperless"), "basic:local-admin:needed").unwrap();
-        std::fs::write(tenant.join("odoo"), "tenant-bridge").unwrap();
-        std::fs::write(
-            tenant.join("paperless-runtime/database-password"),
-            "older-copy",
-        )
-        .unwrap();
-
-        seed_runtime_secret(
-            &runtime.join("database-password"),
-            &[
-                tenant.join("paperless-db"),
-                tenant.join("paperless-runtime/database-password"),
-            ],
-        )
-        .unwrap();
-        seed_runtime_secret(&client.join("paperless"), &[tenant.join("paperless")]).unwrap();
-        remove_legacy_paperless_runtime_secrets(&tenant).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(runtime.join("database-password")).unwrap(),
-            "database-secret"
-        );
-        assert!(!tenant.join("paperless-db").exists());
-        assert!(!tenant.join("paperless-runtime").exists());
-        assert!(!tenant.join("paperless").exists());
-        assert_eq!(
-            std::fs::read_to_string(client.join("paperless")).unwrap(),
-            "basic:local-admin:needed"
-        );
-        assert!(tenant.join("odoo").is_file());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -30,8 +30,9 @@ Redis is deliberately excluded because it is derived queue/cache state.
 
 The component scope is immutable. A full restore requires the current workshop
 to have the same Paperless scope; restore never silently activates, disables,
-or wipes an optional service. Version-1 Odoo-only local sets remain readable as
-legacy recovery points.
+or wipes an optional service. Only the complete
+`makersbrain-workshop-recovery-v2` format is accepted; recovery artifacts from
+the disposable pre-release schema epoch are not retained or restorable.
 
 The manifest records component checksums, source release, and exact Paperless
 image. A Paperless restore is rejected until the recorded image version is

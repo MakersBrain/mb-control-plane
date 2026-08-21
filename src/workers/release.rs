@@ -32,6 +32,16 @@ pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
     {
         tracing::error!(operation=%operation.id,error=%error,"failed to record terminal fleet failure");
     }
+    if let Err(error) = sqlx::query(
+        "update control.runtime_release_slots set state='failed',version=version+1
+         where release_id=$1 and state='prepared'",
+    )
+    .bind(release_id)
+    .execute(store.pool())
+    .await
+    {
+        tracing::error!(operation=%operation.id,error=%error,"failed to quarantine prepared release runtime");
+    }
 }
 
 pub(crate) fn validate_configuration() -> anyhow::Result<()> {
@@ -41,13 +51,14 @@ pub(crate) fn validate_configuration() -> anyhow::Result<()> {
         "CONTROL_RELEASE_COSIGN_IDENTITY",
         "CONTROL_RELEASE_COSIGN_REPOSITORY",
         "CONTROL_DEPLOYMENT_DRIVER_URL",
-        "CONTROL_DEPLOYMENT_DRIVER_TOKEN",
     ] {
-        crate::runtime_secret::environment(name)
+        crate::runtime_secret::configuration(name)
             .map_err(anyhow::Error::msg)?
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("{name} is required for release adoption"))?;
     }
+    crate::runtime_secret::required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
+        .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -77,7 +88,7 @@ async fn verify_release_provenance(
 }
 
 fn required_release_setting(name: &'static str) -> Result<String, IntegrationError> {
-    crate::runtime_secret::required(name).map_err(|_| IntegrationError::ContractDrift)
+    crate::runtime_secret::required_configuration(name).map_err(|_| IntegrationError::ContractDrift)
 }
 
 async fn run_cosign(executable: &str, arguments: &[&str]) -> Result<Vec<u8>, IntegrationError> {
@@ -194,6 +205,35 @@ async fn release_preflight(
             .save_operation_checkpoint(operation, &checkpoint)
             .await
             .map_err(|_| IntegrationError::Unavailable)?,
+    }
+    if tenants.is_empty() {
+        let prepared = driver_request_with_key(
+            operation.id,
+            Uuid::nil(),
+            "release",
+            &format!("release-initial:{release_id}"),
+            &json!({
+                "phase":"prepare-initial",
+                "release_id":release_id,
+                "manifest_digest":manifest_digest,
+            }),
+        )
+        .await?;
+        let evidence = prepared
+            .get("evidence")
+            .filter(|value| value.is_object())
+            .ok_or(IntegrationError::ContractDrift)?;
+        if evidence.get("release_id").and_then(Value::as_str) != Some(release_id)
+            || evidence.get("manifest_digest").and_then(Value::as_str)
+                != Some(manifest_digest.as_str())
+            || evidence.get("provenance_verified").and_then(Value::as_bool) != Some(true)
+            || evidence
+                .get("runtime_inspection_verified")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(IntegrationError::ContractDrift);
+        }
     }
     let mut current = status;
     if current == "preflighting" {

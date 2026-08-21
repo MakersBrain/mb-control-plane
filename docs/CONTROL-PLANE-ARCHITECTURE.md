@@ -82,14 +82,13 @@ Worker-facing integration credentials are separated again: the tenant volume
 contains a distinct high-entropy Odoo bridge token per workshop, while a
 dedicated read-only Paperless client volume is mounted only by the membership
 and invoice workers. Odoo stores only the token's SHA-256 verifier in the
-selected tenant database and accepts the shared bootstrap credential only until
-that verifier exists. Neither worker-facing volume exposes Paperless
+selected tenant database. Neither worker-facing volume exposes Paperless
 infrastructure credentials.
 
-The one-time migration from the former shared bridge credential keeps the
-existing verifier only through fleet upgrade, then tenant reconciliation
-rotates each workshop independently. Production evidence must show that no
-routed workshop remains on the transitional verifier.
+Fresh provisioning uses the process bootstrap credential for the single
+initial tenant-bootstrap request that installs the new tenant verifier. A retry
+with an already-created tenant credential authenticates directly as that
+tenant; authentication failures are never retried with the process credential.
 
 Application releases are immutable, signed manifest records with image,
 source, addon, schema-epoch and directional-compatibility evidence. Tenant
@@ -118,7 +117,7 @@ deployment requirement.
 
 ## 5. Control data and operations
 
-Thirty forward SQL migrations create the control schema. Principal records
+One curated base migration creates the control schema. Principal records
 include users and external identities, workshops and memberships, invitations,
 service instances, desired membership targets, ownership transfers,
 entitlements, capability state, usage reservations/counters, the email outbox,
@@ -142,10 +141,9 @@ once. The same declarations construct the Axum router and OpenAPI path set, so
 the executable contract no longer depends on a duplicated list or source-text
 regex. Public mutation responses use closed schemas, including explicit replay
 and in-progress variants; downloads declare binary media and versioned writes
-declare their ETag response. Generated TypeScript models and compatibility are
-checked against the released v1 baseline. Historical unused v1 success statuses
-remain bodyless compatibility entries rather than claiming an arbitrary JSON
-representation.
+declare their ETag response. Generated TypeScript models are checked for
+freshness against the executable OpenAPI document, whose success statuses are
+limited to responses the handlers can return.
 
 ## 6. Secrets and process privileges
 
@@ -167,7 +165,7 @@ source canary guard this boundary.
 Long-lived Paperless and release-runtime secrets use versioned, read-only
 subpaths in the driver-only volume. Their configuration digests include the
 secret-boundary version and source volume, so a mount-layout change replaces
-the container before legacy credentials are removed.
+the container before an obsolete runtime path is discarded.
 
 Every release executable validates its complete process-specific environment
 against the embedded `configuration-spec.json` before opening a listener or
@@ -218,8 +216,8 @@ Generation-pinned outbox events contain only non-secret signing metadata. The
 email worker constructs an Ed25519 compact JWS and fragment-delivered acceptance
 URL in memory after proving the event is still current. The API has public
 verification keys only; validation and acceptance receive the token in a POST
-body. Migration `0015_secure_invitation_capabilities` invalidates legacy links
-and redacts their queued outbox URLs.
+body. The fresh base schema contains only generation-pinned invitation and
+outbox contracts; no earlier link format is accepted.
 
 Audit events are inserted alongside commands and are not exposed with secret
 payloads. A database trigger rejects every audit-row update or delete, and the
@@ -288,9 +286,9 @@ capability, recovery, release, platform and privacy views—is typed once in Rus
 and reused by the web application. Mutation request bodies are derived from the
 same Rust inputs, bodyless commands advertise no fictional payload, and the
 bounded operator query parameters are explicit. Public responses not consumed
-by the browser still need the same treatment. CI compares the emitted contract with the
-released v1 baseline and rejects removed operations, successful responses,
-properties or newly required parameters.
+by the browser still need the same treatment. CI regenerates the browser client
+and rejects generated-source drift. The retained bridge integration lane checks
+the current control-plane client against the current external Odoo provider.
 
 Structured JSON logs, durable worker heartbeats, privacy-safe HTTP counters and
 latency sums, queue/dead-letter/lease metrics, release adoption status, backup

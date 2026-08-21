@@ -968,6 +968,9 @@ async fn restore_recovery_set(
     if !safe_pg_identifier(target_database) {
         return Err(DriverError::bad("unsafe target database reference"));
     }
+    if format_version != RECOVERY_FORMAT_V2 {
+        return Err(DriverError::bad("unsupported recovery format"));
+    }
     if storage_ref.starts_with("s3://") {
         return restore_remote_recovery_set(
             state,
@@ -985,9 +988,6 @@ async fn restore_recovery_set(
     let root = std::fs::canonicalize(&state.config.backup_root).map_err(DriverError::internal)?;
     if !resolved.starts_with(&root) || !resolved.join("complete.json").is_file() {
         return Err(DriverError::bad("recovery set is incomplete"));
-    }
-    if format_version == "makersbrain-odoo-recovery-v1" {
-        return restore_legacy_recovery_set(state, target_database, &relative, &resolved).await;
     }
     let manifest = verify_recovery_directory(&resolved, workshop, expected_scope)?;
     validate_paperless_version(state, &manifest)?;
@@ -2288,53 +2288,6 @@ async fn run_paperless_volume_job(
         }),
     )
     .await
-}
-
-async fn restore_legacy_recovery_set(
-    state: &DriverState,
-    target_database: &str,
-    relative: &Path,
-    resolved: &Path,
-) -> Result<(), DriverError> {
-    if !resolved.join("database.dump").is_file() {
-        return Err(DriverError::bad("legacy recovery set is incomplete"));
-    }
-    validate_local_dump(state, &relative.join("database.dump"), "odoo").await?;
-    replace_database(state, target_database).await?;
-    run_postgres_job(
-        state,
-        &format!(
-            "mb-pg-restore-{}",
-            &Uuid::new_v4().simple().to_string()[..12]
-        ),
-        vec![
-            "pg_restore".into(),
-            "--exit-on-error".into(),
-            "--no-owner".into(),
-            "--no-acl".into(),
-            format!("--host={}", state.config.postgres_host),
-            format!("--port={}", state.config.postgres_port),
-            format!("--username={}", state.config.postgres_admin_user),
-            format!("--dbname={target_database}"),
-            format!("/backups/{}/database.dump", relative.to_string_lossy()),
-        ],
-    )
-    .await?;
-    let target_filestore = state
-        .config
-        .odoo_data_root
-        .join("filestore")
-        .join(target_database);
-    if target_filestore.exists() {
-        std::fs::remove_dir_all(&target_filestore).map_err(DriverError::internal)?;
-    }
-    copy_directory(
-        &resolved.join("filestore"),
-        &target_filestore,
-        Some((state.config.odoo_uid, state.config.odoo_gid)),
-    )
-    .map_err(DriverError::internal)?;
-    validate_database_table(state, target_database, "ir_module_module").await
 }
 
 async fn validate_local_dump(

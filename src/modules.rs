@@ -12,7 +12,7 @@ pub struct ModuleBundle {
     pub minimum_release: &'static str,
 }
 
-pub const REGISTRY_VERSION: u32 = 2;
+pub const REGISTRY_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EmbeddedCapabilityRegistry {
@@ -31,7 +31,7 @@ pub(crate) struct EmbeddedCapability {
     pub service: Option<String>,
 }
 
-const EMBEDDED_REGISTRY: &[u8] = include_bytes!("../deploy/capability-registry-v2.json");
+const EMBEDDED_REGISTRY: &[u8] = include_bytes!("../deploy/capability-registry.json");
 
 pub(crate) fn embedded_registry() -> anyhow::Result<EmbeddedCapabilityRegistry> {
     serde_json::from_slice(EMBEDDED_REGISTRY)
@@ -228,7 +228,7 @@ mod tests {
         for bundle in CATALOG {
             assert!(bundle.dependencies.iter().all(|key| keys.contains(key)));
         }
-        assert_eq!(REGISTRY_VERSION, 2);
+        assert_eq!(REGISTRY_VERSION, 1);
         let embedded = embedded_registry().unwrap();
         assert_eq!(embedded.version, REGISTRY_VERSION);
         assert_eq!(embedded.capabilities.len(), CATALOG.len());

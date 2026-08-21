@@ -1069,7 +1069,52 @@ pub(super) async fn platform_release_adopt(
     let tenants=sqlx::query_as::<_,(Uuid,Uuid,String,bool)>("select w.id,d.id,d.database_ref,exists(select 1 from control.workshop_modules m where m.workshop_id=w.id and m.module_key='documents' and m.state='enabled') from control.workshops w join control.odoo_databases d on d.workshop_id=w.id where w.status<>'deleted' and d.kind='primary' and d.deleted_at is null order by w.created_at,w.id for share of w,d")
         .fetch_all(&mut *tx).await?;
     if tenants.is_empty() {
-        return Err(ApiError::Conflict("there are no tenant databases to adopt"));
+        let activation = crate::persistence::activate_initial_release(&mut tx, &id)
+            .await
+            .map_err(|error| match error {
+                crate::persistence::InitialReleaseActivationError::Conflict(message) => {
+                    ApiError::Conflict(message)
+                }
+                crate::persistence::InitialReleaseActivationError::Database(error) => {
+                    ApiError::from(error)
+                }
+            })?;
+        audit_command(
+            &mut tx,
+            (Some(who.user_id), None),
+            "release.activate_initial",
+            "application_release",
+            id.clone(),
+            correlation,
+            command_id,
+        )
+        .await?;
+        let response = json!({
+            "release_id":id,
+            "runtime_key":"shared-odoo",
+            "slot":activation.slot,
+            "tenant_count":0,
+            "status":"active",
+            "version":activation.version,
+        });
+        complete_command(
+            &mut tx,
+            command_id,
+            CommandResult {
+                operation_id: None,
+                response_status: StatusCode::OK.as_u16(),
+                response_body: Some(&response),
+                result_ref: Some(&id),
+            },
+        )
+        .await
+        .map_err(command_error)?;
+        tx.commit().await?;
+        return Ok((
+            StatusCode::OK,
+            etag(&resource, activation.version)?,
+            Json(response),
+        ));
     }
     for tenant in &tenants {
         lock_lifecycle(&mut tx, tenant.0).await?;
