@@ -103,7 +103,7 @@ impl InventoryVisionClient {
                 .timeout(Duration::from_secs(90))
                 .connect_timeout(Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
-                .user_agent("makersbrain-ai-broker")
+                .user_agent("mb-ai-broker")
                 .build()?,
             endpoint,
             model: model.to_owned(),

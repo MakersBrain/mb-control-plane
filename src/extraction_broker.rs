@@ -179,10 +179,10 @@ async fn metrics(
         .lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut body = String::from(
-        "# HELP makersbrain_provider_requests_total Provider calls by bounded provider, operation and outcome.\n\
-# TYPE makersbrain_provider_requests_total counter\n\
-# HELP makersbrain_provider_latency_seconds_sum Accumulated provider latency by bounded provider, operation and outcome.\n\
-# TYPE makersbrain_provider_latency_seconds_sum counter\n",
+        "# HELP mb_provider_requests_total Provider calls by bounded provider, operation and outcome.\n\
+# TYPE mb_provider_requests_total counter\n\
+# HELP mb_provider_latency_seconds_sum Accumulated provider latency by bounded provider, operation and outcome.\n\
+# TYPE mb_provider_latency_seconds_sum counter\n",
     );
     for (key, metric) in metrics.iter() {
         let labels = format!(
@@ -190,7 +190,7 @@ async fn metrics(
             key.provider, key.operation, key.outcome
         );
         body.push_str(&format!(
-            "makersbrain_provider_requests_total{{{labels}}} {}\nmakersbrain_provider_latency_seconds_sum{{{labels}}} {}\n",
+            "mb_provider_requests_total{{{labels}}} {}\nmb_provider_latency_seconds_sum{{{labels}}} {}\n",
             metric.requests,
             metric.latency_micros as f64 / 1_000_000.0
         ));

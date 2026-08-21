@@ -1,16 +1,16 @@
 use std::time::Duration;
 
-use makersbrain_control_plane::domain::OperationKind;
-use makersbrain_control_plane::persistence::{NewOperation, Store};
+use mb_control_plane::domain::OperationKind;
+use mb_control_plane::persistence::{NewOperation, Store};
 use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    makersbrain_control_plane::startup_config::validate_process("backup_scheduler")?;
-    let _telemetry = makersbrain_control_plane::telemetry::init("makersbrain-backup-scheduler")?;
-    let store = Store::connect(&makersbrain_control_plane::Config::database_url()?).await?;
+    mb_control_plane::startup_config::validate_process("backup_scheduler")?;
+    let _telemetry = mb_control_plane::telemetry::init("mb-backup-scheduler")?;
+    let store = Store::connect(&mb_control_plane::Config::database_url()?).await?;
     let interval = std::env::var("CONTROL_BACKUP_INTERVAL_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
     let driver_url = std::env::var("CONTROL_DEPLOYMENT_DRIVER_URL")?;
     let driver_token =
-        makersbrain_control_plane::runtime_secret::required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
+        mb_control_plane::runtime_secret::required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
             .map_err(anyhow::Error::msg)?;
     let client = reqwest::Client::new();
     if !enabled {
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {},
-            _ = makersbrain_control_plane::shutdown_signal() => break,
+            _ = mb_control_plane::shutdown_signal() => break,
         }
     }
     Ok(())
@@ -244,7 +244,7 @@ async fn schedule_due_backups(store: &Store) -> anyhow::Result<()> {
             },
         )
         .await?;
-        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Nightly workshop backup',$5,$6,'makersbrain-workshop-recovery-v2') on conflict(id) do nothing")
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Nightly workshop backup',$5,$6,'mb-workshop-recovery-v2') on conflict(id) do nothing")
             .bind(recovery).bind(workshop).bind(database).bind(operation).bind(owner).bind(&scope).execute(&mut *tx).await?;
         sqlx::query("insert into control.audit_events(id,actor_user_id,workshop_id,action,target_type,target_id,correlation_id,outcome,detail) values($1,null,$2,'database.backup.schedule','workshop_recovery_point',$3,$4,'accepted',$5)")
             .bind(Uuid::new_v4()).bind(workshop).bind(recovery.to_string()).bind(correlation).bind(json!({"schedule":"nightly","requested_for_owner":owner})).execute(&mut *tx).await?;

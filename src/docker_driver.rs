@@ -223,7 +223,7 @@ impl DockerDriverConfig {
             if !age_recipient.starts_with("age1") {
                 anyhow::bail!("BACKUP_AGE_RECIPIENT must be an age X25519 recipient");
             }
-            if !age_identity_file.starts_with("/run/makersbrain-recovery-secrets/") {
+            if !age_identity_file.starts_with("/run/mb-recovery-secrets/") {
                 anyhow::bail!(
                     "BACKUP_AGE_IDENTITY_FILE must use the isolated recovery-secret mount"
                 );
@@ -376,7 +376,7 @@ struct DriverState {
     serial: Arc<Mutex<()>>,
 }
 
-const RECOVERY_FORMAT_V2: &str = "makersbrain-workshop-recovery-v2";
+const RECOVERY_FORMAT_V2: &str = "mb-workshop-recovery-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RecoveryManifest {
@@ -416,7 +416,7 @@ struct StoredRecovery {
 pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.secret_root)?;
     normalize_secret_permissions(&config.secret_root)?;
-    if config.odoo_client_secret_root != Path::new("/run/makersbrain-odoo-client-secrets") {
+    if config.odoo_client_secret_root != Path::new("/run/mb-odoo-client-secrets") {
         anyhow::bail!("DRIVER_ODOO_CLIENT_SECRET_ROOT must use the isolated Odoo client mount");
     }
     std::fs::create_dir_all(&config.odoo_client_secret_root)?;
@@ -426,8 +426,7 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
         Some(config.odoo_uid),
         Some(config.odoo_gid),
     )?;
-    if config.paperless_client_secret_root != Path::new("/run/makersbrain-paperless-client-secrets")
-    {
+    if config.paperless_client_secret_root != Path::new("/run/mb-paperless-client-secrets") {
         anyhow::bail!(
             "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT must use the isolated Paperless client mount"
         );
@@ -435,7 +434,7 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.paperless_client_secret_root)?;
     normalize_secret_permissions(&config.paperless_client_secret_root)?;
     let expected_job_root = match config.container_runtime {
-        ContainerRuntimeKind::Docker => PathBuf::from("/run/makersbrain-backup-secrets/jobs"),
+        ContainerRuntimeKind::Docker => PathBuf::from("/run/mb-backup-secrets/jobs"),
         ContainerRuntimeKind::Podman => Path::new(&config.runtime_secret_source).join("jobs"),
     };
     if config.job_secret_root != expected_job_root {
@@ -1304,7 +1303,7 @@ fn postgres_ca_mount(state: &DriverState) -> Result<Option<Value>, DriverError> 
     Ok(Some(json!({
         "Type":"bind",
         "Source":source,
-        "Target":"/run/makersbrain-postgres-ca/postgres-ca.crt",
+        "Target":"/run/mb-postgres-ca/postgres-ca.crt",
         "ReadOnly":true
     })))
 }
@@ -1395,11 +1394,7 @@ async fn run_docker_job_with_secrets(
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| DriverError::internal("job Mounts must be an array"))?
-            .push(job_secret_mount(
-                state,
-                &job,
-                "/run/makersbrain-job-secrets",
-            )?);
+            .push(job_secret_mount(state, &job, "/run/mb-job-secrets")?);
         if let Some(mount) = postgres_ca_mount(state)? {
             host.get_mut("Mounts")
                 .and_then(Value::as_array_mut)
@@ -1413,9 +1408,7 @@ async fn run_docker_job_with_secrets(
                 .as_array_mut()
                 .ok_or_else(|| DriverError::internal("job Env must be an array"))?;
             environment.push(json!("PGSSLMODE=verify-full"));
-            environment.push(json!(
-                "PGSSLROOTCERT=/run/makersbrain-postgres-ca/postgres-ca.crt"
-            ));
+            environment.push(json!("PGSSLROOTCERT=/run/mb-postgres-ca/postgres-ca.crt"));
         }
         run_docker_job(state, container, body).await
     }
@@ -1501,7 +1494,7 @@ mod tests {
     fn podman_secret_mount_uses_a_protected_host_path() {
         let mount = secret_mount_payload(
             ContainerRuntimeKind::Podman,
-            "/var/lib/makersbrain/tenant-runtime-secrets",
+            "/var/lib/mb/tenant-runtime-secrets",
             Path::new("jobs/job-id"),
             "/run/secrets",
         )
@@ -1509,7 +1502,7 @@ mod tests {
         assert_eq!(mount["Type"], "bind");
         assert_eq!(
             mount["Source"],
-            "/var/lib/makersbrain/tenant-runtime-secrets/jobs/job-id"
+            "/var/lib/mb/tenant-runtime-secrets/jobs/job-id"
         );
         assert!(mount.get("VolumeOptions").is_none());
     }
@@ -1519,7 +1512,7 @@ mod tests {
         assert!(
             secret_mount_payload(
                 ContainerRuntimeKind::Podman,
-                "/var/lib/makersbrain/tenant-runtime-secrets",
+                "/var/lib/mb/tenant-runtime-secrets",
                 Path::new("../other-user"),
                 "/run/secrets",
             )
@@ -1893,22 +1886,19 @@ mod tests {
     fn s3_recovery_references_are_bucket_and_workshop_scoped() {
         let workshop = Uuid::new_v4();
         let recovery = Uuid::new_v4();
-        let valid =
-            format!("s3://makersbrain-production-backups/workshops/{workshop}/recovery/{recovery}");
+        let valid = format!("s3://mb-production-backups/workshops/{workshop}/recovery/{recovery}");
         assert_eq!(
-            safe_s3_storage_ref(&valid, "makersbrain-production-backups", workshop)
+            safe_s3_storage_ref(&valid, "mb-production-backups", workshop)
                 .unwrap()
                 .1,
             recovery
         );
-        assert!(safe_s3_storage_ref(&valid, "makersbrain-staging-backups", workshop).is_err());
-        assert!(
-            safe_s3_storage_ref(&valid, "makersbrain-production-backups", Uuid::new_v4()).is_err()
-        );
+        assert!(safe_s3_storage_ref(&valid, "mb-staging-backups", workshop).is_err());
+        assert!(safe_s3_storage_ref(&valid, "mb-production-backups", Uuid::new_v4()).is_err());
         assert!(
             safe_s3_storage_ref(
                 &format!("{valid}/../../other"),
-                "makersbrain-production-backups",
+                "mb-production-backups",
                 workshop
             )
             .is_err()

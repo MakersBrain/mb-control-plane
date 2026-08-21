@@ -236,10 +236,7 @@ impl MailGatewayState {
         provider_token.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("X-Auth-Token", provider_token);
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static("makersbrain-mail-gateway/1"),
-        );
+        headers.insert(USER_AGENT, HeaderValue::from_static("mb-mail-gateway/1"));
         let provider_client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(20))
@@ -248,7 +245,7 @@ impl MailGatewayState {
         let public_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-mail-gateway/1")
+            .user_agent("mb-mail-gateway/1")
             .build()?;
         let control_event_url = Url::parse(&configured("MAIL_GATEWAY_CONTROL_EVENT_URL")?)?;
         if !matches!(control_event_url.scheme(), "http" | "https")
@@ -1126,7 +1123,7 @@ mod tests {
 
     fn test_state(endpoint: Url, provider_client: reqwest::Client) -> MailGatewayState {
         let journal_directory =
-            std::env::temp_dir().join(format!("makersbrain-mail-gateway-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("mb-mail-gateway-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&journal_directory).unwrap();
         MailGatewayState {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -1142,9 +1139,8 @@ mod tests {
             from_email: "notifications@notify.staging.makersbrain.net".into(),
             from_name: "MakersBrain".into(),
             allowed_recipients: HashSet::from(["synthetic@example.test".into()]),
-            sns_topic_arn:
-                "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem"
-                    .into(),
+            sns_topic_arn: "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mb-staging-tem"
+                .into(),
             sns_root_ca: Vec::new(),
             sns_intermediate_ca: Vec::new(),
             signer_certificates: Arc::new(Mutex::new(HashMap::new())),
@@ -1158,9 +1154,8 @@ mod tests {
         SnsEnvelope {
             kind: "Notification".into(),
             message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
-            topic_arn:
-                "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem"
-                    .into(),
+            topic_arn: "arn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mb-staging-tem"
+                .into(),
             message: "payload".into(),
             timestamp: "2026-08-15T12:00:00Z".into(),
             signature_version: "1".into(),
@@ -1329,7 +1324,7 @@ mod tests {
                 "MessageId\ncccccccc-cccc-4ccc-8ccc-cccccccccccc\n",
                 "Subject\ndelivery\n",
                 "Timestamp\n2026-08-15T12:00:00Z\n",
-                "TopicArn\narn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:makersbrain-staging-tem\n",
+                "TopicArn\narn:scw:sns:fr-par:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:mb-staging-tem\n",
                 "Type\nNotification\n"
             )
         );
@@ -1381,10 +1376,10 @@ mod tests {
     fn sns_rsa_sha1_signature_is_verified_and_tampering_is_rejected() {
         // Fixed test-only RSA material generated for this canonical SNS fixture.
         let subject_public_key_info = base64::engine::general_purpose::STANDARD
-            .decode("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTmxd/7ltYRDEoLNHEdTBnAdL9Z8T1Xr6f27raE3lW47a3lp7z936i8I5UoQrI7b9Iy0JVmE/fN5q//CoKaQYkUxCs/M/Lt1bxZr68eFsebzPizJrv6SeVPbn6aVZEKMS186qEWGBJfLC3ybWRXUvaTbWMfKpdkNtdENI18ESPzBReLHnYLpyKOEfs7BNINDXn6pl212x+v8BO87z+xnX5utpI/dsb+D3wWSdB4AJZK/k9s9ReM2ht5g7p3yje3ReRnzhNPqWWErpKolpxS35vfQotrKWC6Hm0vaLERV7iMVoGPf3IyiAUq7pnAJ/zinSXqsKp+n9z1hsQRX5FmDMwIDAQAB")
+            .decode("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo8toNBGSGoRdr6d0doEc+iIB3pMmRiokiKTCCUiaD5ZxPEnWTnLT48tzCln37ptIEAJT11ATdUJwXg15apng7UMvWvLT2kVZ6bnbUZHDjMimT8VDBlVKYJ5lY3DW2jMMVOaXzOTTTbbnoDmihCbjOBNgrVmmxDV+0LF1mxBVnUy32hxeZSgBSkoyzX2EccyDmfJHWlluQCNqqHxLnBsNBuj+5HPPztQTIOE3eE/KdRkXJU/7lvHJwaOeN07g+ec/Wx7x3PHsHEq/zdqKP7KEpjnlkMliKAoVCLyjis2yMYXOg+v0codf8Is+4vF7P0D3faq9KMgcrDHvHl+SAgbwrQIDAQAB")
             .unwrap();
         let signature = base64::engine::general_purpose::STANDARD
-            .decode("gqb3zVRCywH0XiEUlFy+KtWqlvWk12Gw1OOm0jfsaP7I0AVwRZ5gY1xqiw/q9rQUHFAdftWEMKH2uhie4c8uIu/FLP/RFfg4csOgtn+qwdrO8+X93urDI+9QVGpgImCjzurktmn7tvL7lzR24lRfkz4Bpaqo9bLgRJ53BPyNSoj4T4RAB3iuHcLNEWKkGkdcuiOeJLNfKdm7fPyJuQ6t4DaQ31EnwhdELT3sUl1lAKZHVYBoDTtgZqHY0MskIGije4PwkU11PE7TZf1zYqhBukR9IVmlMggP7shPA7a5MPCC/9DrWSW11tDmQWI5lgj/F1d+jb5yvp9yYdFeUY5yHQ==")
+            .decode("KzrjArwgyfnBODbTDf2SGfP2Egr3C6HT9ebKXtycbW+7WbhT8sawifj5cL5KlMcQzxS3yUlUOc0H6zB8PBy1SaaIOp1rMsw2Kw701w0yX48is25i4vRigDb6CBz5yYNOPYkNPQKcE+HpVtKDu7iMkueXVhOMkhddAdC5aqUNCDzaH8DnoFxw4OvuytvwnL77oydheubNVyR2SF7hGQTV8xiAVrwj5yvIHlFnmwsVXLIHskBJImm+CWlVFZdbJYSe+jOec6J0Nhvv4edDSaRjm89zTo8+oZB/9+ck2qzNvm5VCkf5rL0R9ep8LXfnGBIeEVGguJd137lv1MVr48pLtw==")
             .unwrap();
         let canonical = canonical_sns_message(&notification_envelope()).unwrap();
         assert!(

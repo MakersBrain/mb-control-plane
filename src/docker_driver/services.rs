@@ -64,7 +64,7 @@ pub(super) async fn ensure_oidc_clients(
     odoo_hostname: &str,
     paperless_hostname: Option<&str>,
 ) -> Result<(String, Option<(String, String)>), DriverError> {
-    let odoo_id = format!("makersbrain-odoo-{tenant_key}");
+    let odoo_id = format!("mb-odoo-{tenant_key}");
     let odoo_origin = state.config.public_origin(odoo_hostname);
     ensure_rauthy_client(
         state,
@@ -78,7 +78,7 @@ pub(super) async fn ensure_oidc_clients(
     let Some(paperless_hostname) = paperless_hostname else {
         return Ok((odoo_id, None));
     };
-    let paperless_id = format!("makersbrain-paperless-{tenant_key}");
+    let paperless_id = format!("mb-paperless-{tenant_key}");
     let paperless_origin = state.config.public_origin(paperless_hostname);
     ensure_rauthy_client(
         state,
@@ -187,14 +187,14 @@ pub(super) async fn ensure_odoo_database(
         &container,
         json!({
             "Image":state.config.odoo_image,
-            "Cmd":["/bin/sh","-ec","password=$(cat /run/makersbrain-job-secrets/postgres-password); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/makersbrain-job-secrets/bridge-token); exec odoo --database=\"$MB_ODOO_DATABASE\" --stop-after-init --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=odoo --db_password=\"$password\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --init=auth_oidc,mb_control_bridge,mb_brand,mb_workshop_pos,l10n_fr_micro_enterprise --update=mb_control_bridge --without-demo=all"],
+            "Cmd":["/bin/sh","-ec","password=$(cat /run/mb-job-secrets/postgres-password); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/mb-job-secrets/bridge-token); exec odoo --database=\"$MB_ODOO_DATABASE\" --stop-after-init --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=odoo --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --init=auth_oidc,mb_control_bridge,mb_brand,mb_workshop_pos,l10n_fr_micro_enterprise --update=mb_control_bridge --without-demo=all"],
             "Env":[
                 format!("MB_ODOO_DATABASE={database_ref}"),
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
                 "USER=odoo"
             ],
-            "Labels":{"makersbrain.kind":"odoo-init"},
+            "Labels":{"mb.kind":"odoo-init"},
             "HostConfig":{"NetworkMode":state.config.docker_network,"Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)]}
         }),
         &[
@@ -224,16 +224,16 @@ pub(super) async fn ensure_odoo_break_glass(
             "Cmd":[
                 "/bin/sh",
                 "-ec",
-                "password=$(cat /run/makersbrain-job-secrets/postgres-password); exec odoo shell --database=\"$MB_ODOO_DATABASE\" --no-http --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons < /mnt/makersbrain-addons/mb_control_bridge/scripts/set_break_glass_password.py"
+                "password=$(cat /run/mb-job-secrets/postgres-password); exec odoo shell --database=\"$MB_ODOO_DATABASE\" --no-http --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons < /mnt/mb-addons/mb_control_bridge/scripts/set_break_glass_password.py"
             ],
             "Env":[
                 format!("MB_ODOO_DATABASE={database_ref}"),
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
                 "USER=odoo",
-                "MB_BREAK_GLASS_PASSWORD_FILE=/run/makersbrain-odoo-secrets/admin-password"
+                "MB_BREAK_GLASS_PASSWORD_FILE=/run/mb-odoo-secrets/admin-password"
             ],
-            "Labels":{"makersbrain.kind":"odoo-break-glass"},
+            "Labels":{"mb.kind":"odoo-break-glass"},
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
                 "GroupAdd":["0"],
@@ -241,7 +241,7 @@ pub(super) async fn ensure_odoo_break_glass(
                 "Mounts":[runtime_secret_mount(
                     state,
                     &PathBuf::from("odoo").join(workshop.to_string()),
-                    "/run/makersbrain-odoo-secrets",
+                    "/run/mb-odoo-secrets",
                 )?]
             }
         }),
@@ -302,27 +302,27 @@ pub(super) async fn ensure_paperless(
         .map_err(DriverError::internal)?;
     let public_origin = state.config.public_origin(public_hostname);
     let mut environment = vec![
-        "PAPERLESS_REDIS_FILE=/run/makersbrain-secrets/redis-url".into(),
+        "PAPERLESS_REDIS_FILE=/run/mb-secrets/redis-url".into(),
         format!("PAPERLESS_REDIS_PREFIX={redis_prefix}"),
         "PAPERLESS_DBENGINE=postgresql".into(),
         format!("PAPERLESS_DBHOST={}", state.config.postgres_host),
         format!("PAPERLESS_DBPORT={}", state.config.postgres_port),
         format!("PAPERLESS_DBNAME={database}"),
         format!("PAPERLESS_DBUSER={role}"),
-        "PAPERLESS_DBPASS_FILE=/run/makersbrain-secrets/database-password".into(),
-        "PAPERLESS_SECRET_KEY_FILE=/run/makersbrain-secrets/secret-key".into(),
+        "PAPERLESS_DBPASS_FILE=/run/mb-secrets/database-password".into(),
+        "PAPERLESS_SECRET_KEY_FILE=/run/mb-secrets/secret-key".into(),
         format!("PAPERLESS_URL={public_origin}"),
         "PAPERLESS_TIME_ZONE=Europe/Paris".into(),
         "PAPERLESS_OCR_LANGUAGE=fra+eng".into(),
         "PAPERLESS_APPS=allauth.socialaccount.providers.openid_connect".into(),
-        "PAPERLESS_SOCIALACCOUNT_PROVIDERS_FILE=/run/makersbrain-secrets/providers".into(),
+        "PAPERLESS_SOCIALACCOUNT_PROVIDERS_FILE=/run/mb-secrets/providers".into(),
         "PAPERLESS_DISABLE_REGULAR_LOGIN=true".into(),
         "PAPERLESS_REDIRECT_LOGIN_TO_SSO=true".into(),
         "PAPERLESS_SOCIAL_AUTO_SIGNUP=false".into(),
         "PAPERLESS_ADMIN_USER=local-admin".into(),
-        "PAPERLESS_ADMIN_PASSWORD_FILE=/run/makersbrain-secrets/admin-password".into(),
+        "PAPERLESS_ADMIN_PASSWORD_FILE=/run/mb-secrets/admin-password".into(),
         "PAPERLESS_POST_CONSUME_SCRIPT=/usr/src/paperless/post-consume.py".into(),
-        "PAPERLESS_WEBHOOK_SECRET_FILE=/run/makersbrain-secrets/webhook-secret".into(),
+        "PAPERLESS_WEBHOOK_SECRET_FILE=/run/mb-secrets/webhook-secret".into(),
         format!("MAKERSBRAIN_WORKSHOP_ID={workshop}"),
         format!(
             "MAKERSBRAIN_CONTROL_URL={}",
@@ -332,11 +332,11 @@ pub(super) async fn ensure_paperless(
     let mut mounts = vec![runtime_secret_mount(
         state,
         &PathBuf::from("paperless").join(workshop.to_string()),
-        "/run/makersbrain-secrets",
+        "/run/mb-secrets",
     )?];
     if let Some(ca_mount) = postgres_ca_mount(state)? {
         environment.push(
-            "PAPERLESS_DB_OPTIONS=sslmode=verify-full,sslrootcert=/run/makersbrain-postgres-ca/postgres-ca.crt"
+            "PAPERLESS_DB_OPTIONS=sslmode=verify-full,sslrootcert=/run/mb-postgres-ca/postgres-ca.crt"
                 .into(),
         );
         mounts.push(ca_mount);
@@ -362,7 +362,7 @@ pub(super) async fn ensure_paperless(
     if docker_container_exists(state, container).await? {
         let inspect = docker_inspect_container(state, container).await?;
         let current_digest = inspect
-            .pointer("/Config/Labels/makersbrain.config-digest")
+            .pointer("/Config/Labels/mb.config-digest")
             .and_then(Value::as_str);
         if current_digest != Some(&config_digest) {
             docker_delete_container(state, container).await?;
@@ -379,7 +379,7 @@ pub(super) async fn ensure_paperless(
         json!({
             "Image":paperless_image,
             "Env":environment,
-            "Labels":{"makersbrain.kind":"paperless","makersbrain.workshop":workshop.to_string(),"makersbrain.config-digest":config_digest},
+            "Labels":{"mb.kind":"paperless","mb.workshop":workshop.to_string(),"mb.config-digest":config_digest},
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
                 "Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")],

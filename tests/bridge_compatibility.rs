@@ -29,8 +29,8 @@
 //! restores, each with its own `source_database_id`. This lane exercises a
 //! single database, which is the unit the bridge authenticates against.
 
-use makersbrain_control_plane::domain::IntegrationError;
-use makersbrain_control_plane::integrations::odoo::{
+use mb_control_plane::domain::IntegrationError;
+use mb_control_plane::integrations::odoo::{
     EntitlementCommand, ErasureReplayCommand, MembershipCommand, ModuleEnableCommand,
     ModuleRestrictCommand, OdooClient, PrivacyExportCommand, TenantBootstrapCommand,
 };

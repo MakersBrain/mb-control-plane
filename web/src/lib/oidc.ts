@@ -1,5 +1,5 @@
 import { CLIENT_ID,ISSUER,REDIRECT_URI } from './config';
-const ATTEMPT='makersbrain.members.oauth-attempt',REFRESH='makersbrain.members.refresh-token';
+const ATTEMPT='mb.members.oauth-attempt',REFRESH='mb.members.refresh-token';
 type Attempt={verifier:string;state:string;returnTo:string};
 export type Tokens={access_token:string;refresh_token?:string;expires_in:number;id_token?:string};
 const b64=(bytes:Uint8Array)=>{let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};

@@ -122,7 +122,7 @@ pub(super) async fn export(
         )
     })?;
     let result = json!({
-        "format":"makersbrain-processor-subject-export-v1",
+        "format":"mb-processor-subject-export-v1",
         "request_id":request_id,"workshop_id":workshop,"user_id":subject.0,
         "odoo":odoo,"paperless":paperless
     });

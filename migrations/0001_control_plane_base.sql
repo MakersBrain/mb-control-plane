@@ -1254,7 +1254,7 @@ CREATE TABLE control.webshop_domains (
     disconnected_at timestamp with time zone,
     version bigint DEFAULT 1 NOT NULL,
     CONSTRAINT webshop_domains_certificate_state_check CHECK ((certificate_state = ANY (ARRAY['pending'::text, 'provisioning'::text, 'active'::text, 'failed'::text, 'expired'::text]))),
-    CONSTRAINT webshop_domains_check CHECK ((verification_name = ('_makersbrain-challenge.'::text || hostname))),
+    CONSTRAINT webshop_domains_check CHECK ((verification_name = ('_mb-challenge.'::text || hostname))),
     CONSTRAINT webshop_domains_check1 CHECK (((redirect_target IS NULL) OR (redirect_target <> hostname))),
     CONSTRAINT webshop_domains_check2 CHECK (((state = 'disconnected'::text) = (disconnected_at IS NOT NULL))),
     CONSTRAINT webshop_domains_check3 CHECK (((state <> 'active'::text) OR ((ownership_verified_at IS NOT NULL) AND (dns_state = 'verified'::text) AND (certificate_state = 'active'::text) AND (provider_ref IS NOT NULL)))),
@@ -1266,7 +1266,7 @@ CREATE TABLE control.webshop_domains (
     CONSTRAINT webshop_domains_hostname_check2 CHECK ((hostname !~ '\.\.'::text)),
     CONSTRAINT webshop_domains_routing_target_check CHECK ((routing_target ~ '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'::text)),
     CONSTRAINT webshop_domains_state_check CHECK ((state = ANY (ARRAY['ownership_pending'::text, 'dns_pending'::text, 'certificate_pending'::text, 'testing'::text, 'active'::text, 'action_required'::text, 'suspended'::text, 'disconnecting'::text, 'disconnected'::text]))),
-    CONSTRAINT webshop_domains_verification_value_check CHECK ((verification_value ~ '^makersbrain-verification=[A-Za-z0-9]{32}$'::text)),
+    CONSTRAINT webshop_domains_verification_value_check CHECK ((verification_value ~ '^mb-verification=[A-Za-z0-9]{32}$'::text)),
     CONSTRAINT webshop_domains_version_check CHECK ((version > 0))
 );
 
@@ -1411,7 +1411,7 @@ CREATE TABLE control.workshop_recovery_points (
     ready_at timestamp with time zone,
     expires_at timestamp with time zone,
     component_scope text[] DEFAULT ARRAY['odoo'::text] NOT NULL,
-    format_version text DEFAULT 'makersbrain-workshop-recovery-v2'::text NOT NULL,
+    format_version text DEFAULT 'mb-workshop-recovery-v2'::text NOT NULL,
     storage_location text DEFAULT 'local'::text NOT NULL,
     object_prefix text,
     manifest_digest text,
@@ -1432,7 +1432,7 @@ CREATE TABLE control.workshop_recovery_points (
     CONSTRAINT workshop_recovery_points_archive_digest_check CHECK (((archive_digest IS NULL) OR (archive_digest ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT workshop_recovery_points_archive_size_bytes_check CHECK ((archive_size_bytes >= 0)),
     CONSTRAINT workshop_recovery_points_component_scope_check CHECK (((cardinality(component_scope) > 0) AND (component_scope @> ARRAY['odoo'::text]) AND (component_scope <@ ARRAY['odoo'::text, 'paperless'::text]))),
-    CONSTRAINT workshop_recovery_points_format_version_check CHECK ((format_version = 'makersbrain-workshop-recovery-v2'::text)),
+    CONSTRAINT workshop_recovery_points_format_version_check CHECK ((format_version = 'mb-workshop-recovery-v2'::text)),
     CONSTRAINT workshop_recovery_points_manifest_digest_check CHECK (((manifest_digest IS NULL) OR (manifest_digest ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT workshop_recovery_points_storage_location_check CHECK ((storage_location = ANY (ARRAY['local'::text, 's3'::text]))),
     CONSTRAINT workshop_recovery_points_verification_state_check CHECK ((verification_state = ANY (ARRAY['pending'::text, 'verified'::text, 'failed'::text]))),

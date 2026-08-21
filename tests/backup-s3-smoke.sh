@@ -29,7 +29,7 @@ test "$ready" = true
 docker run --rm --network "$network" --entrypoint sh minio/mc:RELEASE.2025-04-16T18-13-26Z \
   -c "mc alias set smoke http://$server:9000 smoke-access smoke-secret-password >/dev/null && mc mb smoke/recovery >/dev/null"
 
-docker run --rm --user 0:0 -v "$workdir:/work" makersbrain-control-backup:local sh -ec '
+docker run --rm --user 0:0 -v "$workdir:/work" mb-control-backup:local sh -ec '
   umask 077
   age-keygen -o /work/identity >/dev/null 2>&1
   age-keygen -o /work/wrong-identity >/dev/null 2>&1
@@ -39,9 +39,9 @@ docker run --rm --user 0:0 -v "$workdir:/work" makersbrain-control-backup:local 
 '
 docker run --rm --user 0:0 --network "$network" -v "$workdir:/work" \
   -e AWS_ACCESS_KEY_ID=smoke-access -e AWS_SECRET_ACCESS_KEY=smoke-secret-password \
-  -e AWS_DEFAULT_REGION=fr-par makersbrain-control-backup:local sh -ec \
+  -e AWS_DEFAULT_REGION=fr-par mb-control-backup:local sh -ec \
   "aws --endpoint-url http://$server:9000 s3 cp --only-show-errors /work/object.enc s3://recovery/workshops/fixture/recovery/fixture/object.enc && aws --endpoint-url http://$server:9000 s3 cp --only-show-errors s3://recovery/workshops/fixture/recovery/fixture/object.enc /work/download.enc"
-docker run --rm --user 0:0 -v "$workdir:/work" makersbrain-control-backup:local sh -ec '
+docker run --rm --user 0:0 -v "$workdir:/work" mb-control-backup:local sh -ec '
   set -o pipefail
   test "$(sha256sum /work/download.enc | cut -d" " -f1)" = "$(cat /work/object.sha256)"
   test "$(age -d -i /work/identity /work/download.enc | zstd -q -d)" = recovery-s3-smoke

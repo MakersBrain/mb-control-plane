@@ -1449,8 +1449,8 @@ mod tests {
             .bind(domain)
             .bind(workshop)
             .bind(format!("{}.example.test", domain.simple()))
-            .bind(format!("_makersbrain-challenge.{}.example.test", domain.simple()))
-            .bind(format!("makersbrain-verification={}", &domain.simple().to_string()[..32]))
+            .bind(format!("_mb-challenge.{}.example.test", domain.simple()))
+            .bind(format!("mb-verification={}", &domain.simple().to_string()[..32]))
             .bind(user)
             .execute(store.pool())
             .await

@@ -3,7 +3,7 @@ fn main() -> anyhow::Result<()> {
     match arguments.next().as_deref() {
         None => println!(
             "{}",
-            serde_json::to_string_pretty(&makersbrain_control_plane::openapi::document())?
+            serde_json::to_string_pretty(&mb_control_plane::openapi::document())?
         ),
         Some("--typescript") => {
             let path = arguments
@@ -16,10 +16,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(
-                target,
-                makersbrain_control_plane::openapi::typescript_client(),
-            )?;
+            std::fs::write(target, mb_control_plane::openapi::typescript_client())?;
         }
         Some("--json") => {
             let path = arguments
@@ -30,7 +27,7 @@ fn main() -> anyhow::Result<()> {
             }
             std::fs::write(
                 path,
-                serde_json::to_vec_pretty(&makersbrain_control_plane::openapi::document())?,
+                serde_json::to_vec_pretty(&mb_control_plane::openapi::document())?,
             )?;
         }
         Some(argument) => anyhow::bail!("unknown control-openapi argument {argument}"),

@@ -60,7 +60,7 @@ for forbidden in (
 
 for marker in (
     "run_docker_job_with_secrets(",
-    '"PGPASSFILE=/run/makersbrain-job-secrets/pgpass"',
+    '"PGPASSFILE=/run/mb-job-secrets/pgpass"',
     "aws_secret_prelude()",
     'ContainerRuntimeKind::Podman => json!({',
     '"Type":"bind"',
@@ -102,7 +102,7 @@ for forbidden in ("eval ", "${!", "@/run/secrets/"):
         raise SystemExit(f"Odoo entrypoint regained generic secret resolution: {forbidden}")
 
 
-with tempfile.TemporaryDirectory(prefix="makersbrain-odoo-entrypoint-") as directory:
+with tempfile.TemporaryDirectory(prefix="mb-odoo-entrypoint-") as directory:
     fixture = Path(directory)
     password = fixture / "password"
     bridge = fixture / "bridge"

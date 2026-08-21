@@ -10,8 +10,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const ISSUER: &str = "makersbrain-control";
-const AUDIENCE: &str = "makersbrain-invitation";
+const ISSUER: &str = "mb-control";
+const AUDIENCE: &str = "mb-invitation";
 const MEDIA_TYPE: &str = "mb-invitation+jwt";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -257,7 +257,7 @@ impl OdooClient {
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-control-worker")
+            .user_agent("mb-control-worker")
             .build()?;
         Ok(Self { http, base_url })
     }
@@ -604,7 +604,7 @@ mod tests {
         let command = TenantBootstrapCommand {
             operation_key: "tenant-bootstrap:fixture".into(),
             workshop_id: Uuid::new_v4(),
-            oidc_client_id: "makersbrain-odoo-fixture".into(),
+            oidc_client_id: "mb-odoo-fixture".into(),
             oidc_issuer: "https://identity.example.test".into(),
             bridge_token: "a".repeat(64),
             public_hostname: "atelier.example.test".into(),

@@ -1,6 +1,6 @@
 [
   {
-    "id":"makersbrain-members","name":"MakersBrain members","secret":null,
+    "id":"mb-members","name":"MakersBrain members","secret":null,
     "redirect_uris":["http://localhost:4175/oauth/callback"],
     "post_logout_redirect_uris":["http://localhost:4175/signed-out"],
     "allowed_origins":["http://localhost:4175"],"enabled":true,

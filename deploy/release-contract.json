@@ -163,7 +163,7 @@
     "database_identity_reconciliation": {
       "command": [
         "/bin/sh",
-        "/run/makersbrain/reconcile-database-identities.sh"
+        "/run/mb/reconcile-database-identities.sh"
       ],
       "run_before": [
         "migration"
@@ -653,7 +653,7 @@
   "development_tunnel": {
     "connector": "cloudflared:2026.7.2",
     "domain_pattern": "*.dev[1-4].makersbrain.net",
-    "infrastructure_root": "../makersbrain-infra/environments/development/developer-tunnels",
+    "infrastructure_root": "../mb-infra/environments/development/developer-tunnels",
     "synthetic_data_only": true
   },
   "paperless": {

@@ -172,7 +172,7 @@ remain.
 
 ### 5.3 Legacy recovery format
 
-Remove support for `makersbrain-odoo-recovery-v1`, including
+Remove support for `mb-odoo-recovery-v1`, including
 `restore_legacy_recovery_set` and documentation promising that old local sets
 remain restorable. Retain only the current complete workshop recovery format.
 

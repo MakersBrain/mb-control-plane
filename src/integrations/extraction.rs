@@ -34,7 +34,7 @@ impl ExtractionBrokerClient {
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-extraction-client")
+            .user_agent("mb-extraction-client")
             .build()?;
         Ok(Self { http, endpoint })
     }

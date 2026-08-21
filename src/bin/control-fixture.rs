@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn authorized(headers: &HeaderMap) -> bool {
-    let expected = makersbrain_control_plane::runtime_secret::environment("FIXTURE_TOKEN")
+    let expected = mb_control_plane::runtime_secret::environment("FIXTURE_TOKEN")
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -39,10 +39,10 @@ async fn tenant(
             .unwrap_or("duplicate");
         let result = match lifecycle {
             "snapshot" | "backup" => {
-                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"recovery_point":{"storage_ref":format!("fixture/{workshop}/{recovery}"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"makersbrain-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
+                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"recovery_point":{"storage_ref":format!("fixture/{workshop}/{recovery}"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"mb-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
             }
             "restore" => {
-                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"safety_recovery_point":{"storage_ref":format!("fixture/{workshop}/safety"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"makersbrain-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
+                json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"safety_recovery_point":{"storage_ref":format!("fixture/{workshop}/safety"),"storage_location":"local","size_bytes":1048576,"manifest_digest":"0000000000000000000000000000000000000000000000000000000000000000","format_version":"mb-workshop-recovery-v2","source_release":env!("CARGO_PKG_VERSION"),"paperless_version":null,"components":[{"name":"odoo-database","path":"odoo/database.dump","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},{"name":"odoo-filestore","path":"odoo/filestore","size_bytes":524288,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}})
             }
             "duplicate" => {
                 json!({"workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),"duplicate":{"ready":true,"routable":false}})
@@ -59,7 +59,7 @@ async fn tenant(
         "workshop_id":workshop,"action":action,"release_id":env!("CARGO_PKG_VERSION"),
         "odoo":{"base_url":"http://odoo:8069","secret_ref":"local/odoo","database":database},
         "paperless":{"base_url":"http://paperless:8000","secret_ref":"local/paperless"},
-        "odoo_oidc":{"client_id":"makersbrain-odoo-local","issuer":issuer}
+        "odoo_oidc":{"client_id":"mb-odoo-local","issuer":issuer}
     })))
 }
 
@@ -82,7 +82,7 @@ async fn mail(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _telemetry = makersbrain_control_plane::telemetry::init("makersbrain-control-fixture")?;
+    let _telemetry = mb_control_plane::telemetry::init("mb-control-fixture")?;
     let app = Router::new()
         .route("/health/live", get(|| async { "live" }))
         .route("/v1/tenants/{workshop}/{action}", post(tenant))

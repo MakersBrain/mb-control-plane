@@ -98,7 +98,7 @@ pub(crate) async fn run(
     let sns_arn = crate::runtime_secret::required_configuration("CONTROL_MAIL_SNS_TOPIC_ARN")
         .map_err(|_| IntegrationError::ContractDrift)?;
     let webhook_ref = provider
-        .ensure_webhook(observation.id, &sns_arn, &format!("makersbrain-{id}"))
+        .ensure_webhook(observation.id, &sns_arn, &format!("mb-{id}"))
         .await?;
     sqlx::query(
         "update control.webshop_email_domains set webhook_ref=$2 where id=$1 and operation_id=$3",

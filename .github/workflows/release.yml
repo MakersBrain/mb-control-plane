@@ -173,7 +173,7 @@ jobs:
           fi
 
           jq -n \
-            --arg schema "makersbrain.control-plane.release.v1" \
+            --arg schema "mb.control-plane.release.v1" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg commit "$GITHUB_SHA" \
             --arg ref "$GITHUB_REF" \
@@ -253,7 +253,7 @@ jobs:
           set -euo pipefail
           artifact="$REGISTRY/$REPOSITORY_PREFIX/mb-control-plane-release:${GITHUB_SHA}"
           oras push "$artifact" \
-            --artifact-type application/vnd.makersbrain.control-plane-release.v1+json \
+            --artifact-type application/vnd.mb.control-plane-release.v1+json \
             ${{ steps.record.outputs.files }}
           # Not signed separately: its digest is recorded here and bound by
           # mb-infra's composed release record, the single provenance anchor

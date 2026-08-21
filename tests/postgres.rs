@@ -1,9 +1,9 @@
-use makersbrain_control_plane::command::{
+use mb_control_plane::command::{
     CommandAdmission, CommandError, CommandResult, NewCommand, admit_command, complete_command,
 };
-use makersbrain_control_plane::domain::OperationKind;
-use makersbrain_control_plane::modules::{CATALOG, REGISTRY_VERSION};
-use makersbrain_control_plane::persistence::{NewOperation, Store};
+use mb_control_plane::domain::OperationKind;
+use mb_control_plane::modules::{CATALOG, REGISTRY_VERSION};
+use mb_control_plane::persistence::{NewOperation, Store};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -92,13 +92,13 @@ async fn webshop_domain_registry_enforces_global_claim_and_active_evidence() {
             .execute(store.pool()).await.unwrap();
     }
     let domain = Uuid::new_v4();
-    sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_makersbrain-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
+    sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_mb-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
         .bind(domain).bind(first)
-        .bind("makersbrain-verification=0123456789abcdefghijklmnopqrstuv")
+        .bind("mb-verification=0123456789abcdefghijklmnopqrstuv")
         .bind(user).execute(store.pool()).await.unwrap();
-    let stolen = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_makersbrain-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
+    let stolen = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,'www.atelier-luna.fr','_mb-challenge.www.atelier-luna.fr',$3,'shops.makersbrain.com',$4)")
         .bind(Uuid::new_v4()).bind(second)
-        .bind("makersbrain-verification=abcdefghijklmnopqrstuvwxyz012345")
+        .bind("mb-verification=abcdefghijklmnopqrstuvwxyz012345")
         .bind(user).execute(store.pool()).await;
     assert!(
         stolen.is_err(),
@@ -120,9 +120,9 @@ async fn webshop_domain_registry_enforces_global_claim_and_active_evidence() {
         .execute(store.pool())
         .await
         .unwrap();
-    let result = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by,canonical) values($1,$2,'shop.atelier-luna.fr','_makersbrain-challenge.shop.atelier-luna.fr',$3,'shops.makersbrain.com',$4,true)")
+    let result = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by,canonical) values($1,$2,'shop.atelier-luna.fr','_mb-challenge.shop.atelier-luna.fr',$3,'shops.makersbrain.com',$4,true)")
         .bind(duplicate_canonical).bind(first)
-        .bind("makersbrain-verification=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+        .bind("mb-verification=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
         .bind(user).execute(store.pool()).await;
     assert!(
         result.is_err(),
@@ -345,7 +345,7 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
         .await
         .expect("the driver ledger must accept rehearsal actions");
 
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Full workshop',$4,array['odoo','paperless'],'makersbrain-workshop-recovery-v2')")
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Full workshop',$4,array['odoo','paperless'],'mb-workshop-recovery-v2')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await.unwrap();
     let default_recovery = Uuid::new_v4();
     sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'snapshot','Current default',$4)")
@@ -357,14 +357,14 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(default_format, "makersbrain-workshop-recovery-v2");
-    let legacy_format = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,format_version) values($1,$2,$3,'snapshot','Obsolete format',$4,'makersbrain-odoo-recovery-v1')")
+    assert_eq!(default_format, "mb-workshop-recovery-v2");
+    let legacy_format = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,format_version) values($1,$2,$3,'snapshot','Obsolete format',$4,'mb-odoo-recovery-v1')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await;
     assert!(
         legacy_format.is_err(),
         "the obsolete Odoo-only recovery format must fail closed"
     );
-    let invalid_scope = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Missing Odoo',$4,array['paperless'],'makersbrain-workshop-recovery-v2')")
+    let invalid_scope = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Missing Odoo',$4,array['paperless'],'mb-workshop-recovery-v2')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await;
     assert!(
         invalid_scope.is_err(),

@@ -313,8 +313,8 @@ pub(super) async fn create(
     };
     let proposed_id = Uuid::new_v4();
     let token = Alphanumeric.sample_string(&mut rand::rng(), 32);
-    let verification_name = format!("_makersbrain-challenge.{hostname}");
-    let verification_value = format!("makersbrain-verification={token}");
+    let verification_name = format!("_mb-challenge.{hostname}");
+    let verification_value = format!("mb-verification={token}");
     let routing_target = format!("shops.{}", state.config.tenant_domain);
     let inserted = sqlx::query_as::<_, (Uuid, i64)>(
         "insert into control.webshop_domains(
@@ -848,12 +848,9 @@ mod tests {
     fn dns_json_txt_matching_handles_quoted_and_split_txt_answers() {
         let payload = json!({"Answer":[
             {"type":1,"data":"192.0.2.1"},
-            {"type":16,"data":"\"makersbrain-\" \"verification=abc\""}
+            {"type":16,"data":"\"mb-\" \"verification=abc\""}
         ]});
-        assert!(txt_answer_matches(&payload, "makersbrain-verification=abc"));
-        assert!(!txt_answer_matches(
-            &payload,
-            "makersbrain-verification=other"
-        ));
+        assert!(txt_answer_matches(&payload, "mb-verification=abc"));
+        assert!(!txt_answer_matches(&payload, "mb-verification=other"));
     }
 }

@@ -1,4 +1,4 @@
-use makersbrain_control_plane::{
+use mb_control_plane::{
     modules::CATALOG,
     persistence::{InitialReleaseActivationError, Store, activate_initial_release},
 };
