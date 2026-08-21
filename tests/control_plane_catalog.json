@@ -22,8 +22,8 @@
     "workshop_recovery_rehearsals", "workshops"
   ],
   "catalog": {
-    "columns": {"count": 633, "digest": "283b4db7dcd423a9ad6ca9709b20d85c"},
-    "constraints": {"count": 498, "digest": "015252aa5976a0347295a40e295f6620"},
+    "columns": {"count": 633, "digest": "d7a17ad92a7b9cfd91a4c8ed090b3c35"},
+    "constraints": {"count": 498, "digest": "eed717cd97d22f755efc674a58a64b43"},
     "indexes": {"count": 125, "digest": "b324de80bd84fa6b665e85b6e8549ba5"},
     "functions": {"count": 20, "digest": "e2f89e8f22d849f30409fd009f25c0bf"},
     "triggers": {"count": 15, "digest": "df70a96b4fdf587e336ce7ec19e653da"},
