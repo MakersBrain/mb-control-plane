@@ -167,8 +167,20 @@ pub(super) async fn docker_inspect_container(
 pub(super) async fn docker_create_container(
     state: &DriverState,
     name: &str,
-    body: Value,
+    mut body: Value,
 ) -> Result<(), DriverError> {
+    let labels = body
+        .as_object_mut()
+        .ok_or_else(|| DriverError::internal("Docker container body must be an object"))?
+        .entry("Labels")
+        .or_insert_with(|| json!({}));
+    labels
+        .as_object_mut()
+        .ok_or_else(|| DriverError::internal("Docker container labels must be an object"))?
+        .insert(
+            "mb.workspace".to_owned(),
+            json!(state.config.workspace_namespace),
+        );
     let response = state
         .runtime
         .client
@@ -315,7 +327,7 @@ pub(super) async fn docker_create_volume(
         .runtime
         .client
         .post(state.runtime.endpoint("/volumes/create"))
-        .json(&json!({"Name":name,"Labels":{"mb.kind":"paperless-volume"}}))
+        .json(&json!({"Name":name,"Labels":{"mb.kind":"paperless-volume","mb.workspace":state.config.workspace_namespace}}))
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -355,7 +367,7 @@ pub(super) async fn docker_create_extension_volume(
     payload_digest: &str,
 ) -> Result<(), DriverError> {
     let response = state.runtime.client.post(state.runtime.endpoint("/volumes/create"))
-        .json(&json!({"Name":name,"Labels":{"mb.kind":"odoo-extension","mb.extension-manifest":manifest_digest,"mb.payload":payload_digest}}))
+        .json(&json!({"Name":name,"Labels":{"mb.kind":"odoo-extension","mb.workspace":state.config.workspace_namespace,"mb.extension-manifest":manifest_digest,"mb.payload":payload_digest}}))
         .send().await.map_err(DriverError::internal)?;
     if !response.status().is_success() {
         return Err(DriverError::internal(format!(

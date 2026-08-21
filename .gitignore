@@ -4,5 +4,7 @@
 /web/build/
 /.env
 /deploy/secrets/
+/deploy/.env
+/deploy/workspaces/
 __pycache__/
 *.pyc

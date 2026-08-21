@@ -179,7 +179,9 @@ pub(super) async fn ensure_odoo_database(
     tenant_key: &str,
 ) -> Result<(), DriverError> {
     let (image, extension_volume) = active_odoo_artifacts(state).await?;
-    let container = format!("mb-odoo-init-{tenant_key}");
+    let container = state
+        .config
+        .docker_resource(format!("odoo-init-{tenant_key}"));
     if docker_container_exists(state, &container).await? {
         let _ = docker_delete_container(state, &container).await;
     }
@@ -245,7 +247,9 @@ pub(super) async fn ensure_odoo_break_glass(
     tenant_key: &str,
 ) -> Result<(), DriverError> {
     let (image, extension_volume) = active_odoo_artifacts(state).await?;
-    let container = format!("mb-odoo-break-glass-{tenant_key}");
+    let container = state
+        .config
+        .docker_resource(format!("odoo-break-glass-{tenant_key}"));
     if docker_container_exists(state, &container).await? {
         let _ = docker_delete_container(state, &container).await;
     }
@@ -311,7 +315,13 @@ pub(super) async fn ensure_paperless(
         .as_deref()
         .ok_or_else(|| DriverError::bad("Paperless is not configured for this deployment"))?;
     for suffix in ["data", "media", "consume"] {
-        docker_create_volume(state, &format!("mb-paperless-{workshop}-{suffix}")).await?;
+        docker_create_volume(
+            state,
+            &state
+                .config
+                .docker_resource(format!("paperless-{workshop}-{suffix}")),
+        )
+        .await?;
     }
     let providers = json!({"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":oidc_client_id,"secret":oidc_secret,"settings":{"server_url":format!("{}/.well-known/openid-configuration",state.config.oidc_issuer),"oauth_pkce_enabled":true,"email_authentication":true}}]}}).to_string();
     let tenant_secret_dir = driver_runtime_secret_root(state)
@@ -418,7 +428,7 @@ pub(super) async fn ensure_paperless(
             "Labels":{"mb.kind":"paperless","mb.workshop":workshop.to_string(),"mb.config-digest":config_digest},
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
-                "Binds":[format!("mb-paperless-{workshop}-data:/usr/src/paperless/data"),format!("mb-paperless-{workshop}-media:/usr/src/paperless/media"),format!("mb-paperless-{workshop}-consume:/usr/src/paperless/consume")],
+                "Binds":[format!("{}:/usr/src/paperless/data",state.config.docker_resource(format!("paperless-{workshop}-data"))),format!("{}:/usr/src/paperless/media",state.config.docker_resource(format!("paperless-{workshop}-media"))),format!("{}:/usr/src/paperless/consume",state.config.docker_resource(format!("paperless-{workshop}-consume")))],
                 "GroupAdd":["0"],
                 "Mounts":mounts
             }

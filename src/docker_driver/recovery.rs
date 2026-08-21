@@ -48,7 +48,9 @@ pub(super) async fn download_backup(
     let result_path = state.config.backup_root.join(&result_name);
     run_docker_job_with_secrets(
         state,
-        &format!("mb-presign-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("presign-{}", &recovery.simple().to_string()[..12])),
         json!({
             "Image": image,
             "User": "0:0",
@@ -60,7 +62,7 @@ pub(super) async fn download_backup(
                 format!("ARCHIVE_KEY={object_key}"),
             ],
             "Labels": {"mb.kind":"s3-backup-presign-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
+            "HostConfig": {"NetworkMode":state.config.docker_network,"Binds": [format!("{}:/backups", state.config.backup_volume)]}
         }),
         &s3_job_secrets(s3, false),
     )
@@ -104,7 +106,9 @@ pub(super) async fn lifecycle(
     payload: &Value,
 ) -> Result<Value, DriverError> {
     let deleting = payload.get("action").and_then(Value::as_str) == Some("delete");
-    let paperless_container = format!("mb-paperless-{}", tenant_key(workshop));
+    let paperless_container = state
+        .config
+        .docker_resource(format!("paperless-{}", tenant_key(workshop)));
     let paperless_running = if docker_container_exists(state, &paperless_container).await? {
         docker_inspect_container(state, &paperless_container)
             .await?
@@ -490,10 +494,10 @@ async fn neutralize_duplicate_carriers(
     let sql = "do $neutralize$ begin if to_regclass('public.delivery_carrier') is not null and exists (select 1 from information_schema.columns where table_schema='public' and table_name='delivery_carrier' and column_name='mb_secret_ref') then update public.delivery_carrier set mb_secret_ref=null,mb_subscription_id=null,mb_credential_state='unconfigured',mb_provider_enabled=false,prod_environment=false where mb_provider_code is not null; end if; end $neutralize$;";
     run_postgres_job(
         state,
-        &format!(
-            "mb-pg-neutralize-{}",
+        &state.config.docker_resource(format!(
+            "pg-neutralize-{}",
             &Uuid::new_v4().simple().to_string()[..12]
-        ),
+        )),
         vec![
             "psql".into(),
             "--no-psqlrc".into(),
@@ -854,7 +858,9 @@ pub(super) async fn create_recovery_set(
     let dump_relative = relative.join("odoo/database.dump");
     run_postgres_job(
         state,
-        &format!("mb-pg-dump-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("pg-dump-{}", &recovery.simple().to_string()[..12])),
         vec![
             "pg_dump".into(),
             "--format=custom".into(),
@@ -1025,15 +1031,16 @@ pub(super) async fn restore_recovery_set(
     replace_database(state, target_database).await?;
     run_postgres_job(
         state,
-        &format!(
-            "mb-pg-restore-{}",
+        &state.config.docker_resource(format!(
+            "pg-restore-{}",
             &Uuid::new_v4().simple().to_string()[..12]
-        ),
+        )),
         vec![
             "pg_restore".into(),
             "--exit-on-error".into(),
             "--no-owner".into(),
             "--no-acl".into(),
+            "--role=odoo".into(),
             format!("--host={}", state.config.postgres_host),
             format!("--port={}", state.config.postgres_port),
             format!("--username={}", state.config.postgres_admin_user),
@@ -1108,6 +1115,7 @@ async fn create_remote_recovery_set(
     let binds = backup_writer_binds(
         &state.config.backup_volume,
         &state.config.odoo_volume,
+        &state.config.workspace_namespace,
         workshop,
         includes_paperless,
     );
@@ -1121,7 +1129,9 @@ async fn create_remote_recovery_set(
     }
     run_docker_job_with_secrets(
         state,
-        &format!("mb-encrypt-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("encrypt-{}", &recovery.simple().to_string()[..12])),
         json!({
             "Image": image,
             "User": "0:0",
@@ -1218,7 +1228,9 @@ async fn create_remote_recovery_set(
     let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(serialized_manifest);
     run_docker_job_with_secrets(
         state,
-        &format!("mb-manifest-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("manifest-{}", &recovery.simple().to_string()[..12])),
         json!({
             "Image": image,
             "User": "0:0",
@@ -1256,7 +1268,9 @@ async fn create_remote_recovery_set(
     const ARCHIVE_NAME: &str = "mb-workshop-backup.tar";
     run_docker_job(
         state,
-        &format!("mb-archive-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("archive-{}", &recovery.simple().to_string()[..12])),
         json!({
             "Image": image,
             "User": "0:0",
@@ -1319,6 +1333,7 @@ async fn create_remote_recovery_set(
 fn backup_writer_binds(
     backup_volume: &str,
     odoo_volume: &str,
+    workspace_namespace: &str,
     workshop: Uuid,
     includes_paperless: bool,
 ) -> Vec<String> {
@@ -1329,7 +1344,7 @@ fn backup_writer_binds(
     if includes_paperless {
         for suffix in ["data", "media", "consume"] {
             binds.push(format!(
-                "mb-paperless-{workshop}-{suffix}:/paperless/{suffix}:ro"
+                "{workspace_namespace}-paperless-{workshop}-{suffix}:/paperless/{suffix}:ro"
             ));
         }
     }
@@ -1382,17 +1397,17 @@ async fn upload_and_verify_s3(
     );
     run_docker_job_with_secrets(
         state,
-        &format!(
-            "mb-upload-{}",
+        &state.config.docker_resource(format!(
+            "upload-{}",
             &manifest.recovery_id.simple().to_string()[..12]
-        ),
+        )),
         json!({
             "Image": image,
             "User": "0:0",
             "Cmd": ["sh", "-ec", command],
             "Env": s3_environment(s3, object_prefix),
             "Labels": {"mb.kind":"s3-backup-upload-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups:ro", state.config.backup_volume)]}
+            "HostConfig": {"NetworkMode":state.config.docker_network,"Binds": [format!("{}:/backups:ro", state.config.backup_volume)]}
         }),
         &s3_job_secrets(s3, true),
     )
@@ -1626,14 +1641,17 @@ async fn restore_remote_recovery_inner(
     );
     run_docker_job_with_secrets(
         state,
-        &format!("mb-download-{}", &Uuid::new_v4().simple().to_string()[..12]),
+        &state.config.docker_resource(format!(
+            "download-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        )),
         json!({
             "Image": image,
             "User": "0:0",
             "Cmd": ["sh", "-ec", bootstrap],
             "Env": environment,
             "Labels": {"mb.kind":"s3-restore-download-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
+            "HostConfig": {"NetworkMode":state.config.docker_network,"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1745,14 +1763,17 @@ async fn restore_remote_recovery_inner(
     );
     run_docker_job_with_secrets(
         state,
-        &format!("mb-verify-{}", &manifest.recovery_id.simple().to_string()[..12]),
+        &state.config.docker_resource(format!(
+            "verify-{}",
+            &manifest.recovery_id.simple().to_string()[..12]
+        )),
         json!({
             "Image": image,
             "User": "0:0",
             "Cmd": ["sh", "-ec", download],
             "Env": environment,
             "Labels": {"mb.kind":"s3-restore-verify-job"},
-            "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
+            "HostConfig": {"NetworkMode":state.config.docker_network,"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
     )
@@ -1790,24 +1811,27 @@ async fn restore_remote_recovery_inner(
     if expected_scope.iter().any(|item| item == "paperless") {
         for suffix in ["data", "media", "consume"] {
             binds.push(format!(
-                "mb-paperless-{workshop}-{suffix}:/paperless/{suffix}"
+                "{}:/paperless/{suffix}",
+                state
+                    .config
+                    .docker_resource(format!("paperless-{workshop}-{suffix}"))
             ));
         }
     }
     let mut restore = format!(
-        "set -eu; set -o pipefail; root=/backups/{}; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$ODOO_DATABASE\"; target=\"/odoo/filestore/$ODOO_DATABASE\"; mkdir -p \"$target\"; find \"$target\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/filestore.tar.zst.enc\" | zstd -q -d | tar -xf - -C \"$target\"; chown -R \"$ODOO_UID:$ODOO_GID\" \"$target\"",
+        "set -eu; set -o pipefail; root=/backups/{}; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --role=odoo --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$ODOO_DATABASE\"; target=\"/odoo/filestore/$ODOO_DATABASE\"; mkdir -p \"$target\"; find \"$target\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/filestore.tar.zst.enc\" | zstd -q -d | tar -xf - -C \"$target\"; chown -R \"$ODOO_UID:$ODOO_GID\" \"$target\"",
         relative.to_string_lossy()
     );
     if expected_scope.iter().any(|item| item == "paperless") {
-        restore.push_str("; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$PAPERLESS_DATABASE\"; for part in data media consume; do find /paperless/$part -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/$part.tar.zst.enc\" | zstd -q -d | tar -xf - -C /paperless/$part; done");
+        restore.push_str("; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --role=\"$PAPERLESS_DATABASE\" --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$PAPERLESS_DATABASE\"; for part in data media consume; do find /paperless/$part -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/$part.tar.zst.enc\" | zstd -q -d | tar -xf - -C /paperless/$part; done");
     }
     let pgpass = postgres_admin_pgpass(state);
     run_docker_job_with_secrets(
         state,
-        &format!(
-            "mb-restore-{}",
+        &state.config.docker_resource(format!(
+            "restore-{}",
             &manifest.recovery_id.simple().to_string()[..12]
-        ),
+        )),
         json!({
             "Image": image,
             "User": "0:0",
@@ -1853,16 +1877,19 @@ async fn validate_remote_database_dumps(
         return Err(error);
     }
     let mut command = format!(
-        "set -eu; set -o pipefail; root=/backups/{}; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$ODOO_TEMPORARY\"",
+        "set -eu; set -o pipefail; root=/backups/{}; age -d -i \"$AGE_IDENTITY\" \"$root/odoo/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --role=odoo --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$ODOO_TEMPORARY\"",
         relative.to_string_lossy()
     );
     if includes_paperless {
-        command.push_str("; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$PAPERLESS_TEMPORARY\"");
+        command.push_str("; age -d -i \"$AGE_IDENTITY\" \"$root/paperless/database.dump.enc\" | zstd -q -d | pg_restore --exit-on-error --no-owner --no-acl --role=\"$PAPERLESS_OWNER\" --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" --dbname=\"$PAPERLESS_TEMPORARY\"");
     }
     let pgpass = postgres_admin_pgpass(state);
     let validation = run_docker_job_with_secrets(
         state,
-        &format!("mb-preflight-{}", &Uuid::new_v4().simple().to_string()[..12]),
+        &state.config.docker_resource(format!(
+            "preflight-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        )),
         json!({
             "Image": image,
             "User": "0:0",
@@ -1875,6 +1902,7 @@ async fn validate_remote_database_dumps(
                 format!("AGE_IDENTITY={}", s3.age_identity_file),
                 format!("ODOO_TEMPORARY={odoo_temporary}"),
                 format!("PAPERLESS_TEMPORARY={paperless_temporary}"),
+                format!("PAPERLESS_OWNER={paperless_owner}"),
             ],
             "Labels": {"mb.kind":"restore-preflight-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
@@ -2194,7 +2222,9 @@ async fn backup_paperless(
     let dump_relative = relative.join("paperless/database.dump");
     run_postgres_job_as(
         state,
-        &format!("mb-pl-dump-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("pl-dump-{}", &recovery.simple().to_string()[..12])),
         &state.config.postgres_admin_user,
         &state.config.postgres_admin_password,
         vec![
@@ -2213,7 +2243,9 @@ async fn backup_paperless(
     run_paperless_volume_job(
         state,
         workshop,
-        &format!("mb-pl-files-{}", &recovery.simple().to_string()[..12]),
+        &state
+            .config
+            .docker_resource(format!("pl-files-{}", &recovery.simple().to_string()[..12])),
         relative,
         false,
     )
@@ -2240,10 +2272,10 @@ async fn restore_paperless(
     replace_database_owned(state, &database, &database).await?;
     run_postgres_job_as(
         state,
-        &format!(
-            "mb-pl-restore-{}",
+        &state.config.docker_resource(format!(
+            "pl-restore-{}",
             &Uuid::new_v4().simple().to_string()[..12]
-        ),
+        )),
         &state.config.postgres_admin_user,
         &state.config.postgres_admin_password,
         vec![
@@ -2251,6 +2283,7 @@ async fn restore_paperless(
             "--exit-on-error".into(),
             "--no-owner".into(),
             "--no-acl".into(),
+            format!("--role={database}"),
             format!("--host={}", state.config.postgres_host),
             format!("--port={}", state.config.postgres_port),
             format!("--username={}", state.config.postgres_admin_user),
@@ -2265,7 +2298,10 @@ async fn restore_paperless(
     run_paperless_volume_job(
         state,
         workshop,
-        &format!("mb-pl-files-{}", &Uuid::new_v4().simple().to_string()[..12]),
+        &state.config.docker_resource(format!(
+            "pl-files-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        )),
         relative,
         true,
     )
@@ -2282,7 +2318,10 @@ async fn run_paperless_volume_job(
     let mut binds = vec![format!("{}:/backups", state.config.backup_volume)];
     for suffix in ["data", "media", "consume"] {
         binds.push(format!(
-            "mb-paperless-{workshop}-{suffix}:/paperless/{suffix}{}",
+            "{}:/paperless/{suffix}{}",
+            state
+                .config
+                .docker_resource(format!("paperless-{workshop}-{suffix}")),
             if restore { "" } else { ":ro" }
         ));
     }
@@ -2318,15 +2357,16 @@ async fn validate_local_dump(
     replace_database_owned(state, &temporary, owner).await?;
     let validation = run_postgres_job(
         state,
-        &format!(
-            "mb-pg-validate-{}",
+        &state.config.docker_resource(format!(
+            "pg-validate-{}",
             &Uuid::new_v4().simple().to_string()[..12]
-        ),
+        )),
         vec![
             "pg_restore".into(),
             "--exit-on-error".into(),
             "--no-owner".into(),
             "--no-acl".into(),
+            format!("--role={owner}"),
             format!("--host={}", state.config.postgres_host),
             format!("--port={}", state.config.postgres_port),
             format!("--username={}", state.config.postgres_admin_user),
@@ -2350,12 +2390,13 @@ mod tests {
     #[test]
     fn backup_writer_never_receives_recovery_secret_bind() {
         let workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
-        let binds = backup_writer_binds("mb-backups", "mb-odoo", workshop, true);
+        let binds = backup_writer_binds("mb-backups", "mb-odoo", "mb-dev1", workshop, true);
 
         assert_eq!(binds.len(), 5);
         assert!(binds.iter().all(|bind| !bind.contains("recovery-secret")));
         assert!(binds.iter().all(|bind| !bind.contains("age-identity")));
         assert_eq!(binds[0], "mb-backups:/backups");
         assert_eq!(binds[1], "mb-odoo:/odoo:ro");
+        assert!(binds[2].starts_with("mb-dev1-paperless-"));
     }
 }

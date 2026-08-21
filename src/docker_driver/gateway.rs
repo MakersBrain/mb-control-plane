@@ -132,7 +132,9 @@ pub(super) async fn restrict_capability(
         .ok_or_else(|| DriverError::bad("invalid database_ref"))?;
     let odoo_hostname = hostname(payload, "public_hostname")?;
     let paperless_hostname = hostname(payload, "paperless_hostname")?;
-    let paperless_container = format!("mb-paperless-{}", tenant_key(workshop));
+    let paperless_container = state
+        .config
+        .docker_resource(format!("paperless-{}", tenant_key(workshop)));
     let config = route_config(
         database_ref,
         odoo_hostname,
