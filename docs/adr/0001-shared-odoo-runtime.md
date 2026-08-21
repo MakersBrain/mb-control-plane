@@ -15,12 +15,10 @@ no tenant verifier, after which every bridge request is authenticated against
 the selected database. Rotating or compromising one workshop credential
 therefore does not authorize another database.
 
-Upgrade from the former shared-token release is deliberately two-phase. The
-module migration seeds the existing verifier so candidate health checks do not
-fail mid-fleet; the first idempotent reconciliation then rotates that workshop
-to its random token. The release is not production-approved until reconciliation
-has completed for every routed workshop and the two-workshop black-box gate
-rejects cross-use.
+The development-only shared-token transition described by the original version
+of this ADR was retired by ADR 0007 before the first production release. Fresh
+provisioning installs the tenant verifier during the single authenticated
+bootstrap request, and the two-workshop black-box gate must reject cross-use.
 
 This reduces idle runtime cost without weakening the data boundary. It requires
 negative routing tests and prevents a runtime switch until every routed tenant

@@ -5,7 +5,7 @@ if [ ! -f deploy/.env ]; then
   exit 1
 fi
 if [ ! -d deploy/secrets/runtime ]; then
-  echo "deploy/secrets/runtime is missing; run deploy/migrate-local-env-secrets.sh --apply for a legacy .env" >&2
+  echo "deploy/secrets/runtime is missing; run deploy/bootstrap-local-env.sh to create a fresh local configuration" >&2
   exit 1
 fi
 if [ ! -f deploy/secrets/release/cosign.pub ]; then

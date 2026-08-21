@@ -59,10 +59,6 @@ The bootstrap writes non-secret configuration and only `@/run/secrets/...`
 references to `deploy/.env`; credential values are read-only files inside the
 mode-0700 `deploy/secrets/runtime` directory. Rendered Compose output is covered by a recognizable
 secret-canary test. Never replace a reference with plaintext in `.env`.
-Existing local installations using the earlier plaintext environment format can
-be converted in place, without regenerating credentials, with
-`./deploy/migrate-local-env-secrets.sh --apply`; the command refuses partial or
-already-migrated state.
 
 Personal mode is intentionally unavailable with the repository defaults. A
 production deployment must set all six governance settings documented beside
@@ -188,8 +184,8 @@ write access to that volume.
 
 Paperless, invoice capture, and Azure extraction are enable-only workshop
 modules. Enable them in that order from the control UI. New workshops provision
-only Odoo and identity; existing workshops with a Paperless service are
-backfilled as enabled by migration `0006_optional_document_services`.
+only Odoo and identity. The fresh control-plane schema contains no historical
+Paperless enablement backfill.
 
 Azure credentials are optional at process startup and are read only after a
 workshop enables `azure-invoice-extraction`. Enabling that module fails safely

@@ -41,7 +41,7 @@ pub struct Config {
 
 impl Config {
     pub fn database_url() -> Result<String, ConfigError> {
-        required("CONTROL_DATABASE_URL")
+        required_secret("CONTROL_DATABASE_URL")
     }
 
     pub fn synthetic_data_only() -> Result<bool, ConfigError> {
@@ -52,8 +52,8 @@ impl Config {
         // The metrics credential exists so that Prometheus, which holds it on
         // disk in its own container, cannot call the internal API. Reusing the
         // internal token here would hand it exactly that, silently.
-        let internal_token = required("CONTROL_INTERNAL_TOKEN")?;
-        let metrics_token = required("CONTROL_METRICS_TOKEN")?;
+        let internal_token = required_secret("CONTROL_INTERNAL_TOKEN")?;
+        let metrics_token = required_secret("CONTROL_METRICS_TOKEN")?;
         distinct_secret(
             "CONTROL_METRICS_TOKEN",
             &metrics_token,
@@ -77,14 +77,14 @@ impl Config {
             tenant_public_port: optional_port("CONTROL_TENANT_PUBLIC_PORT")?,
             internal_token,
             metrics_token,
-            mail_event_token: required("CONTROL_MAIL_EVENT_TOKEN")?,
-            release_publish_token: required("CONTROL_RELEASE_PUBLISH_TOKEN")?,
+            mail_event_token: required_secret("CONTROL_MAIL_EVENT_TOKEN")?,
+            release_publish_token: required_secret("CONTROL_RELEASE_PUBLISH_TOKEN")?,
             invitation_verification_keys_file: PathBuf::from(required(
                 "CONTROL_INVITATION_VERIFICATION_KEYS_FILE",
             )?),
             invitation_signing_key_id: required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
             deployment_driver_url: absolute_url("CONTROL_DEPLOYMENT_DRIVER_URL")?,
-            deployment_driver_token: required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
+            deployment_driver_token: required_secret("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
             allow_self_signup: std::env::var("CONTROL_ALLOW_SELF_SIGNUP")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             operator_emails: std::env::var("CONTROL_OPERATOR_EMAILS")
@@ -230,6 +230,16 @@ fn tenant_domain() -> Result<String, ConfigError> {
 }
 
 fn required(name: &'static str) -> Result<String, ConfigError> {
+    crate::runtime_secret::required_configuration(name).map_err(|reason| {
+        if reason == format!("{name} is required") {
+            ConfigError::Missing(name)
+        } else {
+            ConfigError::Invalid { name, reason }
+        }
+    })
+}
+
+fn required_secret(name: &'static str) -> Result<String, ConfigError> {
     crate::runtime_secret::required(name).map_err(|reason| {
         if reason == format!("{name} is required") {
             ConfigError::Missing(name)

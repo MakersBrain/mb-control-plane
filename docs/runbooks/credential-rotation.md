@@ -19,14 +19,14 @@ priority over the normal overlap sequence.
 Do not rotate by giving a worker a migration owner, another queue's credential,
 or a shared provider administrator key.
 
-After upgrading from the legacy shared Odoo bridge credential, reconcile every
-routed workshop before admitting production traffic. Reconciliation upgrades
-the bridge schema, writes a distinct random tenant token, authenticates the
-versioned bootstrap receipt with the still-valid previous verifier, updates the
-tenant-database hash, and updates the Paperless webhook file. Run
-`make topology-odoo-isolation-check` against two workshops afterward. A workshop
-that still accepts the other workshop's token remains in maintenance; never
-delete or hand-edit its token file to force rotation.
+Odoo bridge credentials are tenant-scoped from initial provisioning. The shared
+process credential authenticates only the first bootstrap request for a blank
+tenant database; it is not a tenant credential and is never a fallback after a
+tenant verifier exists. Rotate a workshop token through the current
+tenant-scoped provisioning/reconciliation contract, then run
+`make topology-odoo-isolation-check` against two workshops. A workshop that
+accepts the other workshop's token remains in maintenance; never delete or
+hand-edit its token file to force rotation.
 
 For a planned privacy-export encryption-key rotation, place only the still-live
 previous key IDs and base64 keys in the API's absolute, access-controlled JSON

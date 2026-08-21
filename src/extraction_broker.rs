@@ -72,9 +72,8 @@ struct ProductLookupRequest {
 
 impl BrokerState {
     pub fn from_env() -> anyhow::Result<Self> {
-        let required = |name| crate::runtime_secret::required(name).map_err(anyhow::Error::msg);
-        let endpoint = broker_environment("BROKER_AZURE_ENDPOINT")?.unwrap_or_default();
-        let key = broker_environment("BROKER_AZURE_KEY")?.unwrap_or_default();
+        let endpoint = broker_configuration("BROKER_AZURE_ENDPOINT")?.unwrap_or_default();
+        let key = broker_secret("BROKER_AZURE_KEY")?.unwrap_or_default();
         if endpoint.trim().is_empty() != key.trim().is_empty() {
             anyhow::bail!("both Azure endpoint and key must be configured together");
         }
@@ -98,18 +97,19 @@ impl BrokerState {
             )?)
         };
         let vision = vision_clients_from_env()?;
-        let lookup_endpoint = broker_environment("BROKER_UPCITEMDB_ENDPOINT")?.unwrap_or_default();
+        let lookup_endpoint =
+            broker_configuration("BROKER_UPCITEMDB_ENDPOINT")?.unwrap_or_default();
         let product_lookup = if lookup_endpoint.trim().is_empty() {
             None
         } else {
-            let lookup_key = broker_environment("BROKER_UPCITEMDB_KEY")?;
+            let lookup_key = broker_secret("BROKER_UPCITEMDB_KEY")?;
             Some(UpcItemDbClient::new(
                 &lookup_endpoint,
                 lookup_key.as_deref(),
             )?)
         };
         Ok(Self {
-            token: required("BROKER_TOKEN")?,
+            token: crate::runtime_secret::required("BROKER_TOKEN").map_err(anyhow::Error::msg)?,
             azure,
             azure_version,
             vision,
@@ -457,33 +457,10 @@ fn vision_clients_from_env() -> anyhow::Result<Vec<InventoryVisionClient>> {
     if primary.trim().is_empty() && !secondary.trim().is_empty() {
         anyhow::bail!("vision secondary requires a configured primary");
     }
-    if !primary.trim().is_empty() {
-        return vision_provider_order(&primary, &secondary)?
-            .into_iter()
-            .map(vision_client_from_env)
-            .collect();
-    }
-
-    let endpoint = broker_environment("BROKER_VISION_ENDPOINT")?.unwrap_or_default();
-    let key = broker_environment("BROKER_VISION_KEY")?.unwrap_or_default();
-    let model = broker_environment("BROKER_VISION_MODEL")?.unwrap_or_default();
-    let configured = [endpoint.as_str(), key.as_str(), model.as_str()]
-        .iter()
-        .filter(|value| !value.trim().is_empty())
-        .count();
-    if !matches!(configured, 0 | 3) {
-        anyhow::bail!("legacy vision endpoint, key, and model must be configured together");
-    }
-    if configured == 3 {
-        Ok(vec![InventoryVisionClient::new(
-            VisionProviderKind::OpenAiCompatible,
-            &endpoint,
-            &key,
-            &model,
-        )?])
-    } else {
-        Ok(Vec::new())
-    }
+    vision_provider_order(&primary, &secondary)?
+        .into_iter()
+        .map(vision_client_from_env)
+        .collect()
 }
 
 fn vision_provider_order(
@@ -501,9 +478,6 @@ fn vision_provider_order(
     if providers.len() == 2 && providers[0] == providers[1] {
         anyhow::bail!("vision primary and secondary must be different providers");
     }
-    if providers.contains(&VisionProviderKind::OpenAiCompatible) {
-        anyhow::bail!("openai-compatible is available only through the legacy vision settings");
-    }
     Ok(providers)
 }
 
@@ -517,26 +491,30 @@ fn vision_failover_allowed(error: crate::domain::IntegrationError) -> bool {
 }
 
 fn vision_client_from_env(provider: VisionProviderKind) -> anyhow::Result<InventoryVisionClient> {
-    if provider == VisionProviderKind::OpenAiCompatible {
-        anyhow::bail!("openai-compatible is available only through the legacy vision settings");
-    }
     let prefix = match provider {
         VisionProviderKind::OpenAi => "BROKER_OPENAI",
         VisionProviderKind::Azure => "BROKER_AZURE_MULTIMODAL",
         VisionProviderKind::Gemini => "BROKER_GEMINI",
         VisionProviderKind::Claude => "BROKER_CLAUDE",
-        VisionProviderKind::OpenAiCompatible => unreachable!(),
     };
-    let endpoint = crate::runtime_secret::required(&format!("{prefix}_ENDPOINT"))
+    let endpoint = crate::runtime_secret::required_configuration(&format!("{prefix}_ENDPOINT"))
         .map_err(anyhow::Error::msg)?;
     let key =
         crate::runtime_secret::required(&format!("{prefix}_KEY")).map_err(anyhow::Error::msg)?;
-    let model =
-        crate::runtime_secret::required(&format!("{prefix}_MODEL")).map_err(anyhow::Error::msg)?;
+    let model = crate::runtime_secret::required_configuration(&format!("{prefix}_MODEL"))
+        .map_err(anyhow::Error::msg)?;
     InventoryVisionClient::new(provider, &endpoint, &key, &model)
 }
 
 fn broker_environment(name: &str) -> anyhow::Result<Option<String>> {
+    broker_configuration(name)
+}
+
+fn broker_configuration(name: &str) -> anyhow::Result<Option<String>> {
+    crate::runtime_secret::configuration(name).map_err(anyhow::Error::msg)
+}
+
+fn broker_secret(name: &str) -> anyhow::Result<Option<String>> {
     crate::runtime_secret::environment(name).map_err(anyhow::Error::msg)
 }
 

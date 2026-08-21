@@ -10,7 +10,7 @@ use crate::persistence::{LeasedOperation, NewOperation, Store};
 fn client() -> Result<ScalewayTemDomainClient, IntegrationError> {
     let token = crate::runtime_secret::required("CONTROL_MAIL_SCW_SECRET_KEY")
         .map_err(|_| IntegrationError::ContractDrift)?;
-    let project = crate::runtime_secret::required("CONTROL_MAIL_SCW_PROJECT_ID")
+    let project = crate::runtime_secret::required_configuration("CONTROL_MAIL_SCW_PROJECT_ID")
         .map_err(|_| IntegrationError::ContractDrift)?
         .parse()
         .map_err(|_| IntegrationError::ContractDrift)?;
@@ -95,7 +95,7 @@ pub(crate) async fn run(
     if observation.status != "checked" || !dns_ready(&observation) {
         return Ok(());
     }
-    let sns_arn = crate::runtime_secret::required("CONTROL_MAIL_SNS_TOPIC_ARN")
+    let sns_arn = crate::runtime_secret::required_configuration("CONTROL_MAIL_SNS_TOPIC_ARN")
         .map_err(|_| IntegrationError::ContractDrift)?;
     let webhook_ref = provider
         .ensure_webhook(observation.id, &sns_arn, &format!("makersbrain-{id}"))

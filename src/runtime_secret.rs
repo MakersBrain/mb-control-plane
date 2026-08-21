@@ -20,12 +20,46 @@ pub fn required(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{name} is required"))
 }
 
+pub fn configuration(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => configuration_value(name, value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+fn configuration_value(name: &str, value: String) -> Result<String, String> {
+    if value.starts_with('@') {
+        Err(format!(
+            "{name} is ordinary configuration and must not use a secret reference"
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+pub fn required_configuration(name: &str) -> Result<String, String> {
+    configuration(name)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{name} is required"))
+}
+
 fn resolve(name: &str, raw: String) -> Result<Option<String>, String> {
     let Some(path) = raw.strip_prefix('@') else {
-        return Ok(Some(raw));
+        return Err(format!(
+            "{name} secret must use an explicit @/run/secrets/<leaf> reference"
+        ));
     };
     let leaf = validate_secret_path(name, Path::new(path))?;
-    read_secret(name, &Path::new("/run/secrets").join(leaf)).map(Some)
+    read_secret(name, &mounted_secret_root().join(leaf)).map(Some)
+}
+
+fn mounted_secret_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("MAKERSBRAIN_TEST_SECRET_ROOT") {
+        return root.into();
+    }
+    Path::new("/run/secrets").to_owned()
 }
 
 fn read_secret(name: &str, path: &Path) -> Result<String, String> {
@@ -71,10 +105,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_values_remain_compatible() {
+    fn direct_secret_values_are_rejected() {
+        assert!(resolve("FIXTURE", "direct-value".into()).is_err());
+    }
+
+    #[test]
+    fn secret_references_are_not_ordinary_configuration() {
+        let error = configuration_value("FIXTURE", "@/run/secrets/fixture".into()).unwrap_err();
+        assert!(error.contains("must not use a secret reference"));
         assert_eq!(
-            resolve("FIXTURE", "direct-value".into()).unwrap(),
-            Some("direct-value".into())
+            configuration_value("FIXTURE", "ordinary-value".into()).unwrap(),
+            "ordinary-value"
         );
     }
 

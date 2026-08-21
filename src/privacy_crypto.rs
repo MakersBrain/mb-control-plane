@@ -42,7 +42,8 @@ fn validate_key_id(value: String) -> Result<String, IntegrationError> {
 
 fn configured_key_id(environment: &str) -> Result<String, IntegrationError> {
     validate_key_id(
-        crate::runtime_secret::required(environment).map_err(|_| IntegrationError::Unauthorized)?,
+        crate::runtime_secret::required_configuration(environment)
+            .map_err(|_| IntegrationError::Unauthorized)?,
     )
 }
 
@@ -313,22 +314,63 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
+    struct TestSecrets {
+        root: PathBuf,
+        names: Vec<&'static str>,
+    }
+
+    impl TestSecrets {
+        fn new(entries: &[(&'static str, String)]) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("makersbrain-mounted-secrets-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            // SAFETY: privacy-crypto tests serialize access to these process
+            // variables with environment_lock and this fixture removes them.
+            unsafe { std::env::set_var("MAKERSBRAIN_TEST_SECRET_ROOT", &root) };
+            let fixture = Self {
+                root,
+                names: entries.iter().map(|(name, _)| *name).collect(),
+            };
+            for (name, value) in entries {
+                fixture.replace(name, value);
+            }
+            fixture
+        }
+
+        fn replace(&self, name: &'static str, value: &str) {
+            let leaf = name.to_ascii_lowercase();
+            fs::write(self.root.join(&leaf), value).unwrap();
+            // SAFETY: see TestSecrets::new; the referenced path shape remains
+            // the production @/run/secrets/<leaf> contract.
+            unsafe { std::env::set_var(name, format!("@/run/secrets/{leaf}")) };
+        }
+    }
+
+    impl Drop for TestSecrets {
+        fn drop(&mut self) {
+            for name in &self.names {
+                // SAFETY: see TestSecrets::new.
+                unsafe { std::env::remove_var(name) };
+            }
+            unsafe { std::env::remove_var("MAKERSBRAIN_TEST_SECRET_ROOT") };
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
     fn encrypted_lookup_is_bound_to_its_tombstone() {
         let _guard = environment_lock();
-        // SAFETY: this unit test is single-threaded with respect to this private
-        // environment name and removes it before returning.
-        unsafe {
-            std::env::set_var(
-                "CONTROL_PRIVACY_LOOKUP_KEY",
-                base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
-            );
-        }
+        let _secrets = TestSecrets::new(&[(
+            "CONTROL_PRIVACY_LOOKUP_KEY",
+            base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
+        )]);
         let tombstone = Uuid::new_v4();
         let (nonce, ciphertext) = encrypt(tombstone, br#"{"rauthy_subject":"subject-1"}"#).unwrap();
         assert_ne!(ciphertext, br#"{"rauthy_subject":"subject-1"}"#);
@@ -337,23 +379,23 @@ mod tests {
             br#"{"rauthy_subject":"subject-1"}"#
         );
         assert!(decrypt(Uuid::new_v4(), &nonce, &ciphertext).is_err());
-        // SAFETY: see setup above.
-        unsafe { std::env::remove_var("CONTROL_PRIVACY_LOOKUP_KEY") };
     }
 
     #[test]
     fn export_ciphertext_uses_its_own_key_and_context() {
         let _guard = environment_lock();
-        unsafe {
-            std::env::set_var(
+        let _secrets = TestSecrets::new(&[
+            (
                 "CONTROL_PRIVACY_EXPORT_KEY",
                 base64::engine::general_purpose::STANDARD.encode([9_u8; 32]),
-            );
-            std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY_ID", "current-export-key");
-            std::env::set_var(
+            ),
+            (
                 "CONTROL_PRIVACY_LOOKUP_KEY",
                 base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
-            );
+            ),
+        ]);
+        unsafe {
+            std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY_ID", "current-export-key");
         }
         let export = Uuid::new_v4();
         let (nonce, ciphertext) = encrypt_export(export, br#"{"subject":"example"}"#).unwrap();
@@ -364,9 +406,7 @@ mod tests {
         assert!(decrypt_export(Uuid::new_v4(), &nonce, &ciphertext).is_err());
         assert!(decrypt(export, &nonce, &ciphertext).is_err());
         unsafe {
-            std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY");
             std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY_ID");
-            std::env::remove_var("CONTROL_PRIVACY_LOOKUP_KEY");
         }
     }
 
@@ -374,12 +414,12 @@ mod tests {
     fn export_artifacts_are_private_exactly_scoped_and_deletable() {
         let _guard = environment_lock();
         let root = std::env::temp_dir().join(format!("makersbrain-export-test-{}", Uuid::new_v4()));
+        let _secrets = TestSecrets::new(&[(
+            "CONTROL_PRIVACY_EXPORT_KEY",
+            base64::engine::general_purpose::STANDARD.encode([9_u8; 32]),
+        )]);
         unsafe {
             std::env::set_var("CONTROL_PRIVACY_EXPORT_ROOT", &root);
-            std::env::set_var(
-                "CONTROL_PRIVACY_EXPORT_KEY",
-                base64::engine::general_purpose::STANDARD.encode([9_u8; 32]),
-            );
             std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY_ID", "current-export-key");
         }
         let export = Uuid::new_v4();
@@ -419,7 +459,6 @@ mod tests {
         fs::remove_dir(&root).unwrap();
         unsafe {
             std::env::remove_var("CONTROL_PRIVACY_EXPORT_ROOT");
-            std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY");
             std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY_ID");
         }
     }
@@ -430,9 +469,9 @@ mod tests {
         let key_file =
             std::env::temp_dir().join(format!("makersbrain-export-keys-{}.json", Uuid::new_v4()));
         let old_key = base64::engine::general_purpose::STANDARD.encode([4_u8; 32]);
+        let secrets = TestSecrets::new(&[("CONTROL_PRIVACY_EXPORT_KEY", old_key.clone())]);
         unsafe {
             std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY_ID", "old-export-key");
-            std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY", &old_key);
         }
         let export = Uuid::new_v4();
         let (nonce, ciphertext) = encrypt_export(export, b"planned rotation").unwrap();
@@ -441,12 +480,12 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"old-export-key":old_key})).unwrap(),
         )
         .unwrap();
+        secrets.replace(
+            "CONTROL_PRIVACY_EXPORT_KEY",
+            &base64::engine::general_purpose::STANDARD.encode([5_u8; 32]),
+        );
         unsafe {
             std::env::set_var("CONTROL_PRIVACY_EXPORT_KEY_ID", "new-export-key");
-            std::env::set_var(
-                "CONTROL_PRIVACY_EXPORT_KEY",
-                base64::engine::general_purpose::STANDARD.encode([5_u8; 32]),
-            );
             std::env::set_var("CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE", &key_file);
         }
         assert_eq!(
@@ -457,7 +496,6 @@ mod tests {
         fs::remove_file(key_file).unwrap();
         unsafe {
             std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY_ID");
-            std::env::remove_var("CONTROL_PRIVACY_EXPORT_KEY");
             std::env::remove_var("CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE");
         }
     }

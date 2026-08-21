@@ -57,10 +57,6 @@ services:
       BROKER_CLAUDE_ENDPOINT: ${INVENTORY_CLAUDE_ENDPOINT:-}
       BROKER_CLAUDE_KEY: "@/run/secrets/inventory_claude_key"
       BROKER_CLAUDE_MODEL: ${INVENTORY_CLAUDE_MODEL:-}
-      # Deprecated compatibility path for an OpenAI Chat Completions-compatible API.
-      BROKER_VISION_ENDPOINT: ${INVENTORY_VISION_ENDPOINT:-}
-      BROKER_VISION_KEY: "@/run/secrets/inventory_vision_key"
-      BROKER_VISION_MODEL: ${INVENTORY_VISION_MODEL:-}
       BROKER_UPCITEMDB_ENDPOINT: ${INVENTORY_UPCITEMDB_ENDPOINT:-}
       BROKER_UPCITEMDB_KEY: "@/run/secrets/inventory_upcitemdb_key"
     secrets:
@@ -70,7 +66,6 @@ services:
       - inventory_azure_multimodal_key
       - inventory_gemini_key
       - inventory_claude_key
-      - inventory_vision_key
       - inventory_upcitemdb_key
     depends_on:
       control-migrate: {condition: service_completed_successfully}
@@ -591,20 +586,17 @@ services:
     image: makersbrain-control-odoo:local
     container_name: makersbrain-shared-odoo
     build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
-    entrypoint: ["/bin/sh", "/run/makersbrain/resolve-secret-env.sh", "/entrypoint.sh"]
+    entrypoint: ["/usr/local/bin/odoo-secret-entrypoint"]
     environment:
       HOST: postgres
       PORT: "5432"
       USER: odoo
-      PASSWORD: "@/run/secrets/odoo_postgres_password"
-      MB_CONTROL_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
       MB_CONTROL_API_URL: http://control-api:8080
       MB_ODOO_CLIENT_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
       MB_CARRIER_CONTROL_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
     command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes:
       - odoo-data:/var/lib/odoo
-      - ./resolve-secret-env.sh:/run/makersbrain/resolve-secret-env.sh:ro
       - odoo-client-secrets:/run/makersbrain-odoo-client-secrets:ro
     secrets: [odoo_postgres_password, odoo_bridge_token]
     depends_on:
@@ -669,7 +661,6 @@ secrets:
   inventory_azure_multimodal_key: {file: ./secrets/runtime/inventory_azure_multimodal_key}
   inventory_gemini_key: {file: ./secrets/runtime/inventory_gemini_key}
   inventory_claude_key: {file: ./secrets/runtime/inventory_claude_key}
-  inventory_vision_key: {file: ./secrets/runtime/inventory_vision_key}
   inventory_upcitemdb_key: {file: ./secrets/runtime/inventory_upcitemdb_key}
   mail_webhook_token: {file: ./secrets/runtime/mail_webhook_token}
   deployment_driver_token: {file: ./secrets/runtime/deployment_driver_token}

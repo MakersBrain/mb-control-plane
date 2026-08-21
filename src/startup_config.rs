@@ -82,8 +82,13 @@ fn validate_with(process: &str, lookup: impl Fn(&str) -> Option<String>) -> anyh
 }
 
 pub fn validate_process(process: &str) -> anyhow::Result<()> {
+    let specification = specification()?;
     validate_with(process, |name| {
-        crate::runtime_secret::environment(name).ok().flatten()
+        if specification.secrets.contains(name) {
+            crate::runtime_secret::environment(name).ok().flatten()
+        } else {
+            crate::runtime_secret::configuration(name).ok().flatten()
+        }
     })
 }
 
