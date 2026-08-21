@@ -321,8 +321,7 @@ mod tests {
 
     impl TestSecrets {
         fn new(entries: &[(&'static str, String)]) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("makersbrain-mounted-secrets-{}", Uuid::new_v4()));
+            let root = std::env::temp_dir().join(format!("mb-mounted-secrets-{}", Uuid::new_v4()));
             fs::create_dir(&root).unwrap();
             // SAFETY: privacy-crypto tests serialize access to these process
             // variables with environment_lock and this fixture removes them.
@@ -413,7 +412,7 @@ mod tests {
     #[test]
     fn export_artifacts_are_private_exactly_scoped_and_deletable() {
         let _guard = environment_lock();
-        let root = std::env::temp_dir().join(format!("makersbrain-export-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mb-export-test-{}", Uuid::new_v4()));
         let _secrets = TestSecrets::new(&[(
             "CONTROL_PRIVACY_EXPORT_KEY",
             base64::engine::general_purpose::STANDARD.encode([9_u8; 32]),
@@ -466,8 +465,7 @@ mod tests {
     #[test]
     fn planned_rotation_can_decrypt_a_bounded_retained_export_key() {
         let _guard = environment_lock();
-        let key_file =
-            std::env::temp_dir().join(format!("makersbrain-export-keys-{}.json", Uuid::new_v4()));
+        let key_file = std::env::temp_dir().join(format!("mb-export-keys-{}.json", Uuid::new_v4()));
         let old_key = base64::engine::general_purpose::STANDARD.encode([4_u8; 32]);
         let secrets = TestSecrets::new(&[("CONTROL_PRIVACY_EXPORT_KEY", old_key.clone())]);
         unsafe {
@@ -503,8 +501,7 @@ mod tests {
     #[test]
     fn retained_export_ring_cannot_duplicate_the_active_key() {
         let _guard = environment_lock();
-        let key_file =
-            std::env::temp_dir().join(format!("makersbrain-export-keys-{}.json", Uuid::new_v4()));
+        let key_file = std::env::temp_dir().join(format!("mb-export-keys-{}.json", Uuid::new_v4()));
         let current_key = base64::engine::general_purpose::STANDARD.encode([6_u8; 32]);
         fs::write(
             &key_file,

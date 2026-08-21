@@ -1,15 +1,15 @@
-use makersbrain_control_plane::api::AppState;
-use makersbrain_control_plane::auth::Authenticator;
-use makersbrain_control_plane::invitation::InvitationVerifier;
-use makersbrain_control_plane::persistence::Store;
-use makersbrain_control_plane::{Config, app, shutdown_signal};
+use mb_control_plane::api::AppState;
+use mb_control_plane::auth::Authenticator;
+use mb_control_plane::invitation::InvitationVerifier;
+use mb_control_plane::persistence::Store;
+use mb_control_plane::{Config, app, shutdown_signal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    makersbrain_control_plane::startup_config::validate_process("api")?;
-    let _telemetry = makersbrain_control_plane::telemetry::init("makersbrain-control-api")?;
+    mb_control_plane::startup_config::validate_process("api")?;
+    let _telemetry = mb_control_plane::telemetry::init("mb-control-api")?;
     let config = Config::from_env()?;
-    makersbrain_control_plane::validate_privacy_export_configuration()?;
+    mb_control_plane::validate_privacy_export_configuration()?;
     let store = Store::connect(&config.database_url).await?;
     let auth = std::sync::Arc::new(Authenticator::new(
         config.oidc_issuer.clone(),

@@ -1,4 +1,4 @@
-name: makersbrain-control
+name: mb-control
 
 x-migration-env: &migration-env
   CONTROL_DATABASE_URL: "@/run/secrets/control_database_url"
@@ -13,7 +13,7 @@ x-migration-env: &migration-env
   OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
   OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
 x-worker: &worker
-  image: makersbrain-control:local
+  image: mb-control:local
   build: {context: ..}
   # The driver writes root-owned 0640 tenant secrets; workers join only the
   # container root group so they can read the shared volume without being root.
@@ -30,7 +30,7 @@ x-worker-env: &worker-env
 
 services:
   document-extraction:
-    image: makersbrain-control:local
+    image: mb-control:local
     build: {context: ..}
     command: ["/usr/local/bin/document-extraction-broker"]
     environment:
@@ -176,7 +176,7 @@ services:
     restart: unless-stopped
 
   control-migrate:
-    image: makersbrain-control:local
+    image: mb-control:local
     build: {context: ..}
     command: ["/usr/local/bin/control-migrate"]
     environment:
@@ -189,7 +189,7 @@ services:
 
   control-database-identities:
     image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
-    entrypoint: ["/bin/sh", "/run/makersbrain/reconcile-database-identities.sh"]
+    entrypoint: ["/bin/sh", "/run/mb/reconcile-database-identities.sh"]
     environment:
       PGHOST: postgres
       POSTGRES_SUPERUSER_PASSWORD: "@/run/secrets/postgres_superuser_password"
@@ -206,7 +206,7 @@ services:
       CONTROL_RELEASE_POSTGRES_PASSWORD: "@/run/secrets/control_release_postgres_password"
       CONTROL_PRIVACY_POSTGRES_PASSWORD: "@/run/secrets/control_privacy_postgres_password"
     volumes:
-      - ./reconcile-database-identities.sh:/run/makersbrain/reconcile-database-identities.sh:ro
+      - ./reconcile-database-identities.sh:/run/mb/reconcile-database-identities.sh:ro
     secrets:
       - postgres_superuser_password
       - control_api_postgres_password
@@ -233,7 +233,7 @@ services:
     restart: "no"
 
   control-api:
-    image: makersbrain-control:local
+    image: mb-control:local
     build: {context: ..}
     environment:
       CONTROL_DATABASE_URL: "@/run/secrets/control_api_database_url"
@@ -248,7 +248,7 @@ services:
       CONTROL_PUBLIC_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
       CONTROL_CORS_ORIGIN: http://localhost:${CONTROL_WEB_PORT:-4175}/
       CONTROL_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1/
-      CONTROL_OIDC_AUDIENCE: makersbrain-members
+      CONTROL_OIDC_AUDIENCE: mb-members
       CONTROL_OIDC_DISCOVERY_URL: http://rauthy:8092/auth/v1/.well-known/openid-configuration
       CONTROL_TENANT_DOMAIN: localhost
       CONTROL_TENANT_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
@@ -257,15 +257,15 @@ services:
       CONTROL_MAIL_EVENT_TOKEN: "@/run/secrets/control_mail_event_token"
       CONTROL_RELEASE_PUBLISH_TOKEN: "@/run/secrets/control_release_publish_token"
       CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
-      CONTROL_INVITATION_VERIFICATION_KEYS_FILE: /run/makersbrain-invitation/public-keys.json
+      CONTROL_INVITATION_VERIFICATION_KEYS_FILE: /run/mb-invitation/public-keys.json
       CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
       CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       CONTROL_PRIVACY_EXPORT_KEY_ID: ${CONTROL_PRIVACY_EXPORT_KEY_ID:?CONTROL_PRIVACY_EXPORT_KEY_ID is required}
       CONTROL_PRIVACY_EXPORT_KEY: "@/run/secrets/control_privacy_export_key"
-      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/makersbrain/privacy-exports
-      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/mb/privacy-exports
+      CONTROL_SECRET_ROOT: /run/mb-secrets
       CONTROL_ALLOW_SELF_SIGNUP: "true"
       CONTROL_OPERATOR_EMAILS: ${CONTROL_OPERATOR_EMAILS:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -273,9 +273,9 @@ services:
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
     ports: ["127.0.0.1:${CONTROL_API_PORT:-8080}:8080"]
     volumes:
-      - ./secrets/invitation/public-keys.json:/run/makersbrain-invitation/public-keys.json:ro
-      - privacy-exports:/var/lib/makersbrain/privacy-exports
-      - tenant-secrets:/run/makersbrain-secrets:ro
+      - ./secrets/invitation/public-keys.json:/run/mb-invitation/public-keys.json:ro
+      - privacy-exports:/var/lib/mb/privacy-exports
+      - tenant-secrets:/run/mb-secrets:ro
     secrets:
       - control_api_database_url
       - control_internal_token
@@ -299,14 +299,14 @@ services:
       args:
         VITE_CONTROL_API_URL: http://localhost:${CONTROL_API_PORT:-8080}
         VITE_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
-        VITE_OIDC_CLIENT_ID: makersbrain-members
+        VITE_OIDC_CLIENT_ID: mb-members
         VITE_OIDC_REDIRECT_URI: http://localhost:${CONTROL_WEB_PORT:-4175}/oauth/callback
         VITE_ACCOUNT_URL: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}
     ports: ["127.0.0.1:${CONTROL_WEB_PORT:-4175}:8080"]
     restart: unless-stopped
 
   integration-fixture:
-    image: makersbrain-control:local
+    image: mb-control:local
     build: {context: ..}
     command: ["/usr/local/bin/control-fixture"]
     environment:
@@ -318,7 +318,7 @@ services:
     restart: unless-stopped
 
   paperless-image:
-    image: makersbrain-control-paperless:local
+    image: mb-control-paperless:local
     build:
       context: .
       dockerfile: Paperless.Dockerfile
@@ -326,7 +326,7 @@ services:
     restart: "no"
 
   backup-image:
-    image: makersbrain-control-backup:local
+    image: mb-control-backup:local
     build:
       context: .
       dockerfile: Backup.Dockerfile
@@ -334,7 +334,7 @@ services:
     restart: "no"
 
   docker-driver:
-    image: makersbrain-control:local
+    image: mb-control:local
     build: {context: ..}
     user: "0:0"
     command: ["/usr/local/bin/control-container-driver"]
@@ -354,17 +354,17 @@ services:
       DRIVER_POSTGRES_CA_SOURCE: ${DRIVER_POSTGRES_CA_SOURCE:-}
       DRIVER_ODOO_POSTGRES_PASSWORD: "@/run/secrets/odoo_postgres_password"
       DRIVER_ODOO_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
-      DRIVER_ODOO_IMAGE: makersbrain-control-odoo:local
+      DRIVER_ODOO_IMAGE: mb-control-odoo:local
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
-      DRIVER_PAPERLESS_IMAGE: makersbrain-control-paperless:local
-      DRIVER_RUNTIME_NETWORK: makersbrain-control-runtime
-      DRIVER_ODOO_VOLUME: makersbrain-control-odoo-data
+      DRIVER_PAPERLESS_IMAGE: mb-control-paperless:local
+      DRIVER_RUNTIME_NETWORK: mb-control-runtime
+      DRIVER_ODOO_VOLUME: mb-control-odoo-data
       DRIVER_ODOO_UID: ${ODOO_RUNTIME_UID:-100}
       DRIVER_ODOO_GID: ${ODOO_RUNTIME_GID:-101}
-      DRIVER_BACKUP_VOLUME: makersbrain-control-backups
+      DRIVER_BACKUP_VOLUME: mb-control-backups
       DRIVER_ODOO_DATA_ROOT: /odoo-data
       DRIVER_BACKUP_ROOT: /backups
-      DRIVER_BACKUP_AGENT_IMAGE: makersbrain-control-backup:local
+      DRIVER_BACKUP_AGENT_IMAGE: mb-control-backup:local
       BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
       BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
       BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
@@ -377,17 +377,17 @@ services:
       BACKUP_ENCRYPTION_KEY_ID: ${BACKUP_ENCRYPTION_KEY_ID:-}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
       DRIVER_REDIS_ADDRESS: redis:6379
-      DRIVER_SECRET_ROOT: /run/makersbrain-secrets
-      DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/makersbrain-odoo-client-secrets
-      DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
-      DRIVER_RUNTIME_SECRET_SOURCE: makersbrain-control-backup-secrets
+      DRIVER_SECRET_ROOT: /run/mb-secrets
+      DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/mb-odoo-client-secrets
+      DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/mb-paperless-client-secrets
+      DRIVER_RUNTIME_SECRET_SOURCE: mb-control-backup-secrets
       # Development has no recovery secrets: S3 backups are unconfigured here, so
       # nothing ever binds this path. Point it at the real host directory holding
       # the age identity before enabling BACKUP_S3_BUCKET on this stack.
-      DRIVER_RECOVERY_SECRET_SOURCE: /var/empty/makersbrain-recovery-secrets
-      DRIVER_JOB_SECRET_ROOT: /run/makersbrain-backup-secrets/jobs
+      DRIVER_RECOVERY_SECRET_SOURCE: /var/empty/mb-recovery-secrets
+      DRIVER_JOB_SECRET_ROOT: /run/mb-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes
-      DRIVER_GATEWAY_CONTAINER: makersbrain-tenant-gateway
+      DRIVER_GATEWAY_CONTAINER: mb-tenant-gateway
       DRIVER_ODOO_BASE_URL: http://odoo:8069
       DRIVER_CONTROL_INTERNAL_URL: http://control-api:8080
       DRIVER_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1
@@ -398,10 +398,10 @@ services:
       DRIVER_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - tenant-secrets:/run/makersbrain-secrets
-      - odoo-client-secrets:/run/makersbrain-odoo-client-secrets
-      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets
-      - backup-secrets:/run/makersbrain-backup-secrets
+      - tenant-secrets:/run/mb-secrets
+      - odoo-client-secrets:/run/mb-odoo-client-secrets
+      - paperless-client-secrets:/run/mb-paperless-client-secrets
+      - backup-secrets:/run/mb-backup-secrets
       - tenant-routes:/routes
       - odoo-data:/odoo-data
       - backup-data:/backups
@@ -437,11 +437,11 @@ services:
       CONTROL_DATABASE_URL: "@/run/secrets/control_membership_database_url"
       CONTROL_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1/
       CONTROL_RAUTHY_ADMIN_KEY: "@/run/secrets/control_rauthy_admin_key"
-      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
-      CONTROL_PAPERLESS_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
+      CONTROL_SECRET_ROOT: /run/mb-secrets
+      CONTROL_PAPERLESS_SECRET_ROOT: /run/mb-paperless-client-secrets
     volumes:
-      - tenant-secrets:/run/makersbrain-secrets:ro
-      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets:ro
+      - tenant-secrets:/run/mb-secrets:ro
+      - paperless-client-secrets:/run/mb-paperless-client-secrets:ro
     secrets: [control_membership_database_url, control_rauthy_admin_key]
   worker-invoice:
     <<: *worker
@@ -450,15 +450,15 @@ services:
       <<: *worker-env
       CONTROL_DATABASE_URL: "@/run/secrets/control_invoice_database_url"
       CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
-      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
-      CONTROL_PAPERLESS_SECRET_ROOT: /run/makersbrain-paperless-client-secrets
+      CONTROL_SECRET_ROOT: /run/mb-secrets
+      CONTROL_PAPERLESS_SECRET_ROOT: /run/mb-paperless-client-secrets
       CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
       CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
       CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
       CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
     volumes:
-      - tenant-secrets:/run/makersbrain-secrets:ro
-      - paperless-client-secrets:/run/makersbrain-paperless-client-secrets:ro
+      - tenant-secrets:/run/mb-secrets:ro
+      - paperless-client-secrets:/run/mb-paperless-client-secrets:ro
     secrets: [control_invoice_database_url, document_extraction_token]
     depends_on:
       postgres: {condition: service_healthy}
@@ -470,13 +470,13 @@ services:
     environment:
       <<: *worker-env
       CONTROL_DATABASE_URL: "@/run/secrets/control_inventory_database_url"
-      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_SECRET_ROOT: /run/mb-secrets
       CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
       CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
       CONTROL_AZURE_MONTHLY_IMAGE_LIMIT: "500"
       CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT: "100"
       CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
-    volumes: ["tenant-secrets:/run/makersbrain-secrets:ro"]
+    volumes: ["tenant-secrets:/run/mb-secrets:ro"]
     secrets: [control_inventory_database_url, document_extraction_token]
     depends_on:
       postgres: {condition: service_healthy}
@@ -502,9 +502,9 @@ services:
       CONTROL_MAIL_WEBHOOK_URL: ${MAIL_WEBHOOK_URL}
       CONTROL_MAIL_WEBHOOK_TOKEN: "@/run/secrets/mail_webhook_token"
       CONTROL_INVITATION_SIGNING_KEY_ID: ${INVITATION_SIGNING_KEY_ID}
-      CONTROL_INVITATION_SIGNING_KEYS_FILE: /run/makersbrain-invitation/private-keys.json
+      CONTROL_INVITATION_SIGNING_KEYS_FILE: /run/mb-invitation/private-keys.json
     volumes:
-      - ./secrets/invitation/private-keys.json:/run/makersbrain-invitation/private-keys.json:ro
+      - ./secrets/invitation/private-keys.json:/run/mb-invitation/private-keys.json:ro
     secrets: [control_email_database_url, mail_webhook_token]
   worker-reconciliation:
     <<: *worker
@@ -515,13 +515,13 @@ services:
       CONTROL_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
-      CONTROL_SECRET_ROOT: /run/makersbrain-secrets
+      CONTROL_SECRET_ROOT: /run/mb-secrets
       CONTROL_CLOUDFLARE_API_TOKEN: "@/run/secrets/control_cloudflare_api_token"
       CONTROL_CLOUDFLARE_ZONE_ID: ${CONTROL_CLOUDFLARE_ZONE_ID:-}
       CONTROL_MAIL_SCW_PROJECT_ID: ${CONTROL_MAIL_SCW_PROJECT_ID:-}
       CONTROL_MAIL_SCW_SECRET_KEY: "@/run/secrets/control_mail_scw_secret_key"
       CONTROL_MAIL_SNS_TOPIC_ARN: ${CONTROL_MAIL_SNS_TOPIC_ARN:-}
-    volumes: ["tenant-secrets:/run/makersbrain-secrets:ro"]
+    volumes: ["tenant-secrets:/run/mb-secrets:ro"]
     secrets: [control_reconciliation_database_url, deployment_driver_token, control_cloudflare_api_token, control_mail_scw_secret_key]
   worker-lifecycle:
     <<: *worker
@@ -559,11 +559,11 @@ services:
       CONTROL_PRIVACY_LOOKUP_KEY: "@/run/secrets/control_privacy_lookup_key"
       CONTROL_PRIVACY_EXPORT_KEY_ID: ${CONTROL_PRIVACY_EXPORT_KEY_ID:?CONTROL_PRIVACY_EXPORT_KEY_ID is required}
       CONTROL_PRIVACY_EXPORT_KEY: "@/run/secrets/control_privacy_export_key"
-      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/makersbrain/privacy-exports
+      CONTROL_PRIVACY_EXPORT_ROOT: /var/lib/mb/privacy-exports
       CONTROL_PRIVACY_DRIVER_URL: http://docker-driver:8080
       CONTROL_PRIVACY_DRIVER_TOKEN: "@/run/secrets/privacy_driver_token"
     volumes:
-      - privacy-exports:/var/lib/makersbrain/privacy-exports
+      - privacy-exports:/var/lib/mb/privacy-exports
     secrets: [control_privacy_database_url, control_privacy_lookup_key, control_privacy_export_key, privacy_driver_token]
     depends_on:
       postgres: {condition: service_healthy}
@@ -583,8 +583,8 @@ services:
     secrets: [control_backup_database_url, deployment_driver_token]
 
   odoo:
-    image: makersbrain-control-odoo:local
-    container_name: makersbrain-shared-odoo
+    image: mb-control-odoo:local
+    container_name: mb-shared-odoo
     build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
     entrypoint: ["/usr/local/bin/odoo-secret-entrypoint"]
     environment:
@@ -592,12 +592,12 @@ services:
       PORT: "5432"
       USER: odoo
       MB_CONTROL_API_URL: http://control-api:8080
-      MB_ODOO_CLIENT_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
-      MB_CARRIER_CONTROL_TOKEN_ROOT: /run/makersbrain-odoo-client-secrets
-    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
+      MB_ODOO_CLIENT_TOKEN_ROOT: /run/mb-odoo-client-secrets
+      MB_CARRIER_CONTROL_TOKEN_ROOT: /run/mb-odoo-client-secrets
+    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes:
       - odoo-data:/var/lib/odoo
-      - odoo-client-secrets:/run/makersbrain-odoo-client-secrets:ro
+      - odoo-client-secrets:/run/mb-odoo-client-secrets:ro
     secrets: [odoo_postgres_password, odoo_bridge_token]
     depends_on:
       postgres: {condition: service_healthy}
@@ -613,7 +613,7 @@ services:
 
   tenant-gateway:
     image: nginx:1.29-alpine
-    container_name: makersbrain-tenant-gateway
+    container_name: mb-tenant-gateway
     volumes:
       - ./gateway.conf:/etc/nginx/nginx.conf:ro
       - tenant-routes:/etc/nginx/tenants:ro
@@ -689,26 +689,26 @@ secrets:
 
 networks:
   default:
-    name: makersbrain-control-runtime
+    name: mb-control-runtime
 
 volumes:
   control-postgres: {}
   rauthy-bootstrap: {}
   odoo-data:
-    name: makersbrain-control-odoo-data
+    name: mb-control-odoo-data
   shared-redis:
-    name: makersbrain-control-redis-data
+    name: mb-control-redis-data
   tenant-routes:
-    name: makersbrain-control-tenant-routes
+    name: mb-control-tenant-routes
   tenant-secrets:
-    name: makersbrain-control-tenant-secrets
+    name: mb-control-tenant-secrets
   paperless-client-secrets:
-    name: makersbrain-control-paperless-client-secrets
+    name: mb-control-paperless-client-secrets
   odoo-client-secrets:
-    name: makersbrain-control-odoo-client-secrets
+    name: mb-control-odoo-client-secrets
   backup-data:
-    name: makersbrain-control-backups
+    name: mb-control-backups
   backup-secrets:
-    name: makersbrain-control-backup-secrets
+    name: mb-control-backup-secrets
   privacy-exports:
-    name: makersbrain-control-privacy-exports
+    name: mb-control-privacy-exports

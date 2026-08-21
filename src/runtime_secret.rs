@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn a_bounded_single_line_secret_is_read_without_its_newline() {
         let directory =
-            std::env::temp_dir().join(format!("makersbrain-runtime-secret-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mb-runtime-secret-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("fixture");
         std::fs::write(&path, "recognizable-secret\n").unwrap();

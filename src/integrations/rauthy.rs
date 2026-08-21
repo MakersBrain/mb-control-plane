@@ -27,7 +27,7 @@ impl RauthyClient {
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-membership-worker")
+            .user_agent("mb-membership-worker")
             .build()?;
         Ok(Self { http, base_url })
     }

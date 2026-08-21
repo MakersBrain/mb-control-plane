@@ -42,7 +42,7 @@ pub(super) async fn download_backup(
                 format!("S3_BUCKET={}", s3.bucket),
                 format!("ARCHIVE_KEY={object_key}"),
             ],
-            "Labels": {"makersbrain.kind":"s3-backup-presign-job"},
+            "Labels": {"mb.kind":"s3-backup-presign-job"},
             "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
         }),
         &s3_job_secrets(s3, false),
@@ -54,7 +54,7 @@ pub(super) async fn download_backup(
         .to_owned();
     let _ = std::fs::remove_file(&result_path);
     Url::parse(&url).map_err(DriverError::internal)?;
-    Ok(json!({"url":url,"expires_in":600,"filename":format!("makersbrain-{recovery}.tar")}))
+    Ok(json!({"url":url,"expires_in":600,"filename":format!("mb-{recovery}.tar")}))
 }
 
 pub(super) async fn rehearse(
@@ -1095,7 +1095,7 @@ async fn create_remote_recovery_set(
     );
     let pgpass = postgres_admin_pgpass(state);
     let mut command = format!(
-        "set -eu; set -o pipefail; umask 077; export PGPASSFILE=/run/makersbrain-job-secrets/pgpass; AGE_RECIPIENT=$(cat /run/makersbrain-job-secrets/age-recipient); reject_special() {{ test ! -d \"$1\" || test -z \"$(find \"$1\" -mindepth 1 ! -type d ! -type f -print -quit)\"; }}; encrypt_stream() {{ output=$1; checksum=$2; fifo=\"${{checksum}}.fifo\"; mkfifo \"$fifo\"; sha256sum <\"$fifo\" | cut -d' ' -f1 >\"$checksum\" & hash_pid=$!; tee \"$fifo\" | zstd -q -T0 | age -r \"$AGE_RECIPIENT\" -o \"$output\"; wait \"$hash_pid\"; rm -f \"$fifo\"; }}; out=/backups/{}; mkdir -p \"$out/odoo\"; pg_dump --format=custom --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" \"$ODOO_DATABASE\" | encrypt_stream \"$out/odoo/database.dump.enc\" \"$out/odoo/database.dump.plain.sha256\"; reject_special \"/odoo/filestore/$ODOO_DATABASE\"; if [ -d \"/odoo/filestore/$ODOO_DATABASE\" ]; then tar -C \"/odoo/filestore/$ODOO_DATABASE\" -cf - .; else tar -cf - --files-from /dev/null; fi | encrypt_stream \"$out/odoo/filestore.tar.zst.enc\" \"$out/odoo/filestore.plain.sha256\"",
+        "set -eu; set -o pipefail; umask 077; export PGPASSFILE=/run/mb-job-secrets/pgpass; AGE_RECIPIENT=$(cat /run/mb-job-secrets/age-recipient); reject_special() {{ test ! -d \"$1\" || test -z \"$(find \"$1\" -mindepth 1 ! -type d ! -type f -print -quit)\"; }}; encrypt_stream() {{ output=$1; checksum=$2; fifo=\"${{checksum}}.fifo\"; mkfifo \"$fifo\"; sha256sum <\"$fifo\" | cut -d' ' -f1 >\"$checksum\" & hash_pid=$!; tee \"$fifo\" | zstd -q -T0 | age -r \"$AGE_RECIPIENT\" -o \"$output\"; wait \"$hash_pid\"; rm -f \"$fifo\"; }}; out=/backups/{}; mkdir -p \"$out/odoo\"; pg_dump --format=custom --no-owner --no-acl --host=\"$PGHOST\" --port=\"$PGPORT\" --username=\"$PGUSER\" \"$ODOO_DATABASE\" | encrypt_stream \"$out/odoo/database.dump.enc\" \"$out/odoo/database.dump.plain.sha256\"; reject_special \"/odoo/filestore/$ODOO_DATABASE\"; if [ -d \"/odoo/filestore/$ODOO_DATABASE\" ]; then tar -C \"/odoo/filestore/$ODOO_DATABASE\" -cf - .; else tar -cf - --files-from /dev/null; fi | encrypt_stream \"$out/odoo/filestore.tar.zst.enc\" \"$out/odoo/filestore.plain.sha256\"",
         relative.to_string_lossy()
     );
     if includes_paperless {
@@ -1115,7 +1115,7 @@ async fn create_remote_recovery_set(
                 format!("ODOO_DATABASE={database_ref}"),
                 format!("PAPERLESS_DATABASE={paperless_database}"),
             ],
-            "Labels": {"makersbrain.kind":"encrypted-backup-job"},
+            "Labels": {"mb.kind":"encrypted-backup-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": binds}
         }),
         &[("pgpass", &pgpass), ("age-recipient", &s3.age_recipient)],
@@ -1203,8 +1203,8 @@ async fn create_remote_recovery_set(
         json!({
             "Image": image,
             "User": "0:0",
-            "Cmd": ["sh", "-ec", format!("set -eu; umask 077; base64 -d < /run/makersbrain-job-secrets/manifest-b64 | age -r \"$(cat /run/makersbrain-job-secrets/age-recipient)\" -o /backups/{}/manifest.json.enc", relative.to_string_lossy())],
-            "Labels": {"makersbrain.kind":"encrypted-backup-manifest-job"},
+            "Cmd": ["sh", "-ec", format!("set -eu; umask 077; base64 -d < /run/mb-job-secrets/manifest-b64 | age -r \"$(cat /run/mb-job-secrets/age-recipient)\" -o /backups/{}/manifest.json.enc", relative.to_string_lossy())],
+            "Labels": {"mb.kind":"encrypted-backup-manifest-job"},
             "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
         }),
         &[("manifest-b64", &manifest_b64), ("age-recipient", &s3.age_recipient)],
@@ -1234,7 +1234,7 @@ async fn create_remote_recovery_set(
         "Building portable archive",
     )
     .await?;
-    const ARCHIVE_NAME: &str = "makersbrain-workshop-backup.tar";
+    const ARCHIVE_NAME: &str = "mb-workshop-backup.tar";
     run_docker_job(
         state,
         &format!("mb-archive-{}", &recovery.simple().to_string()[..12]),
@@ -1242,7 +1242,7 @@ async fn create_remote_recovery_set(
             "Image": image,
             "User": "0:0",
             "Cmd": ["sh", "-ec", format!("set -eu; umask 077; root=/backups/{}; tar -C \"$root\" -cf \"$root/{ARCHIVE_NAME}\" odoo {} manifest.json.enc complete.json", relative.to_string_lossy(), if includes_paperless { "paperless" } else { "" })],
-            "Labels": {"makersbrain.kind":"portable-backup-archive-job"},
+            "Labels": {"mb.kind":"portable-backup-archive-job"},
             "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume)]}
         }),
     )
@@ -1354,10 +1354,10 @@ async fn upload_and_verify_s3(
         .map(|component| component.path.clone())
         .collect::<Vec<_>>();
     object_paths.push("manifest.json.enc".to_owned());
-    object_paths.push("makersbrain-workshop-backup.tar".to_owned());
+    object_paths.push("mb-workshop-backup.tar".to_owned());
     let files = object_paths.join(" ");
     let command = format!(
-        "set -eu; set -o pipefail; {}; root=/backups/{}; for file in {files}; do if [ \"$file\" = makersbrain-workshop-backup.tar ]; then aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors --content-type application/x-tar --content-disposition 'attachment; filename=\"makersbrain-workshop-backup.tar\"' \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; else aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; fi; local_sum=$(sha256sum \"$root/$file\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/$file\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"; done; aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/complete.json\" \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\"; local_sum=$(sha256sum \"$root/complete.json\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"",
+        "set -eu; set -o pipefail; {}; root=/backups/{}; for file in {files}; do if [ \"$file\" = mb-workshop-backup.tar ]; then aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors --content-type application/x-tar --content-disposition 'attachment; filename=\"mb-workshop-backup.tar\"' \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; else aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/$file\" \"s3://$S3_BUCKET/$S3_PREFIX/$file\"; fi; local_sum=$(sha256sum \"$root/$file\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/$file\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"; done; aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"$root/complete.json\" \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\"; local_sum=$(sha256sum \"$root/complete.json\" | cut -d' ' -f1); remote_sum=$(aws --endpoint-url \"$S3_ENDPOINT\" s3 cp --only-show-errors \"s3://$S3_BUCKET/$S3_PREFIX/complete.json\" - | sha256sum | cut -d' ' -f1); test \"$local_sum\" = \"$remote_sum\"",
         aws_secret_prelude(),
         relative.to_string_lossy()
     );
@@ -1372,7 +1372,7 @@ async fn upload_and_verify_s3(
             "User": "0:0",
             "Cmd": ["sh", "-ec", command],
             "Env": s3_environment(s3, object_prefix),
-            "Labels": {"makersbrain.kind":"s3-backup-upload-job"},
+            "Labels": {"mb.kind":"s3-backup-upload-job"},
             "HostConfig": {"Binds": [format!("{}:/backups:ro", state.config.backup_volume)]}
         }),
         &s3_job_secrets(s3, true),
@@ -1514,7 +1514,7 @@ fn s3_job_secrets(s3: &S3BackupConfig, writer: bool) -> [(&'static str, &str); 2
 }
 
 fn recovery_identity_bind(state: &DriverState, s3: &S3BackupConfig) -> Result<String, DriverError> {
-    let container_root = Path::new("/run/makersbrain-recovery-secrets");
+    let container_root = Path::new("/run/mb-recovery-secrets");
     let identity = Path::new(&s3.age_identity_file);
     let relative = identity
         .strip_prefix(container_root)
@@ -1530,7 +1530,7 @@ fn recovery_identity_bind(state: &DriverState, s3: &S3BackupConfig) -> Result<St
 }
 
 fn aws_secret_prelude() -> &'static str {
-    "export AWS_ACCESS_KEY_ID=$(cat /run/makersbrain-job-secrets/aws-access-key-id); export AWS_SECRET_ACCESS_KEY=$(cat /run/makersbrain-job-secrets/aws-secret-access-key)"
+    "export AWS_ACCESS_KEY_ID=$(cat /run/mb-job-secrets/aws-access-key-id); export AWS_SECRET_ACCESS_KEY=$(cat /run/mb-job-secrets/aws-secret-access-key)"
 }
 
 async fn restore_remote_recovery_set(
@@ -1613,7 +1613,7 @@ async fn restore_remote_recovery_inner(
             "User": "0:0",
             "Cmd": ["sh", "-ec", bootstrap],
             "Env": environment,
-            "Labels": {"makersbrain.kind":"s3-restore-download-job"},
+            "Labels": {"mb.kind":"s3-restore-download-job"},
             "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
@@ -1732,7 +1732,7 @@ async fn restore_remote_recovery_inner(
             "User": "0:0",
             "Cmd": ["sh", "-ec", download],
             "Env": environment,
-            "Labels": {"makersbrain.kind":"s3-restore-verify-job"},
+            "Labels": {"mb.kind":"s3-restore-verify-job"},
             "HostConfig": {"Binds": [format!("{}:/backups", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &s3_job_secrets(s3, preflight_only),
@@ -1797,14 +1797,14 @@ async fn restore_remote_recovery_inner(
                 format!("PGHOST={}", state.config.postgres_host),
                 format!("PGPORT={}", state.config.postgres_port),
                 format!("PGUSER={}", state.config.postgres_admin_user),
-                "PGPASSFILE=/run/makersbrain-job-secrets/pgpass",
+                "PGPASSFILE=/run/mb-job-secrets/pgpass",
                 format!("ODOO_DATABASE={target_database}"),
                 format!("PAPERLESS_DATABASE={paperless_database}"),
                 format!("AGE_IDENTITY={}", s3.age_identity_file),
                 format!("ODOO_UID={}", state.config.odoo_uid),
                 format!("ODOO_GID={}", state.config.odoo_gid),
             ],
-            "Labels": {"makersbrain.kind":"encrypted-restore-job"},
+            "Labels": {"mb.kind":"encrypted-restore-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": binds}
         }),
         &[("pgpass", &pgpass)],
@@ -1852,12 +1852,12 @@ async fn validate_remote_database_dumps(
                 format!("PGHOST={}", state.config.postgres_host),
                 format!("PGPORT={}", state.config.postgres_port),
                 format!("PGUSER={}", state.config.postgres_admin_user),
-                "PGPASSFILE=/run/makersbrain-job-secrets/pgpass",
+                "PGPASSFILE=/run/mb-job-secrets/pgpass",
                 format!("AGE_IDENTITY={}", s3.age_identity_file),
                 format!("ODOO_TEMPORARY={odoo_temporary}"),
                 format!("PAPERLESS_TEMPORARY={paperless_temporary}"),
             ],
-            "Labels": {"makersbrain.kind":"restore-preflight-job"},
+            "Labels": {"mb.kind":"restore-preflight-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": [format!("{}:/backups:ro", state.config.backup_volume), recovery_identity_bind(state, s3)?]}
         }),
         &[("pgpass", &pgpass)],
@@ -2283,7 +2283,7 @@ async fn run_paperless_volume_job(
         json!({
             "Image": state.config.postgres_image,
             "Cmd": ["sh", "-ec", command],
-            "Labels": {"makersbrain.kind":"paperless-recovery-job"},
+            "Labels": {"mb.kind":"paperless-recovery-job"},
             "HostConfig": {"NetworkMode": state.config.docker_network, "Binds": binds}
         }),
     )

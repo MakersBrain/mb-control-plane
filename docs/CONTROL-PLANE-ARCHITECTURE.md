@@ -3,7 +3,7 @@
 Status: current state
 Last verified: 2026-08-14
 Normative scope: `control-plane/`, `addons/mb_control_bridge/` and the local
-deployment contract consumed by `makersbrain-infra`
+deployment contract consumed by `mb-infra`
 
 This document describes the implementation that exists in this repository. It
 does not describe intended release-management or production-hardening work;
@@ -362,7 +362,7 @@ adapters and retained live-topology evidence remain deployment gates.
 
 ## History
 
-The control plane was extracted from `../makersbrain` into this repository; the
+The control plane was extracted from a predecessor monolith into this repository; the
 proposal that described that extraction, and the improvement programme that
 turned the result into a release-managed platform, are both complete. Their
 remaining gates live in `CONTROL-PLANE-ROADMAP.md` and their superseded

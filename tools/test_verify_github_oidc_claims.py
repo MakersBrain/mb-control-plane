@@ -33,7 +33,7 @@ def invoke(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
             "--environment",
             "release",
             "--audience",
-            "makersbrain-release",
+            "mb-release",
         ],
         input=token(payload),
         text=True,
@@ -45,7 +45,7 @@ def invoke(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
 def main() -> int:
     claims = {
         "sub": "repo:MakersBrain@311501550/odoo@1332519958:environment:release",
-        "aud": "makersbrain-release",
+        "aud": "mb-release",
         "repository": "MakersBrain/odoo",
         "repository_id": "1332519958",
         "repository_owner_id": "311501550",
@@ -85,7 +85,7 @@ def main() -> int:
             "--environment",
             "release",
             "--audience",
-            "makersbrain-release",
+            "mb-release",
         ],
         input="not-a-jwt",
         text=True,

@@ -147,8 +147,8 @@ pub(super) async fn run_postgres_job_as(
         json!({
             "Image":state.config.postgres_image,
             "Cmd":command,
-            "Env":["PGPASSFILE=/run/makersbrain-job-secrets/pgpass"],
-            "Labels":{"makersbrain.kind":"postgres-lifecycle-job"},
+            "Env":["PGPASSFILE=/run/mb-job-secrets/pgpass"],
+            "Labels":{"mb.kind":"postgres-lifecycle-job"},
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
                 "Binds":[format!("{}:/backups",state.config.backup_volume)]

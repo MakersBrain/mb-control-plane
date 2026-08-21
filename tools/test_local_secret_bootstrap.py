@@ -22,7 +22,7 @@ def main() -> int:
     expected_files = set(
         re.findall(r"\{file: \./secrets/runtime/([a-z0-9_.-]+)\}", compose)
     )
-    with tempfile.TemporaryDirectory(prefix="makersbrain-secret-bootstrap-") as directory:
+    with tempfile.TemporaryDirectory(prefix="mb-secret-bootstrap-") as directory:
         target = Path(directory) / ".env"
         subprocess.run(
             [str(DEPLOY / "bootstrap-local-env.sh"), str(target)],
@@ -52,6 +52,14 @@ def main() -> int:
             value = path.read_text()
             if value and value in environment:
                 raise SystemExit(f"bootstrap secret value leaked into .env: {path.name}")
+        control_database_urls = {
+            name
+            for name in actual_files
+            if name.startswith("control_") and name.endswith("_database_url")
+        } | {"control_database_url"}
+        for name in control_database_urls:
+            if not (runtime / name).read_text().strip().endswith("/mb_control"):
+                raise SystemExit(f"{name} does not use the mb_control database")
         if stat.S_IMODE(runtime.stat().st_mode) != 0o700:
             raise SystemExit("bootstrap secret directory is not mode 0700")
         if stat.S_IMODE(target.stat().st_mode) != 0o600:

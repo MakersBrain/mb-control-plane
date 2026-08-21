@@ -181,7 +181,7 @@ jobs:
           # /mnt/oca-addons, not /mnt/oca-addons/auth_oidc: Odoo looks for modules
           # *inside* each addons-path entry, so naming the module directory hides
           # it. This is the path the real deployment uses.
-          addons=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons
+          addons=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons
 
           # Install the bridge and its dependencies into a fresh database. The
           # OCA auth_oidc module is required: tenant bootstrap refuses without

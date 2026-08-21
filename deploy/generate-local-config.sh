@@ -30,14 +30,14 @@ do
       ;;
   esac
 done
-case "$CONTROL_RAUTHY_ADMIN_KEY" in makersbrain-runtime\$*) ;; *) echo "CONTROL_RAUTHY_ADMIN_KEY must be makersbrain-runtime\$<secret>" >&2; exit 1;; esac
+case "$CONTROL_RAUTHY_ADMIN_KEY" in mb-runtime\$*) ;; *) echo "CONTROL_RAUTHY_ADMIN_KEY must be mb-runtime\$<secret>" >&2; exit 1;; esac
 rauthy_key_secret=${CONTROL_RAUTHY_ADMIN_KEY#*\$}
 case "$rauthy_key_secret" in *[!A-Za-z0-9]*) echo "the Rauthy API-key secret must be alphanumeric" >&2; exit 1;; esac
 if [ "${#rauthy_key_secret}" -lt 64 ]; then
   echo "the Rauthy API-key secret must be at least 64 characters" >&2
   exit 1
 fi
-case "$CONTROL_RAUTHY_DEPLOYMENT_KEY" in makersbrain-deployment\$*) ;; *) echo "CONTROL_RAUTHY_DEPLOYMENT_KEY must be makersbrain-deployment\$<secret>" >&2; exit 1;; esac
+case "$CONTROL_RAUTHY_DEPLOYMENT_KEY" in mb-deployment\$*) ;; *) echo "CONTROL_RAUTHY_DEPLOYMENT_KEY must be mb-deployment\$<secret>" >&2; exit 1;; esac
 rauthy_deployment_secret=${CONTROL_RAUTHY_DEPLOYMENT_KEY#*\$}
 case "$rauthy_deployment_secret" in *[!A-Za-z0-9]*) echo "the Rauthy deployment API-key secret must be alphanumeric" >&2; exit 1;; esac
 if [ "${#rauthy_deployment_secret}" -lt 64 ]; then
@@ -53,7 +53,7 @@ fi
 
 mkdir -p deploy/secrets/rauthy
 jq --arg members "$members_origin" '
-  map(if .id == "makersbrain-members" then
+  map(if .id == "mb-members" then
     .redirect_uris=[$members+"/oauth/callback"] |
     .post_logout_redirect_uris=[$members+"/signed-out"] |
     .allowed_origins=[$members] | .client_uri=$members
@@ -61,8 +61,8 @@ jq --arg members "$members_origin" '
 mv deploy/secrets/rauthy/clients.json.tmp deploy/secrets/rauthy/clients.json
 chmod 600 deploy/secrets/rauthy/clients.json
 jq -n --arg secret "$rauthy_key_secret" --arg deployment_secret "$rauthy_deployment_secret" '[
-  {"name":"makersbrain-runtime","secret":{"Plain":$secret},"access":[{"group":"Users","access_rights":["read","create","update"]},{"group":"Sessions","access_rights":["read","delete"]},{"group":"Events","access_rights":["read"]}]},
-  {"name":"makersbrain-deployment","secret":{"Plain":$deployment_secret},"access":[{"group":"Clients","access_rights":["read","create","update","delete"]},{"group":"Secrets","access_rights":["read"]}]}
+  {"name":"mb-runtime","secret":{"Plain":$secret},"access":[{"group":"Users","access_rights":["read","create","update"]},{"group":"Sessions","access_rights":["read","delete"]},{"group":"Events","access_rights":["read"]}]},
+  {"name":"mb-deployment","secret":{"Plain":$deployment_secret},"access":[{"group":"Clients","access_rights":["read","create","update","delete"]},{"group":"Secrets","access_rights":["read"]}]}
 ]' > deploy/secrets/rauthy/api_keys.json.tmp
 mv deploy/secrets/rauthy/api_keys.json.tmp deploy/secrets/rauthy/api_keys.json
 chmod 600 deploy/secrets/rauthy/api_keys.json

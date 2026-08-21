@@ -52,7 +52,7 @@ impl AzureInvoiceClient {
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-invoice-worker")
+            .user_agent("mb-invoice-worker")
             .build()?;
         Ok(Self {
             http,

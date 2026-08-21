@@ -85,7 +85,7 @@ impl Authenticator {
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-control-plane")
+            .user_agent("mb-control-plane")
             .build()?;
         Ok(Self {
             issuer: issuer.to_string(),

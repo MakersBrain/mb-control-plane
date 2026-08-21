@@ -52,7 +52,7 @@ def render(environment: Path, include_tunnel: bool) -> str:
 
 
 def main() -> int:
-    with tempfile.NamedTemporaryFile("w", prefix="makersbrain-canary-", suffix=".env") as env:
+    with tempfile.NamedTemporaryFile("w", prefix="mb-canary-", suffix=".env") as env:
         env.write(canary_environment())
         env.flush()
         for include_tunnel in (False, True):

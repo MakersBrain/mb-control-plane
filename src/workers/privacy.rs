@@ -95,7 +95,7 @@ async fn processor_exports(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("makersbrain-privacy-worker")
+        .user_agent("mb-privacy-worker")
         .build()
         .map_err(|_| IntegrationError::ContractDrift)?;
     let mut result = Vec::new();
@@ -204,7 +204,7 @@ async fn prepare_data_subject_export(
     let processor_exports = processor_exports(request_id, &memberships, scope).await?;
 
     let payload = json!({
-        "format":"makersbrain-gdpr-export-v1",
+        "format":"mb-gdpr-export-v1",
         "generated_at":export_timestamp(OffsetDateTime::now_utc())?,
         "request":{"id":request_id,"type":request_type,"scope":scope},
         "subject":{

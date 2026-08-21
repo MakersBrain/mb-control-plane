@@ -261,7 +261,7 @@ pub(super) async fn docker_create_volume(
         .runtime
         .client
         .post(state.runtime.endpoint("/volumes/create"))
-        .json(&json!({"Name":name,"Labels":{"makersbrain.kind":"paperless-volume"}}))
+        .json(&json!({"Name":name,"Labels":{"mb.kind":"paperless-volume"}}))
         .send()
         .await
         .map_err(DriverError::internal)?;

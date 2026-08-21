@@ -67,8 +67,8 @@ grant control_runtime_read to control_api,control_membership_worker,
   control_email_worker,control_reconciliation_worker,control_lifecycle_worker,
   control_backup_scheduler,control_driver_ledger,control_release_worker,
   control_privacy_worker;
-revoke all on database makersbrain_control from public;
-grant connect on database makersbrain_control to control_runtime_read;
+revoke all on database mb_control from public;
+grant connect on database mb_control to control_runtime_read;
 SQL
 
 echo "reconciled least-privilege control database login identities"

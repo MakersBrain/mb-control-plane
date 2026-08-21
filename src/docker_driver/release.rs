@@ -103,7 +103,7 @@ pub(super) async fn release_fleet(
         }
     }
 
-    let runtime_container = format!("makersbrain-odoo-{target_slot}");
+    let runtime_container = format!("mb-odoo-{target_slot}");
     ensure_release_runtime(
         state,
         &runtime_container,
@@ -295,7 +295,7 @@ async fn prepare_initial_release(
     .await
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError::bad("no reusable initial runtime slot is available"))?;
-    let runtime_container = format!("makersbrain-odoo-{target_slot}");
+    let runtime_container = format!("mb-odoo-{target_slot}");
     ensure_release_runtime(
         state,
         &runtime_container,
@@ -645,7 +645,7 @@ async fn run_odoo_release_upgrade(
             "Image":image,
             "Cmd":[
                 "/bin/sh","-ec",
-                "password=$(cat /run/makersbrain-job-secrets/runtime-password); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/makersbrain-job-secrets/bridge-token); exec odoo --database=\"$MB_ODOO_DATABASE\" --stop-after-init --no-http --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --update=all --without-demo=all"
+                "password=$(cat /run/mb-job-secrets/runtime-password); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/mb-job-secrets/bridge-token); exec odoo --database=\"$MB_ODOO_DATABASE\" --stop-after-init --no-http --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --update=all --without-demo=all"
             ],
             "Env":[
                 format!("MB_ODOO_DATABASE={}",tenant.database_ref),
@@ -654,9 +654,9 @@ async fn run_odoo_release_upgrade(
                 format!("USER={runtime_role}")
             ],
             "Labels":{
-                "makersbrain.kind":"odoo-release-upgrade",
-                "makersbrain.workshop":tenant.workshop_id.to_string(),
-                "makersbrain.database":tenant.database_id.to_string()
+                "mb.kind":"odoo-release-upgrade",
+                "mb.workshop":tenant.workshop_id.to_string(),
+                "mb.database":tenant.database_id.to_string()
             },
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
@@ -741,7 +741,7 @@ async fn ensure_release_runtime(
     if docker_container_exists(state, container).await? {
         let inspect = docker_inspect_container(state, container).await?;
         if inspect
-            .pointer("/Config/Labels/makersbrain.config-digest")
+            .pointer("/Config/Labels/mb.config-digest")
             .and_then(Value::as_str)
             != Some(&config_digest)
         {
@@ -756,25 +756,21 @@ async fn ensure_release_runtime(
             format!("HOST={}", state.config.postgres_host),
             format!("PORT={}", state.config.postgres_port),
             format!("USER={runtime_role}"),
-            format!("MB_RUNTIME_PASSWORD_FILE=/run/makersbrain-release-secrets/{runtime_role}"),
+            format!("MB_RUNTIME_PASSWORD_FILE=/run/mb-release-secrets/{runtime_role}"),
             format!("MB_CONTROL_API_URL={}", state.config.control_internal_url),
-            "MB_ODOO_CLIENT_TOKEN_ROOT=/run/makersbrain-odoo-client-secrets".into(),
+            "MB_ODOO_CLIENT_TOKEN_ROOT=/run/mb-odoo-client-secrets".into(),
         ];
         let mut mounts = vec![
-            runtime_secret_mount(
-                state,
-                Path::new("releases"),
-                "/run/makersbrain-release-secrets",
-            )?,
+            runtime_secret_mount(state, Path::new("releases"), "/run/mb-release-secrets")?,
             runtime_secret_mount(
                 state,
                 Path::new("odoo-clients"),
-                "/run/makersbrain-odoo-client-secrets",
+                "/run/mb-odoo-client-secrets",
             )?,
         ];
         if let Some(ca_mount) = postgres_ca_mount(state)? {
             environment.push("PGSSLMODE=verify-full".into());
-            environment.push("PGSSLROOTCERT=/run/makersbrain-postgres-ca/postgres-ca.crt".into());
+            environment.push("PGSSLROOTCERT=/run/mb-postgres-ca/postgres-ca.crt".into());
             mounts.push(ca_mount);
         }
         docker_create_container(
@@ -784,13 +780,13 @@ async fn ensure_release_runtime(
                 "Image":image,
                 "Cmd":[
                     "/bin/sh","-ec",
-                    "password=$(cat \"$MB_RUNTIME_PASSWORD_FILE\"); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/makersbrain-release-secrets/bridge-token); exec odoo --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/makersbrain-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode"
+                    "password=$(cat \"$MB_RUNTIME_PASSWORD_FILE\"); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/mb-release-secrets/bridge-token); exec odoo --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --load=base,web,mb_dbfilter_gateway --proxy-mode"
                 ],
                 "Env":environment,
                 "Labels":{
-                    "makersbrain.kind":"odoo-release-runtime",
-                    "makersbrain.config-digest":config_digest,
-                    "makersbrain.image-digest":image
+                    "mb.kind":"odoo-release-runtime",
+                    "mb.config-digest":config_digest,
+                    "mb.image-digest":image
                 },
                 "HostConfig":{
                     "NetworkMode":state.config.docker_network,

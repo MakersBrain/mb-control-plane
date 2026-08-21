@@ -31,7 +31,7 @@ Redis is deliberately excluded because it is derived queue/cache state.
 The component scope is immutable. A full restore requires the current workshop
 to have the same Paperless scope; restore never silently activates, disables,
 or wipes an optional service. Only the complete
-`makersbrain-workshop-recovery-v2` format is accepted; recovery artifacts from
+`mb-workshop-recovery-v2` format is accepted; recovery artifacts from
 the disposable pre-release schema epoch are not retained or restorable.
 
 The manifest records component checksums, source release, and exact Paperless
@@ -48,7 +48,7 @@ infrastructure restores secret references from the approved secret manager.
 A snapshot is an environment-local recovery point optimized for quick rollback.
 It depends on the current deployment and is not downloadable. A backup is the
 portable form: the server-side lifecycle worker creates one
-`makersbrain-workshop-backup.tar` containing the encrypted components, encrypted
+`mb-workshop-backup.tar` containing the encrypted components, encrypted
 manifest and completion marker, uploads it to S3, and verifies it before making
 the Download action available. Requesting a download never sends S3 credentials
 to the API or browser; the isolated driver signs the verified archive for ten

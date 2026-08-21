@@ -405,7 +405,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn version() -> impl IntoResponse {
-    Json(json!({"name": "makersbrain-control-plane", "version": env!("CARGO_PKG_VERSION")}))
+    Json(json!({"name": "mb-control-plane", "version": env!("CARGO_PKG_VERSION")}))
 }
 
 async fn openapi() -> impl IntoResponse {
@@ -439,38 +439,38 @@ async fn metrics(
     let abandoned=sqlx::query_scalar::<_,i64>("select count(*) from control.operations where state='in_flight' and lease_expires_at<now()")
         .fetch_one(state.store.pool()).await?;
     let mut body = String::from(
-        "# HELP makersbrain_queue_depth Due or queued durable operations.\n# TYPE makersbrain_queue_depth gauge\n",
+        "# HELP mb_queue_depth Due or queued durable operations.\n# TYPE mb_queue_depth gauge\n",
     );
     for (queue, depth, dead, age) in queues {
-        body.push_str(&format!("makersbrain_queue_depth{{queue=\"{queue}\"}} {depth}\nmakersbrain_queue_dead_letters{{queue=\"{queue}\"}} {dead}\nmakersbrain_queue_oldest_due_age_seconds{{queue=\"{queue}\"}} {age}\n"));
+        body.push_str(&format!("mb_queue_depth{{queue=\"{queue}\"}} {depth}\nmb_queue_dead_letters{{queue=\"{queue}\"}} {dead}\nmb_queue_oldest_due_age_seconds{{queue=\"{queue}\"}} {age}\n"));
     }
-    body.push_str("# HELP makersbrain_worker_fresh Fresh worker heartbeats by queue.\n# TYPE makersbrain_worker_fresh gauge\n");
+    body.push_str(
+        "# HELP mb_worker_fresh Fresh worker heartbeats by queue.\n# TYPE mb_worker_fresh gauge\n",
+    );
     for (queue, count) in workers {
-        body.push_str(&format!(
-            "makersbrain_worker_fresh{{queue=\"{queue}\"}} {count}\n"
-        ));
+        body.push_str(&format!("mb_worker_fresh{{queue=\"{queue}\"}} {count}\n"));
     }
     for (adoption_state, count) in adoptions {
         body.push_str(&format!(
-            "makersbrain_release_adoptions{{state=\"{adoption_state}\"}} {count}\n"
+            "mb_release_adoptions{{state=\"{adoption_state}\"}} {count}\n"
         ));
     }
-    body.push_str("# HELP makersbrain_integration_instances Connected integration instances by bounded integration and health.\n# TYPE makersbrain_integration_instances gauge\n");
+    body.push_str("# HELP mb_integration_instances Connected integration instances by bounded integration and health.\n# TYPE mb_integration_instances gauge\n");
     for (integration, health, count) in integrations {
         body.push_str(&format!(
-            "makersbrain_integration_instances{{integration=\"{integration}\",health=\"{health}\"}} {count}\n"
+            "mb_integration_instances{{integration=\"{integration}\",health=\"{health}\"}} {count}\n"
         ));
     }
     body.push_str(&format!(
-        "makersbrain_integration_instances{{integration=\"rauthy\",health=\"{}\"}} 1\n",
+        "mb_integration_instances{{integration=\"rauthy\",health=\"{}\"}} 1\n",
         if identity_available {
             "ready"
         } else {
             "failed"
         }
     ));
-    body.push_str(&format!("makersbrain_abandoned_operation_leases {abandoned}\nmakersbrain_backup_freshness_seconds {}\nmakersbrain_restore_rehearsal_age_seconds {}\n",backup_age.unwrap_or(-1.0),rehearsal_age.unwrap_or(-1.0)));
-    body.push_str("# HELP makersbrain_http_requests_total HTTP requests by templated route and status class.\n# TYPE makersbrain_http_requests_total counter\n# HELP makersbrain_http_latency_seconds_sum Accumulated HTTP latency by templated route and status class.\n# TYPE makersbrain_http_latency_seconds_sum counter\n");
+    body.push_str(&format!("mb_abandoned_operation_leases {abandoned}\nmb_backup_freshness_seconds {}\nmb_restore_rehearsal_age_seconds {}\n",backup_age.unwrap_or(-1.0),rehearsal_age.unwrap_or(-1.0)));
+    body.push_str("# HELP mb_http_requests_total HTTP requests by templated route and status class.\n# TYPE mb_http_requests_total counter\n# HELP mb_http_latency_seconds_sum Accumulated HTTP latency by templated route and status class.\n# TYPE mb_http_latency_seconds_sum counter\n");
     if let Ok(metrics) = HTTP_METRICS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
@@ -478,7 +478,7 @@ async fn metrics(
         let mut rows = metrics.iter().collect::<Vec<_>>();
         rows.sort_by(|left, right| left.0.cmp(right.0));
         for ((route, status_class), metric) in rows {
-            body.push_str(&format!("makersbrain_http_requests_total{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\nmakersbrain_http_latency_seconds_sum{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\n",metric.requests,metric.latency_micros as f64/1_000_000.0));
+            body.push_str(&format!("mb_http_requests_total{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\nmb_http_latency_seconds_sum{{route=\"{route}\",status_class=\"{status_class}xx\"}} {}\n",metric.requests,metric.latency_micros as f64/1_000_000.0));
         }
     }
     let mut response_headers = HeaderMap::new();
@@ -503,7 +503,7 @@ async fn live_metrics(
     response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok((
         response_headers,
-        "# TYPE makersbrain_application_live gauge\nmakersbrain_application_live 1\n",
+        "# TYPE mb_application_live gauge\nmb_application_live 1\n",
     ))
 }
 

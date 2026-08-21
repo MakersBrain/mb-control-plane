@@ -648,14 +648,14 @@ def validate() -> list[str]:
     else:
         alert_text = alert_path.read_text()
         for metric in (
-            "makersbrain_worker_fresh",
-            "makersbrain_queue_oldest_due_age_seconds",
-            "makersbrain_queue_dead_letters",
-            "makersbrain_backup_freshness_seconds",
-            "makersbrain_restore_rehearsal_age_seconds",
-            "makersbrain_release_adoptions",
-            "makersbrain_provider_requests_total",
-            "makersbrain_integration_instances",
+            "mb_worker_fresh",
+            "mb_queue_oldest_due_age_seconds",
+            "mb_queue_dead_letters",
+            "mb_backup_freshness_seconds",
+            "mb_restore_rehearsal_age_seconds",
+            "mb_release_adoptions",
+            "mb_provider_requests_total",
+            "mb_integration_instances",
         ):
             if metric not in alert_text:
                 errors.append(f"Prometheus rules do not cover required metric {metric}")

@@ -276,7 +276,7 @@ async fn create_recovery_point(
         },
     )
     .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,$5,$6,$7,$8,'makersbrain-workshop-recovery-v2')")
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,$5,$6,$7,$8,'mb-workshop-recovery-v2')")
         .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
     audit_command(
         &mut tx,
@@ -446,7 +446,7 @@ pub(super) async fn restore_database(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'backup','Automatic pre-restore safety backup',$4,$5,'makersbrain-workshop-recovery-v2')")
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'backup','Automatic pre-restore safety backup',$4,$5,'mb-workshop-recovery-v2')")
         .bind(safety_id).bind(id).bind(database_id).bind(who.user_id).bind(&safety_scope).execute(&mut *tx).await?;
     sqlx::query("update control.odoo_databases set state='restoring' where id=$1")
         .bind(database_id)

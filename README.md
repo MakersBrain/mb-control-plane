@@ -191,7 +191,7 @@ Azure credentials are optional at process startup and are read only after a
 workshop enables `azure-invoice-extraction`. Enabling that module fails safely
 when `CONTROL_AZURE_ENDPOINT` or `CONTROL_AZURE_KEY` is absent. Infrastructure
 may publish the key to
-`makersbrain-runtime/dev/invoice-capture/AZURE_DOCUMENT_KEY` with
+`mb-runtime/dev/invoice-capture/AZURE_DOCUMENT_KEY` with
 `../mb-infra/scripts/azure-document-key.sh`; the key is never read
 from OpenTofu state by this package.
 

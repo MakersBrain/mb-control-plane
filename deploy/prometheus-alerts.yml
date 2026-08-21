@@ -1,5 +1,5 @@
 groups:
-  - name: makersbrain-control-plane
+  - name: mb-control-plane
     rules:
       - alert: MakersBrainApplicationUnavailable
         expr: up{job="control-api-live",environment="staging"} == 0 or absent(up{job="control-api-live",environment="staging"})
@@ -23,70 +23,70 @@ groups:
           summary: "The staging metrics forwarding pipeline is unavailable"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainRequiredWorkerAbsent
-        expr: makersbrain_worker_fresh{environment="staging"} < 1
+        expr: mb_worker_fresh{environment="staging"} < 1
         for: 2m
         labels: {severity: critical, environment: staging}
         annotations:
           summary: "Required control-plane queue has no fresh worker"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainQueueDueTooLong
-        expr: makersbrain_queue_oldest_due_age_seconds{environment="staging"} > 300
+        expr: mb_queue_oldest_due_age_seconds{environment="staging"} > 300
         for: 10m
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "A durable-operation queue is not converging"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainDeadLettersPresent
-        expr: makersbrain_queue_dead_letters{environment="staging"} > 0
+        expr: mb_queue_dead_letters{environment="staging"} > 0
         for: 5m
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "A queue contains dead-lettered operations"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainAbandonedOperationLease
-        expr: makersbrain_abandoned_operation_leases{environment="staging"} > 0
+        expr: mb_abandoned_operation_leases{environment="staging"} > 0
         for: 2m
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "An in-flight operation lease has expired"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainVerifiedBackupStale
-        expr: makersbrain_backup_freshness_seconds{environment="staging"} < 0 or makersbrain_backup_freshness_seconds{environment="staging"} > 93600
+        expr: mb_backup_freshness_seconds{environment="staging"} < 0 or mb_backup_freshness_seconds{environment="staging"} > 93600
         for: 30m
         labels: {severity: critical, environment: staging}
         annotations:
           summary: "No sufficiently recent verified workshop backup exists"
           runbook_url: "docs/runbooks/failed-restore.md"
       - alert: MakersBrainRestoreRehearsalStale
-        expr: makersbrain_restore_rehearsal_age_seconds{environment="staging"} < 0 or makersbrain_restore_rehearsal_age_seconds{environment="staging"} > 2678400
+        expr: mb_restore_rehearsal_age_seconds{environment="staging"} < 0 or mb_restore_rehearsal_age_seconds{environment="staging"} > 2678400
         for: 1h
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "Isolated restore evidence is missing or older than 31 days"
           runbook_url: "docs/runbooks/failed-restore.md"
       - alert: MakersBrainReleaseTenantFailed
-        expr: makersbrain_release_adoptions{environment="staging",state="failed"} > 0
+        expr: mb_release_adoptions{environment="staging",state="failed"} > 0
         for: 2m
         labels: {severity: critical, environment: staging}
         annotations:
           summary: "At least one tenant release adoption failed"
           runbook_url: "docs/runbooks/failed-release-adoption.md"
       - alert: MakersBrainApiServerErrors
-        expr: sum(rate(makersbrain_http_requests_total{environment="staging",status_class="5xx"}[5m])) by (route) > 0.05
+        expr: sum(rate(mb_http_requests_total{environment="staging",status_class="5xx"}[5m])) by (route) > 0.05
         for: 10m
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "Sustained control API server errors"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainProviderFailures
-        expr: sum(rate(makersbrain_provider_requests_total{environment="staging",outcome="failure"}[10m])) by (provider, operation) > 0.05
+        expr: sum(rate(mb_provider_requests_total{environment="staging",outcome="failure"}[10m])) by (provider, operation) > 0.05
         for: 10m
         labels: {severity: warning, environment: staging}
         annotations:
           summary: "A document or product provider has a sustained failure rate"
           runbook_url: "docs/runbooks/queue-and-worker-failure.md"
       - alert: MakersBrainIntegrationUnavailable
-        expr: sum(makersbrain_integration_instances{environment="staging",health=~"degraded|failed"}) by (integration) > 0
+        expr: sum(mb_integration_instances{environment="staging",health=~"degraded|failed"}) by (integration) > 0
         for: 5m
         labels: {severity: warning, environment: staging}
         annotations:

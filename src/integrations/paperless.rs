@@ -85,7 +85,7 @@ impl PaperlessClient {
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("makersbrain-invoice-worker")
+            .user_agent("mb-invoice-worker")
             .build()?;
         Ok(Self { http, base_url })
     }
@@ -178,7 +178,7 @@ impl PaperlessClient {
         }
         let Some(account) = users.first().cloned() else {
             return Ok(json!({
-                "format":"makersbrain-paperless-subject-export-v1",
+                "format":"mb-paperless-subject-export-v1",
                 "workshop_id":workshop_id,"user_id":user_id,"found":false,
                 "account":null,"documents":[]
             }));
@@ -268,7 +268,7 @@ impl PaperlessClient {
             }));
         }
         Ok(json!({
-            "format":"makersbrain-paperless-subject-export-v1",
+            "format":"mb-paperless-subject-export-v1",
             "workshop_id":workshop_id,"user_id":user_id,"found":true,
             "account":account,"documents":documents
         }))

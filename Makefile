@@ -1,5 +1,5 @@
 .PHONY: check test build topology-secret-check topology-odoo-isolation-check configure configure-tunnel compose-config compose-tunnel-config up up-tunnel down down-tunnel
-export CARGO_TARGET_DIR ?= /tmp/makersbrain-control-target
+export CARGO_TARGET_DIR ?= /tmp/mb-control-target
 
 check:
 	cargo fmt --check

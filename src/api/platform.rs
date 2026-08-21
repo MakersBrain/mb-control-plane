@@ -301,7 +301,7 @@ pub(super) async fn platform_delete_workshop(
         },
     )
     .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Final pre-deletion backup',$5,$6,'makersbrain-workshop-recovery-v2')")
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Final pre-deletion backup',$5,$6,'mb-workshop-recovery-v2')")
         .bind(recovery_id).bind(id).bind(database_id).bind(operation_id).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
     sqlx::query("insert into control.workshop_deletions(workshop_id,previous_status,requested_by,operation_id,final_recovery_point_id,purge_after) values($1,$2,$3,$4,$5,now()+interval '30 days')")
         .bind(id).bind(&previous_status).bind(who.user_id).bind(operation_id).bind(recovery_id).execute(&mut *tx).await?;
@@ -1147,7 +1147,7 @@ pub(super) async fn platform_release_adopt(
         } else {
             vec!["odoo"]
         };
-        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version,source_release) values($1,$2,$3,$4,'backup',$5,$6,$7,'makersbrain-workshop-recovery-v2',$8)")
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version,source_release) values($1,$2,$3,$4,'backup',$5,$6,$7,'mb-workshop-recovery-v2',$8)")
             .bind(recovery_id).bind(tenant.0).bind(tenant.1).bind(operation_id).bind(format!("Pre-release recovery for {id}")).bind(who.user_id).bind(&component_scope).bind(&source).execute(&mut *tx).await?;
         sqlx::query("insert into control.tenant_release_adoptions(id,workshop_id,database_id,release_id,source_release_id,registry_version,state,operation_id,backup_recovery_id,target_schema_epoch) values($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9)")
             .bind(adoption_id).bind(tenant.0).bind(tenant.1).bind(&id).bind(source).bind(release.3).bind(operation_id).bind(recovery_id).bind(release.2).execute(&mut *tx).await?;
