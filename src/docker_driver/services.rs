@@ -6,9 +6,27 @@ pub(super) async fn ensure_redis_acl(
     password: &str,
     prefix: &str,
 ) -> Result<(), DriverError> {
+    if let Some(path) = address.strip_prefix("unix:") {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(DriverError::internal)?;
+        return send_redis_acl(&mut stream, username, password, prefix).await;
+    }
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .map_err(DriverError::internal)?;
+    send_redis_acl(&mut stream, username, password, prefix).await
+}
+
+async fn send_redis_acl<S>(
+    stream: &mut S,
+    username: &str,
+    password: &str,
+    prefix: &str,
+) -> Result<(), DriverError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let arguments = redis_acl_arguments(username, password, prefix);
     let mut command = format!("*{}\r\n", arguments.len());
     for argument in arguments {
@@ -315,13 +333,13 @@ pub(super) async fn ensure_paperless(
         .as_deref()
         .ok_or_else(|| DriverError::bad("Paperless is not configured for this deployment"))?;
     for suffix in ["data", "media", "consume"] {
-        docker_create_volume(
-            state,
-            &state
-                .config
-                .docker_resource(format!("paperless-{workshop}-{suffix}")),
-        )
-        .await?;
+        let volume = state
+            .config
+            .docker_resource(format!("paperless-{workshop}-{suffix}"));
+        match &state.backend {
+            RuntimeBackend::Docker => docker_create_volume(state, &volume).await?,
+            RuntimeBackend::Quadlet(backend) => backend.ensure_volume(&volume).await?,
+        }
     }
     let providers = json!({"openid_connect":{"APPS":[{"provider_id":"rauthy","name":"MakersBrain","client_id":oidc_client_id,"secret":oidc_secret,"settings":{"server_url":format!("{}/.well-known/openid-configuration",state.config.oidc_issuer),"oauth_pkce_enabled":true,"email_authentication":true}}]}}).to_string();
     let tenant_secret_dir = driver_runtime_secret_root(state)
@@ -405,6 +423,51 @@ pub(super) async fn ensure_paperless(
             .map_err(DriverError::internal)?
         )
     );
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        let environment = environment
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .ok_or_else(|| DriverError::internal("invalid Paperless environment entry"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        backend
+            .ensure_paperless(&PaperlessDesired {
+                workshop,
+                container_name: container.to_owned(),
+                image: paperless_image.to_owned(),
+                config_digest: config_digest.clone(),
+                environment,
+                secret_directory: tenant_secret_dir,
+                volumes: ["data", "media", "consume"]
+                    .map(|suffix| {
+                        (
+                            state
+                                .config
+                                .docker_resource(format!("paperless-{workshop}-{suffix}")),
+                            format!("/usr/src/paperless/{suffix}"),
+                        )
+                    })
+                    .to_vec(),
+                network: state.config.docker_network.clone(),
+            })
+            .await?;
+        persist_paperless_runtime_spec(
+            state,
+            workshop,
+            container,
+            paperless_image,
+            &config_digest,
+            database,
+            role,
+            redis_user,
+            public_hostname,
+        )
+        .await?;
+        return Ok(());
+    }
     if docker_container_exists(state, container).await? {
         let inspect = docker_inspect_container(state, container).await?;
         let current_digest = inspect
@@ -416,12 +479,26 @@ pub(super) async fn ensure_paperless(
             if inspect.pointer("/State/Running").and_then(Value::as_bool) != Some(true) {
                 docker_start_container(state, container).await?;
             }
-            return wait_for_healthy_container(state, container, "Paperless").await;
+            wait_for_healthy_container(state, container, "Paperless").await?;
+            persist_paperless_runtime_spec(
+                state,
+                workshop,
+                container,
+                paperless_image,
+                &config_digest,
+                database,
+                role,
+                redis_user,
+                public_hostname,
+            )
+            .await?;
+            return Ok(());
         }
     }
     docker_create_container(
         state,
         container,
+        DockerRestartPolicy::UnlessStopped,
         json!({
             "Image":paperless_image,
             "Env":environment,
@@ -436,7 +513,65 @@ pub(super) async fn ensure_paperless(
     )
     .await?;
     docker_start_container(state, container).await?;
-    wait_for_healthy_container(state, container, "Paperless").await
+    wait_for_healthy_container(state, container, "Paperless").await?;
+    persist_paperless_runtime_spec(
+        state,
+        workshop,
+        container,
+        paperless_image,
+        &config_digest,
+        database,
+        role,
+        redis_user,
+        public_hostname,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_paperless_runtime_spec(
+    state: &DriverState,
+    workshop: Uuid,
+    container: &str,
+    image: &str,
+    config_digest: &str,
+    database_ref: &str,
+    database_role: &str,
+    redis_identity: &str,
+    public_hostname: &str,
+) -> Result<(), DriverError> {
+    let volumes = ["data", "media", "consume"]
+        .map(|suffix| {
+            state
+                .config
+                .docker_resource(format!("paperless-{workshop}-{suffix}"))
+        })
+        .to_vec();
+    let result = sqlx::query(
+        "update control.service_instances set runtime_spec=$2
+          where workshop_id=$1 and service='paperless'",
+    )
+    .bind(workshop)
+    .bind(json!({
+        "version": 1,
+        "image": image,
+        "config_digest": config_digest,
+        "container_name": container,
+        "database_ref": database_ref,
+        "database_role": database_role,
+        "redis_identity": redis_identity,
+        "public_hostname": public_hostname,
+        "volumes": volumes,
+    }))
+    .execute(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?;
+    if result.rows_affected() != 1 {
+        return Err(DriverError::internal(
+            "Paperless service instance is missing while persisting runtime specification",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn wait_for_healthy_container(

@@ -239,20 +239,22 @@ async fn driver(
     key: Uuid,
     payload: &Value,
 ) -> ApiResult<Value> {
-    let response = reqwest::Client::builder()
-        .timeout(state.config.request_timeout)
-        .build()
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .post(format!(
-            "{}v1/tenants/{workshop}/{action}",
-            state.config.deployment_driver_url.as_str()
-        ))
-        .bearer_auth(&state.config.deployment_driver_token)
-        .header("idempotency-key", format!("carrier-secret:{key}"))
-        .json(payload)
-        .send()
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
+    let response = crate::deployment_driver_transport::client(
+        None,
+        state.config.request_timeout,
+        state.config.deployment_driver_socket.as_deref(),
+    )
+    .map_err(ApiError::Internal)?
+    .post(format!(
+        "{}v1/tenants/{workshop}/{action}",
+        state.config.deployment_driver_url.as_str()
+    ))
+    .bearer_auth(&state.config.deployment_driver_token)
+    .header("idempotency-key", format!("carrier-secret:{key}"))
+    .json(payload)
+    .send()
+    .await
+    .map_err(|error| ApiError::Internal(error.into()))?;
     if !response.status().is_success() {
         return Err(ApiError::Internal(anyhow::anyhow!(
             "deployment driver refused carrier secret operation"

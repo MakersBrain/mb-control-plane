@@ -109,7 +109,8 @@ pub(super) async fn lifecycle(
     let paperless_container = state
         .config
         .docker_resource(format!("paperless-{}", tenant_key(workshop)));
-    let paperless_running = if docker_container_exists(state, &paperless_container).await? {
+    let paperless_exists = docker_container_exists(state, &paperless_container).await?;
+    let paperless_running = if paperless_exists {
         docker_inspect_container(state, &paperless_container)
             .await?
             .pointer("/State/Running")
@@ -122,14 +123,45 @@ pub(super) async fn lifecycle(
     let result = async {
         let operation = async {
             if paperless_running {
-                docker_stop_container(state, &paperless_container).await?;
+                match &state.backend {
+                    RuntimeBackend::Docker => {
+                        docker_ensure_restart_policy(
+                            state,
+                            &paperless_container,
+                            DockerRestartPolicy::No,
+                        )
+                        .await?;
+                        docker_stop_container(state, &paperless_container).await?;
+                    }
+                    RuntimeBackend::Quadlet(backend) => {
+                        backend
+                            .set_container_boot_selected(&paperless_container, false)
+                            .await?;
+                    }
+                }
             }
             drain_workshop_operations(state, workshop).await?;
             lifecycle_quiesced(state, workshop, payload).await
         }
         .await;
         let restart = if paperless_running && !(deleting && operation.is_ok()) {
-            match docker_start_container(state, &paperless_container).await {
+            let start = match &state.backend {
+                RuntimeBackend::Docker => {
+                    docker_ensure_restart_policy(
+                        state,
+                        &paperless_container,
+                        DockerRestartPolicy::UnlessStopped,
+                    )
+                    .await?;
+                    docker_start_container(state, &paperless_container).await
+                }
+                RuntimeBackend::Quadlet(backend) => {
+                    backend
+                        .set_container_boot_selected(&paperless_container, true)
+                        .await
+                }
+            };
+            match start {
                 Ok(()) => {
                     wait_for_healthy_container(state, &paperless_container, "Paperless").await
                 }
@@ -155,6 +187,23 @@ pub(super) async fn lifecycle(
         return result;
     }
     if deleting && result.is_ok() {
+        if paperless_exists {
+            match &state.backend {
+                RuntimeBackend::Docker => {
+                    docker_ensure_restart_policy(
+                        state,
+                        &paperless_container,
+                        DockerRestartPolicy::No,
+                    )
+                    .await?;
+                }
+                RuntimeBackend::Quadlet(backend) => {
+                    backend
+                        .remove_persistent_container(&paperless_container)
+                        .await?;
+                }
+            }
+        }
         let carrier_secrets = state
             .config
             .secret_root
@@ -641,10 +690,10 @@ pub(super) async fn replace_route_config(
         .config
         .route_root
         .join(format!("{workshop}.recovery.tmp"));
-    std::fs::write(&temporary, contents).map_err(DriverError::internal)?;
+    write_gateway_file(&temporary, contents).map_err(DriverError::internal)?;
     std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
-    docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await?;
-    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
+    let digest = format!("sha256:{:x}", Sha256::digest(contents));
+    reload_gateway_runtime(state, &digest).await?;
     Ok(())
 }
 

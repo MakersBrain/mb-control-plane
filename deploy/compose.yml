@@ -346,7 +346,7 @@ services:
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
       DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       DRIVER_PRIVACY_TOKEN: "@/run/secrets/privacy_driver_token"
-      DRIVER_CONTAINER_RUNTIME: docker
+      DRIVER_BACKEND: docker
       DRIVER_RUNTIME_SOCKET: /var/run/docker.sock
       DRIVER_DATABASE_URL: "@/run/secrets/control_driver_database_url"
       DRIVER_POSTGRES_ADMIN_URL: "@/run/secrets/postgres_admin_database_url"
@@ -379,6 +379,7 @@ services:
       BACKUP_ENCRYPTION_KEY_ID: ${BACKUP_ENCRYPTION_KEY_ID:-}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-}
       DRIVER_REDIS_ADDRESS: redis:6379
+      DRIVER_REDIS_ADMIN_ADDRESS: redis:6379
       DRIVER_SECRET_ROOT: /run/mb-secrets
       DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/mb-odoo-client-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/mb-paperless-client-secrets
@@ -623,6 +624,14 @@ services:
     healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
     restart: unless-stopped
 
+  gateway-route-reset:
+    image: nginx:1.29-alpine
+    entrypoint: ["/bin/sh", "/usr/local/bin/gateway-route-reset.sh"]
+    volumes:
+      - ./gateway-route-reset.sh:/usr/local/bin/gateway-route-reset.sh:ro
+      - tenant-routes:/routes
+    restart: "no"
+
   tenant-gateway:
     image: nginx:1.29-alpine
     container_name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-tenant-gateway
@@ -631,6 +640,7 @@ services:
       - tenant-routes:/etc/nginx/tenants:ro
     ports: ["127.0.0.1:${ODOO_HTTP_PORT:-8169}:8080"]
     depends_on:
+      gateway-route-reset: {condition: service_completed_successfully}
       odoo: {condition: service_started}
       control-migrate: {condition: service_completed_successfully}
     restart: unless-stopped

@@ -2,6 +2,36 @@ use super::*;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DockerRestartPolicy {
+    No,
+    UnlessStopped,
+}
+
+impl DockerRestartPolicy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::UnlessStopped => "unless-stopped",
+        }
+    }
+}
+
+fn apply_restart_policy(body: &mut Value, policy: DockerRestartPolicy) -> Result<(), DriverError> {
+    let host = body
+        .as_object_mut()
+        .ok_or_else(|| DriverError::internal("Docker container body must be an object"))?
+        .entry("HostConfig")
+        .or_insert_with(|| json!({}));
+    host.as_object_mut()
+        .ok_or_else(|| DriverError::internal("Docker HostConfig must be an object"))?
+        .insert(
+            "RestartPolicy".to_owned(),
+            json!({"Name":policy.name(),"MaximumRetryCount":0}),
+        );
+    Ok(())
+}
+
 pub(super) async fn docker_exec(
     state: &DriverState,
     container: &str,
@@ -76,6 +106,9 @@ pub(super) async fn docker_container_exists(
     state: &DriverState,
     name: &str,
 ) -> Result<bool, DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.container_exists(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -96,6 +129,9 @@ pub(super) async fn docker_pull_image(
     state: &DriverState,
     reference: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.assert_image_present(reference).await;
+    }
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("fromImage", reference)
         .finish();
@@ -127,6 +163,9 @@ pub(super) async fn docker_inspect_image(
     state: &DriverState,
     reference: &str,
 ) -> Result<Value, DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.image_inspect(reference).await;
+    }
     let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
     let response = state
         .runtime
@@ -148,6 +187,9 @@ pub(super) async fn docker_inspect_container(
     state: &DriverState,
     name: &str,
 ) -> Result<Value, DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.inspect_container(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -164,11 +206,56 @@ pub(super) async fn docker_inspect_container(
     response.json().await.map_err(DriverError::internal)
 }
 
+pub(super) async fn docker_workspace_containers(
+    state: &DriverState,
+) -> Result<Vec<String>, DriverError> {
+    let filters = json!({
+        "label": [format!("mb.workspace={}", state.config.workspace_namespace)]
+    })
+    .to_string();
+    let query: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("all", "true")
+        .append_pair("filters", &filters)
+        .finish();
+    let response = state
+        .runtime
+        .client
+        .get(state.runtime.endpoint(&format!("/containers/json?{query}")))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker container list returned {}",
+            response.status()
+        )));
+    }
+    let rows = response
+        .json::<Vec<Value>>()
+        .await
+        .map_err(DriverError::internal)?;
+    let mut names = rows
+        .iter()
+        .filter_map(|row| row.get("Names").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|name| name.trim_start_matches('/').to_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 pub(super) async fn docker_create_container(
     state: &DriverState,
     name: &str,
+    restart_policy: DockerRestartPolicy,
     mut body: Value,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.create_archive_container(name, &body).await;
+    }
+    apply_restart_policy(&mut body, restart_policy)?;
     let labels = body
         .as_object_mut()
         .ok_or_else(|| DriverError::internal("Docker container body must be an object"))?
@@ -203,10 +290,69 @@ pub(super) async fn docker_create_container(
     Ok(())
 }
 
+pub(super) async fn docker_update_restart_policy(
+    state: &DriverState,
+    name: &str,
+    restart_policy: DockerRestartPolicy,
+) -> Result<(), DriverError> {
+    let response = state
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{name}/update")),
+        )
+        .json(&json!({
+            "RestartPolicy": {
+                "Name": restart_policy.name(),
+                "MaximumRetryCount": 0
+            }
+        }))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker restart-policy update returned {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn docker_ensure_restart_policy(
+    state: &DriverState,
+    name: &str,
+    restart_policy: DockerRestartPolicy,
+) -> Result<bool, DriverError> {
+    let inspect = docker_inspect_container(state, name).await?;
+    if observed_restart_policy(&inspect) == Some(restart_policy.name()) {
+        return Ok(false);
+    }
+    docker_update_restart_policy(state, name, restart_policy).await?;
+    let observed = docker_inspect_container(state, name).await?;
+    if observed_restart_policy(&observed) != Some(restart_policy.name()) {
+        return Err(DriverError::internal(
+            "Docker restart-policy postcondition did not converge",
+        ));
+    }
+    Ok(true)
+}
+
+pub(super) fn observed_restart_policy(inspect: &Value) -> Option<&str> {
+    inspect
+        .pointer("/HostConfig/RestartPolicy/Name")
+        .and_then(Value::as_str)
+}
+
 pub(super) async fn docker_start_container(
     state: &DriverState,
     name: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.start_container(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -227,6 +373,9 @@ pub(super) async fn docker_stop_container(
     state: &DriverState,
     name: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.stop_container(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -265,8 +414,7 @@ pub(super) async fn docker_signal_container(
         .map_err(DriverError::internal)?;
     if !response.status().is_success() {
         return Err(DriverError::internal(format!(
-            "{} signal returned {}",
-            state.runtime.kind.name(),
+            "Docker signal returned {}",
             response.status()
         )));
     }
@@ -299,6 +447,9 @@ pub(super) async fn docker_delete_container(
     state: &DriverState,
     name: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.delete_container(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -323,6 +474,9 @@ pub(super) async fn docker_create_volume(
     state: &DriverState,
     name: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.ensure_volume(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -344,6 +498,9 @@ pub(super) async fn docker_volume_exists(
     state: &DriverState,
     name: &str,
 ) -> Result<bool, DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.volume_exists(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -366,6 +523,11 @@ pub(super) async fn docker_create_extension_volume(
     manifest_digest: &str,
     payload_digest: &str,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend
+            .create_extension_volume(name, manifest_digest, payload_digest)
+            .await;
+    }
     let response = state.runtime.client.post(state.runtime.endpoint("/volumes/create"))
         .json(&json!({"Name":name,"Labels":{"mb.kind":"odoo-extension","mb.workspace":state.config.workspace_namespace,"mb.extension-manifest":manifest_digest,"mb.payload":payload_digest}}))
         .send().await.map_err(DriverError::internal)?;
@@ -382,6 +544,9 @@ pub(super) async fn docker_delete_extension_volume(
     state: &DriverState,
     name: &str,
 ) -> Result<bool, DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.delete_volume(name).await;
+    }
     let response = state
         .runtime
         .client
@@ -413,6 +578,9 @@ pub(super) async fn docker_get_archive_bounded(
         })
     {
         return Err(DriverError::internal("unsafe archive path"));
+    }
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.get_archive(container, path, maximum).await;
     }
     let response = state
         .runtime
@@ -465,6 +633,9 @@ pub(super) async fn docker_put_archive(
     {
         return Err(DriverError::internal("unsafe archive path"));
     }
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.put_archive(container, path, archive).await;
+    }
     let response = state
         .runtime
         .client
@@ -490,21 +661,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_uses_the_supported_compatibility_api() {
-        assert_eq!(ContainerRuntimeKind::Docker.api_version(), "v1.47");
-        assert_eq!(ContainerRuntimeKind::Podman.api_version(), "v1.40");
+    fn docker_runtime_uses_the_supported_engine_api() {
+        let runtime = ContainerRuntime {
+            client: reqwest::Client::new(),
+        };
+        assert_eq!(runtime.endpoint("/info"), "http://localhost/v1.47/info");
     }
 
     #[test]
     fn runtime_kind_is_closed() {
         assert_eq!(
-            ContainerRuntimeKind::parse("docker").unwrap(),
-            ContainerRuntimeKind::Docker
+            DriverBackendKind::parse("docker").unwrap(),
+            DriverBackendKind::Docker
         );
         assert_eq!(
-            ContainerRuntimeKind::parse("podman").unwrap(),
-            ContainerRuntimeKind::Podman
+            DriverBackendKind::parse("quadlet").unwrap(),
+            DriverBackendKind::Quadlet
         );
-        assert!(ContainerRuntimeKind::parse("containerd").is_err());
+        assert!(DriverBackendKind::parse("podman").is_err());
+    }
+
+    #[test]
+    fn every_create_request_gets_an_explicit_closed_restart_policy() {
+        let mut persistent = json!({"Image":"paperless","HostConfig":{"ReadonlyRootfs":true}});
+        apply_restart_policy(&mut persistent, DockerRestartPolicy::UnlessStopped).unwrap();
+        assert_eq!(
+            persistent.pointer("/HostConfig/RestartPolicy/Name"),
+            Some(&json!("unless-stopped"))
+        );
+        assert_eq!(
+            persistent.pointer("/HostConfig/RestartPolicy/MaximumRetryCount"),
+            Some(&json!(0))
+        );
+
+        let mut job = json!({"Image":"helper"});
+        apply_restart_policy(&mut job, DockerRestartPolicy::No).unwrap();
+        assert_eq!(
+            job.pointer("/HostConfig/RestartPolicy/Name"),
+            Some(&json!("no"))
+        );
     }
 }

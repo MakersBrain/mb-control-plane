@@ -8,19 +8,31 @@
     "sha256": "a6d49252dd8a990409c270c5b492c3922dbc95ae112fdddc77e60bf481f13273"
   },
   "release": "0.1.0",
-  "schema_release": "0003_workspace_extension_volume_names",
-  "schema_compatibility": "=0003_workspace_extension_volume_names",
+  "schema_release": "0004_paperless_runtime_spec",
+  "schema_compatibility": "=0004_paperless_runtime_spec",
   "staging_qualification": {
     "builder": "podman/qualification.py",
     "environment": "synthetic-only staging",
     "mandatory_checks": [
       "release_verification",
+      "odoo_pair_verification",
+      "official_runtime_read_only",
+      "extension_preparation_failure",
       "topology_reboot",
+      "driver_backend_contract",
+      "driver_socket_isolation",
+      "driver_interruption_reconciliation",
+      "driver_gateway_fail_closed",
+      "driver_one_shot_reboot",
+      "driver_canary_leakage",
+      "driver_static_rollback",
+      "debian13_podman5",
       "two_tenant_isolation",
       "queue_workers",
       "release_adoption",
       "failed_upgrade_fencing",
       "rollback",
+      "old_slot_garbage_collection",
       "provider_failure_recovery",
       "webshop_cloudflare_dns_tls",
       "webshop_scaleway_mail",
@@ -407,8 +419,7 @@
     ],
     "docker_driver": [
       "DRIVER_ENVIRONMENT",
-      "DRIVER_CONTAINER_RUNTIME",
-      "DRIVER_RUNTIME_SOCKET",
+      "DRIVER_BACKEND",
       "DRIVER_WORKSPACE_NAMESPACE",
       "DRIVER_LISTEN",
       "DRIVER_TOKEN",
@@ -429,6 +440,7 @@
       "DRIVER_ODOO_DATA_ROOT",
       "DRIVER_BACKUP_ROOT",
       "DRIVER_REDIS_ADDRESS",
+      "DRIVER_REDIS_ADMIN_ADDRESS",
       "DRIVER_SECRET_ROOT",
       "DRIVER_ODOO_CLIENT_SECRET_ROOT",
       "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT",
@@ -536,6 +548,16 @@
     ]
   },
   "optional_environment": {
+    "deployment_driver_socket": [
+      "CONTROL_DEPLOYMENT_DRIVER_SOCKET"
+    ],
+    "quadlet_driver": [
+      "DRIVER_QUADLET_ROOT",
+      "DRIVER_SYSTEMD_RUNTIME_DIR",
+      "DRIVER_IMAGE_GRANT_ROOT",
+      "DRIVER_ALLOW_RAW_PODMAN_MIGRATION",
+      "DRIVER_UNIX_SOCKET"
+    ],
     "tenant_public_port": [
       "CONTROL_TENANT_PUBLIC_PORT"
     ],
@@ -731,15 +753,20 @@
   "deployment_driver": {
     "implementations": {
       "development": "docker",
-      "staging": "podman",
-      "production": "podman"
+      "staging": "quadlet",
+      "production": "quadlet"
     },
-    "runtime_selector": "DRIVER_CONTAINER_RUNTIME",
+    "runtime_selector": "DRIVER_BACKEND",
     "socket_variable": "DRIVER_RUNTIME_SOCKET",
+    "unix_listener_variable": "DRIVER_UNIX_SOCKET",
+    "quadlet_root_variable": "DRIVER_QUADLET_ROOT",
+    "systemd_runtime_variable": "DRIVER_SYSTEMD_RUNTIME_DIR",
+    "image_grant_root_variable": "DRIVER_IMAGE_GRANT_ROOT",
+    "raw_migration_flag": "DRIVER_ALLOW_RAW_PODMAN_MIGRATION",
     "network_variable": "DRIVER_RUNTIME_NETWORK",
     "authentication": "bearer",
     "idempotency": "persistent ledger",
-    "socket": "private rootless Unix socket owned by the selected container runtime",
+    "socket": "Docker Engine socket in development only; production uses no container-runtime API socket",
     "dynamic_resources": [
       "paperless_container",
       "paperless_volumes",
@@ -751,7 +778,7 @@
     ]
   },
   "rollback": {
-    "application": "requires an application release for control-plane schema epoch 0003_workspace_extension_volume_names",
+    "application": "requires an application release for control-plane schema epoch 0004_paperless_runtime_spec",
     "database": "no cross-epoch rollback; destroy the disposable topology and recreate a blank database with one matching code epoch"
   },
   "postgresql_recovery": {

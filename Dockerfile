@@ -28,6 +28,9 @@ RUN --mount=type=cache,id=control-cargo-registry,target=/usr/local/cargo/registr
        target/release/control-extension-helper \
        target/release/control-mail-gateway /out/
 
+FROM scratch AS driver-artifact
+COPY --from=builder /out/control-container-driver /control-container-driver
+
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 RUN --mount=type=cache,id=control-apt-lists,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,id=control-apt-cache,target=/var/cache/apt,sharing=locked \

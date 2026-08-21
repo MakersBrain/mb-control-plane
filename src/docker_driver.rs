@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 use uuid::Uuid;
 
@@ -30,64 +31,56 @@ mod postgres;
 mod privacy;
 mod recovery;
 mod release;
+mod runtime_backend;
 mod services;
+mod startup;
 
 use docker_client::*;
 use gateway::*;
 use postgres::*;
 use recovery::*;
+use runtime_backend::*;
 use services::*;
+use startup::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContainerRuntimeKind {
+enum DriverBackendKind {
     Docker,
-    Podman,
+    Quadlet,
 }
 
-impl ContainerRuntimeKind {
+impl DriverBackendKind {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
             "docker" => Ok(Self::Docker),
-            "podman" => Ok(Self::Podman),
-            _ => anyhow::bail!("DRIVER_CONTAINER_RUNTIME must be docker or podman"),
-        }
-    }
-
-    fn api_version(self) -> &'static str {
-        match self {
-            Self::Docker => "v1.47",
-            // Podman's compatibility API currently targets Docker API v1.40.
-            Self::Podman => "v1.40",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Docker => "Docker",
-            Self::Podman => "Podman",
+            "quadlet" => Ok(Self::Quadlet),
+            _ => anyhow::bail!("DRIVER_BACKEND must be docker or quadlet"),
         }
     }
 }
 
 #[derive(Clone)]
 struct ContainerRuntime {
-    kind: ContainerRuntimeKind,
     client: reqwest::Client,
 }
 
 impl ContainerRuntime {
     fn endpoint(&self, path: &str) -> String {
-        format!("http://localhost/{}{path}", self.kind.api_version())
+        format!("http://localhost/v1.47{path}")
     }
 }
 
 #[derive(Clone)]
 pub struct DockerDriverConfig {
-    pub listen: SocketAddr,
+    pub listen: DriverListen,
     token: String,
     privacy_token: String,
-    container_runtime: ContainerRuntimeKind,
-    runtime_socket: PathBuf,
+    backend: DriverBackendKind,
+    runtime_socket: Option<PathBuf>,
+    quadlet_root: Option<PathBuf>,
+    systemd_runtime_dir: Option<PathBuf>,
+    image_grant_root: Option<PathBuf>,
+    allow_raw_podman_migration: bool,
     database_url: String,
     postgres_admin_url: String,
     postgres_admin_user: String,
@@ -111,6 +104,7 @@ pub struct DockerDriverConfig {
     backup_agent_image: Option<String>,
     s3_backup: Option<S3BackupConfig>,
     redis_address: String,
+    redis_admin_address: String,
     secret_root: PathBuf,
     odoo_client_secret_root: PathBuf,
     paperless_client_secret_root: PathBuf,
@@ -126,6 +120,12 @@ pub struct DockerDriverConfig {
     oidc_issuer: String,
     public_scheme: String,
     public_port: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DriverListen {
+    Tcp(SocketAddr),
+    SystemdUnix(PathBuf),
 }
 
 #[derive(Clone)]
@@ -146,9 +146,8 @@ struct S3BackupConfig {
 impl DockerDriverConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let environment = required("DRIVER_ENVIRONMENT")?;
-        let container_runtime =
-            ContainerRuntimeKind::parse(&required("DRIVER_CONTAINER_RUNTIME")?)?;
-        if container_runtime == ContainerRuntimeKind::Docker && environment != "development" {
+        let backend = DriverBackendKind::parse(&required("DRIVER_BACKEND")?)?;
+        if backend == DriverBackendKind::Docker && environment != "development" {
             anyhow::bail!(
                 "the Docker socket driver is development-only; staging and production must use the infrastructure driver"
             );
@@ -159,9 +158,40 @@ impl DockerDriverConfig {
         ) {
             anyhow::bail!("DRIVER_ENVIRONMENT must be development, staging, or production");
         }
-        let runtime_socket = PathBuf::from(required("DRIVER_RUNTIME_SOCKET")?);
-        if !runtime_socket.is_absolute() {
-            anyhow::bail!("DRIVER_RUNTIME_SOCKET must be an absolute Unix-socket path");
+        let runtime_socket = optional("DRIVER_RUNTIME_SOCKET")?.map(PathBuf::from);
+        if backend == DriverBackendKind::Docker
+            && runtime_socket
+                .as_ref()
+                .is_none_or(|path| !path.is_absolute())
+        {
+            anyhow::bail!("DRIVER_RUNTIME_SOCKET must be an absolute Unix-socket path for Docker");
+        }
+        if backend == DriverBackendKind::Quadlet && runtime_socket.is_some() {
+            anyhow::bail!("DRIVER_RUNTIME_SOCKET is forbidden for the Quadlet backend");
+        }
+        let quadlet_root = optional("DRIVER_QUADLET_ROOT")?.map(PathBuf::from);
+        let systemd_runtime_dir = optional("DRIVER_SYSTEMD_RUNTIME_DIR")?.map(PathBuf::from);
+        let image_grant_root = optional("DRIVER_IMAGE_GRANT_ROOT")?.map(PathBuf::from);
+        let allow_raw_podman_migration = optional("DRIVER_ALLOW_RAW_PODMAN_MIGRATION")?
+            .as_deref()
+            .map(str::parse::<bool>)
+            .transpose()?
+            .unwrap_or(false);
+        if allow_raw_podman_migration && environment != "staging" {
+            anyhow::bail!("raw Podman migration is allowed only in staging");
+        }
+        if backend == DriverBackendKind::Quadlet
+            && [
+                quadlet_root.as_ref(),
+                systemd_runtime_dir.as_ref(),
+                image_grant_root.as_ref(),
+            ]
+            .into_iter()
+            .any(|path| path.is_none_or(|path| !path.is_absolute()))
+        {
+            anyhow::bail!(
+                "DRIVER_QUADLET_ROOT, DRIVER_SYSTEMD_RUNTIME_DIR and DRIVER_IMAGE_GRANT_ROOT must be absolute for Quadlet"
+            );
         }
         let public_scheme = required("DRIVER_PUBLIC_SCHEME")?;
         if !matches!(public_scheme.as_str(), "http" | "https") {
@@ -252,12 +282,11 @@ impl DockerDriverConfig {
         }
         let runtime_secret_source = required("DRIVER_RUNTIME_SECRET_SOURCE")?;
         let recovery_secret_source = required("DRIVER_RECOVERY_SECRET_SOURCE")?;
-        if container_runtime == ContainerRuntimeKind::Podman
-            && !Path::new(&runtime_secret_source).is_absolute()
+        if backend == DriverBackendKind::Quadlet && !Path::new(&runtime_secret_source).is_absolute()
         {
             anyhow::bail!("DRIVER_RUNTIME_SECRET_SOURCE must be an absolute host path for Podman");
         }
-        if container_runtime == ContainerRuntimeKind::Podman
+        if backend == DriverBackendKind::Quadlet
             && !Path::new(&recovery_secret_source).is_absolute()
         {
             anyhow::bail!("DRIVER_RECOVERY_SECRET_SOURCE must be an absolute host path for Podman");
@@ -275,7 +304,7 @@ impl DockerDriverConfig {
             }
         }
         let workspace_namespace = required("DRIVER_WORKSPACE_NAMESPACE")?;
-        if container_runtime == ContainerRuntimeKind::Docker
+        if backend == DriverBackendKind::Docker
             && !matches!(
                 workspace_namespace.as_str(),
                 "mb-control" | "mb-dev1" | "mb-dev2" | "mb-dev3" | "mb-dev4"
@@ -291,12 +320,31 @@ impl DockerDriverConfig {
         {
             anyhow::bail!("DRIVER_WORKSPACE_NAMESPACE contains unsafe characters");
         }
+        let listen = match backend {
+            DriverBackendKind::Docker => DriverListen::Tcp(required("DRIVER_LISTEN")?.parse()?),
+            DriverBackendKind::Quadlet => {
+                let socket = PathBuf::from(required("DRIVER_UNIX_SOCKET")?);
+                let runtime_dir = systemd_runtime_dir
+                    .as_ref()
+                    .expect("validated Quadlet runtime directory");
+                if !socket.is_absolute() || !socket.starts_with(runtime_dir) {
+                    anyhow::bail!(
+                        "DRIVER_UNIX_SOCKET must be an absolute path below DRIVER_SYSTEMD_RUNTIME_DIR"
+                    );
+                }
+                DriverListen::SystemdUnix(socket)
+            }
+        };
         Ok(Self {
-            listen: required("DRIVER_LISTEN")?.parse()?,
+            listen,
             token,
             privacy_token,
-            container_runtime,
+            backend,
             runtime_socket,
+            quadlet_root,
+            systemd_runtime_dir,
+            image_grant_root,
+            allow_raw_podman_migration,
             database_url: required_secret("DRIVER_DATABASE_URL")?,
             postgres_admin_url,
             postgres_admin_user,
@@ -317,7 +365,15 @@ impl DockerDriverConfig {
             postgres_image: required("DRIVER_POSTGRES_IMAGE")?,
             paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
+                .filter(|value| !value.trim().is_empty())
+                .map(|image| {
+                    if environment == "development" {
+                        Ok(image)
+                    } else {
+                        digest_pinned_image("DRIVER_PAPERLESS_IMAGE", &image)
+                    }
+                })
+                .transpose()?,
             workspace_namespace,
             docker_network: required("DRIVER_RUNTIME_NETWORK")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
@@ -329,6 +385,7 @@ impl DockerDriverConfig {
             backup_agent_image,
             s3_backup,
             redis_address: required("DRIVER_REDIS_ADDRESS")?,
+            redis_admin_address: required("DRIVER_REDIS_ADMIN_ADDRESS")?,
             secret_root: required("DRIVER_SECRET_ROOT")?.into(),
             odoo_client_secret_root: required("DRIVER_ODOO_CLIENT_SECRET_ROOT")?.into(),
             paperless_client_secret_root: required("DRIVER_PAPERLESS_CLIENT_SECRET_ROOT")?.into(),
@@ -418,8 +475,10 @@ struct DriverState {
     ledger: PgPool,
     postgres: PgPool,
     runtime: ContainerRuntime,
+    backend: RuntimeBackend,
     rauthy: reqwest::Client,
-    serial: Arc<Mutex<()>>,
+    resource_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    startup: Arc<RwLock<StartupReport>>,
 }
 
 const RECOVERY_FORMAT_V2: &str = "mb-workshop-recovery-v2";
@@ -462,32 +521,50 @@ struct StoredRecovery {
 pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
     std::fs::create_dir_all(&config.secret_root)?;
     normalize_secret_permissions(&config.secret_root)?;
-    if config.odoo_client_secret_root != Path::new("/run/mb-odoo-client-secrets") {
+    let expected_odoo_client_root = match config.backend {
+        DriverBackendKind::Docker => PathBuf::from("/run/mb-odoo-client-secrets"),
+        DriverBackendKind::Quadlet => {
+            Path::new(&config.runtime_secret_source).join("runtime/odoo-clients")
+        }
+    };
+    if config.odoo_client_secret_root != expected_odoo_client_root {
         anyhow::bail!("DRIVER_ODOO_CLIENT_SECRET_ROOT must use the isolated Odoo client mount");
     }
     std::fs::create_dir_all(&config.odoo_client_secret_root)?;
     normalize_secret_permissions(&config.odoo_client_secret_root)?;
-    std::os::unix::fs::chown(
-        &config.odoo_client_secret_root,
-        Some(config.odoo_uid),
-        Some(config.odoo_gid),
-    )?;
-    if config.paperless_client_secret_root != Path::new("/run/mb-paperless-client-secrets") {
+    if config.backend == DriverBackendKind::Docker {
+        std::os::unix::fs::chown(
+            &config.odoo_client_secret_root,
+            Some(config.odoo_uid),
+            Some(config.odoo_gid),
+        )?;
+    }
+    let expected_paperless_client_root = match config.backend {
+        DriverBackendKind::Docker => PathBuf::from("/run/mb-paperless-client-secrets"),
+        DriverBackendKind::Quadlet => {
+            Path::new(&config.runtime_secret_source).join("runtime/paperless-clients")
+        }
+    };
+    if config.paperless_client_secret_root != expected_paperless_client_root {
         anyhow::bail!(
             "DRIVER_PAPERLESS_CLIENT_SECRET_ROOT must use the isolated Paperless client mount"
         );
     }
     std::fs::create_dir_all(&config.paperless_client_secret_root)?;
     normalize_secret_permissions(&config.paperless_client_secret_root)?;
-    let expected_job_root = match config.container_runtime {
-        ContainerRuntimeKind::Docker => PathBuf::from("/run/mb-backup-secrets/jobs"),
-        ContainerRuntimeKind::Podman => Path::new(&config.runtime_secret_source).join("jobs"),
+    let expected_job_root = match config.backend {
+        DriverBackendKind::Docker => PathBuf::from("/run/mb-backup-secrets/jobs"),
+        DriverBackendKind::Quadlet => Path::new(&config.runtime_secret_source).join("jobs"),
     };
     if config.job_secret_root != expected_job_root {
         anyhow::bail!("DRIVER_JOB_SECRET_ROOT must use the scoped runtime job-secret directory");
     }
     secure_directory(&config.job_secret_root)?;
-    clear_stale_job_secrets(&config.job_secret_root)?;
+    if config.backend == DriverBackendKind::Docker {
+        clear_stale_job_secrets(&config.job_secret_root)?;
+    } else {
+        validate_retained_job_secrets(&config.job_secret_root)?;
+    }
     secure_directory(
         &config
             .job_secret_root
@@ -496,6 +573,17 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
             .join("runtime"),
     )?;
     std::fs::create_dir_all(&config.route_root)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config.route_root, std::fs::Permissions::from_mode(0o750))?;
+    }
+    let removed_routes = install_fail_closed_routes(&config.route_root)?;
+    if removed_routes > 0 {
+        tracing::warn!(
+            removed_routes,
+            "removed generated routes before startup reconciliation"
+        );
+    }
     std::fs::create_dir_all(&config.backup_root)?;
     let ledger = PgPoolOptions::new()
         .max_connections(5)
@@ -505,11 +593,16 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
         .max_connections(2)
         .connect(&config.postgres_admin_url)
         .await?;
-    let runtime_kind = config.container_runtime;
-    let runtime_client = reqwest::Client::builder()
-        .unix_socket(config.runtime_socket.clone())
-        .timeout(Duration::from_secs(180))
-        .build()?;
+    let runtime_client = if let Some(socket) = &config.runtime_socket {
+        reqwest::Client::builder()
+            .unix_socket(socket.as_path())
+            .timeout(Duration::from_secs(180))
+            .build()?
+    } else {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()?
+    };
     let mut authorization =
         reqwest::header::HeaderValue::from_str(&format!("API-Key {}", config.rauthy_admin_key))?;
     authorization.set_sensitive(true);
@@ -519,35 +612,56 @@ pub async fn app(config: DockerDriverConfig) -> anyhow::Result<Router> {
         .default_headers(headers)
         .timeout(Duration::from_secs(30))
         .build()?;
+    let backend = RuntimeBackend::from_config(&config)?;
     let state = Arc::new(DriverState {
         config,
         ledger,
         postgres,
         runtime: ContainerRuntime {
-            kind: runtime_kind,
             client: runtime_client,
         },
+        backend,
         rauthy,
-        serial: Arc::new(Mutex::new(())),
+        resource_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        startup: Arc::new(RwLock::new(StartupReport::default())),
     });
     recover_database_connection_limits(&state)
         .await
         .map_err(|error| anyhow::anyhow!(error.1))?;
-    recover_maintenance_routes(&state)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let startup_report = startup::reconcile(&state).await;
+    *state.startup.write().await = startup_report;
     Ok(Router::new()
         .route("/health/live", get(|| async { "live" }))
+        .route("/health/ready", get(ready))
         .route("/v1/tenants/{workshop}/{action}", post(tenant))
         .route("/v1/privacy/{workshop}/export", post(privacy::export))
         .with_state(state))
 }
 
+async fn ready(State(state): State<Arc<DriverState>>) -> Response {
+    let report = state.startup.read().await.clone();
+    let status = if report.command_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(report)).into_response()
+}
+
 async fn recover_database_connection_limits(state: &DriverState) -> Result<(), DriverError> {
-    let rows = sqlx::query("select id,database_ref,connection_limit_before_lifecycle from control.odoo_databases where connection_limit_before_lifecycle is not null")
-        .fetch_all(&state.ledger)
-        .await
-        .map_err(DriverError::internal)?;
+    let rows = sqlx::query(
+        "select d.id,d.database_ref,d.connection_limit_before_lifecycle
+           from control.odoo_databases d
+          where d.connection_limit_before_lifecycle is not null
+            and not exists (
+              select 1 from control.deployment_driver_operations o
+               where o.workshop_id=d.workshop_id and o.action='lifecycle'
+                 and o.state='in_progress'
+            )",
+    )
+    .fetch_all(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?;
     for row in rows {
         let id: Uuid = row.get("id");
         let database: String = row.get("database_ref");
@@ -561,38 +675,6 @@ async fn recover_database_connection_limits(state: &DriverState) -> Result<(), D
         .await
         .map_err(DriverError::internal)?;
         tracing::warn!(database_id=%id,"recovered PostgreSQL connection limit left by an interrupted lifecycle operation");
-    }
-    Ok(())
-}
-
-async fn recover_maintenance_routes(state: &DriverState) -> Result<(), DriverError> {
-    let entries = std::fs::read_dir(&state.config.route_root).map_err(DriverError::internal)?;
-    for entry in entries {
-        let entry = entry.map_err(DriverError::internal)?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(workshop) = name.strip_suffix(".recovery.bak") else {
-            continue;
-        };
-        let workshop = workshop
-            .parse::<Uuid>()
-            .map_err(|_| DriverError::internal("invalid maintenance recovery filename"))?;
-        let restore_unresolved = sqlx::query_scalar::<_, bool>(
-            "select exists(select 1 from control.odoo_databases where workshop_id=$1 and state='restoring' and deleted_at is null)",
-        )
-        .bind(workshop)
-        .fetch_one(&state.ledger)
-        .await
-        .map_err(DriverError::internal)?;
-        if restore_unresolved {
-            tracing::error!(%workshop, "leaving workshop in maintenance because restore recovery is unresolved");
-            continue;
-        }
-        let previous = std::fs::read(entry.path()).map_err(DriverError::internal)?;
-        leave_workshop_maintenance(state, workshop, &previous).await?;
-        tracing::warn!(%workshop, "recovered workshop route left in maintenance by an interrupted lifecycle operation");
     }
     Ok(())
 }
@@ -687,7 +769,7 @@ async fn tenant(
         Sha256::digest(serde_json::to_vec(&payload).unwrap())
     );
     if let Some(row) = sqlx::query(
-        "select request_digest,state,response from control.deployment_driver_operations where idempotency_key=$1",
+        "select request_digest,state,response,safe_error from control.deployment_driver_operations where idempotency_key=$1",
     )
     .bind(idempotency_key)
     .fetch_optional(&state.ledger)
@@ -700,6 +782,27 @@ async fn tenant(
         if row.get::<String, _>("state") == "succeeded" {
             return Ok(Json(row.get("response")));
         }
+        if row.get::<String, _>("state") == "in_progress" {
+            let unknown = row.get::<Option<String>, _>("safe_error").as_deref()
+                == Some("runtime_outcome_unknown");
+            return Err(DriverError(
+                if unknown {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::CONFLICT
+                },
+                if unknown {
+                    "operation outcome requires reconciliation before retry"
+                } else {
+                    "operation is already in progress"
+                }
+                .into(),
+            ));
+        }
+        return Err(DriverError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "idempotent operation previously failed".into(),
+        ));
     } else {
         sqlx::query("insert into control.deployment_driver_operations(idempotency_key,workshop_id,action,request_digest) values($1,$2,$3,$4)")
             .bind(idempotency_key)
@@ -707,7 +810,22 @@ async fn tenant(
             .bind(&action).bind(&digest)
             .execute(&state.ledger).await.map_err(DriverError::internal)?;
     }
-    let _guard = state.serial.lock().await;
+    let lock_key = if action == "release" {
+        "runtime/shared-odoo".to_owned()
+    } else {
+        format!("workshop/{workshop}")
+    };
+    let resource_lock = {
+        let mut locks = state
+            .resource_locks
+            .lock()
+            .map_err(|_| DriverError::internal("resource lock registry is poisoned"))?;
+        locks
+            .entry(lock_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = resource_lock.lock().await;
     let result = match action.as_str() {
         "provision" | "reconcile" => provision(&state, workshop, &payload).await,
         "lifecycle" => lifecycle(&state, workshop, &payload).await,
@@ -727,8 +845,16 @@ async fn tenant(
             Ok(Json(value))
         }
         Err(error) => {
-            sqlx::query("update control.deployment_driver_operations set state='failed',safe_error='deployment_unavailable',updated_at=now() where idempotency_key=$1")
-                .bind(idempotency_key).execute(&state.ledger).await.map_err(DriverError::internal)?;
+            if error.0.is_client_error() {
+                sqlx::query("update control.deployment_driver_operations set state='failed',safe_error='request_rejected',updated_at=now() where idempotency_key=$1")
+                    .bind(idempotency_key).execute(&state.ledger).await.map_err(DriverError::internal)?;
+            } else {
+                // A transport failure may have happened after the host effect.
+                // Keep the durable operation reconcilable instead of converting
+                // an ambiguous outcome into a blind ordinary retry.
+                sqlx::query("update control.deployment_driver_operations set state='in_progress',safe_error='runtime_outcome_unknown',updated_at=now() where idempotency_key=$1")
+                    .bind(idempotency_key).execute(&state.ledger).await.map_err(DriverError::internal)?;
+            }
             Err(error)
         }
     }
@@ -906,21 +1032,23 @@ async fn provision(
         &tenant_bridge_token,
     )
     .map_err(DriverError::internal)?;
-    std::os::unix::fs::chown(
-        runtime_clients.join(workshop.to_string()),
-        Some(state.config.odoo_uid),
-        Some(state.config.odoo_gid),
-    )
-    .map_err(DriverError::internal)?;
-    std::os::unix::fs::chown(
-        state
-            .config
-            .odoo_client_secret_root
-            .join(workshop.to_string()),
-        Some(state.config.odoo_uid),
-        Some(state.config.odoo_gid),
-    )
-    .map_err(DriverError::internal)?;
+    if state.config.backend == DriverBackendKind::Docker {
+        std::os::unix::fs::chown(
+            runtime_clients.join(workshop.to_string()),
+            Some(state.config.odoo_uid),
+            Some(state.config.odoo_gid),
+        )
+        .map_err(DriverError::internal)?;
+        std::os::unix::fs::chown(
+            state
+                .config
+                .odoo_client_secret_root
+                .join(workshop.to_string()),
+            Some(state.config.odoo_uid),
+            Some(state.config.odoo_gid),
+        )
+        .map_err(DriverError::internal)?;
+    }
     // A newly created database has no tenant verifier yet, so its one initial
     // bootstrap is authenticated by the process bootstrap credential. On
     // retries the persisted tenant credential is used directly; an
@@ -930,8 +1058,9 @@ async fn provision(
     } else {
         &tenant_bridge_token
     };
+    let odoo_runtime_url = active_odoo_runtime_url(state).await?;
     let bootstrap_client = OdooClient::new(
-        &state.config.odoo_base_url,
+        &odoo_runtime_url,
         bootstrap_token,
         Some(database_ref),
         Duration::from_secs(30),
@@ -955,7 +1084,7 @@ async fn provision(
         "action": "provision",
         "release_id": release_id,
         "odoo": {
-            "base_url": state.config.odoo_base_url,
+            "base_url": odoo_runtime_url,
             "secret_ref": format!("docker/{workshop}/odoo"),
             "break_glass_secret_ref": format!("driver-runtime/odoo/{workshop}/admin-password"),
             "database": {"database_ref": database_ref, "public_hostname": odoo_hostname}
@@ -1009,7 +1138,7 @@ async fn provision(
             )
             .await?;
             ensure_redis_acl(
-                &state.config.redis_address,
+                &state.config.redis_admin_address,
                 &redis_user,
                 &redis_password,
                 &redis_prefix,
@@ -1316,6 +1445,22 @@ fn clear_stale_job_secrets(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn validate_retained_job_secrets(root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let valid = name
+            .to_str()
+            .is_some_and(|value| value.len() == 32 && Uuid::parse_str(value).is_ok());
+        if !valid || !entry.file_type()?.is_dir() {
+            return Err(std::io::Error::other(
+                "job-secret root contains an unexpected entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn driver_runtime_secret_root(state: &DriverState) -> PathBuf {
     state
         .config
@@ -1323,6 +1468,25 @@ fn driver_runtime_secret_root(state: &DriverState) -> PathBuf {
         .parent()
         .expect("validated job-secret root has a parent")
         .join("runtime")
+}
+
+async fn active_odoo_runtime_url(state: &DriverState) -> Result<String, DriverError> {
+    if state.config.backend == DriverBackendKind::Docker {
+        return Ok(state.config.odoo_base_url.clone());
+    }
+    let slots = sqlx::query_scalar::<_, String>(
+        "select slot from control.runtime_release_slots
+          where runtime_key='shared-odoo' and state='active' order by slot",
+    )
+    .fetch_all(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?;
+    match slots.as_slice() {
+        [slot] if slot == "blue" => Ok("http://127.0.0.1:18069".into()),
+        [slot] if slot == "green" => Ok("http://127.0.0.1:18070".into()),
+        [] => Err(DriverError::internal("no active Odoo runtime is available")),
+        _ => Err(DriverError::internal("Odoo runtime selection is ambiguous")),
+    }
 }
 
 fn validated_secret_relative_path(relative: &Path) -> Result<String, DriverError> {
@@ -1340,21 +1504,21 @@ fn validated_secret_relative_path(relative: &Path) -> Result<String, DriverError
 }
 
 fn secret_mount_payload(
-    runtime: ContainerRuntimeKind,
+    backend: DriverBackendKind,
     source: &str,
     relative: &Path,
     target: &str,
 ) -> Result<Value, DriverError> {
     let relative = validated_secret_relative_path(relative)?;
-    Ok(match runtime {
-        ContainerRuntimeKind::Docker => json!({
+    Ok(match backend {
+        DriverBackendKind::Docker => json!({
             "Type":"volume",
             "Source":source,
             "Target":target,
             "ReadOnly":true,
             "VolumeOptions":{"Subpath":relative}
         }),
-        ContainerRuntimeKind::Podman => json!({
+        DriverBackendKind::Quadlet => json!({
             "Type":"bind",
             "Source":Path::new(source).join(relative),
             "Target":target,
@@ -1369,7 +1533,7 @@ fn runtime_secret_mount(
     target: &str,
 ) -> Result<Value, DriverError> {
     secret_mount_payload(
-        state.runtime.kind,
+        state.config.backend,
         &state.config.runtime_secret_source,
         &Path::new("runtime").join(relative),
         target,
@@ -1378,7 +1542,7 @@ fn runtime_secret_mount(
 
 fn job_secret_mount(state: &DriverState, job: &str, target: &str) -> Result<Value, DriverError> {
     secret_mount_payload(
-        state.runtime.kind,
+        state.config.backend,
         &state.config.runtime_secret_source,
         &Path::new("jobs").join(job),
         target,
@@ -1434,10 +1598,13 @@ async fn run_docker_job(
     container: &str,
     body: Value,
 ) -> Result<(), DriverError> {
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        return backend.run_job(container, &body).await;
+    }
     if docker_container_exists(state, container).await? {
         docker_delete_container(state, container).await?;
     }
-    docker_create_container(state, container, body).await?;
+    docker_create_container(state, container, DockerRestartPolicy::No, body).await?;
     if let Err(error) = docker_start_container(state, container).await {
         let _ = docker_delete_container(state, container).await;
         return Err(error);
@@ -1502,6 +1669,13 @@ async fn run_docker_job_with_secrets(
         run_docker_job(state, container, body).await
     }
     .await;
+    if let RuntimeBackend::Quadlet(backend) = &state.backend
+        && backend.job_active(container).await.unwrap_or(true)
+    {
+        return result.and(Err(DriverError::internal(
+            "runtime job secrets retained while its terminal state is unknown",
+        )));
+    }
     let cleanup = std::fs::remove_dir_all(&directory).map_err(DriverError::internal);
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -1636,7 +1810,7 @@ mod tests {
     #[test]
     fn docker_secret_mount_uses_a_named_volume_subpath() {
         let mount = secret_mount_payload(
-            ContainerRuntimeKind::Docker,
+            DriverBackendKind::Docker,
             "control-secrets",
             Path::new("runtime/paperless/tenant"),
             "/run/secrets",
@@ -1653,7 +1827,7 @@ mod tests {
     #[test]
     fn podman_secret_mount_uses_a_protected_host_path() {
         let mount = secret_mount_payload(
-            ContainerRuntimeKind::Podman,
+            DriverBackendKind::Quadlet,
             "/var/lib/mb/tenant-runtime-secrets",
             Path::new("jobs/job-id"),
             "/run/secrets",
@@ -1671,7 +1845,7 @@ mod tests {
     fn secret_mount_scope_cannot_escape_its_root() {
         assert!(
             secret_mount_payload(
-                ContainerRuntimeKind::Podman,
+                DriverBackendKind::Quadlet,
                 "/var/lib/mb/tenant-runtime-secrets",
                 Path::new("../other-user"),
                 "/run/secrets",

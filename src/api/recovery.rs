@@ -136,20 +136,22 @@ pub(super) async fn download_backup(
             "backup archive is not ready for download",
         ));
     }
-    let response = reqwest::Client::builder()
-        .timeout(state.config.request_timeout)
-        .build()
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .post(format!(
-            "{}v1/tenants/{workshop}/download",
-            state.config.deployment_driver_url.as_str()
-        ))
-        .bearer_auth(&state.config.deployment_driver_token)
-        .header("idempotency-key", Uuid::new_v4().to_string())
-        .json(&json!({"recovery_point_id": recovery}))
-        .send()
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
+    let response = crate::deployment_driver_transport::client(
+        None,
+        state.config.request_timeout,
+        state.config.deployment_driver_socket.as_deref(),
+    )
+    .map_err(ApiError::Internal)?
+    .post(format!(
+        "{}v1/tenants/{workshop}/download",
+        state.config.deployment_driver_url.as_str()
+    ))
+    .bearer_auth(&state.config.deployment_driver_token)
+    .header("idempotency-key", Uuid::new_v4().to_string())
+    .json(&json!({"recovery_point_id": recovery}))
+    .send()
+    .await
+    .map_err(|error| ApiError::Internal(error.into()))?;
     let status = response.status();
     let value = response
         .json::<Value>()

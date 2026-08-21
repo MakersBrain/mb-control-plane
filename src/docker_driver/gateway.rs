@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) fn write_gateway_file(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+}
+
 pub(super) async fn write_routes(
     state: &DriverState,
     workshop: Uuid,
@@ -19,22 +25,37 @@ pub(super) async fn write_routes(
     let path = state.config.route_root.join(format!("{workshop}.conf"));
     let temporary = state.config.route_root.join(format!("{workshop}.conf.tmp"));
     let previous = std::fs::read(&path).ok();
-    std::fs::write(&temporary, config).map_err(DriverError::internal)?;
+    write_gateway_file(&temporary, &config).map_err(DriverError::internal)?;
     std::fs::rename(temporary, &path).map_err(DriverError::internal)?;
-    if let Err(error) = docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await
-    {
+    let digest = format!("sha256:{:x}", Sha256::digest(config.as_bytes()));
+    if let Err(error) = reload_gateway_runtime(state, &digest).await {
         if let Some(previous) = previous {
-            let _ = std::fs::write(&path, previous);
+            let _ = write_gateway_file(&path, previous);
         } else {
             let _ = std::fs::remove_file(&path);
         }
         return Err(error);
     }
-    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) async fn reload_gateway_runtime(
+    state: &DriverState,
+    expected_digest: &str,
+) -> Result<(), DriverError> {
+    match &state.backend {
+        RuntimeBackend::Docker => {
+            docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await?;
+            docker_signal_container(state, &state.config.gateway_container, "HUP").await
+        }
+        RuntimeBackend::Quadlet(backend) => backend
+            .reload_gateway(&state.config.gateway_container, expected_digest)
+            .await
+            .map(|_| ()),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(super) struct CustomHostnameRoute {
     pub hostname: String,
     pub canonical: bool,
@@ -62,6 +83,24 @@ pub(super) fn route_config_with_custom_hostnames(
     paperless_read_only: bool,
     custom_hostnames: &[CustomHostnameRoute],
 ) -> String {
+    route_config_for_upstream(
+        database_ref,
+        odoo_hostname,
+        "odoo",
+        paperless,
+        paperless_read_only,
+        custom_hostnames,
+    )
+}
+
+pub(super) fn route_config_for_upstream(
+    database_ref: &str,
+    odoo_hostname: &str,
+    odoo_container: &str,
+    paperless: Option<(&str, &str)>,
+    paperless_read_only: bool,
+    custom_hostnames: &[CustomHostnameRoute],
+) -> String {
     let custom_canonical = custom_hostnames
         .iter()
         .find(|route| route.canonical)
@@ -76,7 +115,7 @@ pub(super) fn route_config_with_custom_hostnames(
         vec![canonical]
     };
     let mut config = format!(
-        "server {{\n  listen 8080;\n  server_name {};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    set $tenant_upstream \"odoo:8069\";\n    proxy_pass http://$tenant_upstream;\n  }}\n}}\n",
+        "server {{\n  listen 8080;\n  server_name {};\n  location / {{\n    proxy_http_version 1.1;\n    proxy_set_header Host $host;\n    proxy_set_header X-Forwarded-Host $host;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto $forwarded_proto;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection $connection_upgrade;\n    proxy_set_header X-Odoo-Dbfilter '^{}\\Z';\n    set $tenant_upstream \"{odoo_container}:8069\";\n    proxy_pass http://$tenant_upstream;\n  }}\n}}\n",
         proxy_names.join(" "),
         database_ref
     );
