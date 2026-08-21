@@ -97,7 +97,7 @@ pub struct DockerDriverConfig {
     postgres_ca_source: Option<PathBuf>,
     odoo_postgres_password: String,
     odoo_bridge_token: String,
-    odoo_image: String,
+    extension_helper_image: String,
     postgres_image: String,
     paperless_image: Option<String>,
     docker_network: String,
@@ -288,7 +288,14 @@ impl DockerDriverConfig {
             postgres_ca_source,
             odoo_postgres_password: required_secret("DRIVER_ODOO_POSTGRES_PASSWORD")?,
             odoo_bridge_token: required_secret("DRIVER_ODOO_BRIDGE_TOKEN")?,
-            odoo_image: required("DRIVER_ODOO_IMAGE")?,
+            extension_helper_image: {
+                let image = required("DRIVER_EXTENSION_HELPER_IMAGE")?;
+                if environment == "development" {
+                    image
+                } else {
+                    digest_pinned_image("DRIVER_EXTENSION_HELPER_IMAGE", &image)?
+                }
+            },
             postgres_image: required("DRIVER_POSTGRES_IMAGE")?,
             paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
                 .ok()
@@ -331,6 +338,22 @@ impl DockerDriverConfig {
 
 fn required(name: &'static str) -> anyhow::Result<String> {
     crate::runtime_secret::required_configuration(name).map_err(anyhow::Error::msg)
+}
+
+fn digest_pinned_image(name: &'static str, value: &str) -> anyhow::Result<String> {
+    let valid = value
+        .rsplit_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.trim().is_empty()
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
+    if !valid {
+        anyhow::bail!("{name} must be an exact sha256 digest-pinned image reference");
+    }
+    Ok(value.to_owned())
 }
 
 fn optional(name: &'static str) -> anyhow::Result<Option<String>> {
@@ -1205,6 +1228,51 @@ fn write_secret(path: &Path, value: &str) -> std::io::Result<()> {
     result
 }
 
+fn write_protected_configuration(path: &Path, value: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if value.is_empty() || value.len() > 65_536 || value.contains('\0') || !value.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration must be bounded UTF-8 text",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("configuration path has no parent"))?;
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(
+                "configuration target is not a regular file",
+            ));
+        }
+        if std::fs::read_to_string(path)? == value {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "populated runtime configuration cannot be overwritten",
+        ));
+    }
+    let temporary = parent.join(format!(".odoo-config-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, value.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn clear_stale_job_secrets(root: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -1379,7 +1447,12 @@ async fn run_docker_job_with_secrets(
             {
                 return Err(DriverError::internal("invalid job-secret name"));
             }
-            write_secret(&directory.join(name), value).map_err(DriverError::internal)?;
+            if *name == "odoo.conf" {
+                write_protected_configuration(&directory.join(name), value)
+                    .map_err(DriverError::internal)?;
+            } else {
+                write_secret(&directory.join(name), value).map_err(DriverError::internal)?;
+            }
         }
         let host = body
             .get_mut("HostConfig")

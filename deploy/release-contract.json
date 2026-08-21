@@ -59,10 +59,28 @@
       ],
       "source_repository": "MakersBrain/mb-control-plane"
     },
-    "odoo": {
+    "odoo_runtime": {
+      "delivery": "exact Docker Official Image subject with an observed SPDX SBOM, vulnerability report, and MakersBrain admission decision",
       "required_artifacts": [
-        "oci_digest",
-        "spdx_sbom"
+        "oci_subject_digest",
+        "platform_manifest_digest",
+        "image_configuration_digest",
+        "observed_spdx_sbom",
+        "vulnerability_report"
+      ],
+      "source_repository": "odoo/docker"
+    },
+    "odoo_extension": {
+      "delivery": "signed immutable MakersBrain addon and optional Python payload transport image",
+      "required_artifacts": [
+        "oci_subject_digest",
+        "platform_manifest_digest",
+        "image_configuration_digest",
+        "payload_digest",
+        "cosign_signature",
+        "spdx_sbom",
+        "vulnerability_report",
+        "pair_qualification_digest"
       ],
       "source_repository": "MakersBrain/mb-odoo-addons"
     },
@@ -400,7 +418,7 @@
       "DRIVER_POSTGRES_PORT",
       "DRIVER_ODOO_POSTGRES_PASSWORD",
       "DRIVER_ODOO_BRIDGE_TOKEN",
-      "DRIVER_ODOO_IMAGE",
+      "DRIVER_EXTENSION_HELPER_IMAGE",
       "DRIVER_POSTGRES_IMAGE",
       "DRIVER_RUNTIME_NETWORK",
       "DRIVER_ODOO_VOLUME",
@@ -499,6 +517,7 @@
       "CONTROL_DEPLOYMENT_DRIVER_URL",
       "CONTROL_DEPLOYMENT_DRIVER_TOKEN",
       "CONTROL_RELEASE_COSIGN_EXECUTABLE",
+      "CONTROL_RELEASE_ORAS_EXECUTABLE",
       "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
       "CONTROL_RELEASE_COSIGN_IDENTITY",
       "CONTROL_RELEASE_COSIGN_REPOSITORY"
@@ -681,9 +700,10 @@
   },
   "odoo": {
     "version": "19",
-    "deployment": "one shared Odoo process with one opaque PostgreSQL database per workshop",
+    "deployment": "exact official Odoo runtime plus one read-only qualified extension volume, with one opaque PostgreSQL database per workshop",
     "core_modules": [
-      "auth_oidc@OCA/server-auth:f51fe1b36965b78ac935e80c6b95d7115440a1b4",
+      "auth_oauth",
+      "mb_control_bridge",
       "mb_dbfilter_gateway",
       "mb_brand",
       "mb_workshop_pos"

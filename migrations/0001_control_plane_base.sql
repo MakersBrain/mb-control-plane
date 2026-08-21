@@ -182,7 +182,10 @@ CREATE FUNCTION control.validate_fleet_activation_intent_update() RETURNS trigge
 begin
     if new.id<>old.id or new.fleet_run_id<>old.fleet_run_id
        or new.release_id<>old.release_id or new.runtime_key<>old.runtime_key
-       or new.target_slot<>old.target_slot or new.image_digest<>old.image_digest
+       or new.target_slot<>old.target_slot
+       or new.odoo_subject_digest<>old.odoo_subject_digest
+       or new.extension_subject_digest<>old.extension_subject_digest
+       or new.pair_qualification_digest<>old.pair_qualification_digest
        or new.prepared_tenants<>old.prepared_tenants
        or new.gateway_configuration_digest<>old.gateway_configuration_digest
        or new.driver_action_id<>old.driver_action_id or new.created_at<>old.created_at
@@ -357,7 +360,11 @@ CREATE TABLE control.application_releases (
     id text NOT NULL,
     source_commit text NOT NULL,
     odoo_version text NOT NULL,
-    image_digest text NOT NULL,
+    odoo_subject_digest text NOT NULL,
+    extension_subject_digest text NOT NULL,
+    odoo_runtime jsonb NOT NULL,
+    extension_bundle jsonb NOT NULL,
+    pair_qualifications jsonb NOT NULL,
     manifest_digest text NOT NULL,
     addon_versions jsonb NOT NULL,
     compatibility jsonb NOT NULL,
@@ -367,7 +374,7 @@ CREATE TABLE control.application_releases (
     required_postconditions jsonb NOT NULL,
     manifest jsonb NOT NULL,
     signature_bundle_ref text NOT NULL,
-    provenance_ref text NOT NULL,
+    extension_signature_ref text NOT NULL,
     sbom_ref text NOT NULL,
     published_at timestamp with time zone NOT NULL,
     status text DEFAULT 'candidate'::text NOT NULL,
@@ -380,7 +387,11 @@ CREATE TABLE control.application_releases (
     CONSTRAINT application_releases_change_class_check CHECK ((change_class = ANY (ARRAY['A'::text, 'B'::text, 'C'::text]))),
     CONSTRAINT application_releases_compatibility_check CHECK ((jsonb_typeof(compatibility) = 'object'::text)),
     CONSTRAINT application_releases_id_check CHECK ((id ~ '^odoo-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[a-f0-9]{7,64}$'::text)),
-    CONSTRAINT application_releases_image_digest_check CHECK ((image_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT application_releases_odoo_subject_digest_check CHECK ((odoo_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT application_releases_extension_subject_digest_check CHECK ((extension_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT application_releases_odoo_runtime_check CHECK ((jsonb_typeof(odoo_runtime) = 'object'::text)),
+    CONSTRAINT application_releases_extension_bundle_check CHECK ((jsonb_typeof(extension_bundle) = 'object'::text)),
+    CONSTRAINT application_releases_pair_qualifications_check CHECK ((jsonb_typeof(pair_qualifications) = 'array'::text AND jsonb_array_length(pair_qualifications) > 0)),
     CONSTRAINT application_releases_manifest_check CHECK ((jsonb_typeof(manifest) = 'object'::text)),
     CONSTRAINT application_releases_manifest_digest_check CHECK ((manifest_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
     CONSTRAINT application_releases_odoo_version_check CHECK ((odoo_version ~ '^19\.[0-9]+$'::text)),
@@ -703,7 +714,9 @@ CREATE TABLE control.fleet_activation_intents (
     release_id text NOT NULL,
     runtime_key text NOT NULL,
     target_slot text NOT NULL,
-    image_digest text NOT NULL,
+    odoo_subject_digest text NOT NULL,
+    extension_subject_digest text NOT NULL,
+    pair_qualification_digest text NOT NULL,
     prepared_tenants jsonb NOT NULL,
     gateway_configuration_digest text NOT NULL,
     driver_action_id uuid NOT NULL,
@@ -711,7 +724,9 @@ CREATE TABLE control.fleet_activation_intents (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     activated_at timestamp with time zone,
     CONSTRAINT fleet_activation_intents_gateway_configuration_digest_check CHECK ((gateway_configuration_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
-    CONSTRAINT fleet_activation_intents_image_digest_check CHECK ((image_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT fleet_activation_intents_odoo_subject_digest_check CHECK ((odoo_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT fleet_activation_intents_extension_subject_digest_check CHECK ((extension_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT fleet_activation_intents_pair_qualification_digest_check CHECK ((pair_qualification_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
     CONSTRAINT fleet_activation_intents_prepared_tenants_check CHECK ((jsonb_typeof(prepared_tenants) = 'array'::text)),
     CONSTRAINT fleet_activation_intents_target_slot_check CHECK ((target_slot = ANY (ARRAY['blue'::text, 'green'::text])))
 );
@@ -1130,18 +1145,54 @@ CREATE TABLE control.runtime_release_slots (
     slot text NOT NULL,
     release_id text NOT NULL,
     state text NOT NULL,
-    image_digest text NOT NULL,
+    odoo_subject_digest text NOT NULL,
+    odoo_manifest_digest text NOT NULL,
+    odoo_config_digest text NOT NULL,
+    extension_subject_digest text NOT NULL,
+    extension_manifest_digest text NOT NULL,
+    extension_config_digest text NOT NULL,
+    payload_digest text NOT NULL,
+    extension_volume text NOT NULL,
+    pair_qualification_digest text NOT NULL,
+    bridge_contract_digest text NOT NULL,
+    installed_addon_versions jsonb NOT NULL,
     started_at timestamp with time zone,
     verified_at timestamp with time zone,
     activated_at timestamp with time zone,
     evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
     version bigint DEFAULT 1 NOT NULL,
     CONSTRAINT runtime_release_slots_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
-    CONSTRAINT runtime_release_slots_image_digest_check CHECK ((image_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_odoo_subject_digest_check CHECK ((odoo_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_odoo_manifest_digest_check CHECK ((odoo_manifest_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_odoo_config_digest_check CHECK ((odoo_config_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_extension_subject_digest_check CHECK ((extension_subject_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_extension_manifest_digest_check CHECK ((extension_manifest_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_extension_config_digest_check CHECK ((extension_config_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_payload_digest_check CHECK ((payload_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_pair_qualification_digest_check CHECK ((pair_qualification_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_bridge_contract_digest_check CHECK ((bridge_contract_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT runtime_release_slots_extension_volume_check CHECK ((extension_volume ~ '^mb-ext-[a-f0-9]{16}-[a-f0-9]{16}$'::text)),
+    CONSTRAINT runtime_release_slots_installed_addon_versions_check CHECK ((jsonb_typeof(installed_addon_versions) = 'object'::text)),
     CONSTRAINT runtime_release_slots_runtime_key_check CHECK ((btrim(runtime_key) <> ''::text)),
     CONSTRAINT runtime_release_slots_slot_check CHECK ((slot = ANY (ARRAY['blue'::text, 'green'::text]))),
     CONSTRAINT runtime_release_slots_state_check CHECK ((state = ANY (ARRAY['inactive'::text, 'starting'::text, 'verifying'::text, 'prepared'::text, 'active'::text, 'retained'::text, 'failed'::text]))),
     CONSTRAINT runtime_release_slots_version_check CHECK ((version > 0))
+);
+
+CREATE TABLE control.extension_volume_preparations (
+    volume_name text NOT NULL,
+    release_id text NOT NULL,
+    extension_manifest_digest text NOT NULL,
+    payload_digest text NOT NULL,
+    lease_id uuid NOT NULL,
+    lease_expires_at timestamp with time zone NOT NULL,
+    verified_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT extension_volume_preparations_volume_name_check CHECK ((volume_name ~ '^mb-ext-[a-f0-9]{16}-[a-f0-9]{16}$'::text)),
+    CONSTRAINT extension_volume_preparations_extension_manifest_digest_check CHECK ((extension_manifest_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT extension_volume_preparations_payload_digest_check CHECK ((payload_digest ~ '^sha256:[a-f0-9]{64}$'::text)),
+    CONSTRAINT extension_volume_preparations_lease_check CHECK ((lease_expires_at > created_at))
 );
 
 CREATE TABLE control.service_instances (
@@ -1470,7 +1521,7 @@ CREATE TABLE control.workshops (
 );
 
 ALTER TABLE ONLY control.application_releases
-    ADD CONSTRAINT application_releases_image_digest_key UNIQUE (image_digest);
+    ADD CONSTRAINT application_releases_pair_subjects_key UNIQUE (odoo_subject_digest, extension_subject_digest);
 
 ALTER TABLE ONLY control.application_releases
     ADD CONSTRAINT application_releases_manifest_digest_key UNIQUE (manifest_digest);
@@ -1672,6 +1723,12 @@ ALTER TABLE ONLY control.retention_runs
 
 ALTER TABLE ONLY control.runtime_release_slots
     ADD CONSTRAINT runtime_release_slots_pkey PRIMARY KEY (runtime_key, slot);
+
+ALTER TABLE ONLY control.extension_volume_preparations
+    ADD CONSTRAINT extension_volume_preparations_pkey PRIMARY KEY (volume_name);
+
+ALTER TABLE ONLY control.extension_volume_preparations
+    ADD CONSTRAINT extension_volume_preparations_lease_id_key UNIQUE (lease_id);
 
 ALTER TABLE ONLY control.service_instances
     ADD CONSTRAINT service_instances_pkey PRIMARY KEY (id);
@@ -2045,6 +2102,9 @@ ALTER TABLE ONLY control.retention_runs
 ALTER TABLE ONLY control.runtime_release_slots
     ADD CONSTRAINT runtime_release_slots_release_id_fkey FOREIGN KEY (release_id) REFERENCES control.application_releases(id) ON DELETE RESTRICT;
 
+ALTER TABLE ONLY control.extension_volume_preparations
+    ADD CONSTRAINT extension_volume_preparations_release_id_fkey FOREIGN KEY (release_id) REFERENCES control.application_releases(id) ON DELETE RESTRICT;
+
 ALTER TABLE ONLY control.service_instances
     ADD CONSTRAINT service_instances_workshop_id_fkey FOREIGN KEY (workshop_id) REFERENCES control.workshops(id) ON DELETE RESTRICT;
 
@@ -2161,7 +2221,9 @@ comment on table control.application_releases is
 comment on table control.tenant_release_adoptions is
 'Per-database immutable release adoption history; at most one adoption is active per tenant database.';
 comment on table control.runtime_release_slots is
-'Verified shared runtime slots; activation remains bound to the declared release image digest.';
+'Verified shared runtime slots bound to both OCI subjects, selected manifests/configurations, payload volume, bridge contract, addon versions, and pair qualification.';
+comment on table control.extension_volume_preparations is
+'Short-lived, replay-safe leases for immutable extension-volume construction. Expired failed-release rows without a runtime-slot reference are eligible for guarded engine garbage collection.';
 comment on table control.fleet_activation_intents is
 'Immutable intent and observed digest evidence for an atomic fleet runtime switch.';
 comment on table control.platform_authority_state is
@@ -2373,6 +2435,7 @@ do $$ begin if exists(select 1 from pg_roles where rolname='control_privacy_work
 do $$ begin if exists(select 1 from pg_roles where rolname='control_api') then execute 'GRANT SELECT ON TABLE control.runtime_release_slots TO control_api;'; end if; end $$;
 do $$ begin if exists(select 1 from pg_roles where rolname='control_release_worker') then execute 'GRANT SELECT,INSERT,UPDATE ON TABLE control.runtime_release_slots TO control_release_worker;'; end if; end $$;
 do $$ begin if exists(select 1 from pg_roles where rolname='control_driver_ledger') then execute 'GRANT SELECT,INSERT,UPDATE ON TABLE control.runtime_release_slots TO control_driver_ledger;'; end if; end $$;
+do $$ begin if exists(select 1 from pg_roles where rolname='control_driver_ledger') then execute 'GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE control.extension_volume_preparations TO control_driver_ledger;'; end if; end $$;
 do $$ begin if exists(select 1 from pg_roles where rolname='control_api') then execute 'GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE control.service_instances TO control_api;'; end if; end $$;
 do $$ begin if exists(select 1 from pg_roles where rolname='control_membership_worker') then execute 'GRANT SELECT ON TABLE control.service_instances TO control_membership_worker;'; end if; end $$;
 do $$ begin if exists(select 1 from pg_roles where rolname='control_provisioning_worker') then execute 'GRANT SELECT,INSERT,UPDATE ON TABLE control.service_instances TO control_provisioning_worker;'; end if; end $$;

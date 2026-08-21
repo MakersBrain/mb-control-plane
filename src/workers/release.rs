@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -50,6 +53,7 @@ pub(crate) fn validate_configuration() -> anyhow::Result<()> {
         "CONTROL_RELEASE_COSIGN_OIDC_ISSUER",
         "CONTROL_RELEASE_COSIGN_IDENTITY",
         "CONTROL_RELEASE_COSIGN_REPOSITORY",
+        "CONTROL_RELEASE_ORAS_EXECUTABLE",
         "CONTROL_DEPLOYMENT_DRIVER_URL",
     ] {
         crate::runtime_secret::configuration(name)
@@ -69,6 +73,7 @@ async fn verify_release_provenance(
     let issuer = required_release_setting("CONTROL_RELEASE_COSIGN_OIDC_ISSUER")?;
     let identity = required_release_setting("CONTROL_RELEASE_COSIGN_IDENTITY")?;
     let repository = required_release_setting("CONTROL_RELEASE_COSIGN_REPOSITORY")?;
+    let oras = required_release_setting("CONTROL_RELEASE_ORAS_EXECUTABLE")?;
     run_cosign(
         &executable,
         &[
@@ -80,11 +85,144 @@ async fn verify_release_provenance(
             "--certificate-github-workflow-repository",
             &repository,
             "--output=json",
-            &manifest.provenance.oci_ref,
+            &manifest.extension_bundle.oci_ref,
         ],
     )
     .await?;
+
+    // Every immutable evidence object is fetched by its subject reference and
+    // checked against the content digest admitted by the release. This is
+    // intentionally independent of registry transport integrity.
+    let mut evidence = vec![&manifest.admission_signature];
+    for runtime in &manifest.odoo_runtime.platforms {
+        evidence.push(&runtime.evidence.sbom);
+        evidence.push(&runtime.evidence.vulnerability_report);
+    }
+    for extension in &manifest.extension_bundle.platforms {
+        evidence.push(&extension.signature);
+        evidence.push(&extension.sbom);
+        evidence.push(&extension.vulnerability_report);
+    }
+    let mut admission_bundle = None;
+    for item in evidence {
+        let bytes = fetch_evidence(&oras, item).await?;
+        if std::ptr::eq(item, &manifest.admission_signature) {
+            admission_bundle = Some(bytes);
+        }
+    }
+
+    let verification_root = temporary_verification_root("admission")?;
+    let payload_path = verification_root.join("application-release.json");
+    let bundle_path = verification_root.join("admission.bundle");
+    std::fs::write(
+        &payload_path,
+        manifest
+            .admission_payload()
+            .map_err(|_| IntegrationError::ContractDrift)?,
+    )
+    .map_err(|_| IntegrationError::Unavailable)?;
+    std::fs::write(
+        &bundle_path,
+        admission_bundle.ok_or(IntegrationError::ContractDrift)?,
+    )
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let verification = run_cosign(
+        &executable,
+        &[
+            "verify-blob",
+            "--bundle",
+            path_text(&bundle_path)?,
+            "--certificate-oidc-issuer",
+            &issuer,
+            "--certificate-identity",
+            &identity,
+            "--certificate-github-workflow-repository",
+            &repository,
+            path_text(&payload_path)?,
+        ],
+    )
+    .await;
+    let cleanup = std::fs::remove_dir_all(&verification_root);
+    verification?;
+    cleanup.map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
+}
+
+fn path_text(path: &Path) -> Result<&str, IntegrationError> {
+    path.to_str().ok_or(IntegrationError::ContractDrift)
+}
+
+fn temporary_verification_root(kind: &str) -> Result<PathBuf, IntegrationError> {
+    let root = std::env::temp_dir().join(format!("mb-release-{kind}-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).map_err(|_| IntegrationError::Unavailable)?;
+    Ok(root)
+}
+
+async fn fetch_evidence(
+    oras: &str,
+    evidence: &crate::release::EvidenceObject,
+) -> Result<Vec<u8>, IntegrationError> {
+    const MAX_EVIDENCE_BYTES: u64 = 128 * 1024 * 1024;
+    let root = temporary_verification_root("evidence")?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(oras)
+            .args(["pull", "--output", path_text(&root)?, &evidence.reference])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(IntegrationError::Rejected);
+    }
+    let files = bounded_regular_files(&root, MAX_EVIDENCE_BYTES)?;
+    if files.len() != 1 {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(IntegrationError::ContractDrift);
+    }
+    let bytes = std::fs::read(&files[0]).map_err(|_| IntegrationError::Unavailable)?;
+    let observed = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let cleanup = std::fs::remove_dir_all(&root);
+    if observed != evidence.sha256_digest {
+        return Err(IntegrationError::Rejected);
+    }
+    cleanup.map_err(|_| IntegrationError::Unavailable)?;
+    Ok(bytes)
+}
+
+fn bounded_regular_files(root: &Path, maximum: u64) -> Result<Vec<PathBuf>, IntegrationError> {
+    let mut pending = vec![root.to_owned()];
+    let mut files = Vec::new();
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).map_err(|_| IntegrationError::Unavailable)? {
+            let entry = entry.map_err(|_| IntegrationError::Unavailable)?;
+            let metadata = entry
+                .path()
+                .symlink_metadata()
+                .map_err(|_| IntegrationError::Unavailable)?;
+            if metadata.file_type().is_symlink() {
+                return Err(IntegrationError::ContractDrift);
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or(IntegrationError::ContractDrift)?;
+                if total > maximum {
+                    return Err(IntegrationError::ContractDrift);
+                }
+                files.push(entry.path());
+            } else {
+                return Err(IntegrationError::ContractDrift);
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn required_release_setting(name: &'static str) -> Result<String, IntegrationError> {
@@ -158,12 +296,7 @@ async fn release_preflight(
     if u32::try_from(active_registry).ok() != Some(manifest.capability_registry_version) {
         return Err(IntegrationError::Rejected);
     }
-    if manifest.release_id != release_id
-        || !manifest
-            .provenance
-            .oci_ref
-            .ends_with(&format!("@{}", manifest.image_digest))
-    {
+    if manifest.release_id != release_id {
         return Err(IntegrationError::ContractDrift);
     }
     verify_release_provenance(&manifest).await?;
@@ -315,8 +448,20 @@ async fn release_fleet_adopt(
         .and_then(Value::as_str)
         .filter(|value| *value == "shared-odoo")
         .ok_or(IntegrationError::ContractDrift)?;
-    let image_digest = evidence
-        .get("image_digest")
+    let odoo_subject_digest = evidence
+        .get("odoo_subject_digest")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let extension_subject_digest = evidence
+        .get("extension_subject_digest")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let pair_qualification_digest = evidence
+        .get("pair_qualification_digest")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::ContractDrift)?;
+    let extension_volume = evidence
+        .get("extension_volume")
         .and_then(Value::as_str)
         .ok_or(IntegrationError::ContractDrift)?;
     let prepared = evidence
@@ -343,14 +488,14 @@ async fn release_fleet_adopt(
         .begin()
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
-    let release_image = sqlx::query_scalar::<_, String>(
-        "select image_digest from control.application_releases where id=$1 for update",
+    let release_identity = sqlx::query_as::<_, (String, String)>(
+        "select odoo_subject_digest,extension_subject_digest from control.application_releases where id=$1 for update",
     )
     .bind(release_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
-    if release_image != image_digest {
+    if release_identity.0 != odoo_subject_digest || release_identity.1 != extension_subject_digest {
         return Err(IntegrationError::ContractDrift);
     }
     let expected_count = sqlx::query_scalar::<_, i64>(
@@ -403,10 +548,18 @@ async fn release_fleet_adopt(
     .map_err(|_| IntegrationError::Unavailable)?;
     sqlx::query(
         "insert into control.runtime_release_slots(
-           runtime_key,slot,release_id,state,image_digest,started_at,verified_at,activated_at,evidence
-         ) values($1,$2,$3,'active',$4,now(),now(),now(),$5)
+           runtime_key,slot,release_id,state,odoo_subject_digest,odoo_manifest_digest,odoo_config_digest,
+           extension_subject_digest,extension_manifest_digest,extension_config_digest,payload_digest,
+           extension_volume,pair_qualification_digest,bridge_contract_digest,installed_addon_versions,
+           started_at,verified_at,activated_at,evidence
+         ) values($1,$2,$3,'active',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now(),now(),$15)
          on conflict(runtime_key,slot) do update set
-           release_id=excluded.release_id,state='active',image_digest=excluded.image_digest,
+           release_id=excluded.release_id,state='active',odoo_subject_digest=excluded.odoo_subject_digest,
+           odoo_manifest_digest=excluded.odoo_manifest_digest,odoo_config_digest=excluded.odoo_config_digest,
+           extension_subject_digest=excluded.extension_subject_digest,extension_manifest_digest=excluded.extension_manifest_digest,
+           extension_config_digest=excluded.extension_config_digest,payload_digest=excluded.payload_digest,
+           extension_volume=excluded.extension_volume,pair_qualification_digest=excluded.pair_qualification_digest,
+           bridge_contract_digest=excluded.bridge_contract_digest,installed_addon_versions=excluded.installed_addon_versions,
            started_at=coalesce(control.runtime_release_slots.started_at,now()),
            verified_at=now(),activated_at=now(),evidence=excluded.evidence,
            version=control.runtime_release_slots.version+1",
@@ -414,7 +567,17 @@ async fn release_fleet_adopt(
     .bind(runtime_key)
     .bind(target_slot)
     .bind(release_id)
-    .bind(image_digest)
+    .bind(odoo_subject_digest)
+    .bind(evidence.get("odoo_manifest_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(evidence.get("odoo_config_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(extension_subject_digest)
+    .bind(evidence.get("extension_manifest_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(evidence.get("extension_config_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(evidence.get("payload_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(extension_volume)
+    .bind(pair_qualification_digest)
+    .bind(evidence.get("bridge_contract_digest").and_then(Value::as_str).ok_or(IntegrationError::ContractDrift)?)
+    .bind(evidence.get("installed_addon_versions").cloned().ok_or(IntegrationError::ContractDrift)?)
     .bind(&evidence)
     .execute(&mut *tx)
     .await

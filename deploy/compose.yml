@@ -354,7 +354,7 @@ services:
       DRIVER_POSTGRES_CA_SOURCE: ${DRIVER_POSTGRES_CA_SOURCE:-}
       DRIVER_ODOO_POSTGRES_PASSWORD: "@/run/secrets/odoo_postgres_password"
       DRIVER_ODOO_BRIDGE_TOKEN: "@/run/secrets/odoo_bridge_token"
-      DRIVER_ODOO_IMAGE: mb-control-odoo:local
+      DRIVER_EXTENSION_HELPER_IMAGE: mb-control:local
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
       DRIVER_PAPERLESS_IMAGE: mb-control-paperless:local
       DRIVER_RUNTIME_NETWORK: mb-control-runtime
@@ -544,6 +544,7 @@ services:
       CONTROL_DEPLOYMENT_DRIVER_URL: ${DEPLOYMENT_DRIVER_URL}
       CONTROL_DEPLOYMENT_DRIVER_TOKEN: "@/run/secrets/deployment_driver_token"
       CONTROL_RELEASE_COSIGN_EXECUTABLE: /usr/local/bin/cosign
+      CONTROL_RELEASE_ORAS_EXECUTABLE: /usr/local/bin/oras
       CONTROL_RELEASE_COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
       CONTROL_RELEASE_COSIGN_IDENTITY: https://github.com/MakersBrain/mb-infra/.github/workflows/release.yml@refs/heads/main
       CONTROL_RELEASE_COSIGN_REPOSITORY: MakersBrain/mb-infra
@@ -583,21 +584,30 @@ services:
     secrets: [control_backup_database_url, deployment_driver_token]
 
   odoo:
-    image: mb-control-odoo:local
+    # Development-only raw-addon fixture. PASSWORD_FILE is accepted here even
+    # though the official entrypoint expands it into argv; release runtimes use
+    # the driver's protected complete ODOO_RC instead.
+    image: odoo:19@sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea
     container_name: mb-shared-odoo
-    build: {context: ../.., dockerfile: control-plane/deploy/Odoo.Dockerfile}
-    entrypoint: ["/usr/local/bin/odoo-secret-entrypoint"]
+    read_only: true
     environment:
       HOST: postgres
       PORT: "5432"
       USER: odoo
+      PASSWORD_FILE: /run/secrets/odoo_postgres_password
+      MB_CONTROL_BRIDGE_TOKEN_FILE: /run/secrets/odoo_bridge_token
       MB_CONTROL_API_URL: http://control-api:8080
       MB_ODOO_CLIENT_TOKEN_ROOT: /run/mb-odoo-client-secrets
       MB_CARRIER_CONTROL_TOKEN_ROOT: /run/mb-odoo-client-secrets
-    command: ["odoo", "--no-database-list", "--db_host=postgres", "--db_user=odoo", "--addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
+      PYTHONPATH: /opt/mb-extension/python
+    command: ["odoo", "--no-database-list", "--addons-path=/opt/mb-extension/addons,/usr/lib/python3/dist-packages/odoo/addons", "--load=base,web,mb_dbfilter_gateway", "--proxy-mode"]
     volumes:
       - odoo-data:/var/lib/odoo
       - odoo-client-secrets:/run/mb-odoo-client-secrets:ro
+      - ../../mb-odoo-addons/addons:/opt/mb-extension/addons:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /var/run/odoo:rw,noexec,nosuid,size=16m
     secrets: [odoo_postgres_password, odoo_bridge_token]
     depends_on:
       postgres: {condition: service_healthy}

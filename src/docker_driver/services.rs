@@ -157,7 +157,7 @@ pub(super) async fn ensure_rauthy_client(
         "name":name,"confidential":confidential,"redirect_uris":[redirect],
         "post_logout_redirect_uris":[logout],"allowed_origins":[origin],"enabled":true,
         "flows_enabled":["authorization_code","refresh_token"],"access_token_alg":"RS256",
-        // The pinned OCA auth_oidc verifier intentionally accepts RS256 only.
+        // The MakersBrain code-flow adapter and centralized verifier accept RS256 only.
         "id_token_alg":"RS256","auth_code_lifetime":60,"access_token_lifetime":300,
         "scopes":["openid","profile","email"],"default_scopes":["openid","profile","email"],
         "challenges":["S256"],"force_mfa":false,"client_uri":origin,
@@ -178,6 +178,7 @@ pub(super) async fn ensure_odoo_database(
     database_ref: &str,
     tenant_key: &str,
 ) -> Result<(), DriverError> {
+    let (image, extension_volume) = active_odoo_artifacts(state).await?;
     let container = format!("mb-odoo-init-{tenant_key}");
     if docker_container_exists(state, &container).await? {
         let _ = docker_delete_container(state, &container).await;
@@ -186,24 +187,55 @@ pub(super) async fn ensure_odoo_database(
         state,
         &container,
         json!({
-            "Image":state.config.odoo_image,
-            "Cmd":["/bin/sh","-ec","password=$(cat /run/mb-job-secrets/postgres-password); export MB_CONTROL_BRIDGE_TOKEN=$(cat /run/mb-job-secrets/bridge-token); exec odoo --database=\"$MB_ODOO_DATABASE\" --stop-after-init --no-database-list --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=odoo --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons --init=auth_oidc,mb_control_bridge,mb_brand,mb_workshop_pos,l10n_fr_micro_enterprise --update=mb_control_bridge --without-demo=all"],
+            "Image":image,
+            "Cmd":["odoo","--database",database_ref,"--stop-after-init","--no-http","--no-database-list","--addons-path=/opt/mb-extension/addons,/usr/lib/python3/dist-packages/odoo/addons","--init=mb_control_bridge,mb_brand,mb_workshop_pos,l10n_fr_micro_enterprise","--update=mb_control_bridge","--without-demo=all"],
             "Env":[
                 format!("MB_ODOO_DATABASE={database_ref}"),
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
-                "USER=odoo"
+                "USER=odoo",
+                "ODOO_RC=/run/mb-job-secrets/odoo.conf",
+                "PYTHONPATH=/opt/mb-extension/python",
+                "MB_CONTROL_BRIDGE_TOKEN_FILE=/run/mb-job-secrets/bridge-token"
             ],
             "Labels":{"mb.kind":"odoo-init"},
-            "HostConfig":{"NetworkMode":state.config.docker_network,"Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)]}
+            "HostConfig":{"NetworkMode":state.config.docker_network,"ReadonlyRootfs":true,"CapDrop":["ALL"],"Tmpfs":{"/tmp":"rw,noexec,nosuid,size=64m","/var/run/odoo":"rw,noexec,nosuid,size=16m"},"Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume),format!("{extension_volume}:/opt/mb-extension:ro")]}
         }),
         &[
-            ("postgres-password", state.config.odoo_postgres_password.as_str()),
+            ("odoo.conf", &super::release::odoo_configuration(state, "odoo", &state.config.odoo_postgres_password)?),
             ("bridge-token", state.config.odoo_bridge_token.as_str()),
         ],
     )
     .await?;
     Ok(())
+}
+
+async fn active_odoo_artifacts(state: &DriverState) -> Result<(String, String), DriverError> {
+    let (manifest_value, slot_runtime_subject, slot_extension_subject, extension_volume) =
+        sqlx::query_as::<_, (Value, String, String, String)>(
+            "select r.manifest,s.odoo_subject_digest,s.extension_subject_digest,s.extension_volume
+             from control.application_releases r
+             join control.runtime_release_slots s on s.release_id=r.id
+             where r.status='active' and s.runtime_key='shared-odoo' and s.state='active'",
+        )
+        .fetch_optional(&state.ledger)
+        .await
+        .map_err(DriverError::internal)?
+        .ok_or_else(|| DriverError::bad("Odoo provisioning requires an active paired release"))?;
+    let manifest: crate::release::ApplicationReleaseManifest =
+        serde_json::from_value(manifest_value)
+            .map_err(|_| DriverError::internal("active application release manifest is invalid"))?;
+    manifest
+        .validate()
+        .map_err(|_| DriverError::internal("active application release manifest is invalid"))?;
+    if manifest.odoo_runtime.subject_digest != slot_runtime_subject
+        || manifest.extension_bundle.subject_digest != slot_extension_subject
+    {
+        return Err(DriverError::internal(
+            "active runtime slot does not match its paired release",
+        ));
+    }
+    Ok((manifest.odoo_runtime.deployment_ref, extension_volume))
 }
 
 pub(super) async fn ensure_odoo_break_glass(
@@ -212,6 +244,7 @@ pub(super) async fn ensure_odoo_break_glass(
     database_ref: &str,
     tenant_key: &str,
 ) -> Result<(), DriverError> {
+    let (image, extension_volume) = active_odoo_artifacts(state).await?;
     let container = format!("mb-odoo-break-glass-{tenant_key}");
     if docker_container_exists(state, &container).await? {
         let _ = docker_delete_container(state, &container).await;
@@ -220,24 +253,27 @@ pub(super) async fn ensure_odoo_break_glass(
         state,
         &container,
         json!({
-            "Image":state.config.odoo_image,
+            "Image":image,
             "Cmd":[
                 "/bin/sh",
                 "-ec",
-                "password=$(cat /run/mb-job-secrets/postgres-password); exec odoo shell --database=\"$MB_ODOO_DATABASE\" --no-http --db_host=\"$HOST\" --db_port=\"$PORT\" --db_user=\"$USER\" --db_password=\"$password\" --addons-path=/mnt/mb-addons,/mnt/oca-addons,/usr/lib/python3/dist-packages/odoo/addons < /mnt/mb-addons/mb_control_bridge/scripts/set_break_glass_password.py"
+                "odoo shell --database=\"$MB_ODOO_DATABASE\" --no-http --addons-path=/opt/mb-extension/addons,/usr/lib/python3/dist-packages/odoo/addons < /opt/mb-extension/addons/mb_control_bridge/scripts/set_break_glass_password.py"
             ],
             "Env":[
                 format!("MB_ODOO_DATABASE={database_ref}"),
                 format!("HOST={}",state.config.postgres_host),
                 format!("PORT={}",state.config.postgres_port),
                 "USER=odoo",
+                "ODOO_RC=/run/mb-job-secrets/odoo.conf",
+                "PYTHONPATH=/opt/mb-extension/python",
                 "MB_BREAK_GLASS_PASSWORD_FILE=/run/mb-odoo-secrets/admin-password"
             ],
             "Labels":{"mb.kind":"odoo-break-glass"},
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
                 "GroupAdd":["0"],
-                "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume)],
+                "ReadonlyRootfs":true,"CapDrop":["ALL"],"Tmpfs":{"/tmp":"rw,noexec,nosuid,size=64m","/var/run/odoo":"rw,noexec,nosuid,size=16m"},
+                "Binds":[format!("{}:/var/lib/odoo",state.config.odoo_volume),format!("{extension_volume}:/opt/mb-extension:ro")],
                 "Mounts":[runtime_secret_mount(
                     state,
                     &PathBuf::from("odoo").join(workshop.to_string()),
@@ -245,7 +281,7 @@ pub(super) async fn ensure_odoo_break_glass(
                 )?]
             }
         }),
-        &[("postgres-password", state.config.odoo_postgres_password.as_str())],
+        &[("odoo.conf", &super::release::odoo_configuration(state, "odoo", &state.config.odoo_postgres_password)?)],
     )
     .await?;
     Ok(())

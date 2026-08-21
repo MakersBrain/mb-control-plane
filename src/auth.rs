@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, header};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
@@ -42,6 +44,11 @@ pub struct VerifiedToken {
     pub recent_strong_authentication: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIdToken {
+    pub subject: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct Claims {
     iss: String,
@@ -56,6 +63,23 @@ struct Claims {
     #[serde(default)]
     amr: Vec<String>,
     auth_time: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdTokenClaims {
+    sub: String,
+    aud: IdTokenAudience,
+    #[allow(dead_code)]
+    exp: i64,
+    nonce: String,
+    at_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IdTokenAudience {
+    One(String),
+    Many(Vec<String>),
 }
 
 struct VerificationKey {
@@ -149,6 +173,70 @@ impl Authenticator {
             subject: token.subject,
             email,
             recent_strong_authentication: token.recent_strong_authentication,
+        })
+    }
+
+    /// Validate an authorization-code-flow ID token for one exact Odoo client.
+    ///
+    /// The audience is supplied by the trusted caller from the workshop path,
+    /// never copied from the request body. OIDC permits `at_hash` to be absent
+    /// for an ID token returned by the token endpoint; when Rauthy includes it,
+    /// it remains a mandatory token-substitution check.
+    pub async fn verify_id_token(
+        &self,
+        token: &str,
+        access_token: &str,
+        expected_nonce: &str,
+        expected_audience: &str,
+    ) -> Result<VerifiedIdToken, ApiError> {
+        let header = decode_header(token).map_err(|_| ApiError::Unauthenticated)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(ApiError::Unauthenticated);
+        }
+        let kid = header.kid.ok_or(ApiError::Unauthenticated)?;
+        let key = self.key_for(&kid).await.map_err(|_| {
+            tracing::warn!(
+                error_class = "verification_key_unavailable",
+                "unable to select ID-token verification key"
+            );
+            ApiError::Unauthenticated
+        })?;
+        if key.algorithm != Algorithm::RS256 {
+            return Err(ApiError::Unauthenticated);
+        }
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[&self.issuer]);
+        validation.set_audience(&[expected_audience]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "nonce"]);
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.leeway = CLOCK_LEEWAY_SECONDS;
+        let claims = decode::<IdTokenClaims>(token, &key.decoding, &validation)
+            .map_err(|_| ApiError::Unauthenticated)?
+            .claims;
+        let exact_audience = match &claims.aud {
+            IdTokenAudience::One(value) => value == expected_audience,
+            IdTokenAudience::Many(values) => {
+                let _ = values;
+                false
+            }
+        };
+        if !exact_audience
+            || claims.sub.trim().is_empty()
+            || claims.sub.len() > 512
+            || claims.sub.chars().any(char::is_control)
+            || !constant_time_equal(claims.nonce.as_bytes(), expected_nonce.as_bytes())
+        {
+            return Err(ApiError::Unauthenticated);
+        }
+        if let Some(at_hash) = claims.at_hash {
+            let expected = oidc_at_hash(access_token);
+            if !constant_time_equal(at_hash.as_bytes(), expected.as_bytes()) {
+                return Err(ApiError::Unauthenticated);
+            }
+        }
+        Ok(VerifiedIdToken {
+            subject: claims.sub,
         })
     }
 
@@ -309,6 +397,22 @@ impl Authenticator {
     }
 }
 
+fn oidc_at_hash(access_token: &str) -> String {
+    let hash = Sha256::digest(access_token.as_bytes());
+    URL_SAFE_NO_PAD.encode(&hash[..hash.len() / 2])
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
 fn recent_strong_authentication(amr: &[String], auth_time: Option<i64>, now: i64) -> bool {
     const MAX_AGE_SECONDS: i64 = 10 * 60;
     let Some(auth_time) = auth_time else {
@@ -329,7 +433,57 @@ fn recent_strong_authentication(amr: &[String], auth_time: Option<i64>, now: i64
 
 #[cfg(test)]
 mod tests {
-    use super::recent_strong_authentication;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::rsa::KeySize;
+    use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaKeyPair};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use jsonwebtoken::{Algorithm, DecodingKey};
+    use serde_json::{Value, json};
+    use url::Url;
+
+    use super::{
+        Authenticator, VerificationKey, constant_time_equal, oidc_at_hash,
+        recent_strong_authentication,
+    };
+
+    fn signed_rs256_token(key: &RsaKeyPair, kid: &str, claims: Value) -> String {
+        let header = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&json!({"alg":"RS256","kid":kid,"typ":"JWT"})).unwrap());
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{claims}");
+        let mut signature = vec![0_u8; key.public_modulus_len()];
+        key.sign(
+            &RSA_PKCS1_SHA256,
+            &SystemRandom::new(),
+            signing_input.as_bytes(),
+            &mut signature,
+        )
+        .unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    async fn id_token_authenticator(key: &RsaKeyPair, kid: &str) -> Authenticator {
+        let authenticator = Authenticator::new(
+            Url::parse("https://identity.example.test/").unwrap(),
+            "control-api".into(),
+            Url::parse("https://identity.internal/.well-known/openid-configuration").unwrap(),
+        )
+        .unwrap();
+        let mut cache = authenticator.cache.write().await;
+        cache.keys.insert(
+            kid.into(),
+            Arc::new(VerificationKey {
+                decoding: DecodingKey::from_rsa_der(key.public_key().as_ref()),
+                algorithm: Algorithm::RS256,
+            }),
+        );
+        cache.fetched_at = Some(Instant::now());
+        drop(cache);
+        authenticator
+    }
 
     #[test]
     fn step_up_requires_recent_strong_evidence() {
@@ -364,5 +518,146 @@ mod tests {
             None,
             1_300
         ));
+    }
+
+    #[test]
+    fn authorization_code_at_hash_uses_the_oidc_rs256_rule() {
+        // OpenID Connect Core's RS256 example access token and expected hash.
+        assert_eq!(oidc_at_hash("SlAV32hkKG"), "rXH7QWVTZnXYCou_6Vdpfg");
+        assert!(constant_time_equal(b"nonce", b"nonce"));
+        assert!(!constant_time_equal(b"nonce", b"nonce2"));
+    }
+
+    #[tokio::test]
+    async fn id_token_verification_binds_nonce_audience_and_optional_access_token_hash() {
+        let key = RsaKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let authenticator = id_token_authenticator(&key, "current-key").await;
+        let audience = "mb-odoo-00112233445566778899aabbccddeeff";
+        let access_token = "single-use-access-token";
+        let claims = |nonce: &str, audience: &str, at_hash: Option<&str>| {
+            let mut claims = json!({
+                "iss":"https://identity.example.test/",
+                "aud":audience,
+                "sub":"stable-rauthy-subject",
+                "exp":time::OffsetDateTime::now_utc().unix_timestamp() + 300,
+                "nonce":nonce
+            });
+            if let Some(at_hash) = at_hash {
+                claims["at_hash"] = Value::String(at_hash.into());
+            }
+            claims
+        };
+
+        let without_hash = signed_rs256_token(
+            &key,
+            "current-key",
+            claims("expected-nonce", audience, None),
+        );
+        assert_eq!(
+            authenticator
+                .verify_id_token(&without_hash, access_token, "expected-nonce", audience)
+                .await
+                .unwrap()
+                .subject,
+            "stable-rauthy-subject"
+        );
+
+        let valid_hash = oidc_at_hash(access_token);
+        let with_hash = signed_rs256_token(
+            &key,
+            "current-key",
+            claims("expected-nonce", audience, Some(&valid_hash)),
+        );
+        assert!(
+            authenticator
+                .verify_id_token(&with_hash, access_token, "expected-nonce", audience)
+                .await
+                .is_ok()
+        );
+        assert!(
+            authenticator
+                .verify_id_token(&with_hash, "substituted", "expected-nonce", audience)
+                .await
+                .is_err()
+        );
+        let multiple_audiences = signed_rs256_token(
+            &key,
+            "current-key",
+            json!({
+                "iss":"https://identity.example.test/",
+                "aud":[audience,"mb-odoo-another-workshop"],
+                "sub":"stable-rauthy-subject",
+                "exp":time::OffsetDateTime::now_utc().unix_timestamp() + 300,
+                "nonce":"expected-nonce"
+            }),
+        );
+        assert!(
+            authenticator
+                .verify_id_token(
+                    &multiple_audiences,
+                    access_token,
+                    "expected-nonce",
+                    audience
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            authenticator
+                .verify_id_token(&with_hash, access_token, "wrong-nonce", audience)
+                .await
+                .is_err()
+        );
+        assert!(
+            authenticator
+                .verify_id_token(
+                    &with_hash,
+                    access_token,
+                    "expected-nonce",
+                    "mb-odoo-another-workshop",
+                )
+                .await
+                .is_err()
+        );
+        let wrong_issuer = signed_rs256_token(
+            &key,
+            "current-key",
+            json!({
+                "iss":"https://substitute.example.test/",
+                "aud":audience,
+                "sub":"stable-rauthy-subject",
+                "exp":time::OffsetDateTime::now_utc().unix_timestamp() + 300,
+                "nonce":"expected-nonce"
+            }),
+        );
+        assert!(
+            authenticator
+                .verify_id_token(&wrong_issuer, access_token, "expected-nonce", audience)
+                .await
+                .is_err()
+        );
+        let expired = signed_rs256_token(
+            &key,
+            "current-key",
+            json!({
+                "iss":"https://identity.example.test/",
+                "aud":audience,
+                "sub":"stable-rauthy-subject",
+                "exp":time::OffsetDateTime::now_utc().unix_timestamp() - 300,
+                "nonce":"expected-nonce"
+            }),
+        );
+        assert!(
+            authenticator
+                .verify_id_token(&expired, access_token, "expected-nonce", audience)
+                .await
+                .is_err()
+        );
+        assert!(
+            authenticator
+                .verify_id_token("not-a-jwt", access_token, "expected-nonce", audience)
+                .await
+                .is_err()
+        );
     }
 }

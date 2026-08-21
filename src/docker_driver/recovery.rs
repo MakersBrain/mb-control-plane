@@ -1,5 +1,22 @@
 use super::*;
 
+async fn release_odoo_ref(state: &DriverState, release_id: &str) -> Result<String, DriverError> {
+    let manifest = sqlx::query_scalar::<_, Value>(
+        "select manifest from control.application_releases where id=$1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| DriverError::internal("recovery source release is absent"))?;
+    let manifest: crate::release::ApplicationReleaseManifest = serde_json::from_value(manifest)
+        .map_err(|_| DriverError::internal("recovery source release manifest is invalid"))?;
+    manifest
+        .validate()
+        .map_err(|_| DriverError::internal("recovery source release manifest is invalid"))?;
+    Ok(manifest.odoo_runtime.deployment_ref)
+}
+
 pub(super) async fn download_backup(
     state: &DriverState,
     workshop: Uuid,
@@ -704,7 +721,7 @@ async fn recovery_scope(
     .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "recovery point not found".into()))
 }
 
-async fn resolve_stored_recovery(
+pub(super) async fn resolve_stored_recovery(
     state: &DriverState,
     workshop: Uuid,
     recovery: Uuid,
@@ -876,6 +893,7 @@ pub(super) async fn create_recovery_set(
     } else {
         None
     };
+    let odoo_version = release_odoo_ref(state, &source_release).await?;
     let manifest = RecoveryManifest {
         format: RECOVERY_FORMAT_V2.to_owned(),
         recovery_id: recovery,
@@ -883,7 +901,7 @@ pub(super) async fn create_recovery_set(
         database_ref: database_ref.to_owned(),
         kind: kind.to_owned(),
         source_release,
-        odoo_version: state.config.odoo_image.clone(),
+        odoo_version,
         paperless_version,
         paperless_database_ref: component_scope
             .iter()
@@ -957,7 +975,7 @@ async fn existing_recovery_response(
     })))
 }
 
-async fn restore_recovery_set(
+pub(super) async fn restore_recovery_set(
     state: &DriverState,
     workshop: Uuid,
     target_database: &str,
@@ -1172,6 +1190,7 @@ async fn create_remote_recovery_set(
             )?);
         }
     }
+    let odoo_version = release_odoo_ref(state, &source_release).await?;
     let manifest = RecoveryManifest {
         format: RECOVERY_FORMAT_V2.to_owned(),
         recovery_id: recovery,
@@ -1179,7 +1198,7 @@ async fn create_remote_recovery_set(
         database_ref: database_ref.to_owned(),
         kind: kind.to_owned(),
         source_release,
-        odoo_version: state.config.odoo_image.clone(),
+        odoo_version,
         paperless_version: includes_paperless
             .then(|| state.config.paperless_image.clone())
             .flatten(),

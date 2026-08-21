@@ -601,8 +601,8 @@ pub(super) async fn platform_releases(
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<ApplicationReleaseResponse>>> {
     operator(&state, &headers).await?;
-    let rows = sqlx::query_as::<_, (String,String,String,String,String,String,i64,OffsetDateTime,OffsetDateTime)>(
-        "select id,status,source_commit,image_digest,change_class,odoo_version,version,published_at,updated_at
+    let rows = sqlx::query_as::<_, (String,String,String,String,String,String,String,i64,OffsetDateTime,OffsetDateTime)>(
+        "select id,status,source_commit,odoo_subject_digest,extension_subject_digest,change_class,odoo_version,version,published_at,updated_at
          from control.application_releases order by published_at desc,id desc",
     )
     .fetch_all(state.store.pool())
@@ -613,12 +613,13 @@ pub(super) async fn platform_releases(
                 id: row.0,
                 status: row.1,
                 source_commit: row.2,
-                image_digest: row.3,
-                change_class: row.4,
-                odoo_version: row.5,
-                version: row.6,
-                published_at: api_timestamp(row.7),
-                updated_at: api_timestamp(row.8),
+                odoo_subject_digest: row.3,
+                extension_subject_digest: row.4,
+                change_class: row.5,
+                odoo_version: row.6,
+                version: row.7,
+                published_at: api_timestamp(row.8),
+                updated_at: api_timestamp(row.9),
             })
             .collect(),
     ))
@@ -681,17 +682,31 @@ pub(super) async fn publish_release(
     let mut tx = state.store.begin().await?;
     let inserted = sqlx::query(
         "insert into control.application_releases(
-        id,source_commit,odoo_version,image_digest,manifest_digest,addon_versions,
+        id,source_commit,odoo_version,odoo_subject_digest,extension_subject_digest,
+        odoo_runtime,extension_bundle,pair_qualifications,manifest_digest,addon_versions,
         compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,
-        manifest,signature_bundle_ref,provenance_ref,sbom_ref,published_at,
+        manifest,signature_bundle_ref,extension_signature_ref,sbom_ref,published_at,
         publication_idempotency_key,publication_request_digest
-      ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
       on conflict do nothing",
     )
     .bind(&manifest.release_id)
     .bind(&manifest.source_commit)
-    .bind(&manifest.odoo_version)
-    .bind(&manifest.image_digest)
+    .bind(&manifest.odoo_runtime.version)
+    .bind(&manifest.odoo_runtime.subject_digest)
+    .bind(&manifest.extension_bundle.subject_digest)
+    .bind(
+        serde_json::to_value(&manifest.odoo_runtime)
+            .map_err(|error| ApiError::Internal(error.into()))?,
+    )
+    .bind(
+        serde_json::to_value(&manifest.extension_bundle)
+            .map_err(|error| ApiError::Internal(error.into()))?,
+    )
+    .bind(
+        serde_json::to_value(&manifest.pair_qualifications)
+            .map_err(|error| ApiError::Internal(error.into()))?,
+    )
     .bind(&manifest_digest)
     .bind(addons)
     .bind(compatibility)
@@ -703,9 +718,9 @@ pub(super) async fn publish_release(
     .bind(change_class)
     .bind(postconditions)
     .bind(&semantic)
-    .bind(&manifest.provenance.cosign_bundle_ref)
-    .bind(&manifest.provenance.slsa_provenance_ref)
-    .bind(&manifest.provenance.sbom_ref)
+    .bind(&manifest.admission_signature.reference)
+    .bind(&manifest.extension_bundle.platforms[0].signature.reference)
+    .bind(&manifest.odoo_runtime.platforms[0].evidence.sbom.reference)
     .bind(published_at)
     .bind(&key)
     .bind(request_digest.as_slice())
@@ -764,6 +779,7 @@ pub(super) async fn platform_release(
             String,
             String,
             String,
+            String,
             Value,
             Value,
             String,
@@ -775,7 +791,7 @@ pub(super) async fn platform_release(
             OffsetDateTime,
         ),
     >(
-        "select id,status,source_commit,image_digest,manifest_digest,change_class,
+        "select id,status,source_commit,odoo_subject_digest,extension_subject_digest,manifest_digest,change_class,
                 addon_versions,compatibility,bridge_contract,schema_epoch,
                 required_postconditions,manifest,version,published_at,updated_at
          from control.application_releases where id=$1",
@@ -784,32 +800,33 @@ pub(super) async fn platform_release(
     .fetch_optional(state.store.pool())
     .await?
     .ok_or(ApiError::NotFound)?;
-    let slots = sqlx::query_as::<_, (String, String, String, String, String, i64, Value)>(
-        "select runtime_key,slot,release_id,state,image_digest,version,evidence
+    let slots = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, i64, Value)>(
+        "select runtime_key,slot,release_id,state,odoo_subject_digest,extension_subject_digest,extension_volume,pair_qualification_digest,version,evidence
          from control.runtime_release_slots where release_id=$1 order by runtime_key,slot",
     )
     .bind(&id)
     .fetch_all(state.store.pool())
     .await?;
-    let version = row.12;
+    let version = row.13;
     Ok((
         etag(&format!("release-{id}"), version)?,
         Json(ApplicationReleaseDetailResponse {
             id: row.0,
             status: row.1,
             source_commit: row.2,
-            image_digest: row.3,
-            manifest_digest: row.4,
-            change_class: row.5,
-            addon_versions: row.6,
-            compatibility: row.7,
-            bridge_contract: row.8,
-            schema_epoch: row.9,
-            required_postconditions: row.10,
-            manifest: row.11,
+            odoo_subject_digest: row.3,
+            extension_subject_digest: row.4,
+            manifest_digest: row.5,
+            change_class: row.6,
+            addon_versions: row.7,
+            compatibility: row.8,
+            bridge_contract: row.9,
+            schema_epoch: row.10,
+            required_postconditions: row.11,
+            manifest: row.12,
             version,
-            published_at: api_timestamp(row.13),
-            updated_at: api_timestamp(row.14),
+            published_at: api_timestamp(row.14),
+            updated_at: api_timestamp(row.15),
             runtime_slots: slots
                 .into_iter()
                 .map(|slot| RuntimeReleaseSlotResponse {
@@ -817,9 +834,12 @@ pub(super) async fn platform_release(
                     slot: slot.1,
                     release_id: slot.2,
                     state: slot.3,
-                    image_digest: slot.4,
-                    version: slot.5,
-                    evidence: slot.6,
+                    odoo_subject_digest: slot.4,
+                    extension_subject_digest: slot.5,
+                    extension_volume: slot.6,
+                    pair_qualification_digest: slot.7,
+                    version: slot.8,
+                    evidence: slot.9,
                 })
                 .collect(),
         }),

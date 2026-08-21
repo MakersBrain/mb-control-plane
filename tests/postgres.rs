@@ -802,25 +802,59 @@ async fn release_state_machine_and_fleet_fences_are_database_enforced() {
     let suffix = Uuid::new_v4().simple().to_string();
     let release = format!("odoo-2026.08.14-{}", &suffix[..12]);
     let digest = format!("sha256:{}", "1".repeat(64));
+    let extension_digest = format!("sha256:{}", "5".repeat(64));
     let manifest_digest = format!("sha256:{}", "2".repeat(64));
     sqlx::query(
         "insert into control.application_releases(
-           id,source_commit,odoo_version,image_digest,manifest_digest,addon_versions,
+           id,source_commit,odoo_version,odoo_subject_digest,extension_subject_digest,
+           odoo_runtime,extension_bundle,pair_qualifications,manifest_digest,addon_versions,
            compatibility,bridge_contract,schema_epoch,change_class,
-           required_postconditions,manifest,signature_bundle_ref,provenance_ref,
+           required_postconditions,manifest,signature_bundle_ref,extension_signature_ref,
            sbom_ref,published_at,publication_idempotency_key,publication_request_digest
-         ) values($1,$2,'19.0',$3,$4,'{}','{}','>=3.2.0,<4.0.0',42,'B',
-                  '[]','{}','oci://signature','oci://provenance','oci://sbom',now(),$5,$6)",
+         ) values($1,$2,'19.0',$3,$4,'{}','{}','[{}]',$5,'{}','{}','>=3.2.0,<4.0.0',42,'B',
+                  '[]','{}','oci://signature','oci://extension-signature','oci://sbom',now(),$6,$7)",
     )
     .bind(&release)
     .bind("a".repeat(40))
     .bind(&digest)
+    .bind(&extension_digest)
     .bind(&manifest_digest)
     .bind(format!("release-publication:{release}"))
     .bind(vec![0_u8; 32])
     .execute(store.pool())
     .await
     .unwrap();
+
+    let volume = format!("mb-ext-{}-{}", "7".repeat(16), "8".repeat(16));
+    let lease = Uuid::new_v4();
+    sqlx::query(
+        "insert into control.extension_volume_preparations(
+           volume_name,release_id,extension_manifest_digest,payload_digest,lease_id,lease_expires_at
+         ) values($1,$2,$3,$4,$5,now()+interval '2 hours')",
+    )
+    .bind(&volume)
+    .bind(&release)
+    .bind(format!("sha256:{}", "7".repeat(64)))
+    .bind(format!("sha256:{}", "8".repeat(64)))
+    .bind(lease)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let unsafe_volume = sqlx::query(
+        "insert into control.extension_volume_preparations(
+           volume_name,release_id,extension_manifest_digest,payload_digest,lease_id,lease_expires_at
+         ) values('../escape',$1,$2,$3,$4,now()+interval '2 hours')",
+    )
+    .bind(&release)
+    .bind(format!("sha256:{}", "7".repeat(64)))
+    .bind(format!("sha256:{}", "8".repeat(64)))
+    .bind(Uuid::new_v4())
+    .execute(store.pool())
+    .await;
+    assert!(
+        unsafe_volume.is_err(),
+        "unsafe preparation volume names fail closed"
+    );
 
     let illegal = sqlx::query(
         "update control.application_releases set status='active',version=version+1 where id=$1",
@@ -870,8 +904,8 @@ async fn release_state_machine_and_fleet_fences_are_database_enforced() {
     let intent = Uuid::new_v4();
     let action = Uuid::new_v4();
     let gateway_digest = format!("sha256:{}", "3".repeat(64));
-    sqlx::query("insert into control.fleet_activation_intents(id,fleet_run_id,release_id,runtime_key,target_slot,image_digest,prepared_tenants,gateway_configuration_digest,driver_action_id) values($1,$2,$3,'shared-odoo','blue',$4,'[]',$5,$6)")
-        .bind(intent).bind(fleet_run).bind(&release).bind(&digest).bind(&gateway_digest).bind(action).execute(store.pool()).await.unwrap();
+    sqlx::query("insert into control.fleet_activation_intents(id,fleet_run_id,release_id,runtime_key,target_slot,odoo_subject_digest,extension_subject_digest,pair_qualification_digest,prepared_tenants,gateway_configuration_digest,driver_action_id) values($1,$2,$3,'shared-odoo','blue',$4,$5,$6,'[]',$7,$8)")
+        .bind(intent).bind(fleet_run).bind(&release).bind(&digest).bind(&extension_digest).bind(format!("sha256:{}", "6".repeat(64))).bind(&gateway_digest).bind(action).execute(store.pool()).await.unwrap();
     sqlx::query("update control.fleet_activation_intents set observed_configuration_digest=$2,activated_at=now() where id=$1")
         .bind(intent).bind(&gateway_digest).execute(store.pool()).await.unwrap();
     let mutate =

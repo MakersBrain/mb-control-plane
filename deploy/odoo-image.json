@@ -1,18 +1,17 @@
 {
-  "_comment": [
-    "The Odoo image this repository tests its bridge client against.",
-    "",
-    "Pinned by digest so the compatibility lane answers a fixed question: does",
-    "this client still work against that provider. A tag would let the answer",
-    "change without any commit here, which is the opposite of what a",
-    "compatibility gate is for.",
-    "",
-    "mb-infra overrides it when composing a release with a new image",
-    "combination, which is the case this cannot cover: a candidate Odoo that",
-    "does not exist yet when this pin is written.",
-    "",
-    "Raise it deliberately, after the lane passes against the new digest."
+  "schema": "makersbrain.odoo.official-runtime.v1",
+  "official_source_ref": "docker.io/library/odoo@sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea",
+  "deployment_ref": "docker.io/library/odoo@sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea",
+  "subject_digest": "sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea",
+  "subject_kind": "image_index",
+  "version": "19.0",
+  "platforms": [
+    {
+      "platform": {"os": "linux", "architecture": "amd64"},
+      "manifest_digest": "sha256:7fcd40c8638205f4844240397712ebbaa07918eb54f734f09e2c61274c3ae83f",
+      "config_digest": "sha256:09e7bc64740590e083400ad0f96745ca7290e4fda6bfa1dd1dedc3cccd88e51b"
+    }
   ],
-  "image": "ghcr.io/makersbrain/mb-odoo@sha256:c6f981a3eb68212eca82ab09fcfc2360d08c5db1065afa09cea4c7d4075b6ebd",
-  "source_repository": "MakersBrain/mb-odoo-addons"
+  "source_repository": "odoo/docker",
+  "sbom_kind": "observed"
 }

@@ -1,6 +1,59 @@
 use super::*;
 use base64::Engine as _;
 
+const ID_TOKEN_REQUEST_MAX_BYTES: usize = 128 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VerifyIdTokenBody {
+    id_token: String,
+    access_token: String,
+    nonce: String,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct VerifiedIdTokenResponse {
+    subject: String,
+}
+
+pub(super) async fn verify_odoo_id_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(workshop_id): Path<Uuid>,
+    body: bytes::Bytes,
+) -> ApiResult<Json<VerifiedIdTokenResponse>> {
+    // Authenticate the workshop selected by the path before parsing any token
+    // or accepting any identity assertion from the request payload.
+    tenant_bridge(&state, &headers, workshop_id).await?;
+    if body.is_empty() || body.len() > ID_TOKEN_REQUEST_MAX_BYTES {
+        return Err(ApiError::Validation(
+            "ID-token verification body is invalid",
+        ));
+    }
+    let body: VerifyIdTokenBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::Validation("ID-token verification body is invalid"))?;
+    if body.id_token.is_empty()
+        || body.id_token.len() > 64 * 1024
+        || body.access_token.is_empty()
+        || body.access_token.len() > 64 * 1024
+        || body.nonce.is_empty()
+        || body.nonce.len() > 1024
+        || body.nonce.chars().any(char::is_control)
+    {
+        return Err(ApiError::Validation(
+            "ID-token verification body is invalid",
+        ));
+    }
+    let audience = format!("mb-odoo-{}", workshop_id.simple());
+    let identity = state
+        .auth
+        .verify_id_token(&body.id_token, &body.access_token, &body.nonce, &audience)
+        .await?;
+    Ok(Json(VerifiedIdTokenResponse {
+        subject: identity.subject,
+    }))
+}
+
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransactionalMailAttachment {
