@@ -2,15 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "contract_version": 2,
   "application_release_schema": "application-release.schema.json",
-  "public_openapi_baseline": "openapi-v1-baseline.json",
   "capability_registry": {
-    "path": "capability-registry-v2.json",
-    "version": 2,
-    "sha256": "b3fa712b507f7fcb6558f203c0585307bf0de958e51760b1026d016d1dad412c"
+    "path": "capability-registry.json",
+    "version": 1,
+    "sha256": "a6d49252dd8a990409c270c5b492c3922dbc95ae112fdddc77e60bf481f13273"
   },
   "release": "0.1.0",
-  "schema_release": "0039_webshop_onboarding",
-  "schema_compatibility": ">=0024_worker_heartbeats,<0025",
+  "schema_release": "0001_control_plane_base",
+  "schema_compatibility": "=0001_control_plane_base",
   "staging_qualification": {
     "builder": "podman/qualification.py",
     "environment": "synthetic-only staging",
@@ -558,9 +557,6 @@
       "BROKER_CLAUDE_ENDPOINT",
       "BROKER_CLAUDE_KEY",
       "BROKER_CLAUDE_MODEL",
-      "BROKER_VISION_ENDPOINT",
-      "BROKER_VISION_KEY",
-      "BROKER_VISION_MODEL",
       "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT"
     ],
     "inventory_product_lookup": [
@@ -734,8 +730,8 @@
     ]
   },
   "rollback": {
-    "application": "requires an application release compatible with 0024_worker_heartbeats",
-    "database": "forward repair only after migration adoption; restore the verified workshop recovery set for destructive recovery"
+    "application": "requires an application release for control-plane schema epoch 0001_control_plane_base",
+    "database": "no cross-epoch rollback; destroy the disposable topology and recreate a blank database with one matching code epoch"
   },
   "postgresql_recovery": {
     "tool": "podman/database/restore.py",

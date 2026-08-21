@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "version": 2,
+  "version": 1,
   "minimum_application_release": "0.1.0",
   "capabilities": [
     {"key":"ceramics-production","dependencies":["firings"],"odoo_modules":["mb_ceramics_workflow"]},

@@ -2,6 +2,7 @@ use makersbrain_control_plane::command::{
     CommandAdmission, CommandError, CommandResult, NewCommand, admit_command, complete_command,
 };
 use makersbrain_control_plane::domain::OperationKind;
+use makersbrain_control_plane::modules::{CATALOG, REGISTRY_VERSION};
 use makersbrain_control_plane::persistence::{NewOperation, Store};
 use serde_json::json;
 use uuid::Uuid;
@@ -346,6 +347,23 @@ async fn database_enforces_last_owner_and_non_owner_invitations() {
 
     sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Full workshop',$4,array['odoo','paperless'],'makersbrain-workshop-recovery-v2')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await.unwrap();
+    let default_recovery = Uuid::new_v4();
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'snapshot','Current default',$4)")
+        .bind(default_recovery).bind(workshop).bind(database).bind(user).execute(store.pool()).await.unwrap();
+    let default_format: String = sqlx::query_scalar(
+        "select format_version from control.workshop_recovery_points where id=$1",
+    )
+    .bind(default_recovery)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(default_format, "makersbrain-workshop-recovery-v2");
+    let legacy_format = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,format_version) values($1,$2,$3,'snapshot','Obsolete format',$4,'makersbrain-odoo-recovery-v1')")
+        .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await;
+    assert!(
+        legacy_format.is_err(),
+        "the obsolete Odoo-only recovery format must fail closed"
+    );
     let invalid_scope = sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'snapshot','Missing Odoo',$4,array['paperless'],'makersbrain-workshop-recovery-v2')")
         .bind(Uuid::new_v4()).bind(workshop).bind(database).bind(user).execute(store.pool()).await;
     assert!(
@@ -638,19 +656,22 @@ async fn commands_replay_stored_results_and_audit_is_append_only() {
 async fn capability_compare_and_set_allows_exactly_one_winner() {
     let store = store().await;
     let registry_count: i64 = sqlx::query_scalar(
-        "select count(*) from control.capability_registry_entries where registry_version=1",
+        "select count(*) from control.capability_registry_entries where registry_version=$1",
     )
+    .bind(i32::try_from(REGISTRY_VERSION).unwrap())
     .fetch_one(store.pool())
     .await
     .unwrap();
     assert_eq!(
-        registry_count, 13,
+        registry_count,
+        i64::try_from(CATALOG.len()).unwrap(),
         "the embedded registry is fully materialized"
     );
     let ceramics_modules: Vec<String> = sqlx::query_scalar(
         "select odoo_modules from control.capability_registry_entries
-         where registry_version=1 and capability_key='ceramics-production'",
+         where registry_version=$1 and capability_key='ceramics-production'",
     )
+    .bind(i32::try_from(REGISTRY_VERSION).unwrap())
     .fetch_one(store.pool())
     .await
     .unwrap();

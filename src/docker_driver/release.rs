@@ -4,8 +4,10 @@ pub(super) async fn release_fleet(
     state: &DriverState,
     payload: &Value,
 ) -> Result<Value, DriverError> {
-    if payload.get("phase").and_then(Value::as_str) != Some("adopt-fleet") {
-        return Err(DriverError::bad("invalid release fleet request"));
+    match payload.get("phase").and_then(Value::as_str) {
+        Some("prepare-initial") => return prepare_initial_release(state, payload).await,
+        Some("adopt-fleet") => {}
+        _ => return Err(DriverError::bad("invalid release fleet request")),
     }
     let fleet_run = payload_uuid(payload, "fleet_run_id")?;
     let release_id = payload
@@ -196,6 +198,158 @@ pub(super) async fn release_fleet(
         "candidate_smoke_verified":true
     });
     Ok(json!({"evidence":evidence}))
+}
+
+async fn prepare_initial_release(
+    state: &DriverState,
+    payload: &Value,
+) -> Result<Value, DriverError> {
+    let release_id = payload
+        .get("release_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| DriverError::bad("release_id is required"))?;
+    let expected_manifest_digest = payload
+        .get("manifest_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::bad("manifest_digest is required"))?;
+    let release_row = sqlx::query_as::<_, (Value, String, String, String)>(
+        "select manifest,status,image_digest,manifest_digest
+         from control.application_releases where id=$1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| {
+        DriverError(
+            StatusCode::NOT_FOUND,
+            "application release not found".into(),
+        )
+    })?;
+    if !matches!(
+        release_row.1.as_str(),
+        "preflighting" | "canary" | "prepared"
+    ) || release_row.3 != expected_manifest_digest
+    {
+        return Err(DriverError::bad(
+            "initial runtime preparation requires the verified preflight release",
+        ));
+    }
+    let manifest: crate::release::ApplicationReleaseManifest =
+        serde_json::from_value(release_row.0)
+            .map_err(|_| DriverError::bad("stored release manifest is invalid"))?;
+    manifest
+        .validate()
+        .map_err(|_| DriverError::bad("stored release manifest is invalid"))?;
+    if manifest.release_id != release_id || manifest.image_digest != release_row.2 {
+        return Err(DriverError::bad(
+            "release identity does not match its manifest",
+        ));
+    }
+    let initial_preparable =
+        sqlx::query_scalar::<_, bool>("select control.initial_release_preparable($1,$2)")
+            .bind(release_id)
+            .bind(
+                i32::try_from(manifest.capability_registry_version)
+                    .map_err(DriverError::internal)?,
+            )
+            .fetch_one(&state.ledger)
+            .await
+            .map_err(DriverError::internal)?;
+    if !initial_preparable {
+        return Err(DriverError::bad(
+            "initial runtime preparation requires an active registry and completely empty fleet",
+        ));
+    }
+    if let Some((stored_image, evidence)) = sqlx::query_as::<_, (String, Value)>(
+        "select image_digest,evidence from control.runtime_release_slots
+         where runtime_key='shared-odoo' and release_id=$1 and state='prepared'",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    {
+        if stored_image == manifest.image_digest
+            && evidence.get("manifest_digest").and_then(Value::as_str)
+                == Some(expected_manifest_digest)
+        {
+            return Ok(json!({"evidence":evidence,"observed":true}));
+        }
+        return Err(DriverError::bad(
+            "prepared initial runtime evidence drifted",
+        ));
+    }
+    let runtime_role = release_runtime_role(&manifest.image_digest);
+    let runtime_password = ensure_release_runtime_role(state, &runtime_role).await?;
+    let target_slot = sqlx::query_scalar::<_, String>(
+        "select candidate.slot
+         from (values ('blue',1),('green',2)) candidate(slot,preference)
+         left join control.runtime_release_slots existing
+           on existing.runtime_key='shared-odoo' and existing.slot=candidate.slot
+         where existing.slot is null or existing.state in ('inactive','retained','failed')
+         order by candidate.preference limit 1",
+    )
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| DriverError::bad("no reusable initial runtime slot is available"))?;
+    let runtime_container = format!("makersbrain-odoo-{target_slot}");
+    ensure_release_runtime(
+        state,
+        &runtime_container,
+        &manifest.provenance.oci_ref,
+        &runtime_role,
+        &runtime_password,
+    )
+    .await?;
+    let inspect = docker_inspect_container(state, &runtime_container).await?;
+    if !initial_runtime_inspection_matches(&inspect, &manifest.provenance.oci_ref) {
+        return Err(DriverError::internal(
+            "initial release runtime inspection did not match the prepared image",
+        ));
+    }
+    let evidence = json!({
+        "release_id":release_id,
+        "image_digest":manifest.image_digest,
+        "manifest_digest":expected_manifest_digest,
+        "runtime_key":"shared-odoo",
+        "target_slot":target_slot,
+        "runtime_container":runtime_container,
+        "runtime_role":runtime_role,
+        "provenance_verified":true,
+        "runtime_inspection_verified":true,
+        "verification":"empty_fleet_runtime_started_and_inspected"
+    });
+    let inserted = sqlx::query(
+        "insert into control.runtime_release_slots(
+            runtime_key,slot,release_id,state,image_digest,started_at,verified_at,evidence
+         ) values('shared-odoo',$1,$2,'prepared',$3,now(),now(),$4)
+         on conflict(runtime_key,slot) do update set
+           release_id=excluded.release_id,state='prepared',image_digest=excluded.image_digest,
+           started_at=excluded.started_at,verified_at=excluded.verified_at,
+           activated_at=null,evidence=excluded.evidence,
+           version=control.runtime_release_slots.version+1
+         where control.runtime_release_slots.state in ('inactive','retained','failed')",
+    )
+    .bind(target_slot)
+    .bind(release_id)
+    .bind(&manifest.image_digest)
+    .bind(&evidence)
+    .execute(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if inserted != 1 {
+        return Err(DriverError::bad("initial runtime slot is already occupied"));
+    }
+    Ok(json!({"evidence":evidence}))
+}
+
+fn initial_runtime_inspection_matches(inspect: &Value, expected_image: &str) -> bool {
+    inspect.pointer("/State/Running").and_then(Value::as_bool) == Some(true)
+        && inspect.pointer("/Config/Image").and_then(Value::as_str) == Some(expected_image)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -851,4 +1005,27 @@ fn previous_route_maintenance(previous: &[u8]) -> Result<Vec<u8>, DriverError> {
         .map(|name| format!("server {{\n  listen 8080;\n  server_name {name};\n  add_header Retry-After 120 always;\n  location / {{ return 503; }}\n}}\n"))
         .collect::<String>()
         .into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_runtime_inspection_matches;
+    use serde_json::json;
+
+    #[test]
+    fn initial_runtime_requires_the_running_declared_image() {
+        let image = format!("registry.example/odoo@sha256:{}", "a".repeat(64));
+        assert!(initial_runtime_inspection_matches(
+            &json!({"State":{"Running":true},"Config":{"Image":image}}),
+            &image,
+        ));
+        assert!(!initial_runtime_inspection_matches(
+            &json!({"State":{"Running":false},"Config":{"Image":image}}),
+            &image,
+        ));
+        assert!(!initial_runtime_inspection_matches(
+            &json!({"State":{"Running":true},"Config":{"Image":"registry.example/odoo@sha256:wrong"}}),
+            &image,
+        ));
+    }
 }

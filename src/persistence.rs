@@ -1,12 +1,13 @@
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
+use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0039_webshop_onboarding";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0001_control_plane_base";
 
 #[derive(Clone)]
 pub struct Store {
@@ -45,6 +46,153 @@ pub enum OperationOutcome {
     Retry(IntegrationError),
     Failed(IntegrationError),
     Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct InitialReleaseActivation {
+    pub slot: String,
+    pub version: i64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum InitialReleaseActivationError {
+    #[error("{0}")]
+    Conflict(&'static str),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+pub async fn activate_initial_release(
+    tx: &mut Transaction<'_, Postgres>,
+    release_id: &str,
+) -> Result<InitialReleaseActivation, InitialReleaseActivationError> {
+    let release = sqlx::query_as::<_, (String, i64, i32, String, String)>(
+        "select status,version,(manifest->>'capability_registry_version')::integer,
+                image_digest,manifest_digest
+         from control.application_releases where id=$1 for update",
+    )
+    .bind(release_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(InitialReleaseActivationError::Conflict(
+        "initial application release was not found",
+    ))?;
+    if release.0 == "active" {
+        let active_slot = sqlx::query_as::<_, (String, String, Value)>(
+            "select slot,image_digest,evidence from control.runtime_release_slots
+             where runtime_key='shared-odoo' and release_id=$1 and state='active'
+               and activated_at is not null",
+        )
+        .bind(release_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(InitialReleaseActivationError::Conflict(
+            "active initial release has no active runtime slot",
+        ))?;
+        validate_initial_slot_evidence(release_id, &release.3, &release.4, &active_slot)?;
+        return Ok(InitialReleaseActivation {
+            slot: active_slot.0,
+            version: release.1,
+            replayed: true,
+        });
+    }
+    if release.0 != "prepared" {
+        return Err(InitialReleaseActivationError::Conflict(
+            "release preflight must be prepared before initial activation",
+        ));
+    }
+    let empty_fleet = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "select
+            not exists(select 1 from control.workshops),
+            not exists(select 1 from control.odoo_databases),
+            not exists(select 1 from control.tenant_release_adoptions),
+            not exists(select 1 from control.application_releases where status='active')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !empty_fleet.0 || !empty_fleet.1 || !empty_fleet.2 || !empty_fleet.3 {
+        return Err(InitialReleaseActivationError::Conflict(
+            "initial release activation requires a completely empty fleet",
+        ));
+    }
+    let active_registry = sqlx::query_scalar::<_, i32>(
+        "select version from control.capability_registry_versions where active for share",
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(InitialReleaseActivationError::Conflict(
+        "there is no active capability registry",
+    ))?;
+    if active_registry != release.2 {
+        return Err(InitialReleaseActivationError::Conflict(
+            "release capability registry does not match the active registry",
+        ));
+    }
+    let prepared_slot = sqlx::query_as::<_, (String, String, Value)>(
+        "select slot,image_digest,evidence from control.runtime_release_slots
+         where runtime_key='shared-odoo' and release_id=$1 and state='prepared'
+           and started_at is not null and verified_at is not null for update",
+    )
+    .bind(release_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(InitialReleaseActivationError::Conflict(
+        "initial release has no verified prepared runtime slot",
+    ))?;
+    validate_initial_slot_evidence(release_id, &release.3, &release.4, &prepared_slot)?;
+    let slot_changed = sqlx::query(
+        "update control.runtime_release_slots
+         set state='active',activated_at=now(),version=version+1
+         where runtime_key='shared-odoo' and slot=$1 and release_id=$2 and state='prepared'",
+    )
+    .bind(&prepared_slot.0)
+    .bind(release_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let release_changed = sqlx::query(
+        "update control.application_releases set status='active',version=version+1
+         where id=$1 and status='prepared'",
+    )
+    .bind(release_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if slot_changed != 1 || release_changed != 1 {
+        return Err(InitialReleaseActivationError::Conflict(
+            "initial release activation lost its compare-and-set",
+        ));
+    }
+    Ok(InitialReleaseActivation {
+        slot: prepared_slot.0,
+        version: release.1 + 1,
+        replayed: false,
+    })
+}
+
+fn validate_initial_slot_evidence(
+    release_id: &str,
+    image_digest: &str,
+    manifest_digest: &str,
+    slot: &(String, String, Value),
+) -> Result<(), InitialReleaseActivationError> {
+    if slot.1 != image_digest
+        || slot.2.get("release_id").and_then(Value::as_str) != Some(release_id)
+        || slot.2.get("image_digest").and_then(Value::as_str) != Some(image_digest)
+        || slot.2.get("manifest_digest").and_then(Value::as_str) != Some(manifest_digest)
+        || slot.2.get("provenance_verified").and_then(Value::as_bool) != Some(true)
+        || slot
+            .2
+            .get("runtime_inspection_verified")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(InitialReleaseActivationError::Conflict(
+            "prepared runtime slot is missing release-integrity evidence",
+        ));
+    }
+    Ok(())
 }
 
 impl Store {

@@ -746,48 +746,47 @@ async fn restrict_module(
     if pinned.0 != "restricting" {
         return Err(IntegrationError::ContractDrift);
     }
-    let evidence =
-        if bundle.service == Some("paperless") {
-            let tenant = sqlx::query_as::<_, (String, String, String)>(
-                "select d.database_ref,d.public_hostname,w.slug from control.odoo_databases d
+    let evidence = if bundle.service == Some("paperless") {
+        let tenant = sqlx::query_as::<_, (String, String, String)>(
+            "select d.database_ref,d.public_hostname,w.slug from control.odoo_databases d
               join control.workshops w on w.id=d.workshop_id
               where d.workshop_id=$1 and d.kind='primary' and d.deleted_at is null
                 and d.public_hostname is not null",
-            )
-            .bind(workshop)
-            .fetch_optional(store.pool())
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?
-            .ok_or(IntegrationError::NotFound)?;
-            driver_request(store, operation.id, workshop, "restrict", &json!({
+        )
+        .bind(workshop)
+        .fetch_optional(store.pool())
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+        .ok_or(IntegrationError::NotFound)?;
+        driver_request(store, operation.id, workshop, "restrict", &json!({
             "capability":module_key,"database_ref":tenant.0,"public_hostname":tenant.1,
-            "paperless_hostname":format!("docs-{}.{}", tenant.2, env("CONTROL_TENANT_DOMAIN")?)
+            "paperless_hostname":format!("docs-{}.{}", tenant.2, configuration("CONTROL_TENANT_DOMAIN")?)
         })).await?
-        } else if !bundle.odoo_modules.is_empty() {
-            let (url, secret_ref, database_ref) = service(store, workshop, "odoo").await?;
-            OdooClient::new(
-                &url,
-                &secret(&secret_ref)?,
-                database_ref.as_deref(),
-                Duration::from_secs(120),
-            )
-            .map_err(|_| IntegrationError::ContractDrift)?
-            .restrict_modules(&ModuleRestrictCommand {
-                operation_key: format!("module-restrict:{workshop}:{module_key}:{}", operation.id),
-                workshop_id: workshop,
-                module_key: module_key.into(),
-                modules: bundle
-                    .odoo_modules
-                    .iter()
-                    .map(|item| (*item).into())
-                    .collect(),
-                reason: reason.into(),
-            })
-            .await?
-        } else {
-            json!({"adapter":"control_api_gate","write_blocked":true,
+    } else if !bundle.odoo_modules.is_empty() {
+        let (url, secret_ref, database_ref) = service(store, workshop, "odoo").await?;
+        OdooClient::new(
+            &url,
+            &secret(&secret_ref)?,
+            database_ref.as_deref(),
+            Duration::from_secs(120),
+        )
+        .map_err(|_| IntegrationError::ContractDrift)?
+        .restrict_modules(&ModuleRestrictCommand {
+            operation_key: format!("module-restrict:{workshop}:{module_key}:{}", operation.id),
+            workshop_id: workshop,
+            module_key: module_key.into(),
+            modules: bundle
+                .odoo_modules
+                .iter()
+                .map(|item| (*item).into())
+                .collect(),
+            reason: reason.into(),
+        })
+        .await?
+    } else {
+        json!({"adapter":"control_api_gate","write_blocked":true,
                "historical_read_retained":true})
-        };
+    };
     if evidence.get("write_blocked").and_then(Value::as_bool) != Some(true)
         || evidence
             .get("historical_read_retained")
@@ -832,7 +831,11 @@ async fn enable_paperless(
     .await
     .map_err(|_| IntegrationError::Unavailable)?
     .ok_or(IntegrationError::NotFound)?;
-    let paperless_hostname = format!("docs-{}.{}", tenant.1, env("CONTROL_TENANT_DOMAIN")?);
+    let paperless_hostname = format!(
+        "docs-{}.{}",
+        tenant.1,
+        configuration("CONTROL_TENANT_DOMAIN")?
+    );
     let payload = json!({
         "database_id": tenant.0,
         "database_ref": tenant.2,
@@ -913,11 +916,16 @@ pub(crate) fn env(name: &str) -> Result<String, IntegrationError> {
         .ok_or(IntegrationError::Unauthorized)
 }
 
+pub(crate) fn configuration(name: &str) -> Result<String, IntegrationError> {
+    crate::runtime_secret::required_configuration(name).map_err(|_| IntegrationError::Unauthorized)
+}
+
 pub(crate) fn extraction_broker(
     timeout: Duration,
 ) -> Result<ExtractionBrokerClient, IntegrationError> {
     ExtractionBrokerClient::new(
-        &env("CONTROL_EXTRACTION_BROKER_URL")?,
+        &crate::runtime_secret::required_configuration("CONTROL_EXTRACTION_BROKER_URL")
+            .map_err(|_| IntegrationError::Unauthorized)?,
         &env("CONTROL_EXTRACTION_BROKER_TOKEN")?,
         timeout,
     )
@@ -1014,7 +1022,7 @@ async fn membership(store: &Store, operation: &LeasedOperation) -> Result<(), In
     }
     let active = row.4 == "active";
     let rauthy = RauthyClient::new(
-        &env("CONTROL_RAUTHY_ADMIN_URL")?,
+        &configuration("CONTROL_RAUTHY_ADMIN_URL")?,
         &env("CONTROL_RAUTHY_ADMIN_KEY")?,
         Duration::from_secs(10),
     )
@@ -1237,7 +1245,7 @@ pub(crate) async fn driver(
         .fetch_one(store.pool())
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
-        sqlx::query("insert into control.tenant_release_adoptions(id,workshop_id,database_id,release_id,registry_version,state,operation_id,target_schema_epoch,started_at,verified_at,activated_at,evidence) select $1,$2,$3,r.id,1,'active',$4,r.schema_epoch,now(),now(),now(),jsonb_build_object('source','tenant_provisioning','release_id',r.id) from control.application_releases r where r.id=$5 and r.status='active' on conflict(workshop_id,database_id,release_id) do nothing")
+        sqlx::query("insert into control.tenant_release_adoptions(id,workshop_id,database_id,release_id,registry_version,state,operation_id,target_schema_epoch,started_at,verified_at,activated_at,evidence) select $1,$2,$3,r.id,(r.manifest->>'capability_registry_version')::integer,'active',$4,r.schema_epoch,now(),now(),now(),jsonb_build_object('source','tenant_provisioning','release_id',r.id,'registry_version',(r.manifest->>'capability_registry_version')::integer) from control.application_releases r join control.capability_registry_versions registry on registry.version=(r.manifest->>'capability_registry_version')::integer and registry.active where r.id=$5 and r.status='active' on conflict(workshop_id,database_id,release_id) do nothing")
             .bind(Uuid::new_v4()).bind(workshop).bind(database_id).bind(operation.id).bind(release_id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
         let adoption_recorded=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.tenant_release_adoptions where workshop_id=$1 and database_id=$2 and release_id=$3 and state='active')")
             .bind(workshop).bind(database_id).bind(release_id).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
@@ -1306,7 +1314,7 @@ pub(crate) async fn driver_request_with_key(
     idempotency_key: &str,
     payload: &Value,
 ) -> Result<Value, IntegrationError> {
-    let url = env("CONTROL_DEPLOYMENT_DRIVER_URL")?;
+    let url = configuration("CONTROL_DEPLOYMENT_DRIVER_URL")?;
     let token = env("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?;
     // First-time Odoo and Paperless initialization can legitimately take several
     // minutes. The operation lease is heartbeated while this request is in flight,
