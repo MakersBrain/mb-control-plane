@@ -131,6 +131,16 @@ mod tests {
     }
 
     #[test]
+    fn required_secret_aliases_are_classified_as_secrets() {
+        let specification = specification().unwrap();
+        assert!(
+            specification
+                .secrets
+                .contains("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
+        );
+    }
+
+    #[test]
     fn startup_gate_rejects_missing_and_placeholder_secrets() {
         let mut values = valid_api_values();
         values.remove("CONTROL_DATABASE_URL");

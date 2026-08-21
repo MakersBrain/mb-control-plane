@@ -1,7 +1,9 @@
 services:
   rauthy:
     environment:
-      LISTEN_SCHEME: https
+      # Keep the private Docker-network discovery endpoint on HTTP while the
+      # tunnel uses the self-signed HTTPS listener for the public origin.
+      LISTEN_SCHEME: http_https
       LISTEN_PORT_HTTPS: "8443"
       PUB_URL: auth.${PUBLIC_DOMAIN}
       PROXY_MODE: "true"

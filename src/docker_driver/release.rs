@@ -127,7 +127,7 @@ pub(super) async fn release_fleet(
         }
     }
 
-    let runtime_container = format!("mb-odoo-{target_slot}");
+    let runtime_container = state.config.docker_resource(format!("odoo-{target_slot}"));
     ensure_release_runtime(
         state,
         &runtime_container,
@@ -313,7 +313,7 @@ async fn rollback_failed_release_tenant(
         ));
     }
 
-    let prior_container = format!("mb-odoo-{prior_slot}");
+    let prior_container = state.config.docker_resource(format!("odoo-{prior_slot}"));
     smoke_release_runtime(state, &prior_container, tenant).await?;
     let route_backup = state
         .config
@@ -437,7 +437,7 @@ async fn prepare_initial_release(
     .await
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError::bad("no reusable initial runtime slot is available"))?;
-    let runtime_container = format!("mb-odoo-{target_slot}");
+    let runtime_container = state.config.docker_resource(format!("odoo-{target_slot}"));
     ensure_release_runtime(
         state,
         &runtime_container,
@@ -678,11 +678,11 @@ async fn materialize_extension(
         &extension.manifest_digest,
         &extension.config_digest,
     )?;
-    let volume = format!(
-        "mb-ext-{}-{}",
+    let volume = state.config.docker_resource(format!(
+        "ext-{}-{}",
         &extension.manifest_digest[7..23],
         &extension.payload_digest[7..23]
-    );
+    ));
     garbage_collect_failed_extension_volumes(state).await?;
     let preparation_lease = acquire_extension_volume_lease(
         state,
@@ -693,7 +693,9 @@ async fn materialize_extension(
     )
     .await?;
     if docker_volume_exists(state, &volume).await? {
-        let verifier = format!("mb-ext-verify-{}", &extension.manifest_digest[7..19]);
+        let verifier = state
+            .config
+            .docker_resource(format!("ext-verify-{}", &extension.manifest_digest[7..19]));
         run_docker_job(state, &verifier, json!({
             "Image":state.config.extension_helper_image,
             "Entrypoint":["/usr/local/bin/control-extension-helper"],
@@ -711,7 +713,9 @@ async fn materialize_extension(
         &extension.payload_digest,
     )
     .await?;
-    let source = format!("mb-ext-source-{}", &extension.manifest_digest[7..19]);
+    let source = state
+        .config
+        .docker_resource(format!("ext-source-{}", &extension.manifest_digest[7..19]));
     if docker_container_exists(state, &source).await? {
         docker_delete_container(state, &source).await?;
     }
@@ -730,7 +734,9 @@ async fn materialize_extension(
         ).await.map_err(|_| DriverError::bad("extension extraction exceeded its time limit"))??;
         // Docker's archive API writes directly into the otherwise empty target
         // volume; no executable from the transport image is ever started.
-        let staging = format!("mb-ext-stage-{}", &extension.manifest_digest[7..19]);
+        let staging = state
+            .config
+            .docker_resource(format!("ext-stage-{}", &extension.manifest_digest[7..19]));
         docker_create_container(state, &staging, json!({
             "Image":state.config.extension_helper_image,
             "Entrypoint":["/bin/false"],"Cmd":[],"NetworkDisabled":true,
@@ -739,7 +745,9 @@ async fn materialize_extension(
         let put = docker_put_archive(state, &staging, "/target", archive).await;
         let cleanup = docker_delete_container(state, &staging).await;
         put?; cleanup?;
-        let helper = format!("mb-ext-helper-{}", &extension.manifest_digest[7..19]);
+        let helper = state
+            .config
+            .docker_resource(format!("ext-helper-{}", &extension.manifest_digest[7..19]));
         run_docker_job(state, &helper, json!({
             "Image":state.config.extension_helper_image,
             "Entrypoint":["/usr/local/bin/control-extension-helper"],
@@ -1161,10 +1169,10 @@ async fn run_odoo_release_upgrade(
     runtime_role: &str,
     runtime_password: &str,
 ) -> Result<(), DriverError> {
-    let container = format!(
-        "mb-release-upgrade-{}",
+    let container = state.config.docker_resource(format!(
+        "release-upgrade-{}",
         &tenant.id.simple().to_string()[..12]
-    );
+    ));
     run_docker_job_with_secrets(
         state,
         &container,

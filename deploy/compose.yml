@@ -1,4 +1,4 @@
-name: mb-control
+name: ${COMPOSE_PROJECT_NAME:-mb-control}
 
 x-migration-env: &migration-env
   CONTROL_DATABASE_URL: "@/run/secrets/control_database_url"
@@ -130,7 +130,8 @@ services:
         chmod 0700 /bootstrap
         chmod 0400 /bootstrap/*.json
     volumes:
-      - ./secrets/rauthy:/source:ro
+      - ${WORKSPACE_RAUTHY_CLIENTS_FILE:-./secrets/rauthy/clients.json}:/source/clients.json:ro
+      - ${WORKSPACE_RAUTHY_API_KEYS_FILE:-./secrets/rauthy/api_keys.json}:/source/api_keys.json:ro
       - ./rauthy:/public:ro
       - rauthy-bootstrap:/bootstrap
     depends_on:
@@ -273,7 +274,7 @@ services:
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
     ports: ["127.0.0.1:${CONTROL_API_PORT:-8080}:8080"]
     volumes:
-      - ./secrets/invitation/public-keys.json:/run/mb-invitation/public-keys.json:ro
+      - ${WORKSPACE_INVITATION_PUBLIC_KEYS_FILE:-./secrets/invitation/public-keys.json}:/run/mb-invitation/public-keys.json:ro
       - privacy-exports:/var/lib/mb/privacy-exports
       - tenant-secrets:/run/mb-secrets:ro
     secrets:
@@ -357,11 +358,12 @@ services:
       DRIVER_EXTENSION_HELPER_IMAGE: mb-control:local
       DRIVER_POSTGRES_IMAGE: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
       DRIVER_PAPERLESS_IMAGE: mb-control-paperless:local
-      DRIVER_RUNTIME_NETWORK: mb-control-runtime
-      DRIVER_ODOO_VOLUME: mb-control-odoo-data
+      DRIVER_WORKSPACE_NAMESPACE: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}
+      DRIVER_RUNTIME_NETWORK: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-runtime
+      DRIVER_ODOO_VOLUME: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-odoo-data
       DRIVER_ODOO_UID: ${ODOO_RUNTIME_UID:-100}
       DRIVER_ODOO_GID: ${ODOO_RUNTIME_GID:-101}
-      DRIVER_BACKUP_VOLUME: mb-control-backups
+      DRIVER_BACKUP_VOLUME: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-backups
       DRIVER_ODOO_DATA_ROOT: /odoo-data
       DRIVER_BACKUP_ROOT: /backups
       DRIVER_BACKUP_AGENT_IMAGE: mb-control-backup:local
@@ -380,14 +382,14 @@ services:
       DRIVER_SECRET_ROOT: /run/mb-secrets
       DRIVER_ODOO_CLIENT_SECRET_ROOT: /run/mb-odoo-client-secrets
       DRIVER_PAPERLESS_CLIENT_SECRET_ROOT: /run/mb-paperless-client-secrets
-      DRIVER_RUNTIME_SECRET_SOURCE: mb-control-backup-secrets
+      DRIVER_RUNTIME_SECRET_SOURCE: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-backup-secrets
       # Development has no recovery secrets: S3 backups are unconfigured here, so
       # nothing ever binds this path. Point it at the real host directory holding
       # the age identity before enabling BACKUP_S3_BUCKET on this stack.
-      DRIVER_RECOVERY_SECRET_SOURCE: /var/empty/mb-recovery-secrets
+      DRIVER_RECOVERY_SECRET_SOURCE: ${WORKSPACE_RECOVERY_SECRET_SOURCE:-/var/empty/mb-recovery-secrets}
       DRIVER_JOB_SECRET_ROOT: /run/mb-backup-secrets/jobs
       DRIVER_ROUTE_ROOT: /routes
-      DRIVER_GATEWAY_CONTAINER: mb-tenant-gateway
+      DRIVER_GATEWAY_CONTAINER: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-tenant-gateway
       DRIVER_ODOO_BASE_URL: http://odoo:8069
       DRIVER_CONTROL_INTERNAL_URL: http://control-api:8080
       DRIVER_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1
@@ -588,7 +590,7 @@ services:
     # though the official entrypoint expands it into argv; release runtimes use
     # the driver's protected complete ODOO_RC instead.
     image: odoo:19@sha256:94a4f480b8039dc9ca2bca9e77e59f97d3311f66e2aad663cf2670be9c66d4ea
-    container_name: mb-shared-odoo
+    container_name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-shared-odoo
     read_only: true
     environment:
       HOST: postgres
@@ -623,7 +625,7 @@ services:
 
   tenant-gateway:
     image: nginx:1.29-alpine
-    container_name: mb-tenant-gateway
+    container_name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-tenant-gateway
     volumes:
       - ./gateway.conf:/etc/nginx/nginx.conf:ro
       - tenant-routes:/etc/nginx/tenants:ro
@@ -634,91 +636,93 @@ services:
     restart: unless-stopped
 
 secrets:
-  cloudflare_tunnel_token: {file: ./secrets/runtime/cloudflare_tunnel_token}
-  control_cloudflare_api_token: {file: ./secrets/runtime/control_cloudflare_api_token}
-  control_mail_scw_secret_key: {file: ./secrets/runtime/control_mail_scw_secret_key}
-  postgres_superuser_password: {file: ./secrets/runtime/postgres_superuser_password}
-  control_postgres_password: {file: ./secrets/runtime/control_postgres_password}
-  control_api_postgres_password: {file: ./secrets/runtime/control_api_postgres_password}
-  control_membership_postgres_password: {file: ./secrets/runtime/control_membership_postgres_password}
-  control_provisioning_postgres_password: {file: ./secrets/runtime/control_provisioning_postgres_password}
-  control_invoice_postgres_password: {file: ./secrets/runtime/control_invoice_postgres_password}
-  control_inventory_postgres_password: {file: ./secrets/runtime/control_inventory_postgres_password}
-  control_email_postgres_password: {file: ./secrets/runtime/control_email_postgres_password}
-  control_reconciliation_postgres_password: {file: ./secrets/runtime/control_reconciliation_postgres_password}
-  control_lifecycle_postgres_password: {file: ./secrets/runtime/control_lifecycle_postgres_password}
-  control_backup_postgres_password: {file: ./secrets/runtime/control_backup_postgres_password}
-  control_driver_postgres_password: {file: ./secrets/runtime/control_driver_postgres_password}
-  control_release_postgres_password: {file: ./secrets/runtime/control_release_postgres_password}
-  control_privacy_postgres_password: {file: ./secrets/runtime/control_privacy_postgres_password}
-  rauthy_postgres_password: {file: ./secrets/runtime/rauthy_postgres_password}
-  odoo_postgres_password: {file: ./secrets/runtime/odoo_postgres_password}
-  rauthy_enc_keys: {file: ./secrets/runtime/rauthy_enc_keys}
-  rauthy_bootstrap_admin_password: {file: ./secrets/runtime/rauthy_bootstrap_admin_password}
-  rauthy_hql_secret_raft: {file: ./secrets/runtime/rauthy_hql_secret_raft}
-  rauthy_hql_secret_api: {file: ./secrets/runtime/rauthy_hql_secret_api}
-  rauthy_config: {file: ./secrets/runtime/rauthy_config.toml}
-  control_internal_token: {file: ./secrets/runtime/control_internal_token}
-  control_metrics_token: {file: ./secrets/runtime/control_metrics_token}
-  control_mail_event_token: {file: ./secrets/runtime/control_mail_event_token}
-  control_release_publish_token: {file: ./secrets/runtime/control_release_publish_token}
-  odoo_bridge_token: {file: ./secrets/runtime/odoo_bridge_token}
-  document_extraction_token: {file: ./secrets/runtime/document_extraction_token}
-  control_rauthy_admin_key: {file: ./secrets/runtime/control_rauthy_admin_key}
-  control_rauthy_deployment_key: {file: ./secrets/runtime/control_rauthy_deployment_key}
-  azure_document_key: {file: ./secrets/runtime/azure_document_key}
-  inventory_openai_key: {file: ./secrets/runtime/inventory_openai_key}
-  inventory_azure_multimodal_key: {file: ./secrets/runtime/inventory_azure_multimodal_key}
-  inventory_gemini_key: {file: ./secrets/runtime/inventory_gemini_key}
-  inventory_claude_key: {file: ./secrets/runtime/inventory_claude_key}
-  inventory_upcitemdb_key: {file: ./secrets/runtime/inventory_upcitemdb_key}
-  mail_webhook_token: {file: ./secrets/runtime/mail_webhook_token}
-  deployment_driver_token: {file: ./secrets/runtime/deployment_driver_token}
-  privacy_driver_token: {file: ./secrets/runtime/privacy_driver_token}
-  control_privacy_lookup_key: {file: ./secrets/runtime/control_privacy_lookup_key}
-  control_privacy_export_key: {file: ./secrets/runtime/control_privacy_export_key}
-  backup_s3_access_key_id: {file: ./secrets/runtime/backup_s3_access_key_id}
-  backup_s3_secret_access_key: {file: ./secrets/runtime/backup_s3_secret_access_key}
-  restore_s3_access_key_id: {file: ./secrets/runtime/restore_s3_access_key_id}
-  restore_s3_secret_access_key: {file: ./secrets/runtime/restore_s3_secret_access_key}
-  backup_age_recipient: {file: ./secrets/runtime/backup_age_recipient}
-  control_database_url: {file: ./secrets/runtime/control_database_url}
-  control_api_database_url: {file: ./secrets/runtime/control_api_database_url}
-  control_membership_database_url: {file: ./secrets/runtime/control_membership_database_url}
-  control_provisioning_database_url: {file: ./secrets/runtime/control_provisioning_database_url}
-  control_invoice_database_url: {file: ./secrets/runtime/control_invoice_database_url}
-  control_inventory_database_url: {file: ./secrets/runtime/control_inventory_database_url}
-  control_email_database_url: {file: ./secrets/runtime/control_email_database_url}
-  control_reconciliation_database_url: {file: ./secrets/runtime/control_reconciliation_database_url}
-  control_lifecycle_database_url: {file: ./secrets/runtime/control_lifecycle_database_url}
-  control_backup_database_url: {file: ./secrets/runtime/control_backup_database_url}
-  control_driver_database_url: {file: ./secrets/runtime/control_driver_database_url}
-  control_release_database_url: {file: ./secrets/runtime/control_release_database_url}
-  control_privacy_database_url: {file: ./secrets/runtime/control_privacy_database_url}
-  postgres_admin_database_url: {file: ./secrets/runtime/postgres_admin_database_url}
+  cloudflare_tunnel_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/cloudflare_tunnel_token"}
+  control_cloudflare_api_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_cloudflare_api_token"}
+  control_mail_scw_secret_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_mail_scw_secret_key"}
+  postgres_superuser_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/postgres_superuser_password"}
+  control_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_postgres_password"}
+  control_api_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_api_postgres_password"}
+  control_membership_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_membership_postgres_password"}
+  control_provisioning_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_provisioning_postgres_password"}
+  control_invoice_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_invoice_postgres_password"}
+  control_inventory_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_inventory_postgres_password"}
+  control_email_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_email_postgres_password"}
+  control_reconciliation_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_reconciliation_postgres_password"}
+  control_lifecycle_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_lifecycle_postgres_password"}
+  control_backup_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_backup_postgres_password"}
+  control_driver_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_driver_postgres_password"}
+  control_release_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_release_postgres_password"}
+  control_privacy_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_privacy_postgres_password"}
+  rauthy_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_postgres_password"}
+  odoo_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/odoo_postgres_password"}
+  rauthy_enc_keys: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_enc_keys"}
+  rauthy_bootstrap_admin_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_bootstrap_admin_password"}
+  rauthy_hql_secret_raft: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_hql_secret_raft"}
+  rauthy_hql_secret_api: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_hql_secret_api"}
+  rauthy_config: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/rauthy_config.toml"}
+  control_internal_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_internal_token"}
+  control_metrics_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_metrics_token"}
+  control_mail_event_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_mail_event_token"}
+  control_release_publish_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_release_publish_token"}
+  odoo_bridge_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/odoo_bridge_token"}
+  document_extraction_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/document_extraction_token"}
+  control_rauthy_admin_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_rauthy_admin_key"}
+  control_rauthy_deployment_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_rauthy_deployment_key"}
+  azure_document_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/azure_document_key"}
+  inventory_openai_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/inventory_openai_key"}
+  inventory_azure_multimodal_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/inventory_azure_multimodal_key"}
+  inventory_gemini_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/inventory_gemini_key"}
+  inventory_claude_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/inventory_claude_key"}
+  inventory_upcitemdb_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/inventory_upcitemdb_key"}
+  mail_webhook_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/mail_webhook_token"}
+  deployment_driver_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/deployment_driver_token"}
+  privacy_driver_token: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/privacy_driver_token"}
+  control_privacy_lookup_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_privacy_lookup_key"}
+  control_privacy_export_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_privacy_export_key"}
+  backup_s3_access_key_id: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/backup_s3_access_key_id"}
+  backup_s3_secret_access_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/backup_s3_secret_access_key"}
+  restore_s3_access_key_id: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/restore_s3_access_key_id"}
+  restore_s3_secret_access_key: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/restore_s3_secret_access_key"}
+  backup_age_recipient: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/backup_age_recipient"}
+  control_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_database_url"}
+  control_api_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_api_database_url"}
+  control_membership_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_membership_database_url"}
+  control_provisioning_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_provisioning_database_url"}
+  control_invoice_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_invoice_database_url"}
+  control_inventory_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_inventory_database_url"}
+  control_email_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_email_database_url"}
+  control_reconciliation_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_reconciliation_database_url"}
+  control_lifecycle_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_lifecycle_database_url"}
+  control_backup_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_backup_database_url"}
+  control_driver_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_driver_database_url"}
+  control_release_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_release_database_url"}
+  control_privacy_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_privacy_database_url"}
+  postgres_admin_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/postgres_admin_database_url"}
 
 networks:
   default:
-    name: mb-control-runtime
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-runtime
 
 volumes:
-  control-postgres: {}
-  rauthy-bootstrap: {}
+  control-postgres:
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-control-postgres
+  rauthy-bootstrap:
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-rauthy-bootstrap
   odoo-data:
-    name: mb-control-odoo-data
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-odoo-data
   shared-redis:
-    name: mb-control-redis-data
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-redis-data
   tenant-routes:
-    name: mb-control-tenant-routes
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-tenant-routes
   tenant-secrets:
-    name: mb-control-tenant-secrets
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-tenant-secrets
   paperless-client-secrets:
-    name: mb-control-paperless-client-secrets
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-paperless-client-secrets
   odoo-client-secrets:
-    name: mb-control-odoo-client-secrets
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-odoo-client-secrets
   backup-data:
-    name: mb-control-backups
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-backups
   backup-secrets:
-    name: mb-control-backup-secrets
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-backup-secrets
   privacy-exports:
-    name: mb-control-privacy-exports
+    name: ${WORKSPACE_DOCKER_NAMESPACE:-mb-control}-privacy-exports

@@ -20,7 +20,10 @@ def main() -> int:
     secret_names = set(specification["secrets"])
     compose = (DEPLOY / "compose.yml").read_text()
     expected_files = set(
-        re.findall(r"\{file: \./secrets/runtime/([a-z0-9_.-]+)\}", compose)
+        re.findall(
+            r'\{file: "\$\{WORKSPACE_SECRET_ROOT:-\./secrets/runtime\}/([a-z0-9_.-]+)"\}',
+            compose,
+        )
     )
     with tempfile.TemporaryDirectory(prefix="mb-secret-bootstrap-") as directory:
         target = Path(directory) / ".env"

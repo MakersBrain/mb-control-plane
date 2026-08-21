@@ -100,6 +100,7 @@ pub struct DockerDriverConfig {
     extension_helper_image: String,
     postgres_image: String,
     paperless_image: Option<String>,
+    workspace_namespace: String,
     docker_network: String,
     odoo_volume: String,
     odoo_uid: u32,
@@ -273,6 +274,23 @@ impl DockerDriverConfig {
                 );
             }
         }
+        let workspace_namespace = required("DRIVER_WORKSPACE_NAMESPACE")?;
+        if container_runtime == ContainerRuntimeKind::Docker
+            && !matches!(
+                workspace_namespace.as_str(),
+                "mb-control" | "mb-dev1" | "mb-dev2" | "mb-dev3" | "mb-dev4"
+            )
+        {
+            anyhow::bail!(
+                "DRIVER_WORKSPACE_NAMESPACE must be mb-control or mb-dev1 through mb-dev4 for Docker"
+            );
+        }
+        if !workspace_namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            anyhow::bail!("DRIVER_WORKSPACE_NAMESPACE contains unsafe characters");
+        }
         Ok(Self {
             listen: required("DRIVER_LISTEN")?.parse()?,
             token,
@@ -300,6 +318,7 @@ impl DockerDriverConfig {
             paperless_image: std::env::var("DRIVER_PAPERLESS_IMAGE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            workspace_namespace,
             docker_network: required("DRIVER_RUNTIME_NETWORK")?,
             odoo_volume: required("DRIVER_ODOO_VOLUME")?,
             odoo_uid: required("DRIVER_ODOO_UID")?.parse()?,
@@ -333,6 +352,10 @@ impl DockerDriverConfig {
             Some(port) => format!("{}://{hostname}:{port}", self.public_scheme),
             None => format!("{}://{hostname}", self.public_scheme),
         }
+    }
+
+    fn docker_resource(&self, suffix: impl AsRef<str>) -> String {
+        format!("{}-{}", self.workspace_namespace, suffix.as_ref())
     }
 }
 
@@ -946,7 +969,7 @@ async fn provision(
         {
             let paperless_database = format!("pl_{compact}");
             let paperless_role = paperless_database.clone();
-            let paperless_container = format!("mb-paperless-{compact}");
+            let paperless_container = state.config.docker_resource(format!("paperless-{compact}"));
             let redis_user = format!("pl_{compact}");
             let redis_prefix = format!("mb:{compact}:");
             let paperless_runtime = driver_runtime_secret_root(state)
@@ -1259,11 +1282,14 @@ fn write_protected_configuration(path: &Path, value: &str) -> std::io::Result<()
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(0o640)
             .open(&temporary)?;
         std::io::Write::write_all(&mut file, value.as_bytes())?;
         file.sync_all()?;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        // Docker jobs run as the image's unprivileged user and are explicitly
+        // added to group 0.  Keep the configuration private to root and that
+        // group, matching the other ephemeral job-secret files.
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o640))?;
         std::fs::rename(&temporary, path)?;
         std::fs::File::open(parent)?.sync_all()
     })();
@@ -1439,20 +1465,10 @@ async fn run_docker_job_with_secrets(
     secure_directory(&directory).map_err(DriverError::internal)?;
     let result = async {
         for (name, value) in secrets {
-            if name.is_empty()
-                || name.len() > 64
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'_'))
-            {
+            if !valid_job_secret_name(name) {
                 return Err(DriverError::internal("invalid job-secret name"));
             }
-            if *name == "odoo.conf" {
-                write_protected_configuration(&directory.join(name), value)
-                    .map_err(DriverError::internal)?;
-            } else {
-                write_secret(&directory.join(name), value).map_err(DriverError::internal)?;
-            }
+            write_job_secret(&directory, name, value).map_err(DriverError::internal)?;
         }
         let host = body
             .get_mut("HostConfig")
@@ -1492,6 +1508,34 @@ async fn run_docker_job_with_secrets(
         (Err(error), Ok(())) => Err(error),
         (_, Err(error)) => Err(error),
     }
+}
+
+fn write_job_secret(directory: &Path, name: &str, value: &str) -> std::io::Result<()> {
+    if name == "odoo.conf" {
+        return write_protected_configuration(&directory.join(name), value);
+    }
+    let path = directory.join(name);
+    write_secret(&path, value)?;
+    if name == "pgpass" {
+        use std::os::unix::fs::PermissionsExt;
+        // libpq rejects password files readable by any group, including the
+        // explicitly granted job-secret group.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn valid_job_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
 }
 
 fn copy_directory(
@@ -1545,6 +1589,49 @@ fn directory_size(path: &Path) -> std::io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_secret_leaf_accepts_odoo_configuration_without_allowing_paths() {
+        for valid in ["odoo.conf", "pgpass", "aws-access-key-id"] {
+            assert!(valid_job_secret_name(valid), "{valid}");
+        }
+        for invalid in ["", ".", "..", ".hidden", "trailing.", "a..b", "a/b"] {
+            assert!(!valid_job_secret_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn protected_job_configuration_is_readable_only_by_root_and_its_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("mb-job-config-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("odoo.conf");
+        write_protected_configuration(&target, "[options]\ndb_user = odoo\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn postgres_job_password_file_is_private_to_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("mb-job-pgpass-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        write_job_secret(&root, "pgpass", "postgres:5432:*:postgres:password").unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("pgpass"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn docker_secret_mount_uses_a_named_volume_subpath() {

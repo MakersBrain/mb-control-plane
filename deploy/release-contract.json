@@ -8,8 +8,8 @@
     "sha256": "a6d49252dd8a990409c270c5b492c3922dbc95ae112fdddc77e60bf481f13273"
   },
   "release": "0.1.0",
-  "schema_release": "0001_control_plane_base",
-  "schema_compatibility": "=0001_control_plane_base",
+  "schema_release": "0003_workspace_extension_volume_names",
+  "schema_compatibility": "=0003_workspace_extension_volume_names",
   "staging_qualification": {
     "builder": "podman/qualification.py",
     "environment": "synthetic-only staging",
@@ -409,6 +409,7 @@
       "DRIVER_ENVIRONMENT",
       "DRIVER_CONTAINER_RUNTIME",
       "DRIVER_RUNTIME_SOCKET",
+      "DRIVER_WORKSPACE_NAMESPACE",
       "DRIVER_LISTEN",
       "DRIVER_TOKEN",
       "DRIVER_PRIVACY_TOKEN",
@@ -750,7 +751,7 @@
     ]
   },
   "rollback": {
-    "application": "requires an application release for control-plane schema epoch 0001_control_plane_base",
+    "application": "requires an application release for control-plane schema epoch 0003_workspace_extension_volume_names",
     "database": "no cross-epoch rollback; destroy the disposable topology and recreate a blank database with one matching code epoch"
   },
   "postgresql_recovery": {

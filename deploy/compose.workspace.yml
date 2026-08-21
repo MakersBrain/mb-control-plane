@@ -1,0 +1,65 @@
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export MINIO_ROOT_USER="$$(cat /run/secrets/minio_root_user)"
+        export MINIO_ROOT_PASSWORD="$$(cat /run/secrets/minio_root_password)"
+        exec minio server /data --console-address :9001
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:?MINIO_API_PORT is required}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:?MINIO_CONSOLE_PORT is required}:9001"
+    volumes: [minio-data:/data]
+    secrets: [minio_root_user, minio_root_password]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-07-21T05-28-08Z
+    entrypoint: ["/bin/sh", "/run/mb/minio-init.sh"]
+    environment:
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?BACKUP_S3_BUCKET is required}
+    volumes:
+      - ./minio-init.sh:/run/mb/minio-init.sh:ro
+    secrets:
+      - minio_root_user
+      - minio_root_password
+      - backup_s3_access_key_id
+      - backup_s3_secret_access_key
+      - restore_s3_access_key_id
+      - restore_s3_secret_access_key
+    depends_on:
+      minio: {condition: service_healthy}
+    restart: "no"
+
+  docker-driver:
+    environment:
+      BACKUP_S3_ENDPOINT: http://minio:9000
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?BACKUP_S3_BUCKET is required}
+      BACKUP_S3_REGION: us-east-1
+      BACKUP_AGE_IDENTITY_FILE: /run/mb-recovery-secrets/BACKUP_AGE_IDENTITY
+      BACKUP_ENCRYPTION_KEY_ID: ${BACKUP_ENCRYPTION_KEY_ID:?BACKUP_ENCRYPTION_KEY_ID is required}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    depends_on:
+      minio-init: {condition: service_completed_successfully}
+
+  backup-scheduler:
+    environment:
+      CONTROL_BACKUP_SCHEDULER_ENABLED: "true"
+    depends_on:
+      minio-init: {condition: service_completed_successfully}
+
+secrets:
+  minio_root_user:
+    file: ${WORKSPACE_EXPORT_ROOT:?WORKSPACE_EXPORT_ROOT is required}/storage-admin/MINIO_ROOT_USER
+  minio_root_password:
+    file: ${WORKSPACE_EXPORT_ROOT:?WORKSPACE_EXPORT_ROOT is required}/storage-admin/MINIO_ROOT_PASSWORD
+
+volumes:
+  minio-data:
+    name: ${WORKSPACE_DOCKER_NAMESPACE:?WORKSPACE_DOCKER_NAMESPACE is required}-minio-data
