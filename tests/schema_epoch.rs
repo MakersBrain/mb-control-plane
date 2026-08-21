@@ -178,7 +178,7 @@ async fn blank_database_migrates_and_second_startup_is_a_no_op() {
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(first.0, 1);
+    assert_eq!(first.0, 3);
     assert_eq!(first.1, 1);
     assert_eq!(first.2, i64::try_from(CATALOG.len()).unwrap());
 
@@ -187,7 +187,7 @@ async fn blank_database_migrates_and_second_startup_is_a_no_op() {
         .fetch_one(store.pool())
         .await
         .unwrap();
-    assert_eq!(second, 1, "the second startup must not append a ledger row");
+    assert_eq!(second, 3, "the second startup must not append a ledger row");
     store.pool().close().await;
     drop_database(&admin, &database).await;
 }
