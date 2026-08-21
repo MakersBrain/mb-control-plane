@@ -1394,16 +1394,9 @@ async fn seed_membership_targets(
 }
 
 fn http_client(token: &str, timeout: Duration) -> Result<reqwest::Client, IntegrationError> {
-    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+    let socket = crate::deployment_driver_transport::configured_socket()
         .map_err(|_| IntegrationError::ContractDrift)?;
-    value.set_sensitive(true);
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, value);
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    crate::deployment_driver_transport::client(Some(token), timeout, socket.as_deref())
         .map_err(|_| IntegrationError::ContractDrift)
 }
 fn super_classify(status: reqwest::StatusCode) -> IntegrationError {

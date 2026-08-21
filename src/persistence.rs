@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0003_workspace_extension_volume_names";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0004_paperless_runtime_spec";
 
 #[derive(Clone)]
 pub struct Store {

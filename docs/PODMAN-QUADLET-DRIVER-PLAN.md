@@ -1,443 +1,252 @@
 # Podman/Quadlet deployment-driver plan
 
-Status: proposed, design review incorporated
+Status: proposed, core delivery scope
+
+Related optional work:
+`docs/PODMAN-QUADLET-DRIVER-FOLLOWUPS.md`
 
 Repositories:
 
-- `mb-control-plane`: authenticated driver contract, durable operation logic,
-  desired-state reconciliation and the Docker development backend;
-- `mb-infra`: production placement, host identity, Quadlet rendering, rootless
-  systemd integration and deployment qualification.
+- `mb-control-plane`: driver contract, durable operations, runtime backend and
+  Docker development implementation;
+- `mb-infra`: production host identity, systemd units, Quadlet layout, release
+  grants and deployment qualification.
 
 ## 1. Objective
 
-Replace the current production Podman compatibility-socket implementation with
-a rootless, systemd-managed Quadlet backend without changing the authenticated
-control-plane driver contract.
+Move staging and production dynamic workloads from raw Podman compatibility-API
+containers to rootless Podman Quadlets managed by user systemd.
 
-Before introducing Quadlet, repair Docker reboot behavior and extract one
-backend-neutral desired-state reconciler. Docker and Quadlet must implement the
-same resource, idempotency, recovery and readiness semantics even though their
-runtime mechanisms differ.
+The migration must first fix the existing Docker reboot gap, preserve the
+current authenticated and idempotent HTTP driver contract, and avoid building a
+second orchestration service.
 
-The final design must ensure:
+The completed core plan provides:
 
-- Docker remains a development-only backend;
-- staging and production do not mount `docker.sock` or `podman.sock` into an
-  application container;
-- long-running Paperless and Odoo runtime resources survive host reboot;
-- only the recorded active Odoo slot returns after reboot;
-- one-shot jobs never restart automatically;
-- missing dynamic containers or units can be reconstructed from non-secret
-  durable intent and protected secret files;
-- static platform rollback does not delete dynamic tenant resources;
-- the driver remains able to accept repair commands while a managed tenant
-  runtime is degraded;
-- public tenant traffic remains on a validated maintenance route until runtime
-  reconciliation completes;
-- control-plane and host-agent journals converge after every interruption
-  without requiring a distributed transaction;
-- the active and retained previous control/agent protocol versions and release
-  grants remain compatible throughout the rollback window;
-- authorized operators can inspect a bounded live log stream for an allowlisted
-  runtime resource without receiving arbitrary runtime or journal access;
-- every backend passes the same driver contract and failure-recovery suite.
+- Docker as a development-only backend;
+- a native rootless production driver managed by `mb-infra`;
+- no Docker or Podman API socket in staging or production;
+- Docker reboot recovery for dynamic Paperless and active Odoo containers;
+- persistent Paperless and Odoo Quadlets that survive reboot;
+- one-shot jobs that never restart automatically;
+- a fail-closed tenant gateway during boot and runtime switching;
+- active and previous release support for bounded rollback;
+- one PostgreSQL driver operation ledger, not a second host journal;
+- common contract and failure tests across Docker and Quadlet.
 
-## 2. Current state and gap
+Live log streaming, centralized log retention, a generic observation history,
+multi-cluster placement and a separate host agent are deliberately outside the
+critical migration. They are described in the follow-up plan.
 
-`control-container-driver` and `control-docker-driver` currently execute the
-same Rust implementation. The selected `DRIVER_CONTAINER_RUNTIME` changes the
-Docker-compatible API version and socket, but does not change the orchestration
-model.
+## 2. Current state and concrete gaps
 
-In development, Docker Compose manages static services with
-`restart: unless-stopped`. Dynamic Paperless containers and Odoo blue/green
-runtime containers are created through the Docker Engine API without an
-explicit restart policy, so Docker applies its default `no` policy. Their
-volumes and secret files survive a reboot, but the containers remain stopped.
+`control-container-driver` and `control-docker-driver` currently run the same
+Rust implementation. `DRIVER_CONTAINER_RUNTIME` changes only the
+Docker-compatible API version and socket.
 
-Driver startup currently:
+### 2.1 Docker reboot gap
 
-- removes stale job-secret directories;
-- repairs interrupted PostgreSQL connection limits;
-- repairs retained maintenance route files.
+Static Compose services use `restart: unless-stopped`. Dynamic Paperless and
+Odoo blue/green containers are created without a restart policy, so Docker uses
+its default `no` policy. After a host or Docker daemon restart:
 
-It does not perform a complete reconciliation of Paperless resources, active
-Odoo slots, restart policies or gateway routing before reporting liveness.
+- volumes and protected secret files remain;
+- the driver and static Compose services restart;
+- dynamic Paperless and release-specific Odoo containers remain stopped;
+- driver startup repairs database limits and maintenance routes but does not
+  restore the complete dynamic runtime.
 
-In staging and production, `mb-infra` runs the driver in a Quadlet container
-that mounts the rootless Podman API socket. The driver creates long-running
-tenant containers through Podman's Docker compatibility API, leaving those
-containers outside systemd/Quadlet ownership. `mb-infra` also renders a static
-`odoo.service`, while the release driver creates `mb-odoo-blue` and
-`mb-odoo-green`, resulting in conflicting runtime ownership.
+### 2.2 Production ownership gap
+
+`mb-infra` renders static Quadlets but runs `control-container-driver` in a
+container with the rootless Podman API socket. The driver creates long-running
+tenant resources outside Quadlet/systemd ownership.
+
+`mb-infra` also renders static `odoo.service`, while the release driver creates
+`mb-odoo-blue` and `mb-odoo-green`. The migration must establish one owner for
+the shared Odoo runtime slots.
 
 ## 3. Target architecture
 
 ```text
-control workers
-      |
-      | authenticated HTTP + idempotency key
-      v
-control-container-driver                    mb-control-plane
-      |
-      | versioned, authenticated Unix protocol
-      v
-makersbrain-quadlet-agent                   mb-infra host user service
-      |
-      +-- atomic Quadlet generation
-      +-- systemctl --user lifecycle
-      +-- typed one-shot jobs
-      +-- platform-release allowlist
-      +-- local action journal
-             |
-             v
-rootless Podman + user systemd
-      +-- Odoo blue/green Quadlets
-      +-- per-workshop Paperless Quadlets
-      +-- per-workshop volume Quadlets
-      +-- transient job Quadlets
-      +-- static mb-infra release Quadlets
+control API and workers
+        |
+        | authenticated HTTP over a protected Unix socket
+        v
+control-container-driver
+native tenant-runtime user service
+        |
+        +-- DockerBackend in development only
+        |
+        +-- QuadletBackend in staging/production
+                |
+                +-- atomic dynamic Quadlet files
+                +-- systemctl --user lifecycle
+                +-- typed podman/systemd one-shot jobs
+                +-- gateway route validation/reload
 ```
 
-The control plane decides which tenant operation is required. Infrastructure
-alone decides how an approved operation becomes a rootless Quadlet/systemd
-resource.
+There is no separate Quadlet agent or second action journal. `mb-infra` owns how
+the production driver binary is installed, sandboxed, configured and rolled
+back. `mb-control-plane` owns the binary and its behavior.
 
-### 3.1 Ownership
+### 3.1 Production connectivity
 
-| Concern | Owner |
-| --- | --- |
-| Public driver HTTP routes and payload semantics | `mb-control-plane` |
-| Command admission, desired state and control PostgreSQL ledger | `mb-control-plane` |
-| Tenant provisioning, recovery and fleet release logic | `mb-control-plane` |
-| Backend-neutral desired-state reconciler | `mb-control-plane` |
-| Operator log authorization, audit metadata and SSE delivery | `mb-control-plane` |
-| Docker development backend | `mb-control-plane` |
-| Versioned Quadlet-agent client | `mb-control-plane` |
-| Host-agent service and Unix socket | `mb-infra` |
-| Dynamic Quadlet templates and policy validation | `mb-infra` |
-| Idempotent host-effect journal and systemd execution | `mb-infra` |
-| Exact-unit journald reads and bounded diagnostic streaming | `mb-infra` |
-| Active/retained platform execution-grant set | composed releases in `mb-infra` |
-| Staging and production qualification evidence | `mb-infra` |
+The native driver uses a systemd socket unit below the `tenant-runtime` runtime
+directory. The socket is mode `0660`, owned by `tenant-runtime` and one dedicated
+driver-client group. Only API, worker and scheduler Quadlets that need the
+existing driver contract receive that supplemental group and mount the exact
+socket. The Podman user/group mapping must preserve the supplemental group and
+is qualified with the production Quadlets. No other service receives the group.
 
-## 4. Phase 0: Docker reboot safety and desired-state foundation
+Existing bearer credentials remain required; socket membership is an additional
+boundary, not a replacement for authentication.
 
-This is the first implementation milestone. It fixes an existing development
-reboot gap and creates the semantic foundation for Quadlet.
+The control-plane HTTP client must support both:
 
-### 4.1 Persist reconstructable runtime intent without a second authority
+- TCP URLs for local Docker development;
+- HTTP over the configured Unix socket for staging and production.
 
-Restart policies can restart an existing container but cannot recreate a
-missing one. Persist one non-secret desired specification for every long-lived
-dynamic resource.
+The native driver needs bounded access to existing internal services:
 
-Do not introduce an independently writable generic intent table. Extend the
-existing domain records and expose one read-only projection to the driver:
+- PostgreSQL remains certificate-validated through its configured address;
+- Redis exposes a host Unix socket owned only by `tenant-runtime` for ACL
+  administration while retaining its private container-network TCP listener;
+- Rauthy and the internal control API expose authenticated loopback-only host
+  ports, or an equivalent protected Unix transport where supported;
+- Odoo candidate smoke checks use fixed loopback-only slot ports or a typed
+  `podman exec`/probe job that does not place credentials in argv.
 
-1. `control.service_instances` remains authoritative for tenant services. Add
-   closed `desired_runtime_state`, `runtime_spec`, `runtime_spec_digest` and
-   `runtime_generation` fields for Paperless. Constrain state to `running`,
-   `stopped` or `absent`, require a positive monotonically increasing
-   generation and validate the JSON structure in application admission plus a
-   database shape check.
-2. `control.runtime_release_slots` remains authoritative for Odoo slots. Its
-   existing slot state maps to runtime intent; do not copy it into another
-   independently writable table.
-3. Create a read-only `control.driver_runtime_intents` view that normalizes the
-   two sources into `resource_key`, `resource_kind`, `desired_state`,
-   `specification`, `specification_digest` and `generation`.
-4. Store backend observations separately in a driver-owned
-   `control.runtime_resource_observations` table. Observations can never change
-   desired state and are replaceable evidence, not authority.
+No internal administration endpoint may bind a public address. Every HTTP
+endpoint retains its existing scoped authentication.
 
-The API or owning worker writes domain state and its runtime specification in
-the same PostgreSQL transaction that admits the corresponding durable
-operation. The provisioning, reconciliation and lifecycle workers own
-Paperless desired-state transitions. The release worker owns Odoo slot
-transitions. The driver receives `SELECT` on the normalized intent view and
-bounded insert/update rights on observations only.
+### 3.2 Native service sandbox
 
-Every transition uses compare-and-set on `runtime_generation`. The reconciler
-reads a generation, acquires the resource lock, rereads the row and abandons
-the stale action if the generation changed. Database constraints and tests must
-prove that one resource key maps to one authoritative domain record.
+`mb-infra` installs the driver as a `tenant-runtime` user service with:
 
-For Paperless, persist:
+- `NoNewPrivileges=yes`;
+- an explicit systemd credential set;
+- a read-only system filesystem except for exact dynamic Quadlet, route,
+  backup, tenant-secret and state paths;
+- a private temporary directory;
+- a bounded process/file-descriptor limit;
+- restricted address families and system calls compatible with PostgreSQL,
+  HTTP, Unix sockets, systemd and rootless Podman;
+- no login shell or host-root authority;
+- journald rate limits and secret-safe logging.
 
-- workshop ID;
-- deterministic container and volume names;
-- database name and database role;
-- Redis username and key/channel prefix;
-- public hostname;
-- OIDC client ID;
-- digest-pinned image reference outside development;
-- expected secret paths and secret-boundary version;
-- configuration digest computed only from non-secret specification fields;
-- desired state.
+The service has the same rootless Podman-user authority that the current socket
+mount provides, but no container-runtime daemon socket and no extra RPC layer.
 
-Database passwords, Redis passwords, OIDC secrets, Django secrets, admin
-passwords and bridge credentials remain only in protected tenant secret files.
-The specification contains their expected paths and secret generation IDs,
-never their values or unkeyed hashes of their values. Secret rotation advances
-the generation and therefore the non-secret configuration digest. If a value
-must be compared during a transition, compare it in memory or use a keyed MAC
-whose key is not stored in PostgreSQL; do not persist a reusable credential
-verifier.
+## 4. Phase 1: repair Docker reboot behavior
 
-Odoo reconstruction should use existing application-release manifests,
-`runtime_release_slots`, extension-volume records and protected release
-configuration files. Persist only additional non-secret information required
-to recreate an identical container.
+This is the first implementation milestone and can ship independently.
 
-Existing successful service rows must be backfilled before enabling boot
-reconstruction. A first-time provision that creates an external resource but
-disconnects before the worker commits its result remains recoverable through
-the existing operation and backend host-effect idempotency record (the Docker
-driver ledger initially, the agent journal later); boot reconciliation must not
-invent a desired resource absent from authoritative domain state.
+### 4.1 Explicit restart policies
 
-### 4.2 Add explicit Docker restart policies
-
-Update dynamic container creation in `src/docker_driver/services.rs` and
-`src/docker_driver/release.rs`.
+Update dynamic Docker create requests:
 
 | Resource | Restart policy |
 | --- | --- |
-| Paperless with desired state `running` | `unless-stopped` |
+| Enabled Paperless service | `unless-stopped` |
 | Active Odoo slot | `unless-stopped` |
-| Candidate Odoo slot | `no` while prepared or verified |
+| Candidate Odoo slot | `no` |
 | Retained, inactive or failed Odoo slot | `no` |
-| Migration, backup, restore and initialization jobs | `no` |
+| Migration, initialization, backup and restore job | `no` |
 
-Add a Docker backend operation that updates an existing container's restart
-policy. During an Odoo activation:
+Add a backend operation to update the restart policy of an existing container.
+During an Odoo activation, set the candidate to `unless-stopped` before opening
+tenant traffic and set the retained slot to `no` before deliberately stopping
+it.
 
-1. prepare and verify the candidate with restart policy `no`;
-2. persist the activation intent;
-3. place tenant ingress behind the validated cutover/maintenance gate;
-4. set the candidate container to `unless-stopped` and observe that policy;
-5. atomically activate and verify gateway routes;
-6. mark the new slot active and the old slot retained in one database
-   transaction;
-7. set the old container to `no` and observe that policy;
-8. open the traffic gate only after the database state, gateway digest and new
-   runtime observation agree;
-9. stop the old container when its retention state permits it.
+### 4.2 Startup reconciliation
 
-The persisted activation intent records each boundary. The reconciler repairs
-restart-policy or route drift if the process terminates between steps. Until it
-does, ingress remains on maintenance or the last completely committed route;
-it must never expose a route whose selected runtime is not observed healthy.
+Add one bounded startup pass after the current database-limit repair. Fold the
+existing maintenance-route recovery into the final validated route
+reconstruction; it must not reopen a saved route before runtime health is
+known:
 
-### 4.3 Add a backend-neutral boot reconciler
+1. read the active slot and any non-terminal release operation;
+2. ensure the active slot is running with `unless-stopped`;
+3. ensure retained, inactive and failed slots use `no` and remain stopped;
+4. leave `starting`, `verifying` and `prepared` candidates to the durable release
+   operation: startup neither resumes nor stops them and keeps tenant traffic on
+   maintenance until that operation reconciles its postcondition;
+5. find Paperless service instances expected to run and start their existing
+   matching containers;
+6. verify configuration labels before starting anything;
+7. leave unknown containers untouched and report them;
+8. validate the gateway route digest;
+9. open tenant routes only after the active runtime is observed healthy and no
+   release operation still owns a candidate transition.
 
-Extract a shared runtime boundary, for example:
+The first Docker fix does not need a generic runtime-intent table or complete
+missing-container reconstruction. A reboot does not delete containers. Existing
+periodic durable tenant reconciliation remains the drift-repair mechanism.
 
-```text
-src/container_runtime/
-  mod.rs
-  observation.rs
-  reconcile.rs
-  docker.rs
-  quadlet_agent.rs     added in a later phase
-```
+If a known container is missing, startup reports degraded state and leaves
+tenant traffic on maintenance. Reconstructing a deleted resource is added only
+when the Quadlet desired-state representation exists.
 
-Run boot reconciliation after the existing connection-limit and maintenance
-route repairs and before driver readiness.
+### 4.3 Readiness and traffic safety
 
-The reconciler must:
+`/health/live` remains process-only. `/health/ready` means the driver can accept,
+journal and execute repair commands. A degraded managed resource does not make
+the driver unavailable.
 
-1. load the recorded active Odoo slot;
-2. inspect both deterministic Odoo slot resources;
-3. ensure exactly the active slot is running and reboot-enabled;
-4. keep retained, inactive and failed slots stopped;
-5. load Paperless runtime intents;
-6. ensure every `running` Paperless resource exists, matches its specification
-   digest and becomes healthy;
-7. keep `stopped` resources stopped;
-8. report unknown or orphaned resources without automatically deleting them;
-9. validate and restore the intended gateway route digest;
-10. reconcile interrupted database limits and maintenance routes;
-11. remove abandoned job secrets only after proving no corresponding job is
-    running;
-12. record a completed reconciliation generation.
+Before the gateway binds its tenant listener, one small prerequisite service
+removes every generated tenant `*.conf` from the gateway include directory and
+installs one validated default maintenance response. All removed routes are
+derivable from control-plane state. The gateway depends on that prerequisite;
+the driver still depends on the gateway. The prerequisite has no database
+access, journal or reconciliation logic and never reconstructs routes.
 
-If a long-running container is missing, recreate it from the persisted
-non-secret specification. Require all referenced volumes and secret files to
-exist. A missing secret, image, volume or release identity is a fail-closed
-error; boot reconciliation must never generate replacement credentials.
+Startup reconciliation atomically installs active tenant routes only after the
+recorded slot, image/configuration labels, health and route digest agree.
+Operator, API and authentication routes remain reachable for repair.
 
-If no valid active Odoo slot exists, the driver remains command-ready so an
-authorized release or recovery action can repair it, but tenant ingress remains
-on maintenance. A pristine installation with no provisioned workshop and no
-active application release is reported separately from a degraded established
-installation.
+### 4.4 Docker tests
 
-### 4.4 Add periodic reconciliation
+Tests must prove:
 
-Startup reconciliation alone does not handle a Docker daemon restart while the
-driver process remains alive.
-
-Add a background loop that:
-
-- runs at a bounded 30-60 second interval;
-- uses mandatory per-resource locks for Paperless and individual slots plus a
-  fleet-wide lock only for route/slot activation;
-- retries with exponential backoff while Docker is unavailable;
-- reconciles immediately after the Docker socket reconnects;
-- does not mutate a resource owned by an in-flight fleet, lifecycle or recovery
-  action;
-- records drift and repair metrics without secret values.
-
-The loop must not hold a global lock while waiting for container health. It
-reads the desired generation, acquires the narrow lock, rereads the generation,
-performs the mutation and releases the lock before long observation polling
-where safe. A final generation check prevents stale observations from being
-committed.
-
-Every successful action should also reconcile and observe the affected
-resource before returning.
-
-### 4.5 Driver readiness
-
-Keep `/health/live` process-only. `/health/ready` answers whether the driver can
-accept, journal and reconcile commands; it must not become false merely because
-a managed Odoo or Paperless resource is degraded. Driver readiness requires:
-
-- the driver ledger is reachable;
-- PostgreSQL administration is reachable;
-- the selected runtime backend is reachable;
-- the initial intent scan completed and the reconciliation loop is running;
-- the host-agent protocol is compatible when that backend is selected;
-- the driver can read desired generations and write operation/observation
-  records.
-
-Expose managed-resource convergence separately through metrics and an
-operator-only `/health/runtime` report. A degraded active slot, stale gateway
-digest or unresolved activation intent keeps the public traffic gate closed and
-raises alerts, while the driver stays available for release, lifecycle and
-recovery commands.
-
-Change the Docker Compose driver health check from `/health/live` to
-`/health/ready`.
-
-### 4.6 Public traffic boot gate
-
-Introduce a backend-neutral runtime traffic gate. On boot, the gateway serves a
-validated maintenance configuration until the reconciler proves that the
-recorded active slot, observed container/unit, image identity and route digest
-agree. The reconciler then atomically installs the active routes and reloads the
-gateway.
-
-For Quadlet, add a `makersbrain-runtime-ready.target` or equivalent convergence
-marker. Before the gateway starts, a one-shot initializer must replace any
-persisted tenant route selection with the validated maintenance configuration;
-the agent may select active tenant routes only after reaching the marker.
-`cloudflared` may start earlier so operator, API and authentication routes remain
-available for repair, but its tenant-gateway origin sees maintenance until the
-gate opens. Nothing should order the complete tunnel behind Odoo health.
-
-On loss of convergence after boot, switch tenant routes back to maintenance
-before attempting destructive repair. Test the window between gateway startup,
-driver startup and active-slot reconstruction explicitly.
-
-### 4.7 Docker reboot tests
-
-Unit and adapter tests must prove:
-
-- dynamic create bodies use the correct restart policy;
-- one-shot jobs always use `no`;
-- an existing stopped Paperless container restarts;
-- a missing Paperless container is reconstructed from intent and existing
-  secret files;
-- a missing secret blocks reconstruction;
-- exactly the active Odoo slot starts;
+- dynamic create requests contain the correct restart policy;
+- one-shot jobs never restart;
+- the active Odoo slot returns after Docker restart;
 - retained and inactive slots remain stopped;
-- two active slots or another ambiguous state fail closed;
-- unknown resources are reported but not deleted;
-- reconciliation is idempotent;
+- existing Paperless containers return after Docker restart;
 - restart-policy drift is repaired;
-- gateway routes are restored before the tenant traffic gate opens;
-- the driver remains command-ready while tenant ingress is gated for a failed
-  active runtime;
-- cloud/tunnel ingress cannot reach a stale tenant route during boot;
-- interruption at each blue/green transition converges to the durable intent.
+- two active slots or another ambiguous state fail closed;
+- an interrupted `starting`, `verifying` or `prepared` candidate is not changed
+  by startup and remains fenced until its release operation reconciles;
+- unknown containers are reported but not deleted;
+- the gateway cannot expose a persisted active route before its pre-start
+  maintenance prerequisite completes;
+- an interrupted lifecycle route backup cannot reopen traffic before runtime
+  validation;
+- the driver remains command-ready while tenant routes remain on maintenance;
+- repeated startup reconciliation is idempotent.
 
-Add a live Docker reboot/restart test that:
+Add one live Docker test that provisions two Paperless workshops, activates one
+Odoo slot, restarts Docker and verifies restart, routing and isolation.
 
-1. provisions two Paperless workshops and one active Odoo slot;
-2. restarts Docker;
-3. verifies automatic restart and isolation;
-4. removes one disposable Paperless container without removing its volumes;
-5. restarts the driver;
-6. verifies reconstruction from the durable intent;
-7. confirms one-shot containers do not return.
+## 5. Phase 2: introduce one runtime backend boundary
 
-## 5. Phase 1: freeze the driver contract
+Use one internal `RuntimeBackend` trait or enum. Do not split it into a family of
+interfaces until a concrete implementation needs that separation.
 
-Make the existing authenticated HTTP contract executable and backend-neutral.
-
-Define request and response fixtures for:
-
-- `provision`;
-- `reconcile`;
-- `lifecycle`;
-- `rehearse`;
-- `download`;
-- `release`;
-- `resume`;
-- `erasure`;
-- `restrict`;
-- `carrier-secret`;
-- `carrier-secret-delete`;
-- privacy export.
-
-Capture bearer authentication, `idempotency-key`, payload-digest conflict,
-timeout and safe-error behavior. Add a conformance runner that can target the
-Docker driver or a staging Quadlet driver.
-
-Preserve current opaque secret references such as `docker/<workshop>/...`
-during this migration. Renaming persisted references belongs to a separate
-schema-epoch decision.
-
-Define a separate, read-only diagnostic contract for live logs. It is not part
-of the authenticated mutation routes and does not use an idempotency key. The
-control API accepts only an opaque, validated runtime resource key such as:
+The initial typed operations are:
 
 ```text
-workshop/<uuid>/paperless
-runtime/shared-odoo/blue
-service/control-api
-job/<action-id>
+inspect(resource_key)
+ensure_paperless(desired)
+ensure_odoo_slot(desired)
+set_state(resource_key, running|stopped|absent)
+ensure_volume(desired)
+run_job(job_kind, bounded_parameters, secret_paths)
+reload_gateway(expected_digest)
 ```
 
-The backend maps that key to a deterministic container or systemd unit. Clients
-can never supply a container ID, unit name, journal match, filesystem path or
-runtime command directly.
-
-The operator-facing API should use server-sent events because delivery is
-one-way. Its contract includes an opaque cursor, bounded initial tail and
-terminal reasons such as `duration_limit`, `byte_limit`, `resource_stopped` and
-`backend_unavailable`. Log contents are never included in command/audit replay
-responses.
-
-## 6. Phase 2: extract runtime interfaces
-
-Move raw Docker operations behind internal interfaces:
-
-- `PersistentRuntime`: ensure/remove/start/stop and inspect Paperless and Odoo
-  services;
-- `JobRuntime`: run Odoo, PostgreSQL, backup, restore and volume jobs;
-- `VolumeRuntime`: ensure, inspect and retention-gated deletion;
-- `ImageRuntime`: prove exact image presence and normalized OCI identity;
-- `GatewayRuntime`: validate, reload and observe a route digest.
-- `DiagnosticRuntime`: resolve an allowlisted resource key and return a bounded,
-  cancellable stream of normalized log records.
-
-Do not expose raw Docker inspect JSON above the backend. Use normalized
-observations such as:
+Return one normalized observation:
 
 ```text
 RuntimeObservation
@@ -445,546 +254,278 @@ RuntimeObservation
   desired_digest
   observed_digest
   image_digest
-  service_name
-  active_state
-  health_state
+  state
+  health
   runtime_object_id
 ```
 
-Keep the current Engine implementation as `DockerRuntimeBackend`. The shared
-reconciler must consume only the interfaces above.
+The observation is returned to the caller and used for metrics/evidence. Do not
+add a generic observation-history table in the core migration.
 
-For Docker development, `DiagnosticRuntime` uses the Engine container-log
-endpoint with stdout, stderr, `follow` and a bounded `since` cursor. It resolves
-the container name from durable runtime intent, never from caller input. The
-adapter must cancel the Engine response immediately when the API client
-disconnects and must not hold a reconciliation or resource lock while
-streaming.
+Implementations:
+
+- `DockerBackend`: wraps the current Engine API transport;
+- `QuadletBackend`: writes validated Quadlets and invokes bounded user-systemd
+  and Podman commands.
 
 Configuration changes:
 
-- add `DRIVER_BACKEND=docker|quadlet-agent`;
-- add `DRIVER_AGENT_SOCKET` and a file-backed `DRIVER_AGENT_TOKEN`;
-- add file-backed `DRIVER_DIAGNOSTIC_TOKEN`,
-  `CONTROL_RUNTIME_LOG_DRIVER_URL` and `CONTROL_RUNTIME_LOG_DRIVER_TOKEN`; the
-  diagnostic token must be distinct from deployment and privacy credentials;
-- retain `DRIVER_CONTAINER_RUNTIME` and `DRIVER_RUNTIME_SOCKET` only for the
-  Docker compatibility backend;
-- reject the Docker backend outside development after staging migration;
-- update `configuration-spec.json`, `release-contract.json`, secret staging and
-  agreement tests in the same release.
+- add `DRIVER_BACKEND=docker|quadlet`;
+- keep `DRIVER_RUNTIME_SOCKET` only for Docker development;
+- add `DRIVER_QUADLET_ROOT`, `DRIVER_SYSTEMD_RUNTIME_DIR` and the protected
+  driver Unix-listener path;
+- reject `DRIVER_BACKEND=docker` outside development;
+- update configuration spec, release contract, secret staging and agreement
+  tests together.
 
-## 7. Phase 3: implement the `mb-infra` Quadlet agent
+## 6. Phase 3: deploy the native production driver
 
-Add infrastructure-owned rootless user units:
+### 6.1 Immutable artifact
 
-```text
-makersbrain-quadlet-agent.socket
-makersbrain-quadlet-agent.service
-```
+The control-plane release publishes the native driver binary as a digest-pinned
+OCI artifact in addition to the control container image. `mb-infra` verifies the
+same release provenance already required for the control image.
 
-Run them as `tenant-runtime`, outside a container, with:
-
-- `HOME=/home/tenant-runtime`;
-- the correct `XDG_RUNTIME_DIR`;
-- access to the user systemd bus;
-- no TCP listener;
-- a mode-`0600` Unix socket mounted only into the driver container;
-- a distinct agent credential;
-- no control database, Rauthy, mail, cloud-backup or tenant business
-  credentials.
-
-The protocol must be typed and closed. It must not accept arbitrary commands,
-arbitrary Quadlet text, arbitrary environment keys or arbitrary host paths.
-
-Suggested operations:
-
-- `capabilities`;
-- `ensure_paperless`;
-- `remove_paperless`;
-- `ensure_odoo_slot`;
-- `set_resource_state`;
-- `run_job`;
-- `ensure_volume`;
-- `inspect_resource`;
-- `reload_gateway`;
-- `reconcile`.
-
-Each request includes a protocol version, action ID, idempotency key, canonical
-request digest, resource key and typed desired state.
-
-For every request, the agent must:
-
-1. authenticate the caller;
-2. validate the operation-specific allowlist;
-3. check its local action journal for replay or digest conflict;
-4. render into a temporary generation;
-5. run Quadlet generator and systemd verification;
-6. atomically install the generation;
-7. call `systemctl --user daemon-reload`;
-8. start, reload or stop the exact derived unit;
-9. wait for bounded readiness;
-10. persist observed evidence before replying.
-
-Use argv-based subprocess execution only. No request value may be interpolated
-into a shell command.
-
-### 7.1 Control-ledger and agent-journal crash protocol
-
-The two journals have distinct authority and do not attempt a distributed
-transaction:
-
-- the control PostgreSQL ledger owns command admission, public idempotency and
-  the durable operation outcome;
-- the agent journal owns whether one exact host-side effect was accepted,
-  applied and observed;
-- desired domain state remains in control PostgreSQL; the agent journal never
-  changes it.
-
-Use the same stable `action_id`, idempotency key and canonical request digest
-at both layers. The execution sequence is:
-
-1. the control driver durably admits the operation before contacting the agent;
-2. the agent rejects a reused key or action ID with a different digest;
-3. the agent persists and fsyncs an `accepted` record before the first host
-   mutation;
-4. it advances through `applying` and persists a normalized observation;
-5. it fsyncs `succeeded` before sending a success response;
-6. only then does the control driver commit its successful response.
-
-If the response is lost after step 5, a retry returns the stored agent result
-without repeating the effect. If the agent fails before it can prove that no
-effect occurred, its record remains non-terminal and the control operation
-stays `awaiting_reconciliation`; neither layer may convert an ambiguous result
-to an ordinary failure. On restart, the agent inspects the exact unit/job and
-either completes the existing record or returns bounded reconciliation
-evidence. A safe terminal failure is permitted only when the agent proves the
-effect did not occur or completed rollback to the prior observed generation.
-
-Journal records include protocol version, policy version, action ID, request
-digest, resource key, previous and desired generation, state, normalized
-observation and timestamps. They contain no request secret, environment value,
-raw subprocess output or unrestricted path. Journal writes use atomic replace,
-`fsync` of the file/database and containing directory, or SQLite with full
-durability settings. Host replacement can rebuild desired resources from
-control PostgreSQL; retaining the journal is required for the normal rollback
-and ambiguous-outcome window but it is not a second desired-state authority.
-
-### 7.2 Agent artifact and protocol lifecycle
-
-The agent is an immutable component of the composed platform release. Record
-its source digest, installed artifact digest, policy version, protocol minimum
-and protocol maximum. Install it under a versioned path such as:
+Install under a versioned path:
 
 ```text
-/opt/makersbrain/quadlet-agent/<artifact-digest>/
+/opt/makersbrain/control-container-driver/<artifact-digest>/
 ```
 
-Select the active version with an atomic symlink used by the user service.
-Retain the previous artifact for the complete application rollback window.
+An atomic symlink selects the active binary. Retain the immediately previous
+binary for the platform rollback window.
 
-Each platform deployment follows this order:
+### 6.2 Credentials and configuration
 
-1. verify that the currently installed agent supports the candidate control
-   client's protocol, or that the candidate agent supports both the current
-   and candidate clients;
-2. install and start the candidate agent while the current control release is
-   still active;
-3. run capability, policy and no-mutation probes through both current and
-   candidate protocol fixtures;
-4. activate the candidate static Quadlet release;
-5. retain the previous control and agent pair until the rollback window closes.
+Use systemd `LoadCredential=` or exact mode-`0400`/`0600` files prepared by the
+existing Infisical materialization path. The native service receives only the
+credentials currently scoped to the driver.
 
-Automatic rollback first restores an agent version compatible with the
-previous control client, then restores the previous static Quadlet release.
-Every release must support the immediately previous protocol during the
-rollback window. A breaking protocol change therefore requires an explicit
-expand/migrate/contract sequence across at least two platform releases.
+Do not place secret values in:
 
-### 7.3 Read-only live-log diagnostic stream
+- the unit file;
+- environment values;
+- Quadlet source;
+- Podman/systemd command argv;
+- release records;
+- journald messages.
 
-Add a separately authorized diagnostic request class to the agent protocol. It
-is read-only, is never written to the host-effect action journal and cannot be
-upgraded into a general journal or command interface.
+Configuration may use `@/run/credentials/...` references resolved by the
+existing runtime-secret boundary.
 
-For Quadlet resources, the agent maps the validated resource key to one exact
-user-systemd unit and reads only that unit's journald records. Prefer the
-systemd journal API; an argv-only `journalctl --user --unit <derived-unit>
---output=json --follow` adapter is acceptable when its executable, arguments
-and derived unit are fixed by policy. The caller may not provide journal match
-expressions, unit names, namespaces, fields or output formats.
+### 6.3 Activation and rollback
 
-Normalize each record before it leaves the agent:
+`mb-infra` installs and validates the candidate binary before switching the
+static application release. Activation checks:
 
-```text
-RuntimeLogRecord
-  cursor          opaque journal/backend cursor
-  timestamp       UTC
-  resource_key    validated opaque resource identifier
-  stream          stdout | stderr | service
-  message         bounded UTF-8 text
-  truncated       boolean
-```
+- binary digest and provenance;
+- configuration contract version;
+- database schema epoch compatibility;
+- rootless Podman and user-systemd access;
+- writable-path confinement;
+- Unix socket ownership, supplemental-group mapping and authorized client access;
+- no-mutation backend preflight.
 
-Strip ANSI/control sequences other than permitted whitespace, replace invalid
-UTF-8, cap each message at 16 KiB and never forward unrestricted structured
-journal fields. The stream applies all of these hard limits:
+On failure, restore the previous binary symlink and service unit before
+restoring the previous static release.
 
-- default initial tail: 200 records;
-- maximum initial tail: 1,000 records;
-- maximum duration: 5 minutes;
-- maximum transferred bytes: 5 MiB;
-- maximum two concurrent streams per operator and a bounded global limit;
-- immediate cancellation and child/reader cleanup on downstream disconnect.
+## 7. Phase 4: dynamic Quadlet resources
 
-The control API owns operator authorization. Introduce a dedicated
-`runtime.logs.read` permission, granted only through reviewed platform roles,
-and require recent strong authentication. Workshop resources additionally
-require authority for that workshop unless an explicitly audited platform
-security role is used. Browser delivery uses SSE through the control API. The
-control API calls a distinct internal driver diagnostic route with a credential
-that cannot invoke deployment or privacy mutations.
+### 7.1 Storage layout
 
-Audit only the actor, resource key, cursor/time range, start/completion time,
-transferred byte/record counts and terminal reason. Do not put messages in
-control PostgreSQL, traces, audit payloads or error reports. Redaction in the
-stream is defense in depth; every container remains responsible for producing
-secret-safe and privacy-minimized logs at source. Exclude a job/resource class
-from live viewing when its output cannot meet that contract.
-
-Live streaming is for short operational diagnosis, not retention or search.
-Longer retention should forward journald through a separately reviewed logging
-pipeline to a dedicated backend; adding such a backend is outside the driver
-migration unless separately approved.
-
-## 8. Phase 4: dynamic Quadlet storage layout
-
-Keep immutable static releases and dynamic tenant resources separate:
+Keep static and dynamic Quadlets separate:
 
 ```text
 ~/.config/containers/systemd/
   makersbrain -> immutable static platform release
   makersbrain-dynamic/
-    tenants/<workshop-id>/
+    paperless/
     odoo-slots/
     volumes/
 ```
 
-Put transient jobs below:
+For every persistent mutation, the driver:
 
-```text
-$XDG_RUNTIME_DIR/containers/systemd/makersbrain-jobs/<action-id>/
-```
+1. validates a typed desired resource;
+2. renders into a temporary directory;
+3. verifies the exact candidate with the Quadlet generator;
+4. atomically selects the resource generation;
+5. runs `systemctl --user daemon-reload`;
+6. starts/reloads/stops the derived service;
+7. waits for bounded health;
+8. returns the normalized observation.
 
-This ensures:
+The driver accepts no arbitrary unit text, unit name, host path, command or
+environment key from an HTTP caller.
 
-- static release rollback does not delete tenant units;
-- durable tenant resources survive reboot;
-- interrupted one-shot jobs do not restart automatically;
-- unit names derive only from validated UUIDs and fixed prefixes;
-- every generated file has a recorded SHA-256 digest.
+Removing a Quadlet file does not delete data. The driver stops the service,
+removes the selected unit generation and reloads systemd. Volume deletion is a
+separate retention-gated operation.
 
-Removing a Quadlet source file is not resource deletion. The agent must stop
-the generated service, verify it is inactive, remove the source generation,
-run `daemon-reload`, verify the generated unit is gone and reset any obsolete
-failed state. Podman volume deletion is a separate, explicit operation allowed
-only after the control-plane retention gate; removing a `.volume` file must
-never be treated as deletion of its data.
+### 7.2 Paperless
 
-Use deterministic service names:
+Persist only the non-secret Paperless fields that cannot be derived from
+existing `service_instances`, workshop state and deterministic naming. A narrow
+closed `runtime_spec` on the Paperless service row is acceptable; do not create
+a generic resource catalogue.
 
-```text
-mb-paperless-<compact-workshop-id>.service
-mb-odoo-blue.service
-mb-odoo-green.service
-mb-driver-job-<action-id>.service
-mb-paperless-data-<compact-workshop-id>-volume.service
-```
+The generated unit includes:
 
-## 9. Phase 5: migrate Paperless
+- exact image digest;
+- deterministic service/container and volume names;
+- fixed rootless network;
+- database and Redis identity names;
+- read-only versioned secret directory;
+- explicit writable mounts/tmpfs;
+- dropped capabilities and read-only root filesystem where supported;
+- health and restart policy;
+- a digest of non-secret configuration and secret generation IDs.
 
-Port Paperless first because it is tenant-scoped and does not switch the shared
-Odoo fleet.
+No unkeyed hash of a secret value is stored in PostgreSQL.
 
-Each generated unit must contain:
+### 7.3 Odoo slots
 
-- an exact digest-pinned image;
-- the fixed MakersBrain rootless network;
-- a deterministic container name;
-- tenant-specific database and Redis identities;
-- tenant-specific persistent volumes;
-- a versioned, read-only secret subpath;
-- a read-only root filesystem where supported;
-- explicit writable paths and tmpfs mounts;
-- dropped capabilities;
-- a health check and restart policy;
-- a configuration-digest label.
+Remove static `odoo.container` after the dynamic slot path is qualified.
+`control.runtime_release_slots` remains authoritative.
 
-Reconciliation rules:
+Map slot state as follows:
 
-- missing unit: create and start from durable intent;
-- identical digest: observe without replacement;
-- changed digest: stop, atomically replace and start;
-- failed health: retain the prior generation and return a retry-safe error;
-- database, volume or secret identity drift: fail closed.
+| Slot state | Runtime state |
+| --- | --- |
+| `active` | running and boot-selected |
+| `starting`, `verifying`, `prepared` | explicitly started only by its operation |
+| `retained`, `inactive`, `failed` | stopped |
 
-## 10. Phase 6: migrate transient jobs
+The Odoo data volume remains infrastructure-defined. The gateway selects only
+the active slot after health and route validation.
 
-Move PostgreSQL, Odoo initialization, extension materialization, backup,
-restore and Paperless-volume jobs to transient Quadlets.
+### 7.4 One-shot jobs
 
-For every `job_kind`, define:
+Do not generate persistent Quadlets for every transient job. Use a typed,
+bounded command such as `systemd-run --user --wait --collect` around
+`podman run --rm`.
 
-- allowed image source;
-- exact command template;
-- allowed scalar parameters;
-- allowed volumes and secret mounts;
-- timeout;
-- bounded output size;
-- cleanup policy;
-- unknown-outcome retry classification.
+Each job kind owns an exact image allowlist, command template, scalar parameter
+schema, mount list, timeout, output limit and retry classification. Job secrets
+are exact regular files below the job-secret root and are removed only after
+the job is terminal and absent.
 
-The agent may accept only job-secret paths beneath the configured job-secret
-root. Every referenced path must be a regular, non-symlink file.
+Restore, erasure, database cutover and credential rotation are never blindly
+replayed. On an ambiguous disconnect, the existing driver operation remains
+`in_progress`. A retry first inspects the deterministic systemd scope or
+external postcondition and never repeats the effect blindly.
 
-### 10.1 Transient-job adoption and non-replay
+## 8. Idempotency and reconciliation
 
-An agent or driver restart does not imply that a transient systemd job stopped.
-At startup, the agent must load every non-terminal journal record and inspect
-the exact generated unit before accepting another request:
+Keep `control.deployment_driver_operations` as the single operation ledger.
+Every runtime resource and job has a deterministic name derived from validated
+domain identifiers and action IDs.
 
-- a still-running matching unit is adopted and observed under its original
-  action ID;
-- a completed unit has its exit status and bounded evidence committed to the
-  existing record;
-- a missing unit with a proven pre-effect record can fail safely;
-- a missing or indeterminate unit after the effect boundary remains unknown and
-  requires operation-specific reconciliation.
+Before mutation, the driver:
 
-Classify every job kind as replay-safe, externally reconcilable or
-non-repeatable. Restore, erasure replay, database cutover and credential
-rotation are never recreated merely because an HTTP request was retried.
-Cleanup removes a transient unit and its job-secret directory only after the
-journal is terminal and the unit is absent or observed stopped. Reboot and
-agent-restart tests must cover a process termination before start, while
-running, after exit and after durable success but before the response.
+1. durably admits the idempotency key and request digest;
+2. inspects the deterministic existing resource;
+3. returns the prior result when desired and observed digests already match;
+4. applies one bounded mutation otherwise;
+5. observes the postcondition;
+6. commits success only after the postcondition is durable.
 
-## 11. Phase 7: migrate Odoo slots and gateway ownership
+An ambiguous runtime/systemd outcome remains reconcilable. The driver never
+changes it to an ordinary retryable failure without proving that no effect
+occurred or that rollback completed.
 
-Remove the ownership conflict between `mb-infra`'s static `odoo.service` and
-the driver's blue/green runtime containers.
+Use per-resource locks. A fleet-wide lock is used only for Odoo route/slot
+activation. Never hold a global lock while waiting for unrelated resource
+health.
 
-Final ownership:
+## 9. Release grants and rollback
 
-- remove static `odoo.container` from the persistent platform-unit set;
-- let the driver own `mb-odoo-blue` and `mb-odoo-green` through the agent;
-- keep the Odoo data volume infrastructure-defined and persistent;
-- allow the gateway to start without requiring static `odoo.service`;
-- route only to the recorded active slot;
-- keep tenant ingress on maintenance until a valid active slot exists while
-  leaving the driver command-ready for authorized repair.
+The native driver may run only images admitted by the active or retained
+previous composed platform release.
 
-Map shared state consistently:
+`mb-infra` materializes both records in a read-only grant directory. A grant
+cannot be removed while referenced by:
 
-| Shared state | Docker | Quadlet/systemd |
-| --- | --- | --- |
-| Active | running and `unless-stopped` | active and boot-selected |
-| Candidate | explicitly started, restart `no` | explicitly started, not boot-selected |
-| Retained | stopped, restart `no` | stopped |
-| Failed | stopped, restart `no` | failed/stopped pending reconciliation |
-| Absent | remove after retention gate | remove generated unit after retention gate |
+- an active, prepared or retained Odoo slot;
+- a non-terminal job;
+- the supported application rollback;
+- recovery tooling still within its retention window.
 
-Add an `ExecReload` path to the gateway that validates its configuration,
-reloads it and reports the observed digest. The driver calls the agent's typed
-gateway operation instead of executing and signalling the gateway container
-through the runtime API.
+Online driver actions assert that an admitted digest is already present. Image
+verification and pull remain deployment responsibilities.
 
-## 12. Phase 8: bind runtime actions to the composed release
+Static rollback restores the matching previous binary, grant and static
+Quadlet release as one set. Dynamic tenant units and volumes remain untouched;
+the reconciler changes them only when their authoritative domain state requires
+it.
 
-The agent must not run an image merely because an authenticated driver request
-names it.
+## 10. Migration sequence
 
-Use a bounded set of composed platform releases as execution grants:
+For each existing raw Podman Paperless or Odoo resource:
 
-- materialize the active and retained previous release records in an
-  agent-readable, read-only grant directory;
-- admit only image digests present in the active record or a still-retained
-  rollback record;
-- require the exact qualified Odoo runtime/extension pair;
-- require release ID, runtime subject, extension subject and qualification
-  digest agreement;
-- pre-pull and verify images through `mb-infra` before granting them;
-- make online driver operations assert local image presence instead of pulling
-  an unreviewed image.
-
-Each grant records its activation and expiry boundary. A grant cannot be
-removed while referenced by an active, candidate or retained Odoo slot, a
-non-terminal job, a supported application rollback, or a recovery record that
-requires its tooling. Grant garbage collection first proves those references
-are absent and that the rollback window expired, then removes the grant and
-eventually the unreferenced local image. Static rollback atomically reselects
-the corresponding retained grant before restarting the previous control
-release.
-
-Extend cross-repository release agreement checks to cover:
-
-- agent protocol version;
-- dynamic Quadlet policy version;
-- supported driver actions;
-- configuration-spec digest;
-- control image digest;
-- admissible Odoo and extension subjects.
-
-A platform record must be deployed before the release worker can activate an
-Odoo pair absent from the current host grant.
-
-## 13. Phase 9: update `mb-infra` deployment
-
-The application release role must:
-
-- verify and install the versioned agent artifact and atomically select a
-  protocol-compatible version before application Quadlet activation;
-- start the agent socket and pass current/previous-client compatibility probes;
-- create agent state and dynamic Quadlet directories with mode `0700`;
-- verify lingering and the user systemd bus;
-- remove Podman socket ordering and mounting from
-  `control-container-driver.container`;
-- set `DRIVER_BACKEND=quadlet-agent`;
-- mount only the agent Unix socket into the driver;
-- materialize a distinct diagnostic credential into only the control API and
-  driver, never the browser or ordinary workers;
-- pin application Quadlets to journald logging, configure bounded systemd log
-  rate limits and verify that the `tenant-runtime` agent can read only the
-  intended user-unit records;
-- remove static Odoo ordering after slot migration;
-- install the maintenance route and runtime-ready traffic gate before removing
-  static Odoo ordering;
-- ensure `release.py` never removes the dynamic tree during static rollback;
-- retain the previous agent artifact, execution grant and static release as one
-  rollback set;
-- protect and back up the agent journal for the idempotency/recovery window,
-  while treating control PostgreSQL as the rebuild source for desired state;
-  do not back up transient job units or job-secret directories;
-- publish agent version, reconciliation generation and resource counts to
-  deployment evidence and monitoring;
-- publish privacy-safe counters for opened, rejected, truncated and
-  limit-terminated log streams without resource messages or tenant identifiers.
-
-Remove `SecurityLabelDisable=true` if remaining mounts work with a narrow label
-policy. If an exception remains necessary, document and test its exact scope.
-
-## 14. Phase 10: existing resource migration and rollback
-
-For each raw Podman resource:
-
-1. inventory its container ID, image digest, mounts, volume names, health and
-   labels;
-2. render the equivalent Quadlet and compare the canonical desired digest;
-3. stop the raw container without removing volumes;
-4. remove only the raw container object;
-5. install and start the Quadlet with the same deterministic resource names;
+1. inventory image digest, mounts, volumes, labels and health;
+2. render and verify the equivalent Quadlet;
+3. place affected tenant traffic on maintenance;
+4. stop and remove only the raw container object;
+5. install/start the Quadlet using the same persistent volumes;
 6. verify health, routing and secret isolation;
-7. fsync successful adoption evidence in the agent journal;
-8. return that evidence under the original action ID and let the control driver
-   commit the durable operation result. A disconnect between these commits is
-   resolved by replaying the stored agent result.
+7. record success in the existing driver operation ledger;
+8. reopen traffic.
 
-Keep the raw Podman backend available in staging for one release behind an
-explicit emergency feature flag. Never fall back automatically after a partial
-Quadlet operation because doing so can create duplicate resource ownership.
+Keep the raw Podman compatibility backend available in staging for one release
+behind an explicit emergency flag. Never fall back automatically after a
+partial Quadlet operation.
 
-Transition rollback must:
+## 11. Verification gates
 
-- stop the generated service;
-- restore the retained previous desired-state record;
-- recreate a raw container only from that recorded specification;
-- preserve all volumes and tenant secrets;
-- record rollback as a new driver action.
-
-After the staging evidence window, remove the production compatibility backend
-and its Podman socket mount.
-
-## 15. Verification gates
-
-The migration is complete only when:
+The core migration is complete only when:
 
 - Docker and Quadlet pass the same driver contract fixtures;
-- no staging or production application container mounts a container-runtime
-  socket;
-- only the host agent writes the dynamic Quadlet tree;
-- the agent rejects mutable tags, unapproved digests, traversal, symlinks,
-  unknown environment keys, arbitrary commands and invalid resource names;
-- two-workshop negative isolation tests pass for PostgreSQL, Redis, Paperless
-  volumes, tenant secrets, gateway routes, backups and restores;
-- driver or agent termination at every activation boundary reconciles to one
-  owner and one observed result;
-- a success persisted by the agent but disconnected before the control commit
-  is replayed without repeating the host effect;
-- ambiguous effects remain reconcilable and are never downgraded to an ordinary
-  retryable failure;
-- reboot restores durable Paperless and the active Odoo slot but not abandoned
-  one-shot jobs;
-- agent restart adopts a still-running transient job and never replays a
-  non-repeatable job;
-- static platform rollback leaves dynamic tenant units and volumes intact;
-- static rollback restores a compatible retained agent and execution grant;
-- both current and immediately previous control clients pass protocol probes
-  against the candidate agent during the rollback window;
-- blue/green activation survives failures before and after route switching;
-- the driver remains command-ready during managed-runtime degradation while
-  public tenant traffic remains on maintenance;
-- unrelated tenant reconciliation continues while another tenant waits for a
-  long health check, proving that no global lock is held;
-- Docker and Quadlet return equivalent normalized log records for the same
-  contract fixture;
-- live-log requests reject arbitrary unit/container names, unknown resources,
-  unauthorized workshops, stale strong authentication and mutation
-  credentials;
-- record, tail, duration, byte, concurrency and disconnect limits terminate
-  streams without leaking tasks, subprocesses, descriptors or runtime locks;
-- log messages never enter control PostgreSQL, audit payloads, traces or agent
-  action journals, and secret canaries are absent from every streamed fixture;
-- secret values are absent from Quadlets, generated systemd units, environment
-  inspection, journals and release records, and PostgreSQL contains no unkeyed
-  secret-value digest;
-- complete recovery, erasure replay, privacy export and backup rehearsal pass
-  without a mounted runtime API socket;
-- a real Debian 13 and Podman 5.x VM passes Quadlet generation,
-  `systemd-analyze --user verify`, reboot and failure-injection tests.
+- Docker reboot restores enabled Paperless and exactly the active Odoo slot;
+- staging and production mount no container-runtime API socket;
+- the native driver runs as `tenant-runtime` with verified filesystem and
+  systemd confinement;
+- authorized container users can reach the driver socket through the dedicated
+  group, while otherwise identical containers without that group cannot;
+- HTTP callers cannot supply unit names, commands, environment keys or host
+  paths;
+- two-workshop isolation passes for PostgreSQL, Redis, secrets, volumes,
+  gateway routes, backups and restores;
+- agent/second-journal components are absent from the deployed topology;
+- driver termination at every activation boundary converges through the
+  existing operation ledger and runtime inspection;
+- unrelated tenant operations proceed while another resource waits for health;
+- gateway boot and cutover never expose a stale or unhealthy tenant route;
+- reboot restores persistent Quadlets and never restarts one-shot jobs;
+- static rollback retains dynamic tenant resources and selects an admitted
+  previous binary/image set;
+- secret canaries are absent from units, Quadlets, argv, environment inspection,
+  release records and journals;
+- a real Debian 13/Podman 5.x VM passes generator verification, reboot,
+  interruption, migration and rollback tests.
 
-## 16. Pull-request order
+## 12. Pull-request order
 
-1. `mb-control-plane`: extend authoritative domain records, add the normalized
-   intent view and persist non-secret runtime specifications.
-2. `mb-control-plane`: add Docker dynamic restart policies.
-3. `mb-control-plane`: add boot and periodic reconciliation.
-4. `mb-control-plane`: add readiness and live Docker reboot tests.
-5. `mb-control-plane`: freeze driver contract fixtures and normalized runtime
-   observations.
-6. `mb-control-plane`: extract runtime interfaces behind the unchanged Docker
-   backend.
-7. `mb-infra`: implement the Quadlet agent, crash-safe journal, typed renderer,
-   immutable artifact installation and current/previous protocol tests.
-8. Both repositories: add the agent client and cross-repository conformance
-   workflow.
-9. Both repositories: add the read-only diagnostic protocol, Docker log
-   adapter, Quadlet/journald adapter, control API SSE route and authorization
-   tests.
-10. `mb-infra`: migrate Paperless dynamic resources.
-11. Both repositories: migrate transient jobs and recovery tests.
-12. Both repositories: migrate Odoo slots and gateway reload.
-13. `mb-infra`: install the agent through Ansible, enforce active/retained
-    release grants, add the runtime traffic gate and monitoring.
-14. Staging: run reboot, interruption, isolation, live-log privacy and rollback
-    qualification and retain evidence.
-15. Both repositories: reject production compatibility-socket operation and
-    remove obsolete Podman configuration.
+1. `mb-control-plane`: Docker restart policies and startup reconciliation.
+2. `mb-control-plane`: driver readiness, maintenance-route gating and live
+   Docker reboot test.
+3. `mb-control-plane`: one `RuntimeBackend` boundary with unchanged Docker
+   behavior.
+4. `mb-control-plane`: native driver Unix listener and digest-pinned binary
+   artifact.
+5. `mb-infra`: native user service, credentials, sandbox and protected internal
+   connectivity.
+6. Both repositories: Paperless Quadlet backend and migration tests.
+7. Both repositories: typed one-shot job execution and recovery tests.
+8. Both repositories: Odoo slot/gateway ownership migration.
+9. `mb-infra`: active/previous grants, rollback integration and monitoring.
+10. Staging: reboot, interruption, isolation, recovery and rollback
+    qualification.
+11. Both repositories: reject/remove production compatibility-socket operation.
 
-## 17. References
+## 13. References
 
 - Podman Quadlet and rootless search paths:
   <https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html>
-- Podman Quadlet management:
-  <https://docs.podman.io/en/latest/markdown/podman-quadlet.1.html>
 - Docker restart policies:
   <https://docs.docker.com/engine/containers/start-containers-automatically/>

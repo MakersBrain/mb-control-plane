@@ -3,6 +3,7 @@ pub mod api_error;
 pub mod auth;
 pub mod command;
 pub mod config;
+pub mod deployment_driver_transport;
 pub mod docker_driver;
 pub mod domain;
 pub mod extraction_broker;

@@ -60,7 +60,7 @@ for marker in (
     "run_docker_job_with_secrets(",
     '"PGPASSFILE=/run/mb-job-secrets/pgpass"',
     "aws_secret_prelude()",
-    'ContainerRuntimeKind::Podman => json!({',
+    'DriverBackendKind::Quadlet => json!({',
     '"Type":"bind"',
 ):
     if marker not in DRIVER_TREE:

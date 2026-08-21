@@ -85,19 +85,14 @@ async fn processor_exports(
         .map_err(|_| IntegrationError::Unauthorized)?
         .filter(|value| !value.trim().is_empty())
         .ok_or(IntegrationError::Unauthorized)?;
-    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+    let socket = crate::deployment_driver_transport::configured_socket()
         .map_err(|_| IntegrationError::ContractDrift)?;
-    authorization.set_sensitive(true);
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, authorization);
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("mb-privacy-worker")
-        .build()
-        .map_err(|_| IntegrationError::ContractDrift)?;
+    let client = crate::deployment_driver_transport::client(
+        Some(&token),
+        Duration::from_secs(300),
+        socket.as_deref(),
+    )
+    .map_err(|_| IntegrationError::ContractDrift)?;
     let mut result = Vec::new();
     let mut remaining = privacy_crypto::MAX_EXPORT_BYTES - 1024 * 1024;
     for membership in memberships {

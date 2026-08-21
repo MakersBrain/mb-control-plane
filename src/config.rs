@@ -32,6 +32,7 @@ pub struct Config {
     pub invitation_verification_keys_file: PathBuf,
     pub invitation_signing_key_id: String,
     pub deployment_driver_url: Url,
+    pub deployment_driver_socket: Option<PathBuf>,
     pub deployment_driver_token: String,
     pub allow_self_signup: bool,
     pub operator_emails: HashSet<String>,
@@ -84,6 +85,11 @@ impl Config {
             )?),
             invitation_signing_key_id: required("CONTROL_INVITATION_SIGNING_KEY_ID")?,
             deployment_driver_url: absolute_url("CONTROL_DEPLOYMENT_DRIVER_URL")?,
+            deployment_driver_socket: crate::deployment_driver_transport::configured_socket()
+                .map_err(|error| ConfigError::Invalid {
+                    name: "CONTROL_DEPLOYMENT_DRIVER_SOCKET",
+                    reason: error.to_string(),
+                })?,
             deployment_driver_token: required_secret("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
             allow_self_signup: std::env::var("CONTROL_ALLOW_SELF_SIGNUP")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),

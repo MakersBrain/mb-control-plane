@@ -135,6 +135,7 @@ pub(super) async fn release_fleet(
         &extension_volume,
         &runtime_role,
         &runtime_password,
+        false,
     )
     .await?;
     for tenant in &tenants {
@@ -150,6 +151,25 @@ pub(super) async fn release_fleet(
     .execute(&state.ledger)
     .await
     .map_err(DriverError::internal)?;
+    if matches!(state.backend, RuntimeBackend::Docker) {
+        docker_ensure_restart_policy(
+            state,
+            &runtime_container,
+            DockerRestartPolicy::UnlessStopped,
+        )
+        .await?;
+    } else {
+        ensure_release_runtime(
+            state,
+            &runtime_container,
+            &manifest.odoo_runtime.deployment_ref,
+            &extension_volume,
+            &runtime_role,
+            &runtime_password,
+            true,
+        )
+        .await?;
+    }
     let prepared_tenants = release_tenant_evidence(&tenants);
     let existing_intent = sqlx::query_as::<_, (String, Uuid, Option<String>, Value)>(
         "select gateway_configuration_digest,driver_action_id,
@@ -211,6 +231,21 @@ pub(super) async fn release_fleet(
     .execute(&state.ledger)
     .await
     .map_err(DriverError::internal)?;
+    if let Some((old_slot, _)) = &active_slot {
+        let old_container = state.config.docker_resource(format!("odoo-{old_slot}"));
+        match &state.backend {
+            RuntimeBackend::Docker => {
+                if docker_container_exists(state, &old_container).await? {
+                    docker_ensure_restart_policy(state, &old_container, DockerRestartPolicy::No)
+                        .await?;
+                    docker_stop_container(state, &old_container).await?;
+                }
+            }
+            RuntimeBackend::Quadlet(backend) => {
+                backend.set_odoo_boot_selected(old_slot, false).await?;
+            }
+        }
+    }
     let evidence = json!({
         "release_id":release_id,
         "odoo_subject_digest":manifest.odoo_runtime.subject_digest,
@@ -228,12 +263,16 @@ pub(super) async fn release_fleet(
         "target_slot":target_slot,
         "runtime_container":runtime_container,
         "runtime_role":runtime_role,
+        "runtime_deployment_ref":manifest.odoo_runtime.deployment_ref,
+        "runtime_config_digest":release_runtime_config_digest(state, &manifest.odoo_runtime.deployment_ref, &runtime_role, &runtime_password),
         "prepared_tenants":prepared_tenants,
         "gateway_configuration_digest":gateway_digest,
         "driver_action_id":action_id,
         "old_runtime_database_access_revoked":true,
         "tenant_recovery_verified":true,
         "candidate_smoke_verified":true
+        ,"candidate_restart_policy":"unless-stopped"
+        ,"retained_restart_policy":"no"
     });
     Ok(json!({"evidence":evidence}))
 }
@@ -445,18 +484,21 @@ async fn prepare_initial_release(
         &extension_volume,
         &runtime_role,
         &runtime_password,
+        false,
     )
     .await?;
-    let inspect = docker_inspect_container(state, &runtime_container).await?;
-    if !initial_runtime_inspection_matches(
-        &inspect,
-        &manifest.odoo_runtime.deployment_ref,
-        &runtime_platform.config_digest,
-        &extension_volume,
-    ) {
-        return Err(DriverError::internal(
-            "initial release runtime inspection did not match the prepared image",
-        ));
+    if matches!(state.backend, RuntimeBackend::Docker) {
+        let inspect = docker_inspect_container(state, &runtime_container).await?;
+        if !initial_runtime_inspection_matches(
+            &inspect,
+            &manifest.odoo_runtime.deployment_ref,
+            &runtime_platform.config_digest,
+            &extension_volume,
+        ) {
+            return Err(DriverError::internal(
+                "initial release runtime inspection did not match the prepared image",
+            ));
+        }
     }
     let evidence = json!({
         "release_id":release_id,
@@ -476,6 +518,8 @@ async fn prepare_initial_release(
         "target_slot":target_slot,
         "runtime_container":runtime_container,
         "runtime_role":runtime_role,
+        "runtime_deployment_ref":manifest.odoo_runtime.deployment_ref,
+        "runtime_config_digest":release_runtime_config_digest(state, &manifest.odoo_runtime.deployment_ref, &runtime_role, &runtime_password),
         "provenance_verified":true,
         "runtime_inspection_verified":true,
         "verification":"empty_fleet_runtime_started_and_inspected"
@@ -719,7 +763,7 @@ async fn materialize_extension(
     if docker_container_exists(state, &source).await? {
         docker_delete_container(state, &source).await?;
     }
-    docker_create_container(state, &source, json!({
+    docker_create_container(state, &source, DockerRestartPolicy::No, json!({
         "Image":manifest.extension_bundle.oci_ref,
         "Entrypoint":["/bin/false"],
         "Cmd":[],
@@ -737,7 +781,7 @@ async fn materialize_extension(
         let staging = state
             .config
             .docker_resource(format!("ext-stage-{}", &extension.manifest_digest[7..19]));
-        docker_create_container(state, &staging, json!({
+        docker_create_container(state, &staging, DockerRestartPolicy::No, json!({
             "Image":state.config.extension_helper_image,
             "Entrypoint":["/bin/false"],"Cmd":[],"NetworkDisabled":true,
             "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"Binds":[format!("{volume}:/target")]}
@@ -1269,6 +1313,7 @@ async fn ensure_release_runtime(
     extension_volume: &str,
     runtime_role: &str,
     runtime_password: &str,
+    boot_selected: bool,
 ) -> Result<(), DriverError> {
     let release_secret_directory = driver_runtime_secret_root(state).join("releases");
     secure_directory(&release_secret_directory).map_err(DriverError::internal)?;
@@ -1278,16 +1323,54 @@ async fn ensure_release_runtime(
         &odoo_configuration(state, runtime_role, runtime_password)?,
     )
     .map_err(DriverError::internal)?;
-    let config_digest = format!(
-        "{:x}",
-        Sha256::digest(
-            format!(
-                "{image}\0{runtime_role}\0{runtime_password}\0{}\0driver-secret-runtime-v2",
-                state.config.runtime_secret_source
-            )
-            .as_bytes()
-        )
-    );
+    let config_digest = release_runtime_config_digest(state, image, runtime_role, runtime_password);
+    let mut environment = vec![
+        format!("HOST={}", state.config.postgres_host),
+        format!("PORT={}", state.config.postgres_port),
+        format!("USER={runtime_role}"),
+        format!("MB_CONTROL_API_URL={}", state.config.control_internal_url),
+        "MB_ODOO_CLIENT_TOKEN_ROOT=/run/mb-odoo-client-secrets".into(),
+        "MB_CONTROL_BRIDGE_TOKEN_FILE=/run/mb-release-secrets/bridge-token".into(),
+        format!("ODOO_RC=/run/mb-release-secrets/{configuration_name}"),
+        "PYTHONPATH=/opt/mb-extension/python".into(),
+    ];
+    if state.config.postgres_ca_source.is_some() {
+        environment.push("PGSSLMODE=verify-full".into());
+        environment.push("PGSSLROOTCERT=/run/mb-postgres-ca/postgres-ca.crt".into());
+    }
+    if let RuntimeBackend::Quadlet(backend) = &state.backend {
+        let slot = container
+            .strip_suffix("-blue")
+            .map(|_| "blue")
+            .or_else(|| container.strip_suffix("-green").map(|_| "green"))
+            .ok_or_else(|| DriverError::internal("Odoo slot container name is invalid"))?;
+        backend
+            .ensure_odoo_slot(&OdooSlotDesired {
+                slot: slot.into(),
+                container_name: container.into(),
+                image: image.into(),
+                config_digest,
+                environment: environment
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .ok_or_else(|| DriverError::internal("invalid Odoo environment entry"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                secret_directory: release_secret_directory,
+                client_secret_directory: Path::new(&state.config.runtime_secret_source)
+                    .join("runtime/odoo-clients"),
+                postgres_ca: state.config.postgres_ca_source.clone(),
+                extension_volume: extension_volume.into(),
+                data_volume: state.config.odoo_volume.clone(),
+                network: state.config.docker_network.clone(),
+                boot_selected,
+            })
+            .await?;
+        return Ok(());
+    }
     if docker_container_exists(state, container).await? {
         let inspect = docker_inspect_container(state, container).await?;
         if inspect
@@ -1302,16 +1385,6 @@ async fn ensure_release_runtime(
         }
     }
     if !docker_container_exists(state, container).await? {
-        let mut environment = vec![
-            format!("HOST={}", state.config.postgres_host),
-            format!("PORT={}", state.config.postgres_port),
-            format!("USER={runtime_role}"),
-            format!("MB_CONTROL_API_URL={}", state.config.control_internal_url),
-            "MB_ODOO_CLIENT_TOKEN_ROOT=/run/mb-odoo-client-secrets".into(),
-            "MB_CONTROL_BRIDGE_TOKEN_FILE=/run/mb-release-secrets/bridge-token".into(),
-            format!("ODOO_RC=/run/mb-release-secrets/{configuration_name}"),
-            "PYTHONPATH=/opt/mb-extension/python".into(),
-        ];
         let mut mounts = vec![
             runtime_secret_mount(state, Path::new("releases"), "/run/mb-release-secrets")?,
             runtime_secret_mount(
@@ -1321,13 +1394,12 @@ async fn ensure_release_runtime(
             )?,
         ];
         if let Some(ca_mount) = postgres_ca_mount(state)? {
-            environment.push("PGSSLMODE=verify-full".into());
-            environment.push("PGSSLROOTCERT=/run/mb-postgres-ca/postgres-ca.crt".into());
             mounts.push(ca_mount);
         }
         docker_create_container(
             state,
             container,
+            DockerRestartPolicy::No,
             json!({
                 "Image":image,
                 "Cmd":[
@@ -1356,17 +1428,44 @@ async fn ensure_release_runtime(
     Ok(())
 }
 
+fn release_runtime_config_digest(
+    state: &DriverState,
+    image: &str,
+    runtime_role: &str,
+    runtime_password: &str,
+) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{image}\0{runtime_role}\0{runtime_password}\0{}\0driver-secret-runtime-v2",
+                state.config.runtime_secret_source
+            )
+            .as_bytes()
+        )
+    )
+}
+
 async fn smoke_release_runtime(
     state: &DriverState,
     container: &str,
     tenant: &ReleaseTenant,
+) -> Result<(), DriverError> {
+    smoke_release_runtime_identity(state, container, tenant.workshop_id, &tenant.database_ref).await
+}
+
+pub(super) async fn smoke_release_runtime_identity(
+    state: &DriverState,
+    container: &str,
+    workshop: Uuid,
+    database_ref: &str,
 ) -> Result<(), DriverError> {
     let tenant_bridge_token = std::fs::read_to_string(
         state
             .config
             .secret_root
             .join("docker")
-            .join(tenant.workshop_id.to_string())
+            .join(workshop.to_string())
             .join("odoo"),
     )
     .map_err(DriverError::internal)?
@@ -1378,9 +1477,21 @@ async fn smoke_release_runtime(
         ));
     }
     for _ in 0..90 {
+        let runtime_url = match state.backend {
+            RuntimeBackend::Docker => format!("http://{container}:8069"),
+            RuntimeBackend::Quadlet(_) => {
+                if container.ends_with("-blue") {
+                    "http://127.0.0.1:18069".into()
+                } else if container.ends_with("-green") {
+                    "http://127.0.0.1:18070".into()
+                } else {
+                    return Err(DriverError::internal("invalid Odoo slot runtime name"));
+                }
+            }
+        };
         let response = reqwest::Client::new()
-            .get(format!("http://{container}:8069/mb_control/v1/health"))
-            .header("X-Odoo-Dbfilter", &tenant.database_ref)
+            .get(format!("{runtime_url}/mb_control/v1/health"))
+            .header("X-Odoo-Dbfilter", database_ref)
             .bearer_auth(&tenant_bridge_token)
             .send()
             .await;
@@ -1388,9 +1499,9 @@ async fn smoke_release_runtime(
             && response.status().is_success()
             && let Ok(body) = response.json::<Value>().await
             && body.get("status").and_then(Value::as_str) == Some("ready")
-            && body.get("database").and_then(Value::as_str) == Some(&tenant.database_ref)
+            && body.get("database").and_then(Value::as_str) == Some(database_ref)
             && body.get("workshop_id").and_then(Value::as_str)
-                == Some(tenant.workshop_id.to_string().as_str())
+                == Some(workshop.to_string().as_str())
         {
             return Ok(());
         }
@@ -1415,14 +1526,7 @@ async fn activate_release_routes(
         let previous = std::fs::read(&backup).map_err(DriverError::internal)?;
         let previous_text = std::str::from_utf8(&previous)
             .map_err(|_| DriverError::internal("saved tenant route is not UTF-8"))?;
-        if !previous_text.contains("odoo:8069") {
-            return Err(DriverError::internal(
-                "saved tenant route does not identify the retained runtime",
-            ));
-        }
-        let candidate = previous_text
-            .replace("odoo:8069", &format!("{runtime_container}:8069"))
-            .into_bytes();
+        let candidate = select_odoo_route_upstream(previous_text, runtime_container)?.into_bytes();
         replacements.push((tenant.workshop_id, previous, candidate));
     }
     let digest = route_set_digest(
@@ -1436,22 +1540,20 @@ async fn activate_release_routes(
             .config
             .route_root
             .join(format!("{workshop}.release.tmp"));
-        std::fs::write(&temporary, candidate).map_err(DriverError::internal)?;
+        write_gateway_file(&temporary, candidate).map_err(DriverError::internal)?;
         std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
     }
-    if let Err(error) = docker_exec(state, &state.config.gateway_container, &["nginx", "-t"]).await
-    {
+    if let Err(error) = reload_gateway_runtime(state, &digest).await {
         for (workshop, previous, _) in &replacements {
             let maintenance = previous_route_maintenance(previous)?;
-            std::fs::write(
-                state.config.route_root.join(format!("{workshop}.conf")),
+            write_gateway_file(
+                &state.config.route_root.join(format!("{workshop}.conf")),
                 maintenance,
             )
             .map_err(DriverError::internal)?;
         }
         return Err(error);
     }
-    docker_signal_container(state, &state.config.gateway_container, "HUP").await?;
     for (workshop, _, _) in &replacements {
         let backup = state
             .config
@@ -1493,9 +1595,11 @@ fn planned_release_route_digest(
                 .join(format!("{}.recovery.bak", tenant.workshop_id)),
         )
         .map_err(DriverError::internal)?;
-        let candidate = std::str::from_utf8(&previous)
-            .map_err(|_| DriverError::internal("saved tenant route is not UTF-8"))?
-            .replace("odoo:8069", &format!("{runtime_container}:8069"));
+        let candidate = select_odoo_route_upstream(
+            std::str::from_utf8(&previous)
+                .map_err(|_| DriverError::internal("saved tenant route is not UTF-8"))?,
+            runtime_container,
+        )?;
         routes.push((tenant.workshop_id, candidate.into_bytes()));
     }
     Ok(route_set_digest(
@@ -1503,6 +1607,24 @@ fn planned_release_route_digest(
             .iter()
             .map(|(workshop, route)| (*workshop, route.as_slice())),
     ))
+}
+
+fn select_odoo_route_upstream(
+    previous: &str,
+    runtime_container: &str,
+) -> Result<String, DriverError> {
+    let marker = "set $tenant_upstream \"";
+    let start = previous
+        .find(marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| DriverError::internal("saved tenant route has no Odoo upstream"))?;
+    let relative_end = previous[start..]
+        .find(":8069\";")
+        .ok_or_else(|| DriverError::internal("saved tenant route has no Odoo upstream"))?;
+    let end = start + relative_end + ":8069".len();
+    let mut selected = previous.to_owned();
+    selected.replace_range(start..end, &format!("{runtime_container}:8069"));
+    Ok(selected)
 }
 
 fn observed_release_route_digest(

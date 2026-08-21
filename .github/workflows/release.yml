@@ -155,6 +155,26 @@ jobs:
           echo "--- images ---"
           cat release/images.json
 
+      - name: Publish native deployment-driver artifact
+        run: |
+          set -euo pipefail
+          mkdir -p release/driver
+          docker buildx build --target driver-artifact --output type=local,dest=release/driver .
+          test -x release/driver/control-container-driver
+          mkdir -p target/release
+          cp release/driver/control-container-driver target/release/control-container-driver
+          artifact="$REGISTRY/$REPOSITORY_PREFIX/control-container-driver:$GITHUB_SHA"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            digest="sha256:$(sha256sum target/release/control-container-driver | cut -d' ' -f1)"
+          else
+            oras push "$artifact" \
+              --artifact-type application/vnd.makersbrain.control-driver.v1 \
+              target/release/control-container-driver:application/vnd.makersbrain.control-driver.v1
+            digest=$(oras resolve "$artifact")
+            cosign sign --yes "$artifact@$digest"
+          fi
+          printf '%s@%s\n' "$artifact" "$digest" > release/control-container-driver-reference.txt
+
       - name: Component release record
         id: record
         run: |
@@ -181,6 +201,8 @@ jobs:
             --arg schema_release "$(jq -r .schema_release deploy/release-contract.json)" \
             --arg schema_compatibility "$(jq -r .schema_compatibility deploy/release-contract.json)" \
             --arg contract_release "$(jq -r .release deploy/release-contract.json)" \
+            --arg driver_ref "$(cat release/control-container-driver-reference.txt)" \
+            --arg driver_sha256 "$(sha256sum target/release/control-container-driver | cut -d' ' -f1)" \
             --slurpfile images release/images.json \
             '{schema: $schema,
               source: {repository: $repository, commit: $commit, ref: $ref, ci_run: $ci_run},
@@ -188,6 +210,7 @@ jobs:
               schema_release: $schema_release,
               schema_compatibility: $schema_compatibility,
               image_count: ($images[0] | length),
+              artifacts: {control_driver: {reference: $driver_ref, sha256: $driver_sha256, media_type: "application/vnd.makersbrain.control-driver.v1"}},
               images: $images[0]}' > release/release-metadata.json
           # Application-owned configuration that deployment needs but does not
           # own. configuration-spec.json is include_str!'d into the control

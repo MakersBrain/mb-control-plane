@@ -22,7 +22,12 @@ async fn main() -> anyhow::Result<()> {
     let driver_token =
         mb_control_plane::runtime_secret::required("CONTROL_DEPLOYMENT_DRIVER_TOKEN")
             .map_err(anyhow::Error::msg)?;
-    let client = reqwest::Client::new();
+    let socket = mb_control_plane::deployment_driver_transport::configured_socket()?;
+    let client = mb_control_plane::deployment_driver_transport::client(
+        None,
+        Duration::from_secs(900),
+        socket.as_deref(),
+    )?;
     if !enabled {
         tracing::info!("nightly workshop backup scheduling is disabled");
     }
