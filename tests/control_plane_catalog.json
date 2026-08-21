@@ -7,7 +7,7 @@
     "data_subject_processor_tasks", "data_subject_requests",
     "deployment_driver_operations", "email_delivery_events", "email_suppressions",
     "entitlements", "erasure_restore_replays", "erasure_subject_lookups",
-    "erasure_tombstones", "external_identities", "fleet_activation_intents",
+    "erasure_tombstones", "extension_volume_preparations", "external_identities", "fleet_activation_intents",
     "invitations", "legal_holds", "membership_targets", "memberships",
     "odoo_databases", "operations", "outbox", "ownership_transfers",
     "platform_authority_state", "platform_role_assignments", "privacy_incidents",
@@ -22,12 +22,12 @@
     "workshop_recovery_rehearsals", "workshops"
   ],
   "catalog": {
-    "columns": {"count": 633, "digest": "d7a17ad92a7b9cfd91a4c8ed090b3c35"},
-    "constraints": {"count": 498, "digest": "eed717cd97d22f755efc674a58a64b43"},
-    "indexes": {"count": 125, "digest": "b324de80bd84fa6b665e85b6e8549ba5"},
+    "columns": {"count": 658, "digest": "fb611e0b3840931386b13e363a63d7a8"},
+    "constraints": {"count": 521, "digest": "8ae28ab2e0c05c166352e9d1f128401b"},
+    "indexes": {"count": 127, "digest": "bf9bf17a0eeab9f1f375ce91a6f99b7e"},
     "functions": {"count": 20, "digest": "e2f89e8f22d849f30409fd009f25c0bf"},
     "triggers": {"count": 15, "digest": "df70a96b4fdf587e336ce7ec19e653da"},
-    "privileges": {"count": 931, "digest": "19388facd0e7adc1a3c5cdf001c98815"},
+    "privileges": {"count": 943, "digest": "0df6f61e602584ce91ae95f37555d6f8"},
     "default_privileges": {"count": 3, "digest": "0c6219b31f278a51ab29c7f4446032a4"}
   }
 }

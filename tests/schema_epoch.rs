@@ -82,20 +82,23 @@ async fn drop_runtime_roles(admin: &sqlx::PgPool) {
 async fn insert_prepared_release(store: &Store, registry_version: i32) -> (String, String, String) {
     let release_id = format!("odoo-2026.08.21-{}", Uuid::new_v4().simple());
     let image_digest = format!("sha256:{}", "a".repeat(64));
+    let extension_digest = format!("sha256:{}", "c".repeat(64));
     let manifest_digest = format!("sha256:{}", "b".repeat(64));
     sqlx::query(
         "insert into control.application_releases(
-           id,source_commit,odoo_version,image_digest,manifest_digest,addon_versions,
+           id,source_commit,odoo_version,odoo_subject_digest,extension_subject_digest,
+           odoo_runtime,extension_bundle,pair_qualifications,manifest_digest,addon_versions,
            compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,
-           manifest,signature_bundle_ref,provenance_ref,sbom_ref,published_at,status,
+           manifest,signature_bundle_ref,extension_signature_ref,sbom_ref,published_at,status,
            publication_idempotency_key,publication_request_digest
-         ) values($1,$2,'19.0',$3,$4,'{}','{}','>=3.2.0,<4.0.0',1,'A','[]',
-           jsonb_build_object('capability_registry_version',$5),'oci://signature',
-           'oci://provenance','oci://sbom',now(),'prepared',$6,$7)",
+         ) values($1,$2,'19.0',$3,$4,'{}','{}','[{}]',$5,'{}','{}','>=3.2.0,<4.0.0',1,'A','[]',
+           jsonb_build_object('capability_registry_version',$6),'oci://signature',
+           'oci://extension-signature','oci://sbom',now(),'prepared',$7,$8)",
     )
     .bind(&release_id)
     .bind("c".repeat(40))
     .bind(&image_digest)
+    .bind(&extension_digest)
     .bind(&manifest_digest)
     .bind(registry_version)
     .bind(format!("publish:{release_id}"))
@@ -117,19 +120,33 @@ async fn insert_runtime_slot(
 ) {
     let evidence = json!({
         "release_id":release_id,
-        "image_digest":image_digest,
+        "odoo_subject_digest":image_digest,
+        "extension_subject_digest":format!("sha256:{}", "c".repeat(64)),
+        "pair_qualification_digest":format!("sha256:{}", "f".repeat(64)),
         "manifest_digest":manifest_digest,
         "provenance_verified":evidence_verified,
         "runtime_inspection_verified":evidence_verified,
     });
     sqlx::query(
         "insert into control.runtime_release_slots(
-           runtime_key,slot,release_id,state,image_digest,started_at,verified_at,evidence
-         ) values('shared-odoo','blue',$1,$2,$3,now(),case when $4 then now() end,$5)",
+           runtime_key,slot,release_id,state,odoo_subject_digest,odoo_manifest_digest,
+           odoo_config_digest,extension_subject_digest,extension_manifest_digest,
+           extension_config_digest,payload_digest,extension_volume,pair_qualification_digest,
+           bridge_contract_digest,installed_addon_versions,started_at,verified_at,evidence
+         ) values('shared-odoo','blue',$1,$2,$3,$4,$5,$6,$7,$8,$9,
+           'mb-ext-1111111111111111-2222222222222222',$10,$11,'{}',now(),case when $12 then now() end,$13)",
     )
     .bind(release_id)
     .bind(state)
     .bind(image_digest)
+    .bind(format!("sha256:{}", "1".repeat(64)))
+    .bind(format!("sha256:{}", "2".repeat(64)))
+    .bind(format!("sha256:{}", "c".repeat(64)))
+    .bind(format!("sha256:{}", "3".repeat(64)))
+    .bind(format!("sha256:{}", "4".repeat(64)))
+    .bind(format!("sha256:{}", "5".repeat(64)))
+    .bind(format!("sha256:{}", "f".repeat(64)))
+    .bind(format!("sha256:{}", "6".repeat(64)))
     .bind(verified)
     .bind(evidence)
     .execute(store.pool())
@@ -383,14 +400,20 @@ async fn fresh_catalog_matches_the_curated_baseline_manifest() {
     .fetch_all(store.pool())
     .await
     .unwrap();
+    let mut drift = Vec::new();
     for (name, count, digest) in actual {
         let fingerprint = expected.catalog.get(&name).unwrap();
-        assert_eq!(count, fingerprint.count, "{name} count drifted");
-        assert_eq!(digest, fingerprint.digest, "{name} catalog drifted");
+        if count != fingerprint.count || digest != fingerprint.digest {
+            drift.push(format!(
+                "{name}: count={count}, digest={digest} (expected count={}, digest={})",
+                fingerprint.count, fingerprint.digest
+            ));
+        }
     }
     store.pool().close().await;
     drop_database(&admin, &database).await;
     drop_runtime_roles(&admin).await;
+    assert!(drift.is_empty(), "catalog drift:\n{}", drift.join("\n"));
 }
 
 #[tokio::test]
@@ -526,9 +549,9 @@ async fn empty_fleet_activation_refuses_nonempty_or_mismatched_state() {
         .await
         .unwrap();
     let active_release = format!("odoo-2026.08.21-{}", Uuid::new_v4().simple());
-    sqlx::query("insert into control.application_releases(id,source_commit,odoo_version,image_digest,manifest_digest,addon_versions,compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,manifest,signature_bundle_ref,provenance_ref,sbom_ref,published_at,status,publication_idempotency_key,publication_request_digest) select $1,source_commit,odoo_version,$4,$5,addon_versions,compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,manifest,signature_bundle_ref,provenance_ref,sbom_ref,published_at,'active',$2,$3 from control.application_releases where id=$6")
+    sqlx::query("insert into control.application_releases(id,source_commit,odoo_version,odoo_subject_digest,extension_subject_digest,odoo_runtime,extension_bundle,pair_qualifications,manifest_digest,addon_versions,compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,manifest,signature_bundle_ref,extension_signature_ref,sbom_ref,published_at,status,publication_idempotency_key,publication_request_digest) select $1,source_commit,odoo_version,$4,$5,odoo_runtime,extension_bundle,pair_qualifications,$6,addon_versions,compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,manifest,signature_bundle_ref,extension_signature_ref,sbom_ref,published_at,'active',$2,$3 from control.application_releases where id=$7")
         .bind(&active_release).bind(format!("publish:{active_release}")).bind(vec![2_u8;32])
-        .bind(format!("sha256:{}","d".repeat(64))).bind(format!("sha256:{}","e".repeat(64)))
+        .bind(format!("sha256:{}","d".repeat(64))).bind(format!("sha256:{}","e".repeat(64))).bind(format!("sha256:{}","7".repeat(64)))
         .bind(&release).execute(store.pool()).await.unwrap();
     let mut tx = store.begin().await.unwrap();
     assert_activation_conflict(

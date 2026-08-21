@@ -1,91 +1,107 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://makersbrain.net/schemas/application-release-v1.json",
-  "title": "MakersBrain immutable Odoo application release",
+  "$id": "https://makersbrain.net/schemas/application-release-v2.json",
+  "title": "MakersBrain qualified Odoo runtime and extension release",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "release_id",
-    "source_commit",
-    "odoo_version",
-    "image_digest",
-    "built_at",
-    "addons",
-    "oca",
-    "upgradeable_from",
-    "database_runtime_compatibility",
-    "bridge_contract",
-    "schema_epoch",
-    "change_class",
-    "required_postconditions",
-    "capability_registry_version",
-    "provenance"
-  ],
+  "required": ["schema_version", "release_id", "source_commit", "built_at", "odoo_runtime", "extension_bundle", "pair_qualifications", "addons", "locked_dependencies", "upgradeable_from", "database_runtime_compatibility", "bridge_contract", "bridge_contract_digest", "schema_epoch", "change_class", "required_postconditions", "capability_registry_version", "admission_signature"],
   "properties": {
-    "schema_version": {"const": 1},
-    "release_id": {
-      "type": "string",
-      "pattern": "^odoo-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[a-f0-9]{7,64}$"
-    },
+    "schema_version": {"const": 2},
+    "release_id": {"type": "string", "pattern": "^odoo-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[a-f0-9]{7,64}$"},
     "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"},
-    "odoo_version": {"type": "string", "pattern": "^[0-9]+\\.0$"},
-    "image_digest": {"$ref": "#/$defs/sha256Digest"},
     "built_at": {"type": "string", "format": "date-time"},
+    "odoo_runtime": {"$ref": "#/$defs/runtime"},
+    "extension_bundle": {"$ref": "#/$defs/extension"},
+    "pair_qualifications": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/pair"}},
     "addons": {"$ref": "#/$defs/versionMap"},
-    "oca": {"$ref": "#/$defs/commitMap"},
-    "upgradeable_from": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {"type": "string", "minLength": 1}
-    },
-    "database_runtime_compatibility": {
-      "type": "object",
-      "propertyNames": {"minLength": 1},
-      "additionalProperties": {"enum": ["none", "read-only", "read-write"]}
-    },
+    "locked_dependencies": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/lockedDependency"}},
+    "upgradeable_from": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "database_runtime_compatibility": {"type": "object", "additionalProperties": {"enum": ["none", "read-only", "read-write"]}},
     "bridge_contract": {"type": "string", "minLength": 1},
+    "bridge_contract_digest": {"$ref": "#/$defs/digest"},
     "schema_epoch": {"type": "integer", "minimum": 1},
     "change_class": {"enum": ["A", "B", "C"]},
-    "required_postconditions": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {
-        "enum": [
-          "registry_load",
-          "installed_versions",
-          "migration_ledger",
-          "required_columns",
-          "xmlid_ownership",
-          "health"
-        ]
-      }
-    },
+    "required_postconditions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["registry_load", "installed_versions", "migration_ledger", "required_columns", "xmlid_ownership", "health"]}},
     "capability_registry_version": {"type": "integer", "minimum": 1},
-    "provenance": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["oci_ref", "cosign_bundle_ref", "slsa_provenance_ref", "sbom_ref"],
-      "properties": {
-        "oci_ref": {"type": "string", "pattern": "^\\S+@sha256:[a-f0-9]{64}$"},
-        "cosign_bundle_ref": {"type": "string", "minLength": 1},
-        "slsa_provenance_ref": {"type": "string", "minLength": 1},
-        "sbom_ref": {"type": "string", "minLength": 1}
-      }
-    }
+    "admission_signature": {"$ref": "#/$defs/evidence"}
   },
   "$defs": {
-    "sha256Digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
-    "versionMap": {
-      "type": "object",
-      "propertyNames": {"pattern": "^[a-z0-9_]+$"},
-      "additionalProperties": {"type": "string", "minLength": 1}
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "ociRef": {"type": "string", "pattern": "^\\S+@sha256:[a-f0-9]{64}$"},
+    "kind": {"enum": ["image_index", "image_manifest"]},
+    "platform": {
+      "type": "object", "additionalProperties": false, "required": ["os", "architecture"],
+      "properties": {"os": {"const": "linux"}, "architecture": {"type": "string", "minLength": 1}, "variant": {"type": "string", "minLength": 1}}
     },
-    "commitMap": {
-      "type": "object",
-      "propertyNames": {"pattern": "^[a-zA-Z0-9_./-]+$"},
-      "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"}
+    "evidence": {
+      "type": "object", "additionalProperties": false, "required": ["reference", "subject_digest", "sha256_digest"],
+      "properties": {"reference": {"$ref": "#/$defs/ociRef"}, "subject_digest": {"$ref": "#/$defs/digest"}, "sha256_digest": {"$ref": "#/$defs/digest"}}
+    },
+    "runtimeEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sbom", "vulnerability_report", "scanner", "advisory_snapshot_at", "policy_digest", "sbom_kind", "capability_checks_digest"],
+      "properties": {
+        "sbom": {"$ref": "#/$defs/evidence"}, "vulnerability_report": {"$ref": "#/$defs/evidence"},
+        "scanner": {"type": "string", "minLength": 1}, "advisory_snapshot_at": {"type": "string", "format": "date-time"},
+        "policy_digest": {"$ref": "#/$defs/digest"}, "sbom_kind": {"const": "observed"}, "capability_checks_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "runtimePlatform": {
+      "type": "object", "additionalProperties": false, "required": ["platform", "manifest_digest", "config_digest", "evidence"],
+      "properties": {"platform": {"$ref": "#/$defs/platform"}, "manifest_digest": {"$ref": "#/$defs/digest"}, "config_digest": {"$ref": "#/$defs/digest"}, "evidence": {"$ref": "#/$defs/runtimeEvidence"}}
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["official_source_ref", "deployment_ref", "subject_digest", "subject_kind", "version", "platforms"],
+      "properties": {
+        "official_source_ref": {"$ref": "#/$defs/ociRef"}, "deployment_ref": {"$ref": "#/$defs/ociRef"},
+        "subject_digest": {"$ref": "#/$defs/digest"}, "subject_kind": {"$ref": "#/$defs/kind"},
+        "version": {"const": "19.0"}, "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/runtimePlatform"}}
+      }
+    },
+    "qualifiedRuntime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["official_source_ref", "deployment_ref", "subject_digest", "subject_kind", "platform", "manifest_digest", "config_digest"],
+      "properties": {
+        "official_source_ref": {"$ref": "#/$defs/ociRef"}, "deployment_ref": {"$ref": "#/$defs/ociRef"},
+        "subject_digest": {"$ref": "#/$defs/digest"}, "subject_kind": {"$ref": "#/$defs/kind"}, "platform": {"$ref": "#/$defs/platform"},
+        "manifest_digest": {"$ref": "#/$defs/digest"}, "config_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "extensionPlatform": {
+      "type": "object", "additionalProperties": false,
+      "required": ["platform", "manifest_digest", "config_digest", "payload_digest", "python_implementation", "python_abi", "python_platform", "dependency_inventory_digest", "lock_file_digest", "qualified_odoo_runtime", "signature", "sbom", "vulnerability_report"],
+      "properties": {
+        "platform": {"$ref": "#/$defs/platform"}, "manifest_digest": {"$ref": "#/$defs/digest"}, "config_digest": {"$ref": "#/$defs/digest"},
+        "payload_digest": {"$ref": "#/$defs/digest"}, "python_implementation": {"const": "cpython"}, "python_abi": {"type": "string", "minLength": 1},
+        "python_platform": {"type": "string", "minLength": 1}, "dependency_inventory_digest": {"$ref": "#/$defs/digest"}, "lock_file_digest": {"$ref": "#/$defs/digest"},
+        "qualified_odoo_runtime": {"$ref": "#/$defs/qualifiedRuntime"}, "signature": {"$ref": "#/$defs/evidence"},
+        "sbom": {"$ref": "#/$defs/evidence"}, "vulnerability_report": {"$ref": "#/$defs/evidence"}
+      }
+    },
+    "extension": {
+      "type": "object", "additionalProperties": false, "required": ["oci_ref", "subject_digest", "subject_kind", "platforms"],
+      "properties": {
+        "oci_ref": {"$ref": "#/$defs/ociRef"}, "subject_digest": {"$ref": "#/$defs/digest"}, "subject_kind": {"$ref": "#/$defs/kind"},
+        "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/extensionPlatform"}}
+      }
+    },
+    "pair": {
+      "type": "object", "additionalProperties": false,
+      "required": ["platform", "odoo_manifest_digest", "extension_manifest_digest", "payload_digest", "qualification_result", "qualification_digest"],
+      "properties": {
+        "platform": {"$ref": "#/$defs/platform"}, "odoo_manifest_digest": {"$ref": "#/$defs/digest"},
+        "extension_manifest_digest": {"$ref": "#/$defs/digest"}, "payload_digest": {"$ref": "#/$defs/digest"},
+        "qualification_result": {"const": "passed"}, "qualification_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "lockedDependency": {
+      "type": "object", "additionalProperties": false, "required": ["name", "version"],
+      "properties": {"name": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1}}
+    },
+    "versionMap": {
+      "type": "object", "propertyNames": {"pattern": "^[a-z0-9_.-]+$"},
+      "additionalProperties": {"type": "string", "minLength": 1}
     }
   }
 }

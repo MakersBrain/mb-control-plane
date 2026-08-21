@@ -136,6 +136,10 @@ pub fn app(state: AppState) -> Router {
             post(internal::webshop_transactional_mail),
         )
         .route(
+            "/internal/v1/workshops/{workshop_id}/oidc/verify",
+            post(internal::verify_odoo_id_token),
+        )
+        .route(
             "/internal/v1/mail-events",
             post(internal::mail_delivery_event),
         )

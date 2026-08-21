@@ -67,9 +67,9 @@ pub async fn activate_initial_release(
     tx: &mut Transaction<'_, Postgres>,
     release_id: &str,
 ) -> Result<InitialReleaseActivation, InitialReleaseActivationError> {
-    let release = sqlx::query_as::<_, (String, i64, i32, String, String)>(
+    let release = sqlx::query_as::<_, (String, i64, i32, String, String, String)>(
         "select status,version,(manifest->>'capability_registry_version')::integer,
-                image_digest,manifest_digest
+                odoo_subject_digest,extension_subject_digest,manifest_digest
          from control.application_releases where id=$1 for update",
     )
     .bind(release_id)
@@ -79,8 +79,8 @@ pub async fn activate_initial_release(
         "initial application release was not found",
     ))?;
     if release.0 == "active" {
-        let active_slot = sqlx::query_as::<_, (String, String, Value)>(
-            "select slot,image_digest,evidence from control.runtime_release_slots
+        let active_slot = sqlx::query_as::<_, (String, String, String, String, Value)>(
+            "select slot,odoo_subject_digest,extension_subject_digest,pair_qualification_digest,evidence from control.runtime_release_slots
              where runtime_key='shared-odoo' and release_id=$1 and state='active'
                and activated_at is not null",
         )
@@ -90,7 +90,13 @@ pub async fn activate_initial_release(
         .ok_or(InitialReleaseActivationError::Conflict(
             "active initial release has no active runtime slot",
         ))?;
-        validate_initial_slot_evidence(release_id, &release.3, &release.4, &active_slot)?;
+        validate_initial_slot_evidence(
+            release_id,
+            &release.3,
+            &release.4,
+            &release.5,
+            &active_slot,
+        )?;
         return Ok(InitialReleaseActivation {
             slot: active_slot.0,
             version: release.1,
@@ -129,8 +135,8 @@ pub async fn activate_initial_release(
             "release capability registry does not match the active registry",
         ));
     }
-    let prepared_slot = sqlx::query_as::<_, (String, String, Value)>(
-        "select slot,image_digest,evidence from control.runtime_release_slots
+    let prepared_slot = sqlx::query_as::<_, (String, String, String, String, Value)>(
+        "select slot,odoo_subject_digest,extension_subject_digest,pair_qualification_digest,evidence from control.runtime_release_slots
          where runtime_key='shared-odoo' and release_id=$1 and state='prepared'
            and started_at is not null and verified_at is not null for update",
     )
@@ -140,7 +146,13 @@ pub async fn activate_initial_release(
     .ok_or(InitialReleaseActivationError::Conflict(
         "initial release has no verified prepared runtime slot",
     ))?;
-    validate_initial_slot_evidence(release_id, &release.3, &release.4, &prepared_slot)?;
+    validate_initial_slot_evidence(
+        release_id,
+        &release.3,
+        &release.4,
+        &release.5,
+        &prepared_slot,
+    )?;
     let slot_changed = sqlx::query(
         "update control.runtime_release_slots
          set state='active',activated_at=now(),version=version+1
@@ -173,17 +185,29 @@ pub async fn activate_initial_release(
 
 fn validate_initial_slot_evidence(
     release_id: &str,
-    image_digest: &str,
+    odoo_subject_digest: &str,
+    extension_subject_digest: &str,
     manifest_digest: &str,
-    slot: &(String, String, Value),
+    slot: &(String, String, String, String, Value),
 ) -> Result<(), InitialReleaseActivationError> {
-    if slot.1 != image_digest
-        || slot.2.get("release_id").and_then(Value::as_str) != Some(release_id)
-        || slot.2.get("image_digest").and_then(Value::as_str) != Some(image_digest)
-        || slot.2.get("manifest_digest").and_then(Value::as_str) != Some(manifest_digest)
-        || slot.2.get("provenance_verified").and_then(Value::as_bool) != Some(true)
+    if slot.1 != odoo_subject_digest
+        || slot.2 != extension_subject_digest
+        || slot.4.get("release_id").and_then(Value::as_str) != Some(release_id)
+        || slot.4.get("odoo_subject_digest").and_then(Value::as_str) != Some(odoo_subject_digest)
         || slot
-            .2
+            .4
+            .get("extension_subject_digest")
+            .and_then(Value::as_str)
+            != Some(extension_subject_digest)
+        || slot
+            .4
+            .get("pair_qualification_digest")
+            .and_then(Value::as_str)
+            != Some(slot.3.as_str())
+        || slot.4.get("manifest_digest").and_then(Value::as_str) != Some(manifest_digest)
+        || slot.4.get("provenance_verified").and_then(Value::as_bool) != Some(true)
+        || slot
+            .4
             .get("runtime_inspection_verified")
             .and_then(Value::as_bool)
             != Some(true)

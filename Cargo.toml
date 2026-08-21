@@ -42,6 +42,10 @@ path = "src/bin/document-extraction-broker.rs"
 name = "control-mail-gateway"
 path = "src/bin/control-mail-gateway.rs"
 
+[[bin]]
+name = "control-extension-helper"
+path = "src/bin/control-extension-helper.rs"
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"

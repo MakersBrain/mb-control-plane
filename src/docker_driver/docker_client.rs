@@ -1,4 +1,6 @@
 use super::*;
+use bytes::Bytes;
+use futures_util::StreamExt as _;
 
 pub(super) async fn docker_exec(
     state: &DriverState,
@@ -88,6 +90,58 @@ pub(super) async fn docker_container_exists(
             "Docker inspect returned {status}"
         ))),
     }
+}
+
+pub(super) async fn docker_pull_image(
+    state: &DriverState,
+    reference: &str,
+) -> Result<(), DriverError> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("fromImage", reference)
+        .finish();
+    let response = state
+        .runtime
+        .client
+        .post(state.runtime.endpoint(&format!("/images/create?{query}")))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "image pull returned {}",
+            response.status()
+        )));
+    }
+    // The engine returns a bounded progress stream. Consume it so the pull is
+    // complete before any identity inspection or container creation.
+    let bytes = response.bytes().await.map_err(DriverError::internal)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(DriverError::internal(
+            "image pull response exceeded its bound",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn docker_inspect_image(
+    state: &DriverState,
+    reference: &str,
+) -> Result<Value, DriverError> {
+    let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
+    let response = state
+        .runtime
+        .client
+        .get(state.runtime.endpoint(&format!("/images/{encoded}/json")))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "image inspect returned {}",
+            response.status()
+        )));
+    }
+    response.json().await.map_err(DriverError::internal)
 }
 
 pub(super) async fn docker_inspect_container(
@@ -268,6 +322,151 @@ pub(super) async fn docker_create_volume(
     if !response.status().is_success() {
         return Err(DriverError::internal(format!(
             "Docker volume create returned {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn docker_volume_exists(
+    state: &DriverState,
+    name: &str,
+) -> Result<bool, DriverError> {
+    let response = state
+        .runtime
+        .client
+        .get(state.runtime.endpoint(&format!("/volumes/{name}")))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    match response.status() {
+        StatusCode::OK => Ok(true),
+        StatusCode::NOT_FOUND => Ok(false),
+        status => Err(DriverError::internal(format!(
+            "volume inspect returned {status}"
+        ))),
+    }
+}
+
+pub(super) async fn docker_create_extension_volume(
+    state: &DriverState,
+    name: &str,
+    manifest_digest: &str,
+    payload_digest: &str,
+) -> Result<(), DriverError> {
+    let response = state.runtime.client.post(state.runtime.endpoint("/volumes/create"))
+        .json(&json!({"Name":name,"Labels":{"mb.kind":"odoo-extension","mb.extension-manifest":manifest_digest,"mb.payload":payload_digest}}))
+        .send().await.map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "extension volume create returned {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn docker_delete_extension_volume(
+    state: &DriverState,
+    name: &str,
+) -> Result<bool, DriverError> {
+    let response = state
+        .runtime
+        .client
+        .delete(state.runtime.endpoint(&format!("/volumes/{name}")))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    match response.status() {
+        StatusCode::NO_CONTENT => Ok(true),
+        StatusCode::NOT_FOUND => Ok(false),
+        StatusCode::CONFLICT => Err(DriverError::bad(
+            "extension volume is still referenced by an engine mount",
+        )),
+        status => Err(DriverError::internal(format!(
+            "extension volume delete returned {status}"
+        ))),
+    }
+}
+
+pub(super) async fn docker_get_archive_bounded(
+    state: &DriverState,
+    container: &str,
+    path: &str,
+    maximum: usize,
+) -> Result<Bytes, DriverError> {
+    if !path.starts_with('/')
+        || path.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(DriverError::internal("unsafe archive path"));
+    }
+    let response = state
+        .runtime
+        .client
+        .get(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{container}/archive?path={path}")),
+        )
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(
+            "extension payload archive is unavailable",
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(DriverError::bad(
+            "extension payload exceeds the extraction byte limit",
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(DriverError::internal)?;
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err(DriverError::bad(
+                "extension payload exceeds the extraction byte limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(bytes))
+}
+
+pub(super) async fn docker_put_archive(
+    state: &DriverState,
+    container: &str,
+    path: &str,
+    archive: Bytes,
+) -> Result<(), DriverError> {
+    if !path.starts_with('/')
+        || path.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(DriverError::internal("unsafe archive path"));
+    }
+    let response = state
+        .runtime
+        .client
+        .put(state.runtime.endpoint(&format!(
+            "/containers/{container}/archive?path={path}&noOverwriteDirNonDir=true"
+        )))
+        .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+        .body(archive)
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "extension archive extraction returned {}",
             response.status()
         )));
     }
