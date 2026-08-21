@@ -39,6 +39,8 @@ The final design must ensure:
   without requiring a distributed transaction;
 - the active and retained previous control/agent protocol versions and release
   grants remain compatible throughout the rollback window;
+- authorized operators can inspect a bounded live log stream for an allowlisted
+  runtime resource without receiving arbitrary runtime or journal access;
 - every backend passes the same driver contract and failure-recovery suite.
 
 ## 2. Current state and gap
@@ -110,11 +112,13 @@ resource.
 | Command admission, desired state and control PostgreSQL ledger | `mb-control-plane` |
 | Tenant provisioning, recovery and fleet release logic | `mb-control-plane` |
 | Backend-neutral desired-state reconciler | `mb-control-plane` |
+| Operator log authorization, audit metadata and SSE delivery | `mb-control-plane` |
 | Docker development backend | `mb-control-plane` |
 | Versioned Quadlet-agent client | `mb-control-plane` |
 | Host-agent service and Unix socket | `mb-infra` |
 | Dynamic Quadlet templates and policy validation | `mb-infra` |
 | Idempotent host-effect journal and systemd execution | `mb-infra` |
+| Exact-unit journald reads and bounded diagnostic streaming | `mb-infra` |
 | Active/retained platform execution-grant set | composed releases in `mb-infra` |
 | Staging and production qualification evidence | `mb-infra` |
 
@@ -398,6 +402,27 @@ Preserve current opaque secret references such as `docker/<workshop>/...`
 during this migration. Renaming persisted references belongs to a separate
 schema-epoch decision.
 
+Define a separate, read-only diagnostic contract for live logs. It is not part
+of the authenticated mutation routes and does not use an idempotency key. The
+control API accepts only an opaque, validated runtime resource key such as:
+
+```text
+workshop/<uuid>/paperless
+runtime/shared-odoo/blue
+service/control-api
+job/<action-id>
+```
+
+The backend maps that key to a deterministic container or systemd unit. Clients
+can never supply a container ID, unit name, journal match, filesystem path or
+runtime command directly.
+
+The operator-facing API should use server-sent events because delivery is
+one-way. Its contract includes an opaque cursor, bounded initial tail and
+terminal reasons such as `duration_limit`, `byte_limit`, `resource_stopped` and
+`backend_unavailable`. Log contents are never included in command/audit replay
+responses.
+
 ## 6. Phase 2: extract runtime interfaces
 
 Move raw Docker operations behind internal interfaces:
@@ -408,6 +433,8 @@ Move raw Docker operations behind internal interfaces:
 - `VolumeRuntime`: ensure, inspect and retention-gated deletion;
 - `ImageRuntime`: prove exact image presence and normalized OCI identity;
 - `GatewayRuntime`: validate, reload and observe a route digest.
+- `DiagnosticRuntime`: resolve an allowlisted resource key and return a bounded,
+  cancellable stream of normalized log records.
 
 Do not expose raw Docker inspect JSON above the backend. Use normalized
 observations such as:
@@ -427,10 +454,20 @@ RuntimeObservation
 Keep the current Engine implementation as `DockerRuntimeBackend`. The shared
 reconciler must consume only the interfaces above.
 
+For Docker development, `DiagnosticRuntime` uses the Engine container-log
+endpoint with stdout, stderr, `follow` and a bounded `since` cursor. It resolves
+the container name from durable runtime intent, never from caller input. The
+adapter must cancel the Engine response immediately when the API client
+disconnects and must not hold a reconciliation or resource lock while
+streaming.
+
 Configuration changes:
 
 - add `DRIVER_BACKEND=docker|quadlet-agent`;
 - add `DRIVER_AGENT_SOCKET` and a file-backed `DRIVER_AGENT_TOKEN`;
+- add file-backed `DRIVER_DIAGNOSTIC_TOKEN`,
+  `CONTROL_RUNTIME_LOG_DRIVER_URL` and `CONTROL_RUNTIME_LOG_DRIVER_TOKEN`; the
+  diagnostic token must be distinct from deployment and privacy credentials;
 - retain `DRIVER_CONTAINER_RUNTIME` and `DRIVER_RUNTIME_SOCKET` only for the
   Docker compatibility backend;
 - reject the Docker backend outside development after staging migration;
@@ -563,6 +600,62 @@ previous control client, then restores the previous static Quadlet release.
 Every release must support the immediately previous protocol during the
 rollback window. A breaking protocol change therefore requires an explicit
 expand/migrate/contract sequence across at least two platform releases.
+
+### 7.3 Read-only live-log diagnostic stream
+
+Add a separately authorized diagnostic request class to the agent protocol. It
+is read-only, is never written to the host-effect action journal and cannot be
+upgraded into a general journal or command interface.
+
+For Quadlet resources, the agent maps the validated resource key to one exact
+user-systemd unit and reads only that unit's journald records. Prefer the
+systemd journal API; an argv-only `journalctl --user --unit <derived-unit>
+--output=json --follow` adapter is acceptable when its executable, arguments
+and derived unit are fixed by policy. The caller may not provide journal match
+expressions, unit names, namespaces, fields or output formats.
+
+Normalize each record before it leaves the agent:
+
+```text
+RuntimeLogRecord
+  cursor          opaque journal/backend cursor
+  timestamp       UTC
+  resource_key    validated opaque resource identifier
+  stream          stdout | stderr | service
+  message         bounded UTF-8 text
+  truncated       boolean
+```
+
+Strip ANSI/control sequences other than permitted whitespace, replace invalid
+UTF-8, cap each message at 16 KiB and never forward unrestricted structured
+journal fields. The stream applies all of these hard limits:
+
+- default initial tail: 200 records;
+- maximum initial tail: 1,000 records;
+- maximum duration: 5 minutes;
+- maximum transferred bytes: 5 MiB;
+- maximum two concurrent streams per operator and a bounded global limit;
+- immediate cancellation and child/reader cleanup on downstream disconnect.
+
+The control API owns operator authorization. Introduce a dedicated
+`runtime.logs.read` permission, granted only through reviewed platform roles,
+and require recent strong authentication. Workshop resources additionally
+require authority for that workshop unless an explicitly audited platform
+security role is used. Browser delivery uses SSE through the control API. The
+control API calls a distinct internal driver diagnostic route with a credential
+that cannot invoke deployment or privacy mutations.
+
+Audit only the actor, resource key, cursor/time range, start/completion time,
+transferred byte/record counts and terminal reason. Do not put messages in
+control PostgreSQL, traces, audit payloads or error reports. Redaction in the
+stream is defense in depth; every container remains responsible for producing
+secret-safe and privacy-minimized logs at source. Exclude a job/resource class
+from live viewing when its output cannot meet that contract.
+
+Live streaming is for short operational diagnosis, not retention or search.
+Longer retention should forward journald through a separately reviewed logging
+pipeline to a dedicated backend; adding such a backend is outside the driver
+migration unless separately approved.
 
 ## 8. Phase 4: dynamic Quadlet storage layout
 
@@ -758,6 +851,11 @@ The application release role must:
   `control-container-driver.container`;
 - set `DRIVER_BACKEND=quadlet-agent`;
 - mount only the agent Unix socket into the driver;
+- materialize a distinct diagnostic credential into only the control API and
+  driver, never the browser or ordinary workers;
+- pin application Quadlets to journald logging, configure bounded systemd log
+  rate limits and verify that the `tenant-runtime` agent can read only the
+  intended user-unit records;
 - remove static Odoo ordering after slot migration;
 - install the maintenance route and runtime-ready traffic gate before removing
   static Odoo ordering;
@@ -768,7 +866,9 @@ The application release role must:
   while treating control PostgreSQL as the rebuild source for desired state;
   do not back up transient job units or job-secret directories;
 - publish agent version, reconciliation generation and resource counts to
-  deployment evidence and monitoring.
+  deployment evidence and monitoring;
+- publish privacy-safe counters for opened, rejected, truncated and
+  limit-terminated log streams without resource messages or tenant identifiers.
 
 Remove `SecurityLabelDisable=true` if remaining mounts work with a narrow label
 policy. If an exception remains necessary, document and test its exact scope.
@@ -835,6 +935,15 @@ The migration is complete only when:
   public tenant traffic remains on maintenance;
 - unrelated tenant reconciliation continues while another tenant waits for a
   long health check, proving that no global lock is held;
+- Docker and Quadlet return equivalent normalized log records for the same
+  contract fixture;
+- live-log requests reject arbitrary unit/container names, unknown resources,
+  unauthorized workshops, stale strong authentication and mutation
+  credentials;
+- record, tail, duration, byte, concurrency and disconnect limits terminate
+  streams without leaking tasks, subprocesses, descriptors or runtime locks;
+- log messages never enter control PostgreSQL, audit payloads, traces or agent
+  action journals, and secret canaries are absent from every streamed fixture;
 - secret values are absent from Quadlets, generated systemd units, environment
   inspection, journals and release records, and PostgreSQL contains no unkeyed
   secret-value digest;
@@ -858,14 +967,17 @@ The migration is complete only when:
    immutable artifact installation and current/previous protocol tests.
 8. Both repositories: add the agent client and cross-repository conformance
    workflow.
-9. `mb-infra`: migrate Paperless dynamic resources.
-10. Both repositories: migrate transient jobs and recovery tests.
-11. Both repositories: migrate Odoo slots and gateway reload.
-12. `mb-infra`: install the agent through Ansible, enforce active/retained
+9. Both repositories: add the read-only diagnostic protocol, Docker log
+   adapter, Quadlet/journald adapter, control API SSE route and authorization
+   tests.
+10. `mb-infra`: migrate Paperless dynamic resources.
+11. Both repositories: migrate transient jobs and recovery tests.
+12. Both repositories: migrate Odoo slots and gateway reload.
+13. `mb-infra`: install the agent through Ansible, enforce active/retained
     release grants, add the runtime traffic gate and monitoring.
-13. Staging: run reboot, interruption, isolation, recovery and rollback
+14. Staging: run reboot, interruption, isolation, live-log privacy and rollback
     qualification and retain evidence.
-14. Both repositories: reject production compatibility-socket operation and
+15. Both repositories: reject production compatibility-socket operation and
     remove obsolete Podman configuration.
 
 ## 17. References
