@@ -91,14 +91,31 @@ jobs:
       - run: python3 tools/test_compose_secret_canary.py
       - run: python3 tools/test_local_secret_bootstrap.py
       - run: python3 tools/test_dynamic_secret_boundary.py
+      - run: python3 tools/test_privacy_deployment_gate.py
+      - run: python3 tools/test_tenant_query_scope.py
+      - run: python3 tools/test_tenant_execution_scope.py
+      - run: python3 tools/test_worker_execution_scope.py
+      - run: python3 tools/test_release_host_guard.py
+      - run: python3 tools/test_environment_access.py
+      - run: python3 tools/test_http_client_construction.py
+      - run: python3 tools/test_log_safety.py
       - run: python3 tools/test_verify_github_oidc_claims.py
       - run: python3 tools/test_topology_odoo_isolation.py --self-test
+      - run: python3 tools/test_workspace_configuration.py
       - run: cargo clippy --locked --all-targets --manifest-path Cargo.toml -- -D warnings
       - run: cargo test --locked --manifest-path Cargo.toml
       - name: PostgreSQL integration tests
         run: cargo test --locked --manifest-path Cargo.toml --test postgres -- --ignored --test-threads=1
+      - name: PostgreSQL driver boundary tests
+        run: cargo test --locked --manifest-path Cargo.toml --lib docker_driver:: -- --ignored --test-threads=1
+      - name: PostgreSQL scheduler boundary tests
+        run: cargo test --locked --manifest-path Cargo.toml --lib backup_scheduler:: -- --ignored --test-threads=1
+      - name: PostgreSQL privacy cleanup boundary tests
+        run: cargo test --locked --manifest-path Cargo.toml --lib workers::privacy:: -- --ignored --test-threads=1
       - name: PostgreSQL schema epoch tests
         run: cargo test --locked --manifest-path Cargo.toml --test schema_epoch -- --ignored --test-threads=1
+      - name: PostgreSQL tenant isolation tests
+        run: cargo test --locked --manifest-path Cargo.toml --test tenant_isolation -- --ignored --test-threads=1
       - name: Runtime database role matrix
         run: sh tools/test-role-matrix.sh
       - name: Generated browser API client is current

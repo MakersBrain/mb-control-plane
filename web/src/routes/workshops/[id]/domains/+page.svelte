@@ -5,33 +5,13 @@
 	import OperationCard from '$lib/components/OperationCard.svelte';
 	import { request } from '$lib/session.svelte';
 	import type { WorkshopSummary } from '$lib/types';
-
-	type Domain = {
-		id?: string; hostname: string; kind: string; state: string; desired_state: string;
-		dns_state: string; certificate_state: string; verification_name?: string;
-		verification_value?: string; routing_name?: string; routing_target?: string;
-		ownership_verified_at?: string; last_health_checked_at?: string;
-		last_error_class?: string; canonical: boolean; version: number; can_manage: boolean;
-		edge_verification_records: { type: string; name: string; value: string }[];
-		operation_id?: string;
-	};
-	type EmailDomain = {
-		id: string; domain_name: string; sender_local_part: string; state: string; desired_state: string;
-		provider_status?: string; dns_records: Record<string, { name?: string; value?: string }>;
-		verification: Record<string, { status?: string; error?: string }>;
-		test_delivered_at?: string; last_error_class?: string; operation_id?: string; version: number; can_manage: boolean;
-	};
-	type SmtpStatus = {
-		transport: 'platform' | 'smtp'; configured: boolean; host?: string; port?: number;
-		encryption?: 'starttls' | 'ssl'; username?: string; from_email?: string;
-		password_configured: boolean;
-	};
+	import type { EmailDomainResponse, WebshopDomainResponse, WebshopSmtpStatus } from '$lib/generated/control-api';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
-	let domains = $state<Domain[]>([]);
-	let emailDomains = $state<EmailDomain[]>([]);
-	let smtp = $state<SmtpStatus>();
+	let domains = $state<WebshopDomainResponse[]>([]);
+	let emailDomains = $state<EmailDomainResponse[]>([]);
+	let smtp = $state<WebshopSmtpStatus>();
 	let hostname = $state('');
 	let emailDomain = $state('');
 	let senderLocalPart = $state('bonjour');
@@ -49,15 +29,19 @@
 
 	async function load() {
 		try {
-			[workshop, domains, emailDomains, smtp] = await Promise.all([
+			const [loadedWorkshop, loadedDomains, loadedEmailDomains, loadedSmtp] = await Promise.all([
 				request<WorkshopSummary>(`/v1/workshops/${id}`),
-				request<Domain[]>(`/v1/workshops/${id}/domains`),
-				request<EmailDomain[]>(`/v1/workshops/${id}/email-domains`),
-				request<SmtpStatus>(`/v1/workshops/${id}/email/smtp`)
+				request<WebshopDomainResponse[]>(`/v1/workshops/${id}/domains`),
+				request<EmailDomainResponse[]>(`/v1/workshops/${id}/email-domains`),
+				request<WebshopSmtpStatus>(`/v1/workshops/${id}/email/smtp`)
 			]);
+			workshop = loadedWorkshop;
+			domains = loadedDomains;
+			emailDomains = loadedEmailDomains;
+			smtp = loadedSmtp;
 			if (smtp?.configured && !smtpHost) {
 				smtpHost = smtp.host ?? ''; smtpPort = smtp.port ?? 587;
-				smtpEncryption = smtp.encryption ?? 'starttls'; smtpUsername = smtp.username ?? '';
+				smtpEncryption = smtp.encryption === 'ssl' ? 'ssl' : 'starttls'; smtpUsername = smtp.username ?? '';
 				smtpFrom = smtp.from_email ?? '';
 			}
 			error = '';
@@ -68,8 +52,8 @@
 		try { await request(`/v1/workshops/${id}/email-domains`, { method: 'POST', headers: {'idempotency-key': crypto.randomUUID()}, body: JSON.stringify({ domain_name: emailDomain, sender_local_part: senderLocalPart }) }); emailDomain = ''; notice = 'Sender domain registration queued. Publish the DNS records below when they appear.'; await load(); }
 		catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { busy = ''; }
 	}
-	async function checkEmailDomain(domain: EmailDomain) { busy = domain.id; error=''; notice=''; try { await request(`/v1/workshops/${id}/email-domains/${domain.id}/check`, {method:'POST',headers:{'idempotency-key':crypto.randomUUID()}}); notice='Verification check queued. A test message is sent before activation once all required records are valid.'; await load(); } catch(cause){error=cause instanceof Error?cause.message:String(cause)} finally{busy=''} }
-	async function disconnectEmailDomain(domain: EmailDomain) { if(!confirm(`Disconnect ${domain.domain_name} from the MakersBrain relay? Your selected SMTP or relay transport will not change.`))return; busy=domain.id; error=''; try{await request(`/v1/workshops/${id}/email-domains/${domain.id}`,{method:'DELETE',headers:{'idempotency-key':crypto.randomUUID()}});notice='Sender-domain disconnect queued. Your selected SMTP or relay transport is unchanged.';await load()}catch(cause){error=cause instanceof Error?cause.message:String(cause)}finally{busy=''} }
+	async function checkEmailDomain(domain: EmailDomainResponse) { busy = domain.id; error=''; notice=''; try { await request(`/v1/workshops/${id}/email-domains/${domain.id}/check`, {method:'POST',headers:{'idempotency-key':crypto.randomUUID()}}); notice='Verification check queued. A test message is sent before activation once all required records are valid.'; await load(); } catch(cause){error=cause instanceof Error?cause.message:String(cause)} finally{busy=''} }
+	async function disconnectEmailDomain(domain: EmailDomainResponse) { if(!confirm(`Disconnect ${domain.domain_name} from the MakersBrain relay? Your selected SMTP or relay transport will not change.`))return; busy=domain.id; error=''; try{await request(`/v1/workshops/${id}/email-domains/${domain.id}`,{method:'DELETE',headers:{'idempotency-key':crypto.randomUUID()}});notice='Sender-domain disconnect queued. Your selected SMTP or relay transport is unchanged.';await load()}catch(cause){error=cause instanceof Error?cause.message:String(cause)}finally{busy=''} }
 	async function saveSmtp() {
 		busy='smtp'; error=''; notice='';
 		try {
@@ -98,11 +82,11 @@
 		finally { busy = ''; }
 	}
 
-	async function verify(domain: Domain) {
+	async function verify(domain: WebshopDomainResponse) {
 		if (!domain.id) return;
 		busy = domain.id; error = ''; notice = '';
 		try {
-			const observed = await request<Domain>(`/v1/workshops/${id}/domains/${domain.id}/verify`, {
+			const observed = await request<WebshopDomainResponse>(`/v1/workshops/${id}/domains/${domain.id}/verify`, {
 				method: 'POST', headers: { 'idempotency-key': crypto.randomUUID() }
 			});
 			notice = observed.ownership_verified_at
@@ -113,7 +97,7 @@
 		finally { busy = ''; }
 	}
 
-	async function makeCanonical(domain: Domain) {
+	async function makeCanonical(domain: WebshopDomainResponse) {
 		if (!domain.id) return;
 		busy = domain.id; error = ''; notice = '';
 		try {
@@ -129,7 +113,7 @@
 		finally { busy = ''; }
 	}
 
-	async function disconnect(domain: Domain) {
+	async function disconnect(domain: WebshopDomainResponse) {
 		if (!domain.id || !confirm(`Disconnect ${domain.hostname}? Its MakersBrain route and certificate will be removed. Your ownership record is not changed.`)) return;
 		busy = domain.id; error = ''; notice = '';
 		try {
@@ -147,7 +131,7 @@
 		finally { busy = ''; }
 	}
 
-	async function copy(value?: string) {
+	async function copy(value?: string | null) {
 		if (value) { await navigator.clipboard.writeText(value); notice = 'Copied to clipboard.'; }
 	}
 </script>

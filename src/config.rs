@@ -17,7 +17,12 @@ pub enum ConfigError {
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
+    /// Fleet/platform/internal database identity. This pool must never carry a
+    /// caller-selected tenant context.
     pub database_url: String,
+    /// Human workshop database identity. Every use is wrapped in a
+    /// transaction-local workshop execution scope before SQL is issued.
+    pub tenant_database_url: String,
     pub public_origin: Url,
     pub cors_origin: Url,
     pub oidc_issuer: Url,
@@ -34,15 +39,48 @@ pub struct Config {
     pub deployment_driver_url: Url,
     pub deployment_driver_socket: Option<PathBuf>,
     pub deployment_driver_token: String,
+    pub extraction_broker_url: Url,
+    pub extraction_broker_token: String,
     pub allow_self_signup: bool,
     pub operator_emails: HashSet<String>,
     pub request_timeout: Duration,
     pub synthetic_data_only: bool,
 }
 
+/// Immutable configuration for the one-shot schema migration process.
+pub struct MigrationConfig {
+    database_url: String,
+    synthetic_data_only: bool,
+}
+
+impl MigrationConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            database_url: Config::database_url()?,
+            synthetic_data_only: Config::synthetic_data_only()?,
+        })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub fn synthetic_data_only(&self) -> bool {
+        self.synthetic_data_only
+    }
+}
+
 impl Config {
     pub fn database_url() -> Result<String, ConfigError> {
-        required_secret("CONTROL_DATABASE_URL")
+        let value = required_secret("CONTROL_DATABASE_URL")?;
+        validate_database_url("CONTROL_DATABASE_URL", &value)?;
+        Ok(value)
+    }
+
+    pub fn tenant_database_url() -> Result<String, ConfigError> {
+        let value = required_secret("CONTROL_TENANT_DATABASE_URL")?;
+        validate_database_url("CONTROL_TENANT_DATABASE_URL", &value)?;
+        Ok(value)
     }
 
     pub fn synthetic_data_only() -> Result<bool, ConfigError> {
@@ -61,6 +99,9 @@ impl Config {
             "CONTROL_INTERNAL_TOKEN",
             &internal_token,
         )?;
+        let database_url = Self::database_url()?;
+        let tenant_database_url = Self::tenant_database_url()?;
+        distinct_database_login(&database_url, &tenant_database_url)?;
         Ok(Self {
             listen: required("CONTROL_LISTEN")?
                 .parse()
@@ -68,7 +109,8 @@ impl Config {
                     name: "CONTROL_LISTEN",
                     reason: format!("{error}"),
                 })?,
-            database_url: Self::database_url()?,
+            database_url,
+            tenant_database_url,
             public_origin: trusted_origin("CONTROL_PUBLIC_ORIGIN")?,
             cors_origin: trusted_origin("CONTROL_CORS_ORIGIN")?,
             oidc_issuer: trusted_origin("CONTROL_OIDC_ISSUER")?,
@@ -91,6 +133,8 @@ impl Config {
                     reason: error.to_string(),
                 })?,
             deployment_driver_token: required_secret("CONTROL_DEPLOYMENT_DRIVER_TOKEN")?,
+            extraction_broker_url: service_url("CONTROL_EXTRACTION_BROKER_URL")?,
+            extraction_broker_token: required_secret("CONTROL_EXTRACTION_BROKER_TOKEN")?,
             allow_self_signup: std::env::var("CONTROL_ALLOW_SELF_SIGNUP")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
             operator_emails: std::env::var("CONTROL_OPERATOR_EMAILS")
@@ -113,6 +157,44 @@ impl Config {
             .flatten();
         tenant_origin(self.public_origin.scheme(), port, hostname)
     }
+}
+
+pub(crate) fn validate_database_url(name: &'static str, value: &str) -> Result<(), ConfigError> {
+    let url = Url::parse(value).map_err(|error| ConfigError::Invalid {
+        name,
+        reason: format!("must be a PostgreSQL URL: {error}"),
+    })?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") || url.host_str().is_none() {
+        return Err(ConfigError::Invalid {
+            name,
+            reason: "must use the postgres or postgresql scheme and include a host".into(),
+        });
+    }
+    Ok(())
+}
+
+fn distinct_database_login(platform_url: &str, tenant_url: &str) -> Result<(), ConfigError> {
+    let platform = Url::parse(platform_url).map_err(|_| ConfigError::Invalid {
+        name: "CONTROL_DATABASE_URL",
+        reason: "must be validated before database identity comparison".into(),
+    })?;
+    let tenant = Url::parse(tenant_url).map_err(|_| ConfigError::Invalid {
+        name: "CONTROL_TENANT_DATABASE_URL",
+        reason: "must be validated before database identity comparison".into(),
+    })?;
+    if platform.username().is_empty() || tenant.username().is_empty() {
+        return Err(ConfigError::Invalid {
+            name: "CONTROL_TENANT_DATABASE_URL",
+            reason: "both API database URLs must name explicit login roles".into(),
+        });
+    }
+    if platform.username() == tenant.username() {
+        return Err(ConfigError::Invalid {
+            name: "CONTROL_TENANT_DATABASE_URL",
+            reason: "must use a login role distinct from CONTROL_DATABASE_URL".into(),
+        });
+    }
+    Ok(())
 }
 
 fn distinct_secret(
@@ -216,9 +298,11 @@ fn validate_personal_data_governance(
 }
 
 fn tenant_domain() -> Result<String, ConfigError> {
-    let value = required("CONTROL_TENANT_DOMAIN")?
-        .trim()
-        .to_ascii_lowercase();
+    parse_tenant_domain(required("CONTROL_TENANT_DOMAIN")?)
+}
+
+pub(crate) fn parse_tenant_domain(value: String) -> Result<String, ConfigError> {
+    let value = value.trim().to_ascii_lowercase();
     if value.len() > 253
         || !value.contains('.') && value != "localhost"
         || value.starts_with('.')
@@ -265,6 +349,35 @@ fn absolute_url(name: &'static str) -> Result<Url, ConfigError> {
         return Err(ConfigError::Invalid {
             name,
             reason: "must be an absolute HTTP(S) URL".into(),
+        });
+    }
+    Ok(url)
+}
+
+fn service_url(name: &'static str) -> Result<Url, ConfigError> {
+    let value = required(name)?;
+    parse_service_url(name, &value)
+}
+
+fn parse_service_url(name: &'static str, value: &str) -> Result<Url, ConfigError> {
+    let url = Url::parse(value).map_err(|error| ConfigError::Invalid {
+        name,
+        reason: error.to_string(),
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ConfigError::Invalid {
+            name,
+            reason: "must be an absolute HTTP(S) URL".into(),
+        });
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Invalid {
+            name,
+            reason: "must not contain credentials, a query, or a fragment".into(),
         });
     }
     Ok(url)
@@ -319,6 +432,68 @@ mod tests {
                 "internal-value",
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn internal_service_urls_are_absolute_and_never_embed_credentials() {
+        let name = "CONTROL_EXTRACTION_BROKER_URL";
+        assert!(parse_service_url(name, "http://document-extraction:8090").is_ok());
+        for invalid in [
+            "document-extraction:8090",
+            "ftp://document-extraction/archive",
+            "https://token@document-extraction",
+            "https://document-extraction?token=secret",
+            "https://document-extraction/#fragment",
+        ] {
+            assert!(
+                parse_service_url(name, invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn database_urls_are_typed_before_a_process_connects() {
+        assert!(
+            validate_database_url(
+                "CONTROL_DATABASE_URL",
+                "postgresql://control@postgres/control"
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "control-db",
+            "https://postgres/control",
+            "postgresql:///control",
+        ] {
+            assert!(
+                validate_database_url("CONTROL_DATABASE_URL", invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        assert!(
+            distinct_database_login(
+                "postgresql://control_api@postgres/control",
+                "postgresql://control_tenant_api@postgres/control",
+            )
+            .is_ok()
+        );
+        assert!(
+            distinct_database_login(
+                "postgresql://control_api@postgres/control",
+                "postgresql://control_api@postgres/control",
+            )
+            .is_err(),
+            "tenant and platform pools must not share a login role"
+        );
+        assert!(
+            distinct_database_login(
+                "postgresql://postgres@postgres/control",
+                "postgresql://control_tenant_api@postgres/control",
+            )
+            .is_ok(),
+            "identity comparison is independent of host and password handling"
         );
     }
 

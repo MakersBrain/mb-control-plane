@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub const MAX_FLEET_TENANTS: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicationReleaseManifest {
@@ -498,7 +500,7 @@ fn hex_digest(value: &str, min: usize, max: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::Value;
 
@@ -511,7 +513,7 @@ mod tests {
         json!({"reference":format!("registry.example/evidence@{subject}"),"subject_digest":subject,"sha256_digest":digest('f')})
     }
 
-    fn fixture() -> ApplicationReleaseManifest {
+    pub(crate) fn fixture() -> ApplicationReleaseManifest {
         let platform = json!({"os":"linux","architecture":"amd64"});
         let runtime_subject = digest('1');
         let runtime_manifest = digest('2');

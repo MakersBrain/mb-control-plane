@@ -1,13 +1,30 @@
 use super::{bounded_body, classify_status};
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
+
+static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn shared_http() -> anyhow::Result<reqwest::Client> {
+    HTTP.get_or_init(|| {
+        crate::outbound_http::external_api_builder("mb-membership-worker")
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .cloned()
+    .map_err(|error| anyhow::anyhow!(error.clone()))
+}
 
 #[derive(Clone)]
 pub struct RauthyClient {
     http: reqwest::Client,
     base_url: Url,
+    authorization: reqwest::header::HeaderValue,
+    timeout: Duration,
 }
 
 impl RauthyClient {
@@ -20,16 +37,19 @@ impl RauthyClient {
         }
         let mut value = reqwest::header::HeaderValue::from_str(&format!("API-Key {key}"))?;
         value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-membership-worker")
-            .build()?;
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http: shared_http()?,
+            base_url,
+            authorization: value,
+            timeout,
+        })
+    }
+
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .timeout(self.timeout)
     }
 
     pub async fn observe_user(
@@ -42,8 +62,8 @@ impl RauthyClient {
             .join(&format!("users/{subject}"))
             .map_err(|_| IntegrationError::ContractDrift)?;
         let response = self
-            .http
-            .get(url)
+            .request(reqwest::Method::GET, url)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -71,13 +91,18 @@ impl RauthyClient {
             .base_url
             .join(&format!("users/{subject}/logout"))
             .map_err(|_| IntegrationError::ContractDrift)?;
-        let response = self.http.post(url).send().await.map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
+        let response = self
+            .request(reqwest::Method::POST, url)
+            .with_current_trace_context()
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    IntegrationError::UnknownOutcome
+                } else {
+                    IntegrationError::Unavailable
+                }
+            })?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
             Ok(())
         } else {
@@ -108,6 +133,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/auth/v1/users/subject-1"))
                 .and(header("authorization", "API-Key fixture-key"))
+                .and(header("user-agent", "mb-membership-worker"))
                 .respond_with(ResponseTemplate::new(status))
                 .expect(1)
                 .mount(&server)
@@ -170,5 +196,48 @@ mod tests {
         .revoke_sessions("subject-1")
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn pooled_transport_keeps_authorization_and_timeout_request_local() {
+        let first = RauthyClient::new(
+            "https://identity.example.test/auth/v1",
+            "first-fixture-key",
+            Duration::from_secs(7),
+        )
+        .unwrap();
+        let second = RauthyClient::new(
+            "https://identity.example.test/auth/v1",
+            "second-fixture-key",
+            Duration::from_secs(11),
+        )
+        .unwrap();
+
+        let first_request = first
+            .request(
+                reqwest::Method::GET,
+                first.base_url.join("users/one").unwrap(),
+            )
+            .build()
+            .unwrap();
+        let second_request = second
+            .request(
+                reqwest::Method::GET,
+                second.base_url.join("users/two").unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            first_request.headers()[reqwest::header::AUTHORIZATION],
+            "API-Key first-fixture-key"
+        );
+        assert_eq!(
+            second_request.headers()[reqwest::header::AUTHORIZATION],
+            "API-Key second-fixture-key"
+        );
+        assert!(first_request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert_eq!(first_request.timeout(), Some(&Duration::from_secs(7)));
+        assert_eq!(second_request.timeout(), Some(&Duration::from_secs(11)));
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::outbound_http::TraceRequestBuilderExt as _;
+
 pub(super) async fn ensure_redis_acl(
     address: &str,
     username: &str,
@@ -114,6 +116,7 @@ pub(super) async fn ensure_oidc_clients(
             state.config.rauthy_admin_url
         ))
         .json(&json!({}))
+        .with_current_trace_context()
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -146,6 +149,7 @@ pub(super) async fn ensure_rauthy_client(
     let response = state
         .rauthy
         .get(&endpoint)
+        .with_current_trace_context()
         .send()
         .await
         .map_err(DriverError::internal)?;
@@ -154,6 +158,7 @@ pub(super) async fn ensure_rauthy_client(
             .rauthy
             .post(format!("{}/clients", state.config.rauthy_admin_url))
             .json(&json!({"id":id,"name":name,"confidential":confidential,"redirect_uris":[redirect],"post_logout_redirect_uris":[logout]}))
+            .with_current_trace_context()
             .send().await.map_err(DriverError::internal)?;
         if !response.status().is_success() {
             return Err(DriverError::internal(format!(
@@ -181,7 +186,7 @@ pub(super) async fn ensure_rauthy_client(
         "challenges":["S256"],"force_mfa":false,"client_uri":origin,
         "contacts":null,"backchannel_logout_uri":null,"restrict_group_prefix":null,
         "claims":null,"claims_at_root":false,"allowed_resources":null,"default_aud":null,"scim":null
-    })).send().await.map_err(DriverError::internal)?;
+    })).with_current_trace_context().send().await.map_err(DriverError::internal)?;
     if !response.status().is_success() {
         return Err(DriverError::internal(format!(
             "Rauthy client update returned {}",

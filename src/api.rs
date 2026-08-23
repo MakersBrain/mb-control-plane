@@ -9,8 +9,10 @@ use axum::http::Request;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use opentelemetry::propagation::Extractor;
+use opentelemetry::trace::TraceContextExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -21,19 +23,53 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::Config;
 use crate::api_error::ApiError;
-use crate::auth::{Authenticator, Principal};
+use crate::auth::{Authenticator, PlatformScope, Principal, VerifiedToken, WorkshopScope};
 use crate::command::{
     CommandAdmission, CommandError, CommandResult, NewCommand, admit_command, complete_command,
 };
 use crate::domain::{OperationKind, WorkshopRole, normalize_email, opaque_database_ref};
 use crate::integrations::extraction::ExtractionBrokerClient;
 use crate::invitation::InvitationVerifier;
-use crate::persistence::{NewOperation, Store};
+use crate::persistence::{NewOperation, Store, TenantStore};
+
+const REQUEST_ID_HEADER: header::HeaderName = header::HeaderName::from_static("x-request-id");
+
+#[derive(Clone, Copy, Debug)]
+struct HttpRequestId(Uuid);
+
+struct HttpHeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HttpHeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(header::HeaderName::as_str).collect()
+    }
+}
+
+fn remote_trace_context(headers: &HeaderMap) -> Result<Option<opentelemetry::Context>, ()> {
+    if !headers.contains_key("traceparent") {
+        return Ok(None);
+    }
+    let context = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HttpHeaderExtractor(headers))
+    });
+    context
+        .span()
+        .span_context()
+        .is_valid()
+        .then_some(context)
+        .ok_or(())
+        .map(Some)
+}
 
 pub(crate) mod governance;
 use governance::*;
@@ -99,10 +135,51 @@ fn api_timestamp(value: OffsetDateTime) -> String {
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Fleet/platform/internal pool. Tenant handlers must not use this after
+    /// their `WorkshopScope` has been authorized.
     pub store: Store,
+    /// Human workshop pool. SQL is available only through a transaction-local
+    /// workshop scope, never as a bare pooled connection.
+    pub tenant_store: TenantStore,
     pub config: Config,
     pub auth: Arc<Authenticator>,
     pub invitation_verifier: Arc<InvitationVerifier>,
+    dns_client: reqwest::Client,
+    deployment_driver_client: reqwest::Client,
+    extraction_broker: ExtractionBrokerClient,
+}
+
+impl AppState {
+    pub fn new(
+        store: Store,
+        tenant_store: TenantStore,
+        config: Config,
+        auth: Arc<Authenticator>,
+        invitation_verifier: Arc<InvitationVerifier>,
+    ) -> anyhow::Result<Self> {
+        let dns_client = crate::outbound_http::external_api_builder("mb-control-api-dns")
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let deployment_driver_client = crate::deployment_driver_transport::client(
+            config.request_timeout,
+            config.deployment_driver_socket.as_deref(),
+        )?;
+        let extraction_broker = ExtractionBrokerClient::new(
+            config.extraction_broker_url.as_str(),
+            &config.extraction_broker_token,
+            Duration::from_secs(12),
+        )?;
+        Ok(Self {
+            store,
+            tenant_store,
+            config,
+            auth,
+            invitation_verifier,
+            dns_client,
+            deployment_driver_client,
+            extraction_broker,
+        })
+    }
 }
 
 pub fn app(state: AppState) -> Router {
@@ -114,53 +191,11 @@ pub fn app(state: AppState) -> Router {
         .parse()
         .expect("validated CORS origin is a header value");
     let state = Arc::new(state);
-    routes::build()
-        .0
+    routes::build(state.clone())
+        .merge(routes::build_internal(state.clone()))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/openapi.json", get(openapi))
-        .route(
-            "/internal/v1/paperless/{workshop_id}/events",
-            post(internal::paperless_event),
-        )
-        .route(
-            "/internal/v1/workshops/{workshop_id}/inventory-captures",
-            post(internal::inventory_capture),
-        )
-        .route(
-            "/internal/v1/workshops/{workshop_id}/inventory-product-lookups",
-            post(internal::inventory_product_lookup),
-        )
-        .route(
-            "/internal/v1/workshops/{workshop_id}/webshop-mails",
-            post(internal::webshop_transactional_mail),
-        )
-        .route(
-            "/internal/v1/workshops/{workshop_id}/oidc/verify",
-            post(internal::verify_odoo_id_token),
-        )
-        .route(
-            "/internal/v1/mail-events",
-            post(internal::mail_delivery_event),
-        )
-        .route(
-            "/internal/v1/tenants/{workshop_id}/reconcile",
-            post(internal::reconcile_tenant),
-        )
-        .route(
-            "/internal/v1/entitlements/{workshop_id}/ack",
-            post(internal::ack_entitlement),
-        )
-        .route(
-            "/internal/v1/carrier-secrets/resolve",
-            post(carrier_secrets::resolve),
-        )
-        .route(
-            "/internal/v1/application-releases",
-            post(platform::publish_release),
-        )
-        .route("/internal/metrics", get(metrics))
-        .route("/internal/metrics/live", get(live_metrics))
         .layer(
             CorsLayer::new()
                 .allow_origin(origin)
@@ -170,7 +205,9 @@ pub fn app(state: AppState) -> Router {
                     header::CONTENT_TYPE,
                     header::IF_MATCH,
                     header::HeaderName::from_static("idempotency-key"),
-                ]),
+                    REQUEST_ID_HEADER,
+                ])
+                .expose_headers([REQUEST_ID_HEADER]),
         )
         // Transactional mail accepts bounded HTML, text, and 8 MiB of raw
         // attachments. Base64 and JSON escaping make the valid wire envelope larger.
@@ -185,18 +222,70 @@ pub fn app(state: AppState) -> Router {
             enforce_privacy_production_gate,
         ))
         .layer(axum::middleware::from_fn(record_http_metric))
-        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-            tracing::info_span!(
-                "http_request",
-                http_request_method = %request.method(),
-                http_route = request.extensions().get::<MatchedPath>().map_or("unmatched", MatchedPath::as_str)
-            )
-        }))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    let span = tracing::info_span!(
+                        "http_request",
+                        http_request_method = %request.method(),
+                        http_route = request.extensions().get::<MatchedPath>().map_or("unmatched", MatchedPath::as_str),
+                        request_id = %request.extensions().get::<HttpRequestId>().expect("request ID middleware runs before tracing").0,
+                        trace_id = tracing::field::Empty,
+                        http_response_status = tracing::field::Empty,
+                        latency_ms = tracing::field::Empty,
+                    );
+                    match remote_trace_context(request.headers()) {
+                        Ok(Some(parent)) => {
+                            let _ = span.set_parent(parent);
+                        }
+                        Ok(None) => {}
+                        Err(()) => tracing::warn!(
+                            parent: &span,
+                            error_class = "trace_parent_rejected",
+                            "inbound HTTP trace context was rejected"
+                        ),
+                    }
+                    let context = span.context();
+                    let context_span = context.span();
+                    let span_context = context_span.span_context();
+                    if span_context.is_valid() {
+                        span.record("trace_id", span_context.trace_id().to_string());
+                    }
+                    span
+                })
+                .on_response(
+                    |response: &Response, latency: Duration, span: &tracing::Span| {
+                        span.record("http_response_status", response.status().as_u16());
+                        span.record("latency_ms", latency.as_millis() as u64);
+                    },
+                ),
+        )
         .layer(SetSensitiveRequestHeadersLayer::new([
             header::AUTHORIZATION,
             header::COOKIE,
         ]))
+        .layer(axum::middleware::from_fn(ensure_request_id))
         .with_state(state)
+}
+
+async fn ensure_request_id(mut request: Request<Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(&REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    let header_value = HeaderValue::from_str(&request_id.to_string())
+        .expect("a UUID is always a valid HTTP header value");
+    request
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value.clone());
+    request.extensions_mut().insert(HttpRequestId(request_id));
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value);
+    response
 }
 
 async fn enforce_privacy_production_gate(
@@ -261,6 +350,63 @@ async fn authority(state: &AppState, user: Uuid, workshop: Uuid) -> ApiResult<(W
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid stored role")))?,
         epoch,
     ))
+}
+
+async fn revalidate_workshop_scope(
+    tx: &mut sqlx::postgres::PgConnection,
+    scope: &WorkshopScope,
+) -> ApiResult<()> {
+    let current = sqlx::query_as::<_, (String, i32)>(
+        "select role,authority_epoch from control.memberships
+         where workshop_id=$1 and user_id=$2 and status='active'
+         for share",
+    )
+    .bind(scope.workshop_id)
+    .bind(scope.principal_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let role = WorkshopRole::from_str(&current.0)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid stored workshop role")))?;
+    if !workshop_scope_is_current(scope, role, current.1) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn revalidate_platform_scope(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &PlatformScope,
+) -> ApiResult<()> {
+    // Row locks keep every currently-authorizing grant active until the
+    // mutation commits. A concurrent revocation therefore either wins before
+    // this query (and is rejected below) or waits until this command finishes.
+    let roles = sqlx::query_scalar::<_, String>(
+        "select role from control.platform_role_assignments
+         where user_id=$1 and revoked_at is null
+         order by role for share",
+    )
+    .bind(scope.principal().user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if !platform_scope_is_current(scope, &roles) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn platform_scope_is_current(scope: &PlatformScope, current_roles: &[String]) -> bool {
+    scope.permission().allows(current_roles)
+}
+
+fn workshop_scope_is_current(
+    scope: &WorkshopScope,
+    current_role: WorkshopRole,
+    current_epoch: i32,
+) -> bool {
+    current_epoch == scope.authority_epoch
+        && current_role == scope.role
+        && current_role.allows(scope.permission)
 }
 
 fn idempotency(headers: &HeaderMap) -> ApiResult<&str> {
@@ -511,8 +657,10 @@ async fn live_metrics(
     ))
 }
 
-async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
-    let who = principal(&state, &headers).await?;
+async fn me(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<Principal>,
+) -> ApiResult<Json<MeResponse>> {
     let roles = platform_roles(&state, &who).await?;
     Ok(Json(MeResponse {
         id: who.user_id,
@@ -578,30 +726,6 @@ async fn is_operator(state: &AppState, who: &Principal) -> ApiResult<bool> {
     Ok(!platform_roles(state, who).await?.is_empty())
 }
 
-async fn operator(state: &AppState, headers: &HeaderMap) -> ApiResult<Principal> {
-    let who = principal(state, headers).await?;
-    if !is_operator(state, &who).await? {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(who)
-}
-
-async fn platform_role(
-    state: &AppState,
-    headers: &HeaderMap,
-    allowed: &[&str],
-) -> ApiResult<Principal> {
-    let who = principal(state, headers).await?;
-    let roles = platform_roles(state, &who).await?;
-    if !roles
-        .iter()
-        .any(|role| allowed.iter().any(|allowed| role == allowed))
-    {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(who)
-}
-
 fn require_step_up(who: &Principal) -> ApiResult<()> {
     if !who.recent_strong_authentication {
         return Err(ApiError::Precondition(
@@ -614,13 +738,13 @@ fn require_step_up(who: &Principal) -> ApiResult<()> {
 async fn link_identity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(verified): Extension<VerifiedToken>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let client_key = if headers.contains_key("idempotency-key") {
         idempotency(&headers)?.to_owned()
     } else {
         "identity-link".to_owned()
     };
-    let verified = state.auth.verify_headers(&headers).await?;
     let mut tx = state.store.begin().await?;
     let existing_user_id = sqlx::query_scalar::<_, Uuid>(
         "select user_id from control.external_identities where issuer=$1 and subject=$2 and disabled_at is null",
@@ -740,11 +864,10 @@ async fn link_identity(
 
 async fn integrations(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<IntegrationResponse>>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
+    let id = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(id).await?;
     let route = sqlx::query_as::<_, (String, Option<String>)>(
         "select w.slug,d.public_hostname from control.workshops w
          left join control.odoo_databases d on d.workshop_id=w.id and d.kind='primary'
@@ -752,9 +875,10 @@ async fn integrations(
          where w.id=$1",
     )
     .bind(id)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *tx)
     .await?;
-    let rows=sqlx::query_as::<_,(String,String,String,i32,i32,Option<String>)>("select service,base_url,health,desired_epoch,applied_epoch,safe_error_class from control.service_instances where workshop_id=$1 order by service").bind(id).fetch_all(state.store.pool()).await?;
+    let rows=sqlx::query_as::<_,(String,String,String,i32,i32,Option<String>)>("select service,base_url,health,desired_epoch,applied_epoch,safe_error_class from control.service_instances where workshop_id=$1 order by service").bind(id).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         rows.into_iter()
             .map(|row| {
@@ -790,18 +914,18 @@ fn service_external_url(
 
 async fn modules(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<ModuleResponse>>> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
+    let id = scope.workshop_id;
+    let role = scope.role;
+    let mut tx = state.tenant_store.begin(id).await?;
     let entitlement_limits = sqlx::query_scalar::<_, Value>(
         "select limits from control.entitlements
          where workshop_id=$1 and status='active'
            and (expires_at is null or expires_at>now())",
     )
     .bind(id)
-    .fetch_optional(state.store.pool())
+    .fetch_optional(&mut *tx)
     .await?;
     let entitled = entitlement_limits
         .as_ref()
@@ -819,7 +943,7 @@ async fn modules(
          where workshop_id=$1 and state='active' order by activated_at desc,id limit 1",
     )
     .bind(id)
-    .fetch_optional(state.store.pool())
+    .fetch_optional(&mut *tx)
     .await?;
     let release_capabilities = if let Some((_, registry_version)) = &active_release {
         sqlx::query_scalar::<_, String>(
@@ -827,7 +951,7 @@ async fn modules(
              where registry_version=$1",
         )
         .bind(registry_version)
-        .fetch_all(state.store.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .collect::<std::collections::HashSet<_>>()
@@ -851,8 +975,9 @@ async fn modules(
          where wm.workshop_id=$1",
     )
     .bind(id)
-    .fetch_all(state.store.pool())
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let states = rows
         .into_iter()
         .map(|row| (row.0, (row.1, row.2, row.3, row.4, row.5)))
@@ -903,16 +1028,19 @@ async fn modules(
     ))
 }
 
+#[derive(Deserialize)]
+struct ModulePath {
+    module_key: String,
+}
+
 async fn enable_module(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, module_key)): Path<(Uuid, String)>,
+    Extension(scope): Extension<WorkshopScope>,
+    Path(ModulePath { module_key }): Path<ModulePath>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
-    if !role.can_manage_modules() {
-        return Err(ApiError::Forbidden);
-    }
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
     let client_key = idempotency(&headers)?.to_owned();
     let resource = format!("capability-{id}-{module_key}");
     let expected = expected_version(&headers, &resource)?;
@@ -984,13 +1112,14 @@ async fn enable_module(
             "service":activation.5
         }
     });
-    let mut tx = state.store.begin().await?;
-    let scope = format!("workshop:{id}:capability:{module_key}");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
+    let command_scope = format!("workshop:{id}:capability:{module_key}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: actor,
+            scope: &command_scope,
             command_kind: "capability.enable",
             idempotency_key: &client_key,
             semantic_request: &payload,
@@ -1067,7 +1196,7 @@ async fn enable_module(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: Some(who.user_id),
+            requested_by: Some(actor),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -1086,7 +1215,7 @@ async fn enable_module(
     .bind(id)
     .bind(&module_key)
     .bind(operation_id)
-    .bind(who.user_id)
+    .bind(actor)
     .bind(expected)
     .bind(activation.2)
     .bind(&activation.1)
@@ -1101,7 +1230,7 @@ async fn enable_module(
     let version = expected + 1;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(actor), Some(id)),
         "module.enable",
         "workshop_module",
         module_key.clone(),
@@ -1132,10 +1261,9 @@ async fn enable_module(
 
 async fn operation(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<OperationResponse>> {
-    let who = principal(&state, &headers).await?;
     let row=sqlx::query_as::<_,(String,String,Option<Uuid>,i32,i32,Option<String>,OffsetDateTime,Option<OffsetDateTime>,i16,Option<String>,Option<String>,Option<OffsetDateTime>)>("select kind,state,workshop_id,attempt,max_attempts,failure_class,created_at,finished_at,progress_percent,progress_phase,progress_message,progress_updated_at from control.operations where id=$1").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
     if let Some(workshop) = row.2 {
         if !is_operator(&state, &who).await? {
@@ -1169,9 +1297,9 @@ async fn operation(
 async fn retry_operation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
     let key = idempotency(&headers)?.to_owned();
     let row = sqlx::query_as::<_, (Option<Uuid>, String)>(
         "select workshop_id,kind from control.operations where id=$1",
@@ -1180,14 +1308,17 @@ async fn retry_operation(
     .fetch_optional(state.store.pool())
     .await?
     .ok_or(ApiError::NotFound)?;
-    if let Some(workshop) = row.0
-        && !is_operator(&state, &who).await?
-    {
-        let role = authority(&state, who.user_id, workshop).await?.0;
-        if (row.1 == "tenant.lifecycle" && !role.can_manage_database())
-            || (row.1 != "tenant.lifecycle" && !role.can_manage_members())
-        {
-            return Err(ApiError::Forbidden);
+    if !is_operator(&state, &who).await? {
+        let role = match row.0 {
+            Some(workshop) => Some(authority(&state, who.user_id, workshop).await?.0),
+            None => None,
+        };
+        if !non_operator_can_retry_operation(role, &row.1) {
+            return Err(if row.0.is_some() {
+                ApiError::Forbidden
+            } else {
+                ApiError::NotFound
+            });
         }
     }
     let semantic = json!({"operation_id":id});
@@ -1265,8 +1396,18 @@ async fn retry_operation(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
+fn non_operator_can_retry_operation(role: Option<WorkshopRole>, kind: &str) -> bool {
+    role.is_some_and(|role| {
+        if kind == "tenant.lifecycle" {
+            role.can_manage_database()
+        } else {
+            role.can_manage_members()
+        }
+    })
+}
+
 async fn seed_targets(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     workshop: Uuid,
     user: Uuid,
     epoch: i32,
@@ -1279,12 +1420,12 @@ async fn seed_targets(
             where workshop_id=$1 and module_key='documents' and state='enabled'
         )
         on conflict(workshop_id,user_id,target) do update set desired_epoch=excluded.desired_epoch,state='pending',safe_error_class=null")
-        .bind(workshop).bind(user).bind(epoch).execute(&mut **tx).await?;
+        .bind(workshop).bind(user).bind(epoch).execute(&mut *tx).await?;
     Ok(())
 }
 
 async fn audit(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     actor: Option<Uuid>,
     workshop: Option<Uuid>,
     action: &str,
@@ -1293,12 +1434,12 @@ async fn audit(
     correlation: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("insert into control.audit_events(id,actor_audit_subject_id,workshop_id,action,target_type,target_id,correlation_id,outcome) values($1,(select audit_subject_id from control.users where id=$2),$3,$4,$5,$6,$7,'accepted')")
-        .bind(Uuid::new_v4()).bind(actor).bind(workshop).bind(action).bind(target_type).bind(target_id).bind(correlation).execute(&mut **tx).await?;
+        .bind(Uuid::new_v4()).bind(actor).bind(workshop).bind(action).bind(target_type).bind(target_id).bind(correlation).execute(&mut *tx).await?;
     Ok(())
 }
 
 async fn audit_command(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     authority: (Option<Uuid>, Option<Uuid>),
     action: &str,
     target_type: &str,
@@ -1328,16 +1469,144 @@ async fn audit_command(
     .bind(target_id)
     .bind(correlation)
     .bind(command_id)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue, header};
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
+    use axum::routing::get;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tower::ServiceExt as _;
+    use uuid::Uuid;
 
-    use super::{ApiError, api_timestamp, etag, exact_bearer, expected_version, valid_gtin14};
+    use super::{
+        ApiError, REQUEST_ID_HEADER, WorkshopRole, api_timestamp, ensure_request_id, etag,
+        exact_bearer, expected_version, non_operator_can_retry_operation,
+        platform_scope_is_current, remote_trace_context, valid_gtin14, workshop_scope_is_current,
+    };
+
+    #[test]
+    fn inbound_w3c_trace_context_is_validated_before_attachment() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let mut headers = HeaderMap::new();
+        assert!(remote_trace_context(&headers).unwrap().is_none());
+
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        headers.insert("tracestate", HeaderValue::from_static("vendor=value"));
+        let context = remote_trace_context(&headers).unwrap().unwrap();
+        assert!(context.span().span_context().is_remote());
+        assert_eq!(
+            context.span().span_context().trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("subject@example.test"),
+        );
+        assert!(remote_trace_context(&headers).is_err());
+    }
+    use crate::auth::{PlatformPermission, PlatformScope, Principal, WorkshopScope};
+    use crate::domain::WorkshopPermission;
+
+    #[test]
+    fn mutation_scope_requires_the_same_role_epoch_and_permission() {
+        let scope = WorkshopScope {
+            workshop_id: Uuid::new_v4(),
+            principal_id: Uuid::new_v4(),
+            role: WorkshopRole::StudioManager,
+            authority_epoch: 7,
+            permission: WorkshopPermission::ManageMembers,
+        };
+        assert!(workshop_scope_is_current(
+            &scope,
+            WorkshopRole::StudioManager,
+            7
+        ));
+        assert!(!workshop_scope_is_current(
+            &scope,
+            WorkshopRole::StudioManager,
+            8
+        ));
+        assert!(!workshop_scope_is_current(&scope, WorkshopRole::Viewer, 7));
+    }
+
+    #[test]
+    fn platform_mutation_scope_requires_a_current_authorizing_role() {
+        let principal = Principal {
+            user_id: Uuid::new_v4(),
+            issuer: "https://auth.example.test".into(),
+            subject: "operator".into(),
+            email: "operator@example.test".into(),
+            recent_strong_authentication: true,
+        };
+        let scope = PlatformScope::new(principal, PlatformPermission::OperateFleet);
+
+        assert!(platform_scope_is_current(
+            &scope,
+            &["release_operator".into()]
+        ));
+        assert!(platform_scope_is_current(
+            &scope,
+            &["technical_admin".into()]
+        ));
+        assert!(!platform_scope_is_current(&scope, &[]));
+        assert!(!platform_scope_is_current(
+            &scope,
+            &["privacy_reviewer".into()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_validated_and_returned() {
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn(ensure_request_id));
+        let supplied = Uuid::new_v4();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(REQUEST_ID_HEADER, supplied.to_string())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER),
+            Some(&HeaderValue::from_str(&supplied.to_string()).unwrap())
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(REQUEST_ID_HEADER, "unbounded-client-value")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let generated = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        assert!(generated.is_some());
+        assert_ne!(generated, Some(supplied));
+    }
 
     #[test]
     fn api_timestamps_are_rfc3339_for_browser_parsers() {
@@ -1394,5 +1663,30 @@ mod tests {
             HeaderValue::from_static("bearer metrics-only-secret"),
         );
         assert!(!exact_bearer(&headers, "metrics-only-secret"));
+    }
+
+    #[test]
+    fn platform_operations_cannot_be_retried_by_ordinary_members() {
+        assert!(!non_operator_can_retry_operation(None, "privacy.retention"));
+    }
+
+    #[test]
+    fn workshop_operation_retry_permissions_preserve_current_policy() {
+        assert!(non_operator_can_retry_operation(
+            Some(WorkshopRole::StudioManager),
+            "module.enable"
+        ));
+        assert!(!non_operator_can_retry_operation(
+            Some(WorkshopRole::StudioManager),
+            "tenant.lifecycle"
+        ));
+        assert!(non_operator_can_retry_operation(
+            Some(WorkshopRole::Owner),
+            "tenant.lifecycle"
+        ));
+        assert!(!non_operator_can_retry_operation(
+            Some(WorkshopRole::Viewer),
+            "module.enable"
+        ));
     }
 }

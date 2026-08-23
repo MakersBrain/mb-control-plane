@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +11,16 @@ pub enum WorkshopRole {
     Accountant,
     StudioManager,
     Owner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkshopPermission {
+    ViewWorkshop,
+    ManageMembers,
+    ManageModules,
+    ManageDatabase,
+    TransferOwnership,
 }
 
 impl WorkshopRole {
@@ -44,6 +55,16 @@ impl WorkshopRole {
 
     pub fn can_manage_modules(self) -> bool {
         matches!(self, Self::Owner | Self::StudioManager)
+    }
+
+    pub fn allows(self, permission: WorkshopPermission) -> bool {
+        match permission {
+            WorkshopPermission::ViewWorkshop => true,
+            WorkshopPermission::ManageMembers => self.can_manage_members(),
+            WorkshopPermission::ManageModules => self.can_manage_modules(),
+            WorkshopPermission::ManageDatabase => self.can_manage_database(),
+            WorkshopPermission::TransferOwnership => self == Self::Owner,
+        }
     }
 }
 
@@ -87,6 +108,22 @@ pub enum OperationKind {
     WebshopOnboardingReconcile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationExecutionScope {
+    Workshop(Uuid),
+    Fleet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum OperationScopeError {
+    #[error("unknown operation kind")]
+    UnknownKind,
+    #[error("operation was leased from the wrong queue")]
+    QueueMismatch,
+    #[error("operation workshop scope does not match its kind")]
+    WorkshopScopeMismatch,
+}
+
 impl OperationKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -126,6 +163,56 @@ impl OperationKind {
             Self::WebshopDomainReconcile => "tenant-reconciliation",
             Self::WebshopEmailDomainReconcile => "tenant-reconciliation",
             Self::WebshopOnboardingReconcile => "tenant-reconciliation",
+        }
+    }
+
+    pub const fn requires_workshop(self) -> bool {
+        !matches!(
+            self,
+            Self::OdooReleaseAdopt | Self::PrivacyRetention | Self::PrivacyDataSubjectRequest
+        )
+    }
+
+    pub fn execution_scope(
+        self,
+        leased_queue: &str,
+        workshop_id: Option<Uuid>,
+    ) -> Result<OperationExecutionScope, OperationScopeError> {
+        if leased_queue != self.queue() {
+            return Err(OperationScopeError::QueueMismatch);
+        }
+        match (self.requires_workshop(), workshop_id) {
+            (true, Some(workshop_id)) if !workshop_id.is_nil() => {
+                Ok(OperationExecutionScope::Workshop(workshop_id))
+            }
+            (false, None) => Ok(OperationExecutionScope::Fleet),
+            _ => Err(OperationScopeError::WorkshopScopeMismatch),
+        }
+    }
+}
+
+impl FromStr for OperationKind {
+    type Err = OperationScopeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "tenant.provision" => Ok(Self::TenantProvision),
+            "membership.reconcile" => Ok(Self::MembershipReconcile),
+            "entitlement.apply" => Ok(Self::EntitlementApply),
+            "invoice.capture" => Ok(Self::InvoiceCapture),
+            "inventory.capture.extract" => Ok(Self::InventoryCaptureExtract),
+            "tenant.reconcile" => Ok(Self::TenantReconcile),
+            "tenant.lifecycle" => Ok(Self::TenantLifecycle),
+            "email.delivery" => Ok(Self::EmailDelivery),
+            "module.enable" => Ok(Self::ModuleEnable),
+            "module.restrict" => Ok(Self::ModuleRestrict),
+            "odoo.release.adopt" => Ok(Self::OdooReleaseAdopt),
+            "privacy.retention" => Ok(Self::PrivacyRetention),
+            "privacy.data_subject_request" => Ok(Self::PrivacyDataSubjectRequest),
+            "webshop-domain.reconcile" => Ok(Self::WebshopDomainReconcile),
+            "webshop-email-domain.reconcile" => Ok(Self::WebshopEmailDomainReconcile),
+            "webshop-onboarding.reconcile" => Ok(Self::WebshopOnboardingReconcile),
+            _ => Err(OperationScopeError::UnknownKind),
         }
     }
 }
@@ -214,6 +301,31 @@ mod tests {
     }
 
     #[test]
+    fn workshop_permissions_are_capability_oriented_and_fail_closed() {
+        use WorkshopPermission::{
+            ManageDatabase, ManageMembers, ManageModules, TransferOwnership, ViewWorkshop,
+        };
+
+        for role in [
+            WorkshopRole::Viewer,
+            WorkshopRole::Artisan,
+            WorkshopRole::Accountant,
+            WorkshopRole::StudioManager,
+            WorkshopRole::Owner,
+        ] {
+            assert!(role.allows(ViewWorkshop));
+        }
+        assert!(WorkshopRole::StudioManager.allows(ManageMembers));
+        assert!(WorkshopRole::StudioManager.allows(ManageModules));
+        assert!(!WorkshopRole::StudioManager.allows(ManageDatabase));
+        assert!(!WorkshopRole::StudioManager.allows(TransferOwnership));
+        assert!(WorkshopRole::Owner.allows(ManageDatabase));
+        assert!(WorkshopRole::Owner.allows(TransferOwnership));
+        assert!(!WorkshopRole::Viewer.allows(ManageMembers));
+        assert!(!WorkshopRole::Accountant.allows(ManageModules));
+    }
+
+    #[test]
     fn physical_database_reference_is_opaque() {
         let id = uuid::Uuid::parse_str("80f7149c-9215-48e8-88ce-8d1fe50bd656").unwrap();
         let reference = opaque_database_ref(id);
@@ -243,7 +355,64 @@ mod tests {
         ] {
             assert!(!kind.as_str().is_empty());
             assert!(!kind.queue().is_empty());
+            assert_eq!(kind.as_str().parse::<OperationKind>(), Ok(kind));
         }
+    }
+
+    #[test]
+    fn operation_execution_scope_is_closed_and_fail_closed() {
+        let workshop = Uuid::new_v4();
+        for kind in [
+            OperationKind::TenantProvision,
+            OperationKind::MembershipReconcile,
+            OperationKind::EntitlementApply,
+            OperationKind::InvoiceCapture,
+            OperationKind::InventoryCaptureExtract,
+            OperationKind::TenantReconcile,
+            OperationKind::TenantLifecycle,
+            OperationKind::EmailDelivery,
+            OperationKind::ModuleEnable,
+            OperationKind::ModuleRestrict,
+            OperationKind::WebshopDomainReconcile,
+            OperationKind::WebshopEmailDomainReconcile,
+            OperationKind::WebshopOnboardingReconcile,
+        ] {
+            assert_eq!(
+                kind.execution_scope(kind.queue(), Some(workshop)),
+                Ok(OperationExecutionScope::Workshop(workshop))
+            );
+            assert_eq!(
+                kind.execution_scope(kind.queue(), None),
+                Err(OperationScopeError::WorkshopScopeMismatch)
+            );
+        }
+        for kind in [
+            OperationKind::OdooReleaseAdopt,
+            OperationKind::PrivacyRetention,
+            OperationKind::PrivacyDataSubjectRequest,
+        ] {
+            assert_eq!(
+                kind.execution_scope(kind.queue(), None),
+                Ok(OperationExecutionScope::Fleet)
+            );
+            assert_eq!(
+                kind.execution_scope(kind.queue(), Some(workshop)),
+                Err(OperationScopeError::WorkshopScopeMismatch)
+            );
+        }
+        assert_eq!(
+            OperationKind::MembershipReconcile
+                .execution_scope("privacy-operations", Some(workshop)),
+            Err(OperationScopeError::QueueMismatch)
+        );
+        assert_eq!(
+            OperationKind::TenantLifecycle.execution_scope("tenant-lifecycle", Some(Uuid::nil())),
+            Err(OperationScopeError::WorkshopScopeMismatch)
+        );
+        assert_eq!(
+            "private.operation".parse::<OperationKind>(),
+            Err(OperationScopeError::UnknownKind)
+        );
     }
 
     #[test]

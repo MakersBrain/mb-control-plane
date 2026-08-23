@@ -137,7 +137,12 @@ restore, and non-routable duplicate requests. These are durable
 `tenant.lifecycle` operations with typed slug confirmation, serialization,
 audit events, retry status, and an automatic encrypted S3 safety backup. The
 Docker driver operations are authenticated and persist their idempotency
-outcomes. The driver owns tenant databases, volumes, Redis ACLs, Rauthy clients,
+outcomes. Tenant idempotency is scoped by workshop, action, and key; release
+operations use a separate global scope and a database-backed singleton lease
+for the shared runtime. Lease expiry or an unknown release outcome quarantines
+that runtime for explicit reconciliation rather than allowing another replica
+to take it over. Privileged database identifiers are resolved from
+workshop-owned ledger rows rather than request JSON. The driver owns tenant databases, volumes, Redis ACLs, Rauthy clients,
 Paperless containers, and gateway routes. Lifecycle operations treat Odoo and,
 when active, Paperless PostgreSQL plus the data/media/consume volumes as one
 recovery unit. The shared Odoo process remains available to other workshops
@@ -199,9 +204,18 @@ The invoice worker protects the trial subscription at three layers:
 
 - structured UBL/Factur-X is parsed locally and consumes no Azure request;
 - page reservations are transactional and idempotent per operation, with the
-  monthly per-workshop ceiling set by `CONTROL_AZURE_MONTHLY_PAGE_LIMIT`;
+  monthly per-workshop ceiling set by `CONTROL_AZURE_MONTHLY_PAGE_LIMIT`
+  (1,000 by default);
 - analyze submissions are paced across all worker replicas through PostgreSQL
   (`CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS`, 1100 ms by default).
+
+The invoice and inventory workers parse those limits and the Azure interval at
+startup. Limits must be between 0 and 1,000,000,000; the interval must be
+between 100 and 60,000 milliseconds. The inventory Azure-image limit defaults
+to 500, as does the inventory AI-image limit when Compose does not override it.
+`CONTROL_PAPERLESS_CAPTURED_TAG_IDS` is optional and, when configured, must be a
+comma-separated list of at most 100 positive integer tag IDs. Invalid explicit
+values fail worker startup rather than silently falling back.
 
 Polling never runs faster than two seconds. Azure's successful-analyze and 429
 `Retry-After` values take precedence; a throttled POST is returned to the queue

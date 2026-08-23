@@ -665,13 +665,11 @@ pub(super) async fn inventory_product_lookup(
         ));
     }
 
-    let broker_url = std::env::var("CONTROL_EXTRACTION_BROKER_URL")
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let broker_token = crate::runtime_secret::required("CONTROL_EXTRACTION_BROKER_TOKEN")
-        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
-    let broker = ExtractionBrokerClient::new(&broker_url, &broker_token, Duration::from_secs(12))
-        .map_err(ApiError::Internal)?;
-    let response = match broker.product_lookup(provider, gtin14).await {
+    let response = match state
+        .extraction_broker
+        .product_lookup(provider, gtin14)
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             sqlx::query("update control.product_lookup_fills set state='failed',leased_by=null,lease_expires_at=null,last_error_class='provider_unavailable',updated_at=now() where provider=$1 and schema_version=$2 and gtin14=$3 and leased_by=$4")
@@ -791,6 +789,7 @@ async fn queue_tenant_reconciliation(
     requested_by: Option<Uuid>,
     key: &str,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    let mut snapshot_tx = state.tenant_store.begin(workshop_id).await?;
     let tenant = sqlx::query_as::<_, (Uuid, String, String, String)>(
         "select d.id,w.slug,d.database_ref,d.public_hostname
          from control.workshops w
@@ -799,7 +798,7 @@ async fn queue_tenant_reconciliation(
            and d.deleted_at is null and d.public_hostname is not null",
     )
     .bind(workshop_id)
-    .fetch_optional(state.store.pool())
+    .fetch_optional(&mut *snapshot_tx)
     .await?
     .ok_or(ApiError::NotFound)?;
     let paperless_hostname = format!("docs-{}.{}", tenant.1, state.config.tenant_domain);
@@ -808,15 +807,17 @@ async fn queue_tenant_reconciliation(
          where workshop_id=$1 and module_key='documents' and state='enabled')",
     )
     .bind(workshop_id)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *snapshot_tx)
     .await?;
+    let custom_hostnames = crate::worker::routable_custom_hostnames(&mut snapshot_tx).await?;
+    snapshot_tx.commit().await?;
     let payload = json!({
         "database_id": tenant.0,
         "database_ref": tenant.2,
         "public_hostname": tenant.3,
         "paperless_hostname": paperless_hostname,
         "paperless_enabled": paperless_enabled,
-          "custom_hostnames": crate::worker::routable_custom_hostnames(&state.store, workshop_id).await?,
+        "custom_hostnames": custom_hostnames,
     });
     let mut tx = state.store.begin().await?;
     let correlation = Uuid::new_v4();

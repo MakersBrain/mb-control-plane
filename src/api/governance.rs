@@ -2,9 +2,8 @@ use super::*;
 
 pub(super) async fn platform_roles_list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<PlatformRoleResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid,Uuid,String,String,Option<String>,String,OffsetDateTime,Option<OffsetDateTime>,Option<String>,i64)>(
         "select r.id,r.user_id,u.email,r.role,g.email,r.grant_reason_code,r.granted_at,r.revoked_at,r.revoke_reason_code,r.version from control.platform_role_assignments r join control.users u on u.id=r.user_id left join control.users g on g.id=r.granted_by order by r.granted_at desc,r.id",
     )
@@ -39,10 +38,11 @@ pub(crate) struct PlatformRoleGrant {
 pub(super) async fn platform_role_grant(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Json(body): Json<PlatformRoleGrant>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if !matches!(
         body.role.as_str(),
         "technical_admin"
@@ -61,6 +61,7 @@ pub(super) async fn platform_role_grant(
     let correlation = Uuid::new_v4();
     let assignment_id = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -149,11 +150,12 @@ pub(crate) struct PlatformRoleRevoke {
 pub(super) async fn platform_role_revoke(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<PlatformRoleRevoke>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if body.reason_code.trim().is_empty() || body.reason_code.len() > 100 {
         return Err(ApiError::Validation("a bounded reason_code is required"));
     }
@@ -163,6 +165,7 @@ pub(super) async fn platform_role_revoke(
     let semantic = json!({"reason_code":body.reason_code});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -227,6 +230,36 @@ pub(super) async fn platform_role_revoke(
     Ok((etag(&resource, expected + 1)?, Json(response)))
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn privacy_scope_and_export_effect_boundaries_are_explicit() {
+        let source = include_str!("governance.rs");
+        let create = source
+            .rsplit_once("pub(super) async fn create_privacy_request(")
+            .unwrap()
+            .1
+            .split("pub(super) async fn privacy_requests(")
+            .next()
+            .unwrap();
+        assert!(create.contains("state.tenant_store.begin(*workshop)"));
+        assert!(create.contains("workshop_id=$1 and user_id=$2 and status='active'"));
+
+        let consume = source
+            .rsplit_once("pub(super) async fn consume_privacy_export(")
+            .unwrap()
+            .1
+            .split("pub(super) async fn platform_privacy_request_decision(")
+            .next()
+            .unwrap();
+        let consumed = consume.find("consume_data_subject_export").unwrap();
+        let commit = consume.find("tx.commit()").unwrap();
+        let file_read = consume.find("read_export_artifact").unwrap();
+        let decrypt = consume.find("decrypt_export_with_key_id").unwrap();
+        assert!(consumed < commit && commit < file_read && file_read < decrypt);
+    }
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub(crate) struct CreatePrivacyRequest {
     request_type: String,
@@ -236,9 +269,9 @@ pub(crate) struct CreatePrivacyRequest {
 pub(super) async fn create_privacy_request(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Json(body): Json<CreatePrivacyRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
     if !matches!(
         body.request_type.as_str(),
         "access" | "rectification" | "erasure" | "restriction" | "portability" | "objection"
@@ -257,10 +290,20 @@ pub(super) async fn create_privacy_request(
         return Err(ApiError::Validation("workshop scopes must be unique"));
     }
     if !workshops.is_empty() {
-        let authorized=sqlx::query_scalar::<_,i64>("select count(*) from control.memberships where user_id=$1 and workshop_id=any($2) and status='active'")
-            .bind(who.user_id).bind(&workshops).fetch_one(state.store.pool()).await?;
-        if usize::try_from(authorized).ok() != Some(workshops.len()) {
-            return Err(ApiError::Forbidden);
+        for workshop in &workshops {
+            let mut tx = state.tenant_store.begin(*workshop).await?;
+            let authorized = sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from control.memberships
+                 where workshop_id=$1 and user_id=$2 and status='active')",
+            )
+            .bind(workshop)
+            .bind(who.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            if !authorized {
+                return Err(ApiError::Forbidden);
+            }
         }
     }
     let client_key = idempotency(&headers)?.to_owned();
@@ -357,25 +400,22 @@ pub(super) async fn create_privacy_request(
 
 pub(super) async fn privacy_requests(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(who): Extension<Principal>,
 ) -> ApiResult<Json<Vec<PrivacyRequestResponse>>> {
-    let who = principal(&state, &headers).await?;
     Ok(Json(privacy_request_rows(&state, Some(who.user_id)).await?))
 }
 
 pub(super) async fn platform_privacy_requests(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<PrivacyRequestResponse>>> {
-    operator(&state, &headers).await?;
     Ok(Json(privacy_request_rows(&state, None).await?))
 }
 
 pub(super) async fn platform_privacy_overview(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<PrivacyOverviewResponse>> {
-    operator(&state, &headers).await?;
     let platform = sqlx::query_as::<_, (Option<String>,Option<String>,bool,Option<i32>,Option<i32>,Option<String>,i64,OffsetDateTime)>(
         "select controller_ref,dpo_ref,production_personal_data_allowed,approved_retention_policy_version,approved_processing_register_version,dpia_approval_ref,version,updated_at from control.privacy_platform_state where singleton",
     )
@@ -535,17 +575,19 @@ pub(crate) struct CreateRetentionRun {
 pub(super) async fn platform_privacy_retention_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Json(body): Json<CreateRetentionRun>,
 ) -> ApiResult<(StatusCode, Json<RetentionRunCommandResponse>)> {
-    let who = platform_role(&state, &headers, &["technical_admin", "privacy_reviewer"]).await?;
+    let who = scope.principal();
     if !body.dry_run {
-        require_step_up(&who)?;
+        require_step_up(who)?;
     }
     let key = idempotency(&headers)?.to_owned();
     let semantic = json!({"policy_version":body.policy_version,"dry_run":body.dry_run});
     let correlation = Uuid::new_v4();
     let run_id = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -713,10 +755,9 @@ pub(super) async fn privacy_request_rows(
 
 pub(super) async fn consume_privacy_export(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Response> {
-    let who = principal(&state, &headers).await?;
     let mut tx = state.store.begin().await?;
     let export_id = sqlx::query_scalar::<_, Uuid>(
         "select e.id from control.data_subject_export_status e
@@ -737,6 +778,7 @@ pub(super) async fn consume_privacy_export(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::Gone("the export is expired, consumed, or unavailable"))?;
+    tx.commit().await?;
     let ciphertext = match row.4.as_ref() {
         Some(value) if row.2.starts_with("postgres:aead:") => value.clone(),
         None if row.2.starts_with("file:") => {
@@ -762,11 +804,14 @@ pub(super) async fn consume_privacy_export(
             "privacy export integrity check failed"
         )));
     }
-    tx.commit().await?;
     if row.2.starts_with("file:")
         && let Err(error) = crate::privacy_crypto::delete_export_artifact(row.0, &row.2)
     {
-        tracing::error!(export_id=%row.0,error=?error,"consumed privacy export artifact cleanup failed");
+        tracing::error!(
+            export_id = %row.0,
+            error_class = crate::error_reporting::safe_error_class(&error),
+            "consumed privacy export artifact cleanup failed"
+        );
     }
     let mut response = Response::new(Body::from(plaintext));
     response.headers_mut().insert(
@@ -793,10 +838,9 @@ pub(super) async fn consume_privacy_export(
 
 pub(super) async fn privacy_request(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(HeaderMap, Json<PrivacyRequestResponse>)> {
-    let who = principal(&state, &headers).await?;
     let row = privacy_request_rows(&state, Some(who.user_id))
         .await?
         .into_iter()
@@ -815,10 +859,11 @@ pub(crate) struct PrivacyDecision {
 pub(super) async fn platform_privacy_request_decision(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<PrivacyDecision>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["privacy_reviewer"]).await?;
+    let who = scope.principal();
     if !matches!(body.decision.as_str(), "review" | "approve" | "refuse") {
         return Err(ApiError::Validation(
             "decision must be review, approve or refuse",
@@ -833,7 +878,7 @@ pub(super) async fn platform_privacy_request_decision(
         return Err(ApiError::Validation("a bounded decision_code is required"));
     }
     if body.decision != "review" {
-        require_step_up(&who)?;
+        require_step_up(who)?;
         let controller_recorded = sqlx::query_scalar::<_, bool>(
             "select controller_ref is not null and btrim(controller_ref)<>'' from control.privacy_platform_state where singleton",
         )
@@ -851,6 +896,7 @@ pub(super) async fn platform_privacy_request_decision(
     let semantic = json!({"decision":body.decision,"decision_code":body.decision_code});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1009,11 +1055,12 @@ pub(crate) struct ProcessorTaskAcknowledgement {
 pub(super) async fn platform_privacy_processor_task_acknowledge(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<ProcessorTaskAcknowledgement>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["privacy_reviewer"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if !matches!(body.state.as_str(), "acknowledged" | "not_applicable") {
         return Err(ApiError::Validation(
             "state must be acknowledged or not_applicable",
@@ -1028,6 +1075,7 @@ pub(super) async fn platform_privacy_processor_task_acknowledge(
     let semantic = json!({"state":body.state,"evidence_ref":body.evidence_ref});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1112,9 +1160,10 @@ pub(crate) struct CreatePrivacyIncident {
 pub(super) async fn platform_privacy_incident_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Json(body): Json<CreatePrivacyIncident>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["security_responder"]).await?;
+    let who = scope.principal();
     if body.affected_categories.is_empty()
         || body.affected_categories.len() > 50
         || body
@@ -1164,6 +1213,7 @@ pub(super) async fn platform_privacy_incident_create(
     let id = Uuid::new_v4();
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1252,16 +1302,12 @@ pub(crate) struct PrivacyIncidentAssessment {
 pub(super) async fn platform_privacy_incident_assess(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<PrivacyIncidentAssessment>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = platform_role(
-        &state,
-        &headers,
-        &["security_responder", "privacy_reviewer"],
-    )
-    .await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if !matches!(
         body.containment_state.as_str(),
         "investigating" | "contained" | "eradicated" | "monitoring" | "closed"
@@ -1301,6 +1347,7 @@ pub(super) async fn platform_privacy_incident_assess(
     let semantic = json!({"controller_awareness_at":body.controller_awareness_at,"containment_state":body.containment_state,"risk_level":body.risk_level,"notification_required":body.notification_required,"decision_ref":body.decision_ref,"authority_notification_ref":body.authority_notification_ref,"subject_notification_ref":body.subject_notification_ref});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1376,10 +1423,11 @@ pub(crate) struct CreateLegalHold {
 pub(super) async fn platform_privacy_legal_hold_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Json(body): Json<CreateLegalHold>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["privacy_reviewer"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if body.datasets.is_empty()
         || body.datasets.len() > 50
         || body
@@ -1426,13 +1474,14 @@ pub(super) async fn platform_privacy_legal_hold_create(
             "legal hold UUID scopes must be unique and bounded",
         ));
     }
-    let scope =
+    let hold_scope =
         json!({"datasets":body.datasets,"workshop_ids":workshops,"subject_user_ids":subjects});
     let key = idempotency(&headers)?.to_owned();
     let id = Uuid::new_v4();
     let correlation = Uuid::new_v4();
-    let semantic = json!({"scope":scope,"reason_code":body.reason_code,"approval_ref":body.approval_ref,"expires_at":body.expires_at});
+    let semantic = json!({"scope":hold_scope,"reason_code":body.reason_code,"approval_ref":body.approval_ref,"expires_at":body.expires_at});
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1487,7 +1536,7 @@ pub(super) async fn platform_privacy_legal_hold_create(
             return Err(ApiError::Validation("a scoped subject does not exist"));
         }
     }
-    sqlx::query("insert into control.legal_holds(id,scope,reason_code,approval_ref,imposed_by,expires_at) values($1,$2,$3,$4,$5,$6)").bind(id).bind(&scope).bind(&body.reason_code).bind(&body.approval_ref).bind(who.user_id).bind(body.expires_at).execute(&mut *tx).await?;
+    sqlx::query("insert into control.legal_holds(id,scope,reason_code,approval_ref,imposed_by,expires_at) values($1,$2,$3,$4,$5,$6)").bind(id).bind(&hold_scope).bind(&body.reason_code).bind(&body.approval_ref).bind(who.user_id).bind(body.expires_at).execute(&mut *tx).await?;
     audit_command(
         &mut tx,
         (Some(who.user_id), None),
@@ -1524,11 +1573,12 @@ pub(crate) struct ReleaseLegalHold {
 pub(super) async fn platform_privacy_legal_hold_release(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<ReleaseLegalHold>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["privacy_reviewer"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if body.reason_code.trim().is_empty() || body.reason_code.len() > 100 {
         return Err(ApiError::Validation("a bounded reason_code is required"));
     }
@@ -1538,6 +1588,7 @@ pub(super) async fn platform_privacy_legal_hold_release(
     let semantic = json!({"reason_code":body.reason_code});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {

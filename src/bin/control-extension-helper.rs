@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,23 @@ struct Limits {
     bytes: u64,
 }
 
-fn main() -> anyhow::Result<()> {
+fn command_failure(error: &anyhow::Error) -> ExitCode {
+    let (classes, truncated) = mb_control_plane::error_reporting::safe_anyhow_chain(error);
+    let error_class = classes.first().copied().unwrap_or("internal");
+    eprintln!(
+        "{{\"level\":\"ERROR\",\"service\":\"mb-control-extension-helper\",\"error_class\":\"{error_class}\",\"error_chain_truncated\":{truncated},\"message\":\"command failed\"}}"
+    );
+    ExitCode::FAILURE
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => command_failure(&error),
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let seal = match arguments.get(1).map(String::as_str) {
         Some("seal") => true,

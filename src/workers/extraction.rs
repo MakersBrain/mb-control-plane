@@ -10,10 +10,13 @@ use crate::integrations::odoo::OdooClient;
 use crate::integrations::paperless::PaperlessClient;
 use crate::persistence::{LeasedOperation, Store};
 use crate::worker::{extraction_broker, secret, service};
+use crate::worker_config::{InventoryExtractionConfig, InvoiceExtractionConfig};
 
 pub(crate) async fn invoice(
     store: &Store,
     operation: &LeasedOperation,
+    tenant_domain: &str,
+    config: &InvoiceExtractionConfig,
 ) -> Result<(), IntegrationError> {
     let workshop = operation
         .workshop_id
@@ -48,10 +51,8 @@ pub(crate) async fn invoice(
         .await
         .map_err(|_| IntegrationError::Unavailable)?
         .ok_or(IntegrationError::NotFound)?;
-    let paperless_public_url = format!(
-        "https://docs-{slug}.{}/documents/{document_id}/details",
-        crate::worker::configuration("CONTROL_TENANT_DOMAIN")?
-    );
+    let paperless_public_url =
+        format!("https://docs-{slug}.{tenant_domain}/documents/{document_id}/details");
     let digest = format!("{:x}", Sha256::digest(&source));
     let (provider, invoice, confidence, pages) = if let Some(invoice) =
         crate::invoice::structured(&source)
@@ -70,9 +71,10 @@ pub(crate) async fn invoice(
             operation.id,
             workshop,
             estimated_pages(&source, &mimetype),
+            config.monthly_page_limit(),
         )
         .await?;
-        throttle_azure_submission(store).await?;
+        throttle_azure_submission(store, config.azure_min_interval()).await?;
         let result = extraction_broker(Duration::from_secs(120))?
             .invoice(&source, &mimetype)
             .await?;
@@ -100,11 +102,8 @@ pub(crate) async fn invoice(
     )
     .map_err(|_| IntegrationError::ContractDrift)?;
     odoo.capture_invoice(&json!({"operation_key":format!("invoice:{workshop}:{document_id}:{digest}"),"workshop_id":workshop,"external_document_id":format!("paperless:{document_id}"),"source_document_url":paperless_public_url,"content_digest":digest,"source_filename":metadata.filename,"source_mimetype":mimetype,"source_base64":base64::engine::general_purpose::STANDARD.encode(&source),"provider":provider,"model":if provider=="azure"{"prebuilt-invoice"}else{"structured"},"page_count":pages,"requires_review":requires_review,"field_confidence":confidence,"invoice":invoice})).await?;
-    if let Ok(tags) = std::env::var("CONTROL_PAPERLESS_CAPTURED_TAG_IDS") {
-        let mut ids = tags
-            .split(',')
-            .filter_map(|v| v.trim().parse().ok())
-            .collect::<Vec<_>>();
+    if let Some(captured_tag_ids) = config.captured_tag_ids() {
+        let mut ids = captured_tag_ids.to_vec();
         ids.extend(metadata.tags.iter().copied());
         ids.sort_unstable();
         ids.dedup();
@@ -118,6 +117,7 @@ pub(crate) async fn invoice(
 pub(crate) async fn inventory_capture(
     store: &Store,
     operation: &LeasedOperation,
+    config: &InventoryExtractionConfig,
 ) -> Result<(), IntegrationError> {
     let workshop = operation
         .workshop_id
@@ -194,13 +194,20 @@ pub(crate) async fn inventory_capture(
             .map_err(|_| IntegrationError::Unavailable)?;
         return deliver_inventory_checkpoint(&odoo, &checkpoint).await;
     }
-    reserve_azure_inventory(store, operation.id, workshop, assets.len() as i64).await?;
+    reserve_azure_inventory(
+        store,
+        operation.id,
+        workshop,
+        assets.len() as i64,
+        config.azure_monthly_image_limit(),
+    )
+    .await?;
     let broker = extraction_broker(Duration::from_secs(120))?;
     let mut tokens = Vec::new();
     let mut codes = Vec::new();
     let mut candidates = Vec::new();
     for (asset_id, asset) in &assets {
-        throttle_azure_submission(store).await?;
+        throttle_azure_submission(store, config.azure_min_interval()).await?;
         let result = broker
             .inventory_label(&asset.content, &asset.mimetype, &asset_id.to_string())
             .await?;
@@ -262,7 +269,14 @@ pub(crate) async fn inventory_capture(
                 descriptor.get("role").and_then(Value::as_str) != Some("ocr_variant")
             })
             .collect::<Vec<_>>();
-        reserve_inventory_ai(store, operation.id, workshop, vision_inputs.len() as i64).await?;
+        reserve_inventory_ai(
+            store,
+            operation.id,
+            workshop,
+            vision_inputs.len() as i64,
+            config.ai_monthly_image_limit(),
+        )
+        .await?;
         let vision_assets = assets
             .iter()
             .zip(descriptors.iter())
@@ -358,6 +372,7 @@ async fn reserve_azure_inventory(
     operation: Uuid,
     workshop: Uuid,
     images: i64,
+    limit: i64,
 ) -> Result<(), IntegrationError> {
     reserve_inventory_usage(
         store,
@@ -365,7 +380,7 @@ async fn reserve_azure_inventory(
         workshop,
         images,
         "azure_inventory_images",
-        "CONTROL_AZURE_MONTHLY_IMAGE_LIMIT",
+        limit,
     )
     .await
 }
@@ -375,6 +390,7 @@ async fn reserve_inventory_ai(
     operation: Uuid,
     workshop: Uuid,
     images: i64,
+    limit: i64,
 ) -> Result<(), IntegrationError> {
     reserve_inventory_usage(
         store,
@@ -382,7 +398,7 @@ async fn reserve_inventory_ai(
         workshop,
         images,
         "inventory_ai_images",
-        "CONTROL_INVENTORY_AI_MONTHLY_IMAGE_LIMIT",
+        limit,
     )
     .await
 }
@@ -393,12 +409,8 @@ async fn reserve_inventory_usage(
     workshop: Uuid,
     images: i64,
     metric: &str,
-    limit_variable: &str,
+    limit: i64,
 ) -> Result<(), IntegrationError> {
-    let limit = std::env::var(limit_variable)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(500);
     let mut transaction = store
         .begin()
         .await
@@ -482,11 +494,8 @@ async fn reserve_azure(
     operation: Uuid,
     workshop: Uuid,
     pages: i64,
+    limit: i64,
 ) -> Result<(), IntegrationError> {
-    let limit = std::env::var("CONTROL_AZURE_MONTHLY_PAGE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1000);
     let mut transaction = store
         .begin()
         .await
@@ -525,13 +534,11 @@ async fn reserve_azure(
     Ok(())
 }
 
-async fn throttle_azure_submission(store: &Store) -> Result<(), IntegrationError> {
-    let interval_ms = std::env::var("CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_100)
-        .clamp(100, 60_000);
-    let interval_seconds = interval_ms as f64 / 1_000.0;
+async fn throttle_azure_submission(
+    store: &Store,
+    minimum_interval: Duration,
+) -> Result<(), IntegrationError> {
+    let interval_seconds = minimum_interval.as_secs_f64();
     let delay_seconds = sqlx::query_scalar::<_, f64>(
         "insert into control.provider_rate_limits(provider,next_allowed_at)
          values('azure_document_analyze',now()+make_interval(secs=>$1))

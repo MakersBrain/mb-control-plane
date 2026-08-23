@@ -303,9 +303,15 @@ def rehearse(workspace: str) -> None:
     recovery = uuid.UUID(state["recovery_point_id"])
     rehearsal = uuid.uuid5(recovery, "workspace-rehearsal")
     psql(workspace, f"""
-insert into control.workshop_recovery_rehearsals(id,recovery_point_id,workshop_id,state)
-values('{rehearsal}','{recovery}','{state['workshop_id']}','running')
-on conflict(id) do update set state='running',started_at=now(),finished_at=null,safe_error=null;
+insert into control.workshop_recovery_rehearsals(
+    id,recovery_point_id,workshop_id,state,attempt,lease_owner,lease_token,lease_expires_at)
+values(
+    '{rehearsal}','{recovery}','{state['workshop_id']}','running',1,
+    gen_random_uuid(),gen_random_uuid(),now()+interval '20 minutes')
+on conflict(id) do update set
+    state='running',attempt=1,started_at=now(),finished_at=null,safe_error=null,
+    next_attempt_at=null,lease_owner=gen_random_uuid(),lease_token=gen_random_uuid(),
+    lease_expires_at=now()+interval '20 minutes';
 """)
     try:
         driver(
@@ -314,9 +320,9 @@ on conflict(id) do update set state='running',started_at=now(),finished_at=null,
             f"workspace-acceptance-rehearse:{recovery}",
         )
     except Exception:
-        psql(workspace, f"update control.workshop_recovery_rehearsals set state='failed',safe_error='acceptance_failed',finished_at=now() where id='{rehearsal}';")
+        psql(workspace, f"update control.workshop_recovery_rehearsals set state='failed',safe_error='acceptance_failed',finished_at=now(),next_attempt_at=null,lease_owner=null,lease_token=null,lease_expires_at=null where id='{rehearsal}';")
         raise
-    psql(workspace, f"update control.workshop_recovery_rehearsals set state='succeeded',safe_error=null,finished_at=now() where id='{rehearsal}';")
+    psql(workspace, f"update control.workshop_recovery_rehearsals set state='succeeded',safe_error=null,finished_at=now(),next_attempt_at=null,lease_owner=null,lease_token=null,lease_expires_at=null where id='{rehearsal}';")
     print(f"rehearsed recovery point {recovery}")
 
 

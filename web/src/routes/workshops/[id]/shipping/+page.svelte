@@ -4,14 +4,12 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { request } from '$lib/session.svelte';
 	import type { WorkshopSummary } from '$lib/types';
-
-	type CarrierTarget = { company_id:number; company_name:string; carrier_id:number; carrier_name:string; provider:string; environment:string; service_code:string; configured:boolean };
-	type CarrierSecret = { id:string; secret_ref:string; provider:string; environment:string; company_id:number; carrier_id:number; version:number; state:string };
+	import type { CarrierSecretResponse, CarrierTarget } from '$lib/generated/control-api';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
 	let targets = $state<CarrierTarget[]>([]);
-	let secrets = $state<CarrierSecret[]>([]);
+	let secrets = $state<CarrierSecretResponse[]>([]);
 	let selected = $state('');
 	let accessKey = $state('');
 	let secretKey = $state('');
@@ -28,7 +26,7 @@
 			[workshop, targets, secrets] = await Promise.all([
 				request<WorkshopSummary>(`/v1/workshops/${id}`),
 				request<CarrierTarget[]>(`/v1/workshops/${id}/carrier-targets`).catch(() => []),
-				request<CarrierSecret[]>(`/v1/workshops/${id}/carrier-secrets`)
+				request<CarrierSecretResponse[]>(`/v1/workshops/${id}/carrier-secrets`)
 			]);
 			if (!selected && targets.length) selected = String(targets[0].carrier_id);
 			error = '';
@@ -56,7 +54,7 @@
 		finally { busy = false; }
 	}
 
-	async function remove(secret: CarrierSecret) {
+	async function remove(secret: CarrierSecretResponse) {
 		if (!window.confirm('Delete this external carrier credential? Label purchases will stop until new credentials are saved.')) return;
 		busy = true; error = ''; notice = '';
 		try {

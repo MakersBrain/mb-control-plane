@@ -46,6 +46,7 @@ fi
 
 for required in \
   compose/control_api_database_url \
+  compose/control_tenant_api_database_url \
   derived/rauthy_api_keys.json \
   derived/rauthy_enc_key_active \
   application/INVITATION_SIGNING_KEY_ID \

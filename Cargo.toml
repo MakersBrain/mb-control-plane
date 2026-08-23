@@ -55,6 +55,7 @@ base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+libc = "0.2"
 lopdf = "0.44"
 opentelemetry = "0.32"
 opentelemetry-otlp = "0.32"

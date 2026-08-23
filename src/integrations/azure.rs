@@ -5,6 +5,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 use super::{bounded_body, classify_status};
 
@@ -47,12 +48,9 @@ impl AzureInvoiceClient {
         key_header.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ocp-apim-subscription-key", key_header);
-        let http = reqwest::Client::builder()
+        let http = crate::outbound_http::external_api_builder("mb-invoice-worker")
             .default_headers(headers)
             .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-invoice-worker")
             .build()?;
         Ok(Self {
             http,
@@ -98,6 +96,7 @@ impl AzureInvoiceClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, mimetype)
             .body(source.to_vec())
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|error| {
@@ -127,6 +126,7 @@ impl AzureInvoiceClient {
             let response = self
                 .http
                 .get(operation_url.clone())
+                .with_current_trace_context()
                 .send()
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;
@@ -170,6 +170,7 @@ impl AzureInvoiceClient {
             let response = self
                 .http
                 .delete(operation_url.clone())
+                .with_current_trace_context()
                 .send()
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;

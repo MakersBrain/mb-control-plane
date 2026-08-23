@@ -1,28 +1,31 @@
 use super::*;
+use axum::Extension;
+
+use crate::auth::WorkshopScope;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 pub(super) async fn database(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<DatabaseResponse>> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
+    let workshop = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(workshop).await?;
     let primary =
         sqlx::query_as::<_, (Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>)>(
             "select id,public_hostname,state,created_at,last_restored_at
          from control.odoo_databases
          where workshop_id=$1 and kind='primary' and deleted_at is null",
         )
-        .bind(id)
-        .fetch_optional(state.store.pool())
+        .bind(workshop)
+        .fetch_optional(&mut *tx)
         .await?;
     let duplicates = sqlx::query_as::<_, (Uuid, String, String, OffsetDateTime)>(
         "select id,label,state,created_at from control.odoo_databases
          where workshop_id=$1 and kind='duplicate' and deleted_at is null
          order by created_at desc",
     )
-    .bind(id)
-    .fetch_all(state.store.pool())
+    .bind(workshop)
+    .fetch_all(&mut *tx)
     .await?;
     let recovery = sqlx::query_as::<_, RecoveryPointRow>(
         "select r.id,r.kind,r.label,r.state,r.size_bytes,r.created_at,r.ready_at,
@@ -36,11 +39,12 @@ pub(super) async fn database(
          where r.workshop_id=$1 and r.state<>'deleted'
          order by r.created_at desc",
     )
-    .bind(id)
-    .fetch_all(state.store.pool())
+    .bind(workshop)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(DatabaseResponse {
-        can_manage: role.can_manage_database(),
+        can_manage: scope.role.can_manage_database(),
         primary: primary.map(|row| PrimaryDatabaseResponse {
             id: row.0,
             public_hostname: row.1,
@@ -117,11 +121,11 @@ struct RecoveryPointRow {
 
 pub(super) async fn download_backup(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((workshop, recovery)): Path<(Uuid, Uuid)>,
+    Extension(scope): Extension<WorkshopScope>,
+    Path((_, recovery)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(workshop).await?;
     let downloadable = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.workshop_recovery_points
          where id=$1 and workshop_id=$2 and kind='backup' and state='ready'
@@ -129,29 +133,27 @@ pub(super) async fn download_backup(
     )
     .bind(recovery)
     .bind(workshop)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *tx)
     .await?;
     if !downloadable {
         return Err(ApiError::Conflict(
             "backup archive is not ready for download",
         ));
     }
-    let response = crate::deployment_driver_transport::client(
-        None,
-        state.config.request_timeout,
-        state.config.deployment_driver_socket.as_deref(),
-    )
-    .map_err(ApiError::Internal)?
-    .post(format!(
-        "{}v1/tenants/{workshop}/download",
-        state.config.deployment_driver_url.as_str()
-    ))
-    .bearer_auth(&state.config.deployment_driver_token)
-    .header("idempotency-key", Uuid::new_v4().to_string())
-    .json(&json!({"recovery_point_id": recovery}))
-    .send()
-    .await
-    .map_err(|error| ApiError::Internal(error.into()))?;
+    tx.commit().await?;
+    let response = state
+        .deployment_driver_client
+        .post(format!(
+            "{}v1/tenants/{workshop}/download",
+            state.config.deployment_driver_url.as_str()
+        ))
+        .bearer_auth(&state.config.deployment_driver_token)
+        .header("idempotency-key", Uuid::new_v4().to_string())
+        .json(&json!({"recovery_point_id": recovery}))
+        .with_current_trace_context()
+        .send()
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
     let status = response.status();
     let value = response
         .json::<Value>()
@@ -172,31 +174,31 @@ pub(crate) struct RecoveryPointBody {
 
 pub(super) async fn create_snapshot(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
     Json(body): Json<RecoveryPointBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    create_recovery_point(&state, &headers, id, body.label, "snapshot").await
+    create_recovery_point(&state, &scope, &headers, body.label, "snapshot").await
 }
 
 pub(super) async fn create_backup(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
     Json(body): Json<RecoveryPointBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    create_recovery_point(&state, &headers, id, body.label, "backup").await
+    create_recovery_point(&state, &scope, &headers, body.label, "backup").await
 }
 
 async fn create_recovery_point(
     state: &AppState,
+    scope: &WorkshopScope,
     headers: &HeaderMap,
-    workshop: Uuid,
     label: Option<String>,
     kind: &'static str,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(state, headers).await?;
-    require_database_owner(state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    let principal_id = scope.principal_id;
     let client_key = idempotency(headers)?.to_owned();
     let label = lifecycle_label(
         label,
@@ -209,11 +211,12 @@ async fn create_recovery_point(
     let recovery_id = Uuid::new_v4();
     let correlation = Uuid::new_v4();
     let semantic = json!({"kind":kind,"label":label});
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: principal_id,
             scope: &format!("workshop:{workshop}:recovery"),
             command_kind: &format!("database.{kind}"),
             idempotency_key: &client_key,
@@ -272,17 +275,17 @@ async fn create_recovery_point(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: Some(who.user_id),
+            requested_by: Some(principal_id),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
     )
     .await?;
     sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,$5,$6,$7,$8,'mb-workshop-recovery-v2')")
-        .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
+        .bind(recovery_id).bind(workshop).bind(database_id).bind(operation_id).bind(kind).bind(label).bind(principal_id).bind(&component_scope).execute(&mut *tx).await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(principal_id), Some(workshop)),
         &format!("database.{kind}"),
         "workshop_recovery_point",
         recovery_id.to_string(),
@@ -310,24 +313,26 @@ async fn create_recovery_point(
 
 pub(super) async fn restore_database(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
     Json(body): Json<RestoreBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, id).await?;
-    require_step_up(&who)?;
+    let id = scope.workshop_id;
+    let principal_id = scope.principal_id;
+    require_step_up(&principal)?;
     confirm_slug(&state, id, &body.confirmation).await?;
     let client_key = idempotency(&headers)?.to_owned();
     let correlation = Uuid::new_v4();
     let safety_id = Uuid::new_v4();
     let semantic =
         json!({"recovery_point_id":body.recovery_point_id,"confirmation":body.confirmation});
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: principal_id,
             scope: &format!("workshop:{id}:database"),
             command_kind: "database.restore",
             idempotency_key: &client_key,
@@ -418,7 +423,7 @@ pub(super) async fn restore_database(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: Some(who.user_id),
+            requested_by: Some(principal_id),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -437,10 +442,11 @@ pub(super) async fn restore_database(
         }
         sqlx::query(
             "insert into control.erasure_restore_replays(
-                 id,tombstone_id,recovery_point_id,operation_id,required_locations
-             ) values($1,$2,$3,$4,$5)",
+                 id,workshop_id,tombstone_id,recovery_point_id,operation_id,required_locations
+             ) values($1,$2,$3,$4,$5,$6)",
         )
         .bind(Uuid::new_v4())
+        .bind(id)
         .bind(tombstone_id)
         .bind(body.recovery_point_id)
         .bind(operation_id)
@@ -448,15 +454,18 @@ pub(super) async fn restore_database(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,'backup','Automatic pre-restore safety backup',$4,$5,'mb-workshop-recovery-v2')")
-        .bind(safety_id).bind(id).bind(database_id).bind(who.user_id).bind(&safety_scope).execute(&mut *tx).await?;
-    sqlx::query("update control.odoo_databases set state='restoring' where id=$1")
-        .bind(database_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Automatic pre-restore safety backup',$5,$6,'mb-workshop-recovery-v2')")
+        .bind(safety_id).bind(id).bind(database_id).bind(operation_id).bind(principal_id).bind(&safety_scope).execute(&mut *tx).await?;
+    sqlx::query(
+        "update control.odoo_databases set state='restoring' where id=$1 and workshop_id=$2",
+    )
+    .bind(database_id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(principal_id), Some(id)),
         "database.restore",
         "workshop_recovery_point",
         body.recovery_point_id.to_string(),
@@ -496,13 +505,14 @@ pub(crate) struct DuplicateBody {
 
 pub(super) async fn duplicate_database(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
     Json(body): Json<DuplicateBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_database_owner(&state, who.user_id, id).await?;
-    require_step_up(&who)?;
+    let id = scope.workshop_id;
+    let principal_id = scope.principal_id;
+    require_step_up(&principal)?;
     confirm_slug(&state, id, &body.confirmation).await?;
     let label = lifecycle_label(Some(body.label), "Database duplicate")?;
     let client_key = idempotency(&headers)?.to_owned();
@@ -510,11 +520,12 @@ pub(super) async fn duplicate_database(
     let duplicate_ref = opaque_database_ref(duplicate_id);
     let correlation = Uuid::new_v4();
     let semantic = json!({"label":label,"confirmation":body.confirmation});
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: principal_id,
             scope: &format!("workshop:{id}:database"),
             command_kind: "database.duplicate",
             idempotency_key: &client_key,
@@ -555,7 +566,7 @@ pub(super) async fn duplicate_database(
     ensure_lifecycle_idle(&mut tx, id).await?;
     sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,label,state,source_database_id,routable) values($1,$2,'duplicate',$3,$4,'duplicating',$5,false)")
         .bind(duplicate_id).bind(id).bind(&duplicate_ref).bind(label).bind(source_id).execute(&mut *tx).await?;
-    let payload = json!({"action":"duplicate","database_id":source_id,"target_database_id":duplicate_id,"target_database_ref":duplicate_ref,"routable":false});
+    let payload = json!({"action":"duplicate","database_id":source_id,"target_database_id":duplicate_id,"routable":false});
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -564,7 +575,7 @@ pub(super) async fn duplicate_database(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: Some(who.user_id),
+            requested_by: Some(principal_id),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -572,7 +583,7 @@ pub(super) async fn duplicate_database(
     .await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(principal_id), Some(id)),
         "database.duplicate",
         "odoo_database",
         duplicate_id.to_string(),
@@ -596,17 +607,6 @@ pub(super) async fn duplicate_database(
     .map_err(command_error)?;
     tx.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
-}
-
-async fn require_database_owner(state: &AppState, user: Uuid, workshop: Uuid) -> ApiResult<()> {
-    if !authority(state, user, workshop)
-        .await?
-        .0
-        .can_manage_database()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
 }
 
 pub(super) async fn confirm_slug(
@@ -638,32 +638,32 @@ fn lifecycle_label(value: Option<String>, fallback: &str) -> ApiResult<String> {
 }
 
 pub(super) async fn lock_lifecycle(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     workshop: Uuid,
 ) -> ApiResult<()> {
     sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,0))")
         .bind(workshop.to_string())
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     Ok(())
 }
 
 pub(super) async fn primary_database(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     workshop: Uuid,
 ) -> ApiResult<Uuid> {
     sqlx::query_scalar::<_, Uuid>("select id from control.odoo_databases where workshop_id=$1 and kind='primary' and deleted_at is null")
-        .bind(workshop).fetch_optional(&mut **tx).await?.ok_or(ApiError::Conflict("Odoo database is not provisioned"))
+        .bind(workshop).fetch_optional(&mut *tx).await?.ok_or(ApiError::Conflict("Odoo database is not provisioned"))
 }
 
 pub(super) async fn ensure_lifecycle_idle(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::postgres::PgConnection,
     workshop: Uuid,
 ) -> ApiResult<()> {
     let active = sqlx::query_scalar::<_, bool>("select
         exists(select 1 from control.operations where workshop_id=$1 and kind='tenant.lifecycle' and state in ('pending','in_flight','awaiting_reconciliation'))
         or exists(select 1 from control.tenant_release_adoptions where workshop_id=$1 and state in ('pending','isolating','backing_up','upgrading','verifying','prepared','failed','restoring'))")
-        .bind(workshop).fetch_one(&mut **tx).await?;
+        .bind(workshop).fetch_one(&mut *tx).await?;
     if active {
         return Err(ApiError::Conflict(
             "another database operation is already running",

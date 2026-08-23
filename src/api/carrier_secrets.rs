@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::auth::WorkshopScope;
+use crate::outbound_http::TraceRequestBuilderExt as _;
+use axum::extract::Extension;
 use serde::Serialize;
 
 #[derive(Deserialize, Serialize, ToSchema)]
@@ -203,17 +206,6 @@ async fn delete_storage(
     Ok(())
 }
 
-async fn require_manager(state: &AppState, user: Uuid, workshop: Uuid) -> ApiResult<()> {
-    if !authority(state, user, workshop)
-        .await?
-        .0
-        .can_manage_modules()
-    {
-        return Err(ApiError::Forbidden);
-    }
-    Ok(())
-}
-
 async fn require_enabled(state: &AppState, workshop: Uuid, provider: &str) -> ApiResult<()> {
     let module_key = provider_module(provider).ok_or(ApiError::Validation(
         "carrier credential payload is invalid",
@@ -239,22 +231,19 @@ async fn driver(
     key: Uuid,
     payload: &Value,
 ) -> ApiResult<Value> {
-    let response = crate::deployment_driver_transport::client(
-        None,
-        state.config.request_timeout,
-        state.config.deployment_driver_socket.as_deref(),
-    )
-    .map_err(ApiError::Internal)?
-    .post(format!(
-        "{}v1/tenants/{workshop}/{action}",
-        state.config.deployment_driver_url.as_str()
-    ))
-    .bearer_auth(&state.config.deployment_driver_token)
-    .header("idempotency-key", format!("carrier-secret:{key}"))
-    .json(payload)
-    .send()
-    .await
-    .map_err(|error| ApiError::Internal(error.into()))?;
+    let response = state
+        .deployment_driver_client
+        .post(format!(
+            "{}v1/tenants/{workshop}/{action}",
+            state.config.deployment_driver_url.as_str()
+        ))
+        .bearer_auth(&state.config.deployment_driver_token)
+        .header("idempotency-key", format!("carrier-secret:{key}"))
+        .json(payload)
+        .with_current_trace_context()
+        .send()
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
     if !response.status().is_success() {
         return Err(ApiError::Internal(anyhow::anyhow!(
             "deployment driver refused carrier secret operation"
@@ -268,19 +257,19 @@ async fn driver(
 
 pub(super) async fn list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<CarrierSecretResponse>>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(workshop).await?;
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, i64, i64, i64, String)>(
         "select id,secret_ref,provider,environment,company_id,carrier_id,version,state
            from control.carrier_secrets where workshop_id=$1 and state<>'deleted'
            order by provider,environment,carrier_id",
     )
     .bind(workshop)
-    .fetch_all(state.store.pool())
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(
         rows.into_iter()
             .map(|row| CarrierSecretResponse {
@@ -299,11 +288,9 @@ pub(super) async fn list(
 
 pub(super) async fn targets(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<CarrierTargetResponse>>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
     let targets = odoo(&state, workshop)
         .await?
         .carrier_targets()
@@ -314,13 +301,12 @@ pub(super) async fn targets(
 
 pub(super) async fn upsert(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
     Json(body): Json<CarrierSecretBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    let workshop = scope.workshop_id;
     validate(&body)?;
-    let who = principal(&state, &headers).await?;
-    require_manager(&state, who.user_id, workshop).await?;
     require_enabled(&state, workshop, &body.provider).await?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({
@@ -330,13 +316,14 @@ pub(super) async fn upsert(
             serde_json::to_vec(&body.credentials).map_err(|error| ApiError::Internal(error.into()))?
         ))
     });
-    let scope = format!("workshop:{workshop}:carrier-secrets");
-    let mut tx = state.store.begin().await?;
+    let command_scope = format!("workshop:{workshop}:carrier-secrets");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "carrier-secret.upsert",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -384,10 +371,11 @@ pub(super) async fn upsert(
             })?;
         sqlx::query(
             "update control.carrier_secrets set cleanup_pending_ref=null
-              where id=$1 and cleanup_pending_ref=$2",
+              where id=$1 and workshop_id=$3 and cleanup_pending_ref=$2",
         )
         .bind(existing.as_ref().expect("existing row").0)
         .bind(pending_reference)
+        .bind(workshop)
         .execute(&mut *tx)
         .await?;
     }
@@ -450,14 +438,14 @@ pub(super) async fn upsert(
     let version = if existing.is_some() {
         sqlx::query_scalar::<_, i64>(
             "update control.carrier_secrets set version=version+1,secret_ref=$2,cleanup_pending_ref=$3,state='active',rotated_at=now(),deleted_at=null
-              where id=$1 returning version"
-        ).bind(secret_id).bind(secret_ref).bind(existing.as_ref().map(|row| row.2.as_str())).fetch_one(&mut *tx).await?
+              where id=$1 and workshop_id=$4 returning version"
+        ).bind(secret_id).bind(secret_ref).bind(existing.as_ref().map(|row| row.2.as_str())).bind(workshop).fetch_one(&mut *tx).await?
     } else {
         sqlx::query_scalar::<_, i64>(
             "insert into control.carrier_secrets(id,workshop_id,provider,environment,company_id,carrier_id,secret_ref,created_by)
              values($1,$2,$3,$4,$5,$6,$7,$8) returning version"
         ).bind(secret_id).bind(workshop).bind(&body.provider).bind(&body.environment)
-         .bind(body.company_id).bind(body.carrier_id).bind(secret_ref).bind(who.user_id)
+         .bind(body.company_id).bind(body.carrier_id).bind(secret_ref).bind(scope.principal_id)
          .fetch_one(&mut *tx).await?
     };
     let public = json!({
@@ -467,7 +455,7 @@ pub(super) async fn upsert(
     });
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         if existing.is_some() {
             "carrier-secret.rotate"
         } else {
@@ -503,14 +491,17 @@ pub(super) async fn upsert(
                 "stale carrier credential cleanup failed"
             );
         } else {
+            let mut cleanup_tx = state.tenant_store.begin(workshop).await?;
             sqlx::query(
                 "update control.carrier_secrets set cleanup_pending_ref=null
-                  where id=$1 and cleanup_pending_ref=$2",
+                  where id=$1 and workshop_id=$3 and cleanup_pending_ref=$2",
             )
             .bind(secret_id)
             .bind(old_reference)
-            .execute(state.store.pool())
+            .bind(workshop)
+            .execute(&mut *cleanup_tx)
             .await?;
+            cleanup_tx.commit().await?;
         }
     }
     Ok((StatusCode::OK, Json(public)))
@@ -518,23 +509,24 @@ pub(super) async fn upsert(
 
 pub(super) async fn delete(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path((workshop, secret_id)): Path<(Uuid, Uuid)>,
+    Path((_workshop, secret_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_manager(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
     let client_key = idempotency(&headers)?;
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let row = sqlx::query_as::<_, (String, String, String, String, i64, i64, Option<String>)>(
         "select secret_ref,state,provider,environment,company_id,carrier_id,cleanup_pending_ref from control.carrier_secrets where id=$1 and workshop_id=$2 for update"
     ).bind(secret_id).bind(workshop).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
     let semantic = json!({"secret_id":secret_id});
-    let scope = format!("workshop:{workshop}:carrier-secret:{secret_id}");
+    let command_scope = format!("workshop:{workshop}:carrier-secret:{secret_id}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "carrier-secret.delete",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -571,8 +563,9 @@ pub(super) async fn delete(
                 .map_err(|_| {
                     ApiError::Internal(anyhow::anyhow!("stale carrier credential cleanup failed"))
                 })?;
-            sqlx::query("update control.carrier_secrets set cleanup_pending_ref=null where id=$1")
+            sqlx::query("update control.carrier_secrets set cleanup_pending_ref=null where id=$1 and workshop_id=$2")
                 .bind(secret_id)
+                .bind(workshop)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -615,13 +608,13 @@ pub(super) async fn delete(
                 "carrier secret deletion contract drift"
             )));
         }
-        sqlx::query("update control.carrier_secrets set state='deleted',deleted_at=now(),version=version+1 where id=$1")
-            .bind(secret_id).execute(&mut *tx).await?;
+        sqlx::query("update control.carrier_secrets set state='deleted',deleted_at=now(),version=version+1 where id=$1 and workshop_id=$2")
+            .bind(secret_id).bind(workshop).execute(&mut *tx).await?;
     }
     let public = json!({"id":secret_id,"deleted":true});
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "carrier-secret.delete",
         "carrier-secret",
         secret_id.to_string(),

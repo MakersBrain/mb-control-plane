@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 use crate::integrations::scaleway_tem::{EmailDomainObservation, ScalewayTemDomainClient};
-use crate::persistence::{LeasedOperation, NewOperation, Store};
+use crate::persistence::{LeasedOperation, NewOperation, Store, lock_current_operation_lease};
 
 fn client() -> Result<ScalewayTemDomainClient, IntegrationError> {
     let token = crate::runtime_secret::required("CONTROL_MAIL_SCW_SECRET_KEY")
@@ -160,9 +160,12 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
+pub(crate) async fn failed(
+    store: &Store,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
     let Some(workshop) = operation.workshop_id else {
-        return;
+        return Err(IntegrationError::ContractDrift);
     };
     let Some(id) = operation
         .payload
@@ -170,9 +173,19 @@ pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
     else {
-        return;
+        return Err(IntegrationError::ContractDrift);
     };
-    if let Err(error) = sqlx::query(
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    if !lock_current_operation_lease(&mut tx, operation)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+    {
+        return Err(IntegrationError::UnknownOutcome);
+    }
+    let changed = sqlx::query(
         "update control.webshop_email_domains
             set state='action_required',last_error_class='reconciliation_failed',
                 last_health_checked_at=now(),updated_at=now(),version=version+1
@@ -181,11 +194,14 @@ pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
     .bind(id)
     .bind(workshop)
     .bind(operation.id)
-    .execute(store.pool())
+    .execute(&mut *tx)
     .await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not mark webshop email domain reconciliation failed");
+    .map_err(|_| IntegrationError::Unavailable)?
+    .rows_affected();
+    if changed > 1 {
+        return Err(IntegrationError::ContractDrift);
     }
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
 }
 
 #[cfg(test)]

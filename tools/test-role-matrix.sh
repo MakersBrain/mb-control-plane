@@ -3,7 +3,7 @@ set -eu
 
 : "${CONTROL_TEST_ADMIN_URL:?CONTROL_TEST_ADMIN_URL is required}"
 database=control_role_matrix_test
-runtime_roles="control_api control_membership_worker control_provisioning_worker control_invoice_worker control_inventory_worker control_email_worker control_reconciliation_worker control_lifecycle_worker control_backup_scheduler control_driver_ledger control_release_worker control_privacy_worker"
+runtime_roles="control_api control_tenant_api control_membership_worker control_provisioning_worker control_invoice_worker control_inventory_worker control_email_worker control_reconciliation_worker control_lifecycle_worker control_backup_scheduler control_driver_ledger control_release_worker control_privacy_worker"
 
 cleanup() {
   dropdb --if-exists --force --maintenance-db="$CONTROL_TEST_ADMIN_URL" "$database" >/dev/null 2>&1 || true
@@ -18,6 +18,7 @@ cleanup
 psql "$CONTROL_TEST_ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
 create role control_runtime_read nologin;
 create role control_api nologin in role control_runtime_read;
+create role control_tenant_api nologin in role control_runtime_read;
 create role control_membership_worker nologin in role control_runtime_read;
 create role control_provisioning_worker nologin in role control_runtime_read;
 create role control_invoice_worker nologin in role control_runtime_read;
@@ -44,13 +45,64 @@ declare
 begin
   select count(*) into unsafe_roles from pg_roles
   where rolname in (
-    'control_api','control_membership_worker','control_provisioning_worker',
+    'control_api','control_tenant_api','control_membership_worker','control_provisioning_worker',
     'control_invoice_worker','control_inventory_worker','control_email_worker',
     'control_reconciliation_worker','control_lifecycle_worker',
     'control_backup_scheduler','control_driver_ledger','control_release_worker',
     'control_privacy_worker'
   ) and (rolsuper or rolcreatedb or rolcreaterole or rolreplication or rolbypassrls);
   if unsafe_roles <> 0 then raise exception 'a runtime role has administrative attributes'; end if;
+  if pg_has_role('control_tenant_api', 'control_api', 'MEMBER')
+     or pg_has_role('control_tenant_api', 'control_membership_worker', 'MEMBER')
+     or pg_has_role('control_tenant_api', 'control_release_worker', 'MEMBER') then
+    raise exception 'tenant API can assume a platform or fleet role';
+  end if;
+  if not has_table_privilege('control_tenant_api','control.ownership_transfers','SELECT')
+     or not has_table_privilege('control_tenant_api','control.ownership_transfers','INSERT')
+     or not has_table_privilege('control_tenant_api','control.ownership_transfers','UPDATE')
+     or has_table_privilege('control_tenant_api','control.ownership_transfers','DELETE')
+     or not has_function_privilege('control_tenant_api','control.current_workshop_id()','EXECUTE')
+     or has_table_privilege('control_tenant_api','control.platform_role_assignments','SELECT')
+     or has_table_privilege('control_tenant_api','control.data_subject_requests','SELECT')
+     or has_table_privilege('control_tenant_api','control.deployment_driver_operations','SELECT') then
+    raise exception 'tenant API privileges are incomplete or excessive';
+  end if;
+  if not has_function_privilege(
+         'control_tenant_api',
+         'control.claim_webshop_domain(uuid,uuid,text,text,text,text,uuid)',
+         'EXECUTE'
+     )
+     or has_function_privilege(
+         'control_api',
+         'control.claim_webshop_domain(uuid,uuid,text,text,text,text,uuid)',
+         'EXECUTE'
+     )
+     or has_function_privilege(
+         'control_reconciliation_worker',
+         'control.claim_webshop_domain(uuid,uuid,text,text,text,text,uuid)',
+         'EXECUTE'
+     )
+     or has_function_privilege(
+         'control_lifecycle_worker',
+         'control.claim_webshop_domain(uuid,uuid,text,text,text,text,uuid)',
+         'EXECUTE'
+     ) then
+    raise exception 'webshop-domain claim capability is granted to the wrong runtime role';
+  end if;
+  if not exists (
+       select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+       where n.nspname='control' and c.relname='ownership_transfers'
+         and c.relrowsecurity and c.relforcerowsecurity
+     ) or not exists (
+       select 1 from pg_policies
+       where schemaname='control' and tablename='ownership_transfers'
+         and policyname='ownership_transfers_tenant_api'
+         and roles @> array['control_tenant_api']::name[]
+         and qual like '%current_workshop_id%'
+         and with_check like '%current_workshop_id%'
+     ) then
+    raise exception 'ownership transfer forced-RLS contract is incomplete';
+  end if;
   if has_schema_privilege('control_email_worker','control','CREATE') then
     raise exception 'email worker can create schema objects';
   end if;
@@ -73,9 +125,18 @@ begin
      or not has_function_privilege('control_api','control.purge_expired_data_subject_exports()','EXECUTE') then
     raise exception 'API privacy export boundary is unsafe';
   end if;
-  if not has_table_privilege('control_driver_ledger','control.deployment_driver_operations','UPDATE')
+  if has_table_privilege('control_driver_ledger','control.deployment_driver_operations','UPDATE')
+     or not has_column_privilege('control_driver_ledger','control.deployment_driver_operations','state','UPDATE')
+     or not has_column_privilege('control_driver_ledger','control.deployment_driver_operations','response','UPDATE')
+     or not has_column_privilege('control_driver_ledger','control.deployment_driver_operations','safe_error','UPDATE')
+     or not has_column_privilege('control_driver_ledger','control.deployment_driver_operations','updated_at','UPDATE')
+     or has_column_privilege('control_driver_ledger','control.deployment_driver_operations','target_key','UPDATE')
+     or not has_column_privilege('control_driver_ledger','control.fleet_activation_intents','gateway_identity_version','INSERT')
+     or not has_column_privilege('control_driver_ledger','control.fleet_activation_intents','gateway_identity_version','UPDATE')
      or has_table_privilege('control_driver_ledger','control.workshops','SELECT')
-     or not has_function_privilege('control_driver_ledger','control.initial_release_preparable(text,integer)','EXECUTE') then
+     or not has_function_privilege('control_driver_ledger','control.initial_release_preparable(text,integer)','EXECUTE')
+     or not has_function_privilege('control_driver_ledger','control.admit_initial_release_reconciliation(uuid,integer,text,text,text,text,uuid,uuid,integer)','EXECUTE')
+     or not has_function_privilege('control_driver_ledger','control.finish_initial_release_reconciliation(uuid,uuid,uuid,text,jsonb)','EXECUTE') then
     raise exception 'driver ledger privileges are unsafe';
   end if;
   if not has_table_privilege('control_api','control.capability_registry_entries','SELECT')
@@ -114,7 +175,11 @@ begin
      or has_table_privilege('control_privacy_worker','control.service_instances','SELECT')
      or has_table_privilege('control_privacy_worker','control.processor_approvals','UPDATE')
      or has_table_privilege('control_privacy_worker','control.audit_events','UPDATE')
-     or not has_function_privilege('control_privacy_worker','control.legal_hold_applies(text,uuid,uuid[])','EXECUTE') then
+     or not has_function_privilege('control_privacy_worker','control.legal_hold_applies(text,uuid,uuid[])','EXECUTE')
+     or not has_function_privilege('control_privacy_worker','control.claim_privacy_export_cleanup(text)','EXECUTE')
+     or not has_function_privilege('control_privacy_worker','control.renew_privacy_export_cleanup(text,uuid,bigint)','EXECUTE')
+     or not has_function_privilege('control_privacy_worker','control.mark_privacy_export_artifact_purged(uuid,text,text,uuid,bigint)','EXECUTE')
+     or not has_function_privilege('control_privacy_worker','control.release_privacy_export_cleanup(text,uuid,bigint)','EXECUTE') then
     raise exception 'privacy worker privileges are incomplete or excessive';
   end if;
   if not has_table_privilege('control_lifecycle_worker','control.erasure_restore_replays','UPDATE')

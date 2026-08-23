@@ -1,18 +1,41 @@
+use std::ops::{Deref, DerefMut};
+
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0004_paperless_runtime_spec";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0038_release_generation_retention";
 
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
 }
+
+/// Database access for work that has already been authorized for one workshop.
+///
+/// Unlike [`Store`], this type deliberately provides no access to its pool.
+/// Callers must open a [`WorkshopTransaction`], which installs the workshop
+/// identity as transaction-local PostgreSQL state before yielding an executor.
+#[derive(Clone)]
+pub struct TenantStore {
+    pool: PgPool,
+}
+
+/// A transaction whose PostgreSQL tenant context is fixed to one workshop.
+///
+/// Dereferencing yields the transaction's connection so existing SQLx query
+/// calls can use `&mut *transaction`. The underlying tenant pool is never
+/// exposed, preventing statements from bypassing the transaction-local scope.
+pub struct WorkshopTransaction<'a> {
+    transaction: Transaction<'a, Postgres>,
+    workshop_id: Uuid,
+}
+
+const SET_WORKSHOP_CONTEXT_SQL: &str = "select set_config('control.workshop_id',$1,true)";
 
 pub struct NewOperation<'a> {
     pub kind: OperationKind,
@@ -219,7 +242,103 @@ fn validate_initial_slot_evidence(
     Ok(())
 }
 
+impl TenantStore {
+    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(12)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(database_url)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn begin(&self, workshop_id: Uuid) -> Result<WorkshopTransaction<'_>, sqlx::Error> {
+        self.begin_with_isolation(workshop_id, false).await
+    }
+
+    /// Open a tenant-scoped transaction whose reads remain coherent while a
+    /// projection is assembled from more than one query.
+    pub async fn begin_repeatable_read(
+        &self,
+        workshop_id: Uuid,
+    ) -> Result<WorkshopTransaction<'_>, sqlx::Error> {
+        self.begin_with_isolation(workshop_id, true).await
+    }
+
+    async fn begin_with_isolation(
+        &self,
+        workshop_id: Uuid,
+        repeatable_read: bool,
+    ) -> Result<WorkshopTransaction<'_>, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        if repeatable_read {
+            sqlx::query("set transaction isolation level repeatable read")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let installed_context = sqlx::query_scalar::<_, String>(SET_WORKSHOP_CONTEXT_SQL)
+            .bind(workshop_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+        debug_assert_eq!(installed_context, workshop_id.to_string());
+        Ok(WorkshopTransaction {
+            transaction,
+            workshop_id,
+        })
+    }
+}
+
+impl<'a> WorkshopTransaction<'a> {
+    pub fn workshop_id(&self) -> Uuid {
+        self.workshop_id
+    }
+
+    /// Borrow the underlying transaction when calling an existing helper whose
+    /// signature still names `Transaction<Postgres>` explicitly.
+    pub fn as_transaction(&mut self) -> &mut Transaction<'a, Postgres> {
+        &mut self.transaction
+    }
+
+    pub async fn commit(self) -> Result<(), sqlx::Error> {
+        self.transaction.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.transaction.rollback().await
+    }
+}
+
+impl<'a> AsMut<Transaction<'a, Postgres>> for WorkshopTransaction<'a> {
+    fn as_mut(&mut self) -> &mut Transaction<'a, Postgres> {
+        &mut self.transaction
+    }
+}
+
+impl Deref for WorkshopTransaction<'_> {
+    type Target = PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transaction
+    }
+}
+
+impl DerefMut for WorkshopTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transaction
+    }
+}
+
 impl Store {
+    /// Create the transaction-only capability used after a worker has leased a
+    /// workshop operation. Both capabilities intentionally share the worker's
+    /// queue-specific pool: PostgreSQL RLS still applies to the login, while
+    /// the Rust type prevents tenant handlers from issuing unscoped SQL.
+    pub fn worker_tenant_scope(&self) -> TenantStore {
+        TenantStore {
+            pool: self.pool.clone(),
+        }
+    }
+
     pub async fn start_worker(
         &self,
         worker_id: &str,
@@ -359,15 +478,10 @@ impl Store {
     }
 
     pub async fn enqueue(
-        transaction: &mut Transaction<'_, Postgres>,
+        transaction: &mut PgConnection,
         operation: NewOperation<'_>,
     ) -> Result<Uuid, sqlx::Error> {
-        let mut trace_context = std::collections::HashMap::new();
-        opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&tracing::Span::current().context(), &mut trace_context);
-        });
-        let trace_parent = trace_context.remove("traceparent");
-        let trace_state = trace_context.remove("tracestate");
+        let trace_context = crate::telemetry::current_trace_context();
         sqlx::query_scalar(
             "insert into control.operations (
                 id, kind, queue, workshop_id, target_user_id, desired_epoch,
@@ -392,9 +506,9 @@ impl Store {
         .bind(operation.requested_by)
         .bind(operation.correlation_id)
         .bind(operation.idempotency_key)
-        .bind(trace_parent)
-        .bind(trace_state)
-        .fetch_one(&mut **transaction)
+        .bind(trace_context.trace_parent)
+        .bind(trace_context.trace_state)
+        .fetch_one(&mut *transaction)
         .await
     }
 
@@ -414,11 +528,13 @@ impl Store {
         checkpoint: &Value,
     ) -> anyhow::Result<()> {
         let changed = sqlx::query(
-            "update control.operations set checkpoint=$3
-             where id=$1 and state='in_flight' and leased_by=$2 and checkpoint is null",
+            "update control.operations set checkpoint=$4
+             where id=$1 and state='in_flight' and leased_by=$2 and attempt=$3
+               and lease_expires_at>now() and checkpoint is null",
         )
         .bind(operation.id)
         .bind(&operation.leased_by)
+        .bind(operation.attempt)
         .bind(checkpoint)
         .execute(&self.pool)
         .await?
@@ -518,7 +634,8 @@ impl Store {
                 progress_message=case when $4='succeeded' then 'Complete' else progress_message end,
                 progress_updated_at=now(),
                 finished_at=case when $7 then now() else null end
-             where id=$1 and leased_by=$2 and attempt=$3 and state='in_flight'",
+             where id=$1 and leased_by=$2 and attempt=$3 and state='in_flight'
+               and lease_expires_at>now()",
         )
         .bind(operation.id)
         .bind(&operation.leased_by)
@@ -543,7 +660,8 @@ impl Store {
     ) -> anyhow::Result<bool> {
         let changed = sqlx::query(
             "update control.operations set lease_expires_at=now()+interval '60 seconds'
-             where id=$1 and leased_by=$2 and attempt=$3 and state='in_flight'",
+             where id=$1 and leased_by=$2 and attempt=$3 and state='in_flight'
+               and lease_expires_at>now()",
         )
         .bind(operation_id)
         .bind(worker)
@@ -552,6 +670,26 @@ impl Store {
         .await?;
         Ok(changed.rows_affected() == 1)
     }
+}
+
+/// Lock and authenticate the exact unexpired durable-operation authority
+/// before a terminal domain mutation is made in the same transaction.
+pub(crate) async fn lock_current_operation_lease(
+    transaction: &mut PgConnection,
+    operation: &LeasedOperation,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "select id from control.operations
+          where id=$1 and state='in_flight' and leased_by=$2 and attempt=$3
+            and lease_expires_at>now()
+          for update",
+    )
+    .bind(operation.id)
+    .bind(&operation.leased_by)
+    .bind(operation.attempt)
+    .fetch_optional(transaction)
+    .await?
+    .is_some())
 }
 
 fn retry_delay(attempt: i32) -> i64 {
@@ -572,6 +710,24 @@ fn effective_retry_delay(attempt: i32, error: IntegrationError) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workshop_context_is_transaction_local() {
+        assert_eq!(
+            SET_WORKSHOP_CONTEXT_SQL,
+            "select set_config('control.workshop_id',$1,true)"
+        );
+    }
+
+    #[test]
+    fn workshop_transaction_is_a_sqlx_connection_executor() {
+        fn accepts_connection(_: &mut PgConnection) {}
+        fn use_scoped_transaction(transaction: &mut WorkshopTransaction<'_>) {
+            accepts_connection(&mut *transaction);
+        }
+
+        let _type_checked_executor: fn(&mut WorkshopTransaction<'_>) = use_scoped_transaction;
+    }
 
     #[test]
     fn retry_delay_is_bounded() {

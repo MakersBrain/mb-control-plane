@@ -1,30 +1,49 @@
 use super::*;
 
+use super::executor_quiescence::ReleaseExecutorIdentity;
+use crate::outbound_http::TraceRequestBuilderExt as _;
+
+#[tracing::instrument(
+    name = "deployment_driver.release.execute",
+    skip_all,
+    fields(
+        release.route_reservations = lease.reserved_workshops.len(),
+        release.route_reservations_match = tracing::field::Empty
+    )
+)]
 pub(super) async fn release_fleet(
     state: &DriverState,
     payload: &Value,
+    lease: &ReleaseDriverLease,
 ) -> Result<Value, DriverError> {
+    renew_release_driver_lease(state, lease).await?;
     match payload.get("phase").and_then(Value::as_str) {
-        Some("prepare-initial") => return prepare_initial_release(state, payload).await,
+        Some("prepare-initial") => return prepare_initial_release(state, payload, lease).await,
         Some("adopt-fleet") => {}
         _ => return Err(DriverError::bad("invalid release fleet request")),
     }
     let fleet_run = payload_uuid(payload, "fleet_run_id")?;
+    if lease.fleet_run_id != Some(fleet_run) {
+        return Err(DriverError::internal(
+            "release lease fleet identity differs from its payload",
+        ));
+    }
     let release_id = payload
         .get("release_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| DriverError::bad("release_id is required"))?;
-    let run =
-        sqlx::query("select state from control.release_fleet_runs where id=$1 and release_id=$2")
-            .bind(fleet_run)
-            .bind(release_id)
-            .fetch_optional(&state.ledger)
-            .await
-            .map_err(DriverError::internal)?
-            .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "fleet run not found".into()))?;
-    let run_state: String = run.get("state");
-    if run_state == "active" {
+    let run = sqlx::query_as::<_, (String, Value, i64)>(
+        "select state,tenant_snapshot,fleet_generation
+         from control.release_fleet_runs where id=$1 and release_id=$2",
+    )
+    .bind(fleet_run)
+    .bind(release_id)
+    .fetch_optional(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "fleet run not found".into()))?;
+    if run.0 == "active" {
         let evidence = sqlx::query_scalar::<_, Value>(
             "select evidence from control.release_fleet_runs where id=$1",
         )
@@ -34,8 +53,25 @@ pub(super) async fn release_fleet(
         .map_err(DriverError::internal)?;
         return Ok(json!({"evidence":evidence,"observed":true}));
     }
-    if !matches!(run_state.as_str(), "preparing" | "activating") {
+    if !matches!(run.0.as_str(), "preparing" | "activating") {
         return Err(DriverError::bad("fleet run is not adoptable"));
+    }
+    let fenced = sqlx::query(
+        "update control.release_fleet_runs set driver_fence_token=$3,updated_at=now()
+         where id=$1 and release_id=$2 and state in ('preparing','activating')
+           and (driver_fence_token is null or driver_fence_token=$3)",
+    )
+    .bind(fleet_run)
+    .bind(release_id)
+    .bind(lease.fence_token)
+    .execute(&state.ledger)
+    .await
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if fenced != 1 {
+        return Err(DriverError::internal(
+            "fleet run is fenced by another driver attempt",
+        ));
     }
     let release_row = sqlx::query(
         "select manifest,status,odoo_subject_digest from control.application_releases where id=$1",
@@ -67,6 +103,29 @@ pub(super) async fn release_fleet(
             "release identity does not match its manifest",
         ));
     }
+    let tenants = release_tenants(state, fleet_run, release_id).await?;
+    if tenants.is_empty() {
+        return Err(DriverError::bad("fleet run contains no tenants"));
+    }
+    if tenants.len() > crate::release::MAX_FLEET_TENANTS {
+        return Err(DriverError::bad(
+            "fleet release exceeds the bounded tenant limit",
+        ));
+    }
+    if release_tenant_snapshot(&tenants) != run.1 {
+        return Err(DriverError::bad(
+            "fleet release tenant snapshot differs from its adoption ledger",
+        ));
+    }
+    let tenant_workshops = release_tenant_workshops(&tenants)?;
+    let reservations_match = tenant_workshops == lease.reserved_workshops;
+    tracing::Span::current().record("release.route_reservations_match", reservations_match);
+    if !reservations_match {
+        return Err(DriverError::bad(
+            "fleet release tenant set differs from its route reservation",
+        ));
+    }
+    renew_release_driver_lease(state, lease).await?;
     let extension_volume = materialize_extension(state, &manifest).await?;
     let (runtime_platform, extension_platform, pair_qualification) =
         selected_release_platform(&manifest)?;
@@ -85,12 +144,9 @@ pub(super) async fn release_fleet(
     };
     let runtime_role = release_runtime_role(&manifest.odoo_runtime.subject_digest);
     let runtime_password = ensure_release_runtime_role(state, &runtime_role).await?;
-    let tenants = release_tenants(state, fleet_run, release_id).await?;
-    if tenants.is_empty() {
-        return Err(DriverError::bad("fleet run contains no tenants"));
-    }
 
     for tenant in &tenants {
+        renew_release_driver_lease(state, lease).await?;
         if let Err(error) = prepare_release_tenant(
             state,
             tenant,
@@ -98,23 +154,30 @@ pub(super) async fn release_fleet(
             &extension_volume,
             &runtime_role,
             &runtime_password,
+            lease,
         )
         .await
         {
-            let failure_class = match rollback_failed_release_tenant(state, tenant, &runtime_role)
-                .await
+            renew_release_driver_lease(state, lease).await?;
+            let failure_class = match rollback_failed_release_tenant(
+                state,
+                tenant,
+                &runtime_role,
+                lease,
+            )
+            .await
             {
                 Ok(()) => "release_preparation_failed_rolled_back",
                 Err(rollback_error) => {
                     tracing::error!(
                         adoption_id=%tenant.id,
-                        error=%rollback_error.1,
+                        error_class=rollback_error.safe_class(),
                         "release preparation and verified recovery rollback both failed; maintenance remains enabled"
                     );
                     "release_preparation_rollback_failed"
                 }
             };
-            mark_release_tenant_failed(state, tenant.id, failure_class).await?;
+            mark_release_tenant_failed(state, tenant.workshop_id, tenant.id, failure_class).await?;
             sqlx::query(
                 "update control.release_fleet_runs set state='paused',failure_class='tenant_preparation_failed',updated_at=now()
                  where id=$1 and state='preparing'",
@@ -127,6 +190,7 @@ pub(super) async fn release_fleet(
         }
     }
 
+    renew_release_driver_lease(state, lease).await?;
     let runtime_container = state.config.docker_resource(format!("odoo-{target_slot}"));
     ensure_release_runtime(
         state,
@@ -139,10 +203,12 @@ pub(super) async fn release_fleet(
     )
     .await?;
     for tenant in &tenants {
+        renew_release_driver_lease(state, lease).await?;
         smoke_release_runtime(state, &runtime_container, tenant).await?;
     }
 
-    sqlx::query(
+    renew_release_driver_lease(state, lease).await?;
+    let changed = sqlx::query(
         "update control.release_fleet_runs set state='activating',target_slot=$2,updated_at=now()
          where id=$1 and state='preparing'",
     )
@@ -150,7 +216,13 @@ pub(super) async fn release_fleet(
     .bind(target_slot)
     .execute(&state.ledger)
     .await
-    .map_err(DriverError::internal)?;
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if changed != 1 && run.0 != "activating" {
+        return Err(DriverError::internal(
+            "fleet activation transition lost its compare-and-set",
+        ));
+    }
     if matches!(state.backend, RuntimeBackend::Docker) {
         docker_ensure_restart_policy(
             state,
@@ -171,19 +243,40 @@ pub(super) async fn release_fleet(
         .await?;
     }
     let prepared_tenants = release_tenant_evidence(&tenants);
-    let existing_intent = sqlx::query_as::<_, (String, Uuid, Option<String>, Value)>(
+    let existing_intent = sqlx::query_as::<
+        _,
+        (
+            String,
+            Uuid,
+            Option<String>,
+            Value,
+            Option<i64>,
+            String,
+            Option<i16>,
+        ),
+    >(
         "select gateway_configuration_digest,driver_action_id,
-                observed_configuration_digest,prepared_tenants
-         from control.fleet_activation_intents where fleet_run_id=$1",
+                observed_configuration_digest,prepared_tenants,driver_fence_token,
+                target_slot,gateway_identity_version
+         from control.fleet_activation_intents
+         where fleet_run_id=$1 and abandoned_at is null",
     )
     .bind(fleet_run)
     .fetch_optional(&state.ledger)
     .await
     .map_err(DriverError::internal)?;
     let (gateway_digest, action_id) = if let Some(existing) = existing_intent {
-        if existing.3 != prepared_tenants {
+        if existing.3 != prepared_tenants
+            || existing.4 != Some(lease.fence_token)
+            || existing.5 != target_slot
+        {
             return Err(DriverError::internal(
                 "stored fleet activation intent tenant set drifted",
+            ));
+        }
+        if existing.6 != Some(1) {
+            return Err(DriverError::internal(
+                "legacy fleet activation intent requires reconciliation",
             ));
         }
         (existing.0, existing.1)
@@ -194,8 +287,9 @@ pub(super) async fn release_fleet(
             "insert into control.fleet_activation_intents(
            id,fleet_run_id,release_id,runtime_key,target_slot,odoo_subject_digest,
            extension_subject_digest,pair_qualification_digest,prepared_tenants,
-           gateway_configuration_digest,driver_action_id
-         ) values($1,$2,$3,'shared-odoo',$4,$5,$6,$7,$8,$9,$10)",
+           gateway_configuration_digest,driver_action_id,driver_fence_token,
+           gateway_identity_version
+         ) values($1,$2,$3,'shared-odoo',$4,$5,$6,$7,$8,$9,$10,$11,1)",
         )
         .bind(Uuid::new_v4())
         .bind(fleet_run)
@@ -207,30 +301,60 @@ pub(super) async fn release_fleet(
         .bind(&prepared_tenants)
         .bind(&digest)
         .bind(action_id)
+        .bind(lease.fence_token)
         .execute(&state.ledger)
         .await
         .map_err(DriverError::internal)?;
         (digest, action_id)
     };
+    let gateway_identity = ReleaseGatewayGenerationIdentity::new(
+        fleet_run,
+        action_id,
+        lease.fence_token,
+        gateway_digest.clone(),
+        target_slot,
+    )?;
+    renew_release_driver_lease(state, lease).await?;
     let observed = observed_release_route_digest(state, &tenants)?;
     if observed.as_deref() != Some(&gateway_digest) {
-        let activated = activate_release_routes(state, &runtime_container, &tenants).await?;
+        let activated = activate_release_routes(
+            state,
+            &runtime_container,
+            &tenants,
+            lease,
+            &gateway_identity,
+        )
+        .await?;
         if activated != gateway_digest {
             return Err(DriverError::internal(
                 "activated gateway configuration differs from its intent",
             ));
         }
+    } else {
+        publish_release_gateway_identity(state, lease, &gateway_identity).await?;
     }
-    sqlx::query(
+    observe_running_release_gateway_generation(state, &gateway_identity).await?;
+    remove_release_route_backups(state, lease, &tenants).await?;
+    let changed = sqlx::query(
         "update control.fleet_activation_intents
          set observed_configuration_digest=$2,activated_at=coalesce(activated_at,now())
-         where fleet_run_id=$1 and gateway_configuration_digest=$2",
+         where fleet_run_id=$1 and gateway_configuration_digest=$2
+           and driver_fence_token=$3 and gateway_identity_version=1
+           and abandoned_at is null",
     )
     .bind(fleet_run)
     .bind(&gateway_digest)
+    .bind(lease.fence_token)
     .execute(&state.ledger)
     .await
-    .map_err(DriverError::internal)?;
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(DriverError::internal(
+            "fleet activation intent observation lost its compare-and-set",
+        ));
+    }
+    renew_release_driver_lease(state, lease).await?;
     if let Some((old_slot, _)) = &active_slot {
         let old_container = state.config.docker_resource(format!("odoo-{old_slot}"));
         match &state.backend {
@@ -246,6 +370,7 @@ pub(super) async fn release_fleet(
             }
         }
     }
+    renew_release_driver_lease(state, lease).await?;
     let evidence = json!({
         "release_id":release_id,
         "odoo_subject_digest":manifest.odoo_runtime.subject_digest,
@@ -266,8 +391,12 @@ pub(super) async fn release_fleet(
         "runtime_deployment_ref":manifest.odoo_runtime.deployment_ref,
         "runtime_config_digest":release_runtime_config_digest(state, &manifest.odoo_runtime.deployment_ref, &runtime_role, &runtime_password),
         "prepared_tenants":prepared_tenants,
+        "fleet_generation":run.2,
+        "tenant_snapshot":run.1,
         "gateway_configuration_digest":gateway_digest,
         "driver_action_id":action_id,
+        "driver_operation_id":lease.driver_operation_id,
+        "driver_fence_token":lease.fence_token,
         "old_runtime_database_access_revoked":true,
         "tenant_recovery_verified":true,
         "candidate_smoke_verified":true
@@ -281,9 +410,13 @@ async fn rollback_failed_release_tenant(
     state: &DriverState,
     tenant: &ReleaseTenant,
     failed_runtime_role: &str,
+    lease: &ReleaseDriverLease,
 ) -> Result<(), DriverError> {
-    let recovery =
-        resolve_stored_recovery(state, tenant.workshop_id, tenant.backup_recovery_id).await?;
+    let recovery = resolve_stored_recovery(
+        WorkshopRecoveryLedger::new(state, tenant.workshop_id),
+        tenant.backup_recovery_id,
+    )
+    .await?;
     restore_recovery_set(
         state,
         tenant.workshop_id,
@@ -354,34 +487,52 @@ async fn rollback_failed_release_tenant(
 
     let prior_container = state.config.docker_resource(format!("odoo-{prior_slot}"));
     smoke_release_runtime(state, &prior_container, tenant).await?;
-    let route_backup = state
-        .config
-        .route_root
-        .join(format!("{}.recovery.bak", tenant.workshop_id));
+    let selected = selected_route_root(&state.config.route_root)?;
+    let route_backup = selected.join(format!("{}.recovery.bak", tenant.workshop_id));
     let previous_route = std::fs::read(route_backup).map_err(DriverError::internal)?;
-    leave_workshop_maintenance(state, tenant.workshop_id, &previous_route).await?;
-    sqlx::query(
+    leave_release_maintenance(state, tenant.workshop_id, &previous_route, lease).await?;
+    let mut evidence_tx = state
+        .tenant_ledger
+        .begin(tenant.workshop_id)
+        .await
+        .map_err(DriverError::internal)?;
+    let changed = sqlx::query(
         "update control.tenant_release_adoptions
-         set evidence=evidence || $2::jsonb
-         where id=$1 and state in ('backing_up','upgrading','verifying')",
+         set evidence=evidence || $3::jsonb
+         where id=$1 and workshop_id=$2
+           and state in ('backing_up','upgrading','verifying')",
     )
     .bind(tenant.id)
+    .bind(tenant.workshop_id)
     .bind(json!({
         "rollback_recovery_point_id":tenant.backup_recovery_id,
         "prior_runtime_subject_digest":prior_subject,
         "prior_runtime_reconnected":true,
         "maintenance_removed_after_reconnect":true
     }))
-    .execute(&state.ledger)
+    .execute(&mut *evidence_tx)
     .await
-    .map_err(DriverError::internal)?;
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(DriverError::internal(
+            "scoped release rollback evidence target was lost",
+        ));
+    }
+    evidence_tx.commit().await.map_err(DriverError::internal)?;
     Ok(())
 }
 
 async fn prepare_initial_release(
     state: &DriverState,
     payload: &Value,
+    lease: &ReleaseDriverLease,
 ) -> Result<Value, DriverError> {
+    if !lease.reserved_workshops.is_empty() {
+        return Err(DriverError::internal(
+            "initial release unexpectedly owns workshop route reservations",
+        ));
+    }
     let release_id = payload
         .get("release_id")
         .and_then(Value::as_str)
@@ -425,9 +576,6 @@ async fn prepare_initial_release(
             "release identity does not match its manifest",
         ));
     }
-    let extension_volume = materialize_extension(state, &manifest).await?;
-    let (runtime_platform, extension_platform, pair_qualification) =
-        selected_release_platform(&manifest)?;
     let initial_preparable =
         sqlx::query_scalar::<_, bool>("select control.initial_release_preparable($1,$2)")
             .bind(release_id)
@@ -443,7 +591,11 @@ async fn prepare_initial_release(
             "initial runtime preparation requires an active registry and completely empty fleet",
         ));
     }
-    if let Some((stored_image, evidence)) = sqlx::query_as::<_, (String, Value)>(
+    renew_release_driver_lease(state, lease).await?;
+    let extension_volume = materialize_extension(state, &manifest).await?;
+    let (runtime_platform, extension_platform, pair_qualification) =
+        selected_release_platform(&manifest)?;
+    if let Some((stored_image, mut evidence)) = sqlx::query_as::<_, (String, Value)>(
         "select odoo_subject_digest,evidence from control.runtime_release_slots
          where runtime_key='shared-odoo' and release_id=$1 and state='prepared'",
     )
@@ -456,6 +608,8 @@ async fn prepare_initial_release(
             && evidence.get("manifest_digest").and_then(Value::as_str)
                 == Some(expected_manifest_digest)
         {
+            evidence["driver_operation_id"] = json!(lease.driver_operation_id);
+            evidence["driver_fence_token"] = json!(lease.fence_token);
             return Ok(json!({"evidence":evidence,"observed":true}));
         }
         return Err(DriverError::bad(
@@ -477,6 +631,7 @@ async fn prepare_initial_release(
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError::bad("no reusable initial runtime slot is available"))?;
     let runtime_container = state.config.docker_resource(format!("odoo-{target_slot}"));
+    renew_release_driver_lease(state, lease).await?;
     ensure_release_runtime(
         state,
         &runtime_container,
@@ -500,6 +655,7 @@ async fn prepare_initial_release(
             ));
         }
     }
+    renew_release_driver_lease(state, lease).await?;
     let evidence = json!({
         "release_id":release_id,
         "odoo_subject_digest":manifest.odoo_runtime.subject_digest,
@@ -523,6 +679,8 @@ async fn prepare_initial_release(
         "provenance_verified":true,
         "runtime_inspection_verified":true,
         "verification":"empty_fleet_runtime_started_and_inspected"
+        ,"driver_operation_id":lease.driver_operation_id
+        ,"driver_fence_token":lease.fence_token
     });
     let inserted = sqlx::query(
         "insert into control.runtime_release_slots(
@@ -567,7 +725,7 @@ async fn prepare_initial_release(
     Ok(json!({"evidence":evidence}))
 }
 
-fn initial_runtime_inspection_matches(
+pub(super) fn initial_runtime_inspection_matches(
     inspect: &Value,
     expected_image: &str,
     expected_config: &str,
@@ -615,18 +773,52 @@ async fn release_tenants(
          from control.tenant_release_adoptions a
          join control.release_fleet_runs f on f.operation_id=a.operation_id
          join control.odoo_databases d on d.id=a.database_id and d.workshop_id=a.workshop_id
-         join control.workshop_recovery_points r on r.id=a.backup_recovery_id
+         join control.workshop_recovery_points r
+           on r.id=a.backup_recovery_id and r.workshop_id=a.workshop_id
          where f.id=$1 and a.release_id=$2
-         order by a.created_at,a.id",
+         order by a.created_at,a.id limit $3",
     )
     .bind(fleet_run)
     .bind(release_id)
+    .bind(i64::try_from(crate::release::MAX_FLEET_TENANTS + 1).map_err(DriverError::internal)?)
     .fetch_all(&state.ledger)
     .await
     .map_err(DriverError::internal)
 }
 
-fn release_runtime_role(image_digest: &str) -> String {
+fn release_tenant_snapshot(tenants: &[ReleaseTenant]) -> Value {
+    let mut tenants = tenants.iter().collect::<Vec<_>>();
+    tenants.sort_by_key(|tenant| (tenant.workshop_id, tenant.database_id));
+    Value::Array(
+        tenants
+        .into_iter()
+        .map(|tenant| {
+            json!({
+                "workshop_id":tenant.workshop_id,
+                "database_id":tenant.database_id,
+                "database_ref":tenant.database_ref,
+                "paperless_enabled":tenant.component_scope.iter().any(|value| value == "paperless"),
+            })
+        })
+        .collect(),
+    )
+}
+
+fn release_tenant_workshops(tenants: &[ReleaseTenant]) -> Result<Vec<Uuid>, DriverError> {
+    let mut workshops = tenants
+        .iter()
+        .map(|tenant| tenant.workshop_id)
+        .collect::<Vec<_>>();
+    workshops.sort_unstable();
+    if workshops.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DriverError::bad(
+            "fleet release contains duplicate workshop route reservations",
+        ));
+    }
+    Ok(workshops)
+}
+
+pub(super) fn release_runtime_role(image_digest: &str) -> String {
     format!("mb_runtime_{}", &image_digest[7..23])
 }
 
@@ -665,7 +857,7 @@ fn deployment_architecture() -> &'static str {
     }
 }
 
-fn selected_release_platform(
+pub(super) fn selected_release_platform(
     manifest: &crate::release::ApplicationReleaseManifest,
 ) -> Result<
     (
@@ -1004,23 +1196,30 @@ async fn ensure_release_runtime_role(
 
 async fn transition_release_tenant(
     state: &DriverState,
+    workshop: Uuid,
     adoption: Uuid,
     from: &str,
     to: &str,
     evidence: Option<&Value>,
 ) -> Result<(), DriverError> {
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
     let changed = sqlx::query(
-        "update control.tenant_release_adoptions set state=$3,version=version+1,
-                started_at=case when $3='isolating' then coalesce(started_at,now()) else started_at end,
-                verified_at=case when $3='prepared' then now() else verified_at end,
-                evidence=case when $4::jsonb is null then evidence else evidence || $4 end
-         where id=$1 and state=$2",
+        "update control.tenant_release_adoptions set state=$4,version=version+1,
+                started_at=case when $4='isolating' then coalesce(started_at,now()) else started_at end,
+                verified_at=case when $4='prepared' then now() else verified_at end,
+                evidence=case when $5::jsonb is null then evidence else evidence || $5 end
+         where id=$1 and workshop_id=$2 and state=$3",
     )
     .bind(adoption)
+    .bind(workshop)
     .bind(from)
     .bind(to)
     .bind(evidence)
-    .execute(&state.ledger)
+    .execute(&mut *tx)
     .await
     .map_err(DriverError::internal)?
     .rows_affected();
@@ -1029,6 +1228,7 @@ async fn transition_release_tenant(
             "tenant adoption transition {from} -> {to} lost its compare-and-set"
         )));
     }
+    tx.commit().await.map_err(DriverError::internal)?;
     Ok(())
 }
 
@@ -1039,24 +1239,45 @@ async fn prepare_release_tenant(
     extension_volume: &str,
     runtime_role: &str,
     runtime_password: &str,
+    lease: &ReleaseDriverLease,
 ) -> Result<(), DriverError> {
+    renew_release_driver_lease(state, lease).await?;
+    let mut phase_tx = state
+        .tenant_ledger
+        .begin(tenant.workshop_id)
+        .await
+        .map_err(DriverError::internal)?;
     let mut phase = sqlx::query_scalar::<_, String>(
-        "select state from control.tenant_release_adoptions where id=$1",
+        "select state from control.tenant_release_adoptions where id=$1 and workshop_id=$2",
     )
     .bind(tenant.id)
-    .fetch_one(&state.ledger)
+    .bind(tenant.workshop_id)
+    .fetch_one(&mut *phase_tx)
     .await
     .map_err(DriverError::internal)?;
+    phase_tx.commit().await.map_err(DriverError::internal)?;
     if phase == "pending" {
-        transition_release_tenant(state, tenant.id, "pending", "isolating", None).await?;
+        renew_release_driver_lease(state, lease).await?;
+        transition_release_tenant(
+            state,
+            tenant.workshop_id,
+            tenant.id,
+            "pending",
+            "isolating",
+            None,
+        )
+        .await?;
         phase = "isolating".into();
     }
     if phase == "isolating" {
-        enter_workshop_maintenance(state, tenant.workshop_id).await?;
+        renew_release_driver_lease(state, lease).await?;
+        enter_release_maintenance(state, tenant.workshop_id, lease).await?;
         drain_workshop_operations(state, tenant.workshop_id).await?;
         isolate_release_database(state, &tenant.database_ref, runtime_role).await?;
+        renew_release_driver_lease(state, lease).await?;
         transition_release_tenant(
             state,
+            tenant.workshop_id,
             tenant.id,
             "isolating",
             "backing_up",
@@ -1066,6 +1287,7 @@ async fn prepare_release_tenant(
         phase = "backing_up".into();
     }
     if phase == "backing_up" {
+        renew_release_driver_lease(state, lease).await?;
         create_recovery_set(
             state,
             tenant.workshop_id,
@@ -1075,8 +1297,10 @@ async fn prepare_release_tenant(
             &tenant.component_scope,
         )
         .await?;
+        renew_release_driver_lease(state, lease).await?;
         transition_release_tenant(
             state,
+            tenant.workshop_id,
             tenant.id,
             "backing_up",
             "upgrading",
@@ -1086,22 +1310,36 @@ async fn prepare_release_tenant(
         phase = "upgrading".into();
     }
     if phase == "upgrading" {
+        renew_release_driver_lease(state, lease).await?;
         run_odoo_release_upgrade(
             state,
             tenant,
+            lease,
             &manifest.odoo_runtime.deployment_ref,
             extension_volume,
             runtime_role,
             runtime_password,
         )
         .await?;
-        transition_release_tenant(state, tenant.id, "upgrading", "verifying", None).await?;
+        renew_release_driver_lease(state, lease).await?;
+        transition_release_tenant(
+            state,
+            tenant.workshop_id,
+            tenant.id,
+            "upgrading",
+            "verifying",
+            None,
+        )
+        .await?;
         phase = "verifying".into();
     }
     if phase == "verifying" {
+        renew_release_driver_lease(state, lease).await?;
         verify_release_database(state, tenant, manifest).await?;
+        renew_release_driver_lease(state, lease).await?;
         transition_release_tenant(
             state,
+            tenant.workshop_id,
             tenant.id,
             "verifying",
             "prepared",
@@ -1123,19 +1361,34 @@ async fn prepare_release_tenant(
 
 async fn mark_release_tenant_failed(
     state: &DriverState,
+    workshop: Uuid,
     adoption: Uuid,
     failure_class: &str,
 ) -> Result<(), DriverError> {
-    sqlx::query(
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let changed = sqlx::query(
         "update control.tenant_release_adoptions
-         set state='failed',failure_class=$2,version=version+1
-         where id=$1 and state in ('pending','isolating','backing_up','upgrading','verifying')",
+         set state='failed',failure_class=$3,version=version+1
+         where id=$1 and workshop_id=$2
+           and state in ('pending','isolating','backing_up','upgrading','verifying')",
     )
     .bind(adoption)
+    .bind(workshop)
     .bind(failure_class)
-    .execute(&state.ledger)
+    .execute(&mut *tx)
     .await
-    .map_err(DriverError::internal)?;
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(DriverError::internal(
+            "scoped release failure target was lost",
+        ));
+    }
+    tx.commit().await.map_err(DriverError::internal)?;
     Ok(())
 }
 
@@ -1208,11 +1461,25 @@ async fn isolate_release_database(
 async fn run_odoo_release_upgrade(
     state: &DriverState,
     tenant: &ReleaseTenant,
+    lease: &ReleaseDriverLease,
     image: &str,
     extension_volume: &str,
     runtime_role: &str,
     runtime_password: &str,
 ) -> Result<(), DriverError> {
+    let executor = ReleaseExecutorIdentity::new(
+        lease
+            .fleet_run_id
+            .ok_or_else(|| DriverError::internal("release executor fleet identity is absent"))?,
+        lease.driver_operation_id,
+        lease.fence_token,
+        tenant.id,
+    )?;
+    let executor_application_name = executor.postgres_application_name();
+    let job_configuration = format!(
+        "{}db_app_name = {executor_application_name}\n",
+        odoo_configuration(state, runtime_role, runtime_password)?
+    );
     let container = state.config.docker_resource(format!(
         "release-upgrade-{}",
         &tenant.id.simple().to_string()[..12]
@@ -1233,13 +1500,14 @@ async fn run_odoo_release_upgrade(
                 format!("USER={runtime_role}"),
                 "ODOO_RC=/run/mb-job-secrets/odoo.conf".to_owned(),
                 "PYTHONPATH=/opt/mb-extension/python".to_owned(),
+                format!("PGAPPNAME={executor_application_name}"),
                 "MB_CONTROL_BRIDGE_TOKEN_FILE=/run/mb-job-secrets/bridge-token".to_owned()
             ],
-            "Labels":{
-                "mb.kind":"odoo-release-upgrade",
-                "mb.workshop":tenant.workshop_id.to_string(),
-                "mb.database":tenant.database_id.to_string()
-            },
+            "Labels": executor.labels().as_object().cloned().unwrap_or_default().into_iter().chain(serde_json::Map::from_iter([
+                ("mb.kind".to_owned(), json!("odoo-release-upgrade")),
+                ("mb.workshop".to_owned(), json!(tenant.workshop_id.to_string())),
+                ("mb.database".to_owned(), json!(tenant.database_id.to_string())),
+            ])).collect::<serde_json::Map<String, Value>>(),
             "HostConfig":{
                 "NetworkMode":state.config.docker_network,
                 "ReadonlyRootfs":true,
@@ -1249,7 +1517,7 @@ async fn run_odoo_release_upgrade(
             }
         }),
         &[
-            ("odoo.conf", &odoo_configuration(state, runtime_role, runtime_password)?),
+            ("odoo.conf", &job_configuration),
             ("bridge-token", state.config.odoo_bridge_token.as_str()),
         ],
     )
@@ -1261,7 +1529,17 @@ async fn verify_release_database(
     tenant: &ReleaseTenant,
     manifest: &crate::release::ApplicationReleaseManifest,
 ) -> Result<(), DriverError> {
-    let pool = database_pool(state, &tenant.database_ref).await?;
+    verify_release_database_identity(state, &tenant.database_ref, tenant.workshop_id, manifest)
+        .await
+}
+
+pub(super) async fn verify_release_database_identity(
+    state: &DriverState,
+    database_ref: &str,
+    workshop_id: Uuid,
+    manifest: &crate::release::ApplicationReleaseManifest,
+) -> Result<(), DriverError> {
+    let pool = database_pool(state, database_ref).await?;
     let registry = sqlx::query_scalar::<_, bool>(
         "select to_regclass('public.ir_module_module') is not null
              and to_regclass('public.ir_model_data') is not null",
@@ -1298,7 +1576,7 @@ async fn verify_release_database(
     .await
     .map_err(DriverError::internal)?;
     pool.close().await;
-    if workshop.as_deref() != Some(tenant.workshop_id.to_string().as_str()) {
+    if workshop.as_deref() != Some(workshop_id.to_string().as_str()) {
         return Err(DriverError::internal(
             "tenant postcondition resolved another workshop identity",
         ));
@@ -1428,14 +1706,14 @@ async fn ensure_release_runtime(
     Ok(())
 }
 
-fn release_runtime_config_digest(
+pub(super) fn release_runtime_config_digest(
     state: &DriverState,
     image: &str,
     runtime_role: &str,
     runtime_password: &str,
 ) -> String {
     format!(
-        "{:x}",
+        "sha256:{:x}",
         Sha256::digest(
             format!(
                 "{image}\0{runtime_role}\0{runtime_password}\0{}\0driver-secret-runtime-v2",
@@ -1476,6 +1754,7 @@ pub(super) async fn smoke_release_runtime_identity(
             "tenant bridge credential is empty during release verification",
         ));
     }
+    let client = super::startup::odoo_readiness_client()?;
     for _ in 0..90 {
         let runtime_url = match state.backend {
             RuntimeBackend::Docker => format!("http://{container}:8069"),
@@ -1489,12 +1768,16 @@ pub(super) async fn smoke_release_runtime_identity(
                 }
             }
         };
-        let response = reqwest::Client::new()
-            .get(format!("{runtime_url}/mb_control/v1/health"))
-            .header("X-Odoo-Dbfilter", database_ref)
-            .bearer_auth(&tenant_bridge_token)
-            .send()
-            .await;
+        let response = super::startup::odoo_readiness_request(
+            &client,
+            format!("{runtime_url}/mb_control/v1/health"),
+            database_ref,
+            &tenant_bridge_token,
+            None,
+        )
+        .with_current_trace_context()
+        .send()
+        .await;
         if let Ok(response) = response
             && response.status().is_success()
             && let Ok(body) = response.json::<Value>().await
@@ -1512,17 +1795,68 @@ pub(super) async fn smoke_release_runtime_identity(
     ))
 }
 
+/// One read-only readiness observation for reconciliation. Unlike the normal
+/// release path this does not retry under a fixed reconciliation claim.
+pub(super) async fn observe_release_runtime_identity_once(
+    state: &DriverState,
+    container: &str,
+    workshop: Uuid,
+    database_ref: &str,
+    tenant_bridge_token: &str,
+) -> Result<bool, DriverError> {
+    if tenant_bridge_token.is_empty() {
+        return Ok(false);
+    }
+    let runtime_url = match state.backend {
+        RuntimeBackend::Docker => format!("http://{container}:8069"),
+        RuntimeBackend::Quadlet(_) if container.ends_with("-blue") => {
+            "http://127.0.0.1:18069".into()
+        }
+        RuntimeBackend::Quadlet(_) if container.ends_with("-green") => {
+            "http://127.0.0.1:18070".into()
+        }
+        RuntimeBackend::Quadlet(_) => return Ok(false),
+    };
+    let response = super::startup::odoo_readiness_request(
+        &super::startup::odoo_readiness_client()?,
+        format!("{runtime_url}/mb_control/v1/health"),
+        database_ref,
+        tenant_bridge_token,
+        None,
+    )
+    .with_current_trace_context()
+    .send()
+    .await;
+    let Ok(response) = response else {
+        return Ok(false);
+    };
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(DriverError::internal)?;
+    Ok(body.get("status").and_then(Value::as_str) == Some("ready")
+        && body.get("database").and_then(Value::as_str) == Some(database_ref)
+        && body.get("workshop_id").and_then(Value::as_str) == Some(workshop.to_string().as_str()))
+}
+
 async fn activate_release_routes(
     state: &DriverState,
     runtime_container: &str,
     tenants: &[ReleaseTenant],
+    lease: &ReleaseDriverLease,
+    gateway_identity: &ReleaseGatewayGenerationIdentity,
 ) -> Result<String, DriverError> {
+    for tenant in tenants {
+        require_release_route_reservation(lease, tenant.workshop_id)?;
+    }
+    renew_release_driver_lease(state, lease).await?;
+    let selected = selected_route_root(&state.config.route_root)?;
     let mut replacements = Vec::with_capacity(tenants.len());
     for tenant in tenants {
-        let backup = state
-            .config
-            .route_root
-            .join(format!("{}.recovery.bak", tenant.workshop_id));
+        let backup = selected.join(format!("{}.recovery.bak", tenant.workshop_id));
         let previous = std::fs::read(&backup).map_err(DriverError::internal)?;
         let previous_text = std::str::from_utf8(&previous)
             .map_err(|_| DriverError::internal("saved tenant route is not UTF-8"))?;
@@ -1534,34 +1868,130 @@ async fn activate_release_routes(
             .iter()
             .map(|(workshop, _, candidate)| (*workshop, candidate.as_slice())),
     );
+    if gateway_identity.gateway_configuration_digest != digest {
+        return Err(DriverError::internal(
+            "release gateway identity differs from its route candidate",
+        ));
+    }
+    let generation_path = selected.join(RELEASE_GATEWAY_GENERATION_FILE);
+    let previous_generation = std::fs::read(&generation_path).ok();
     for (workshop, _, candidate) in &replacements {
-        let path = state.config.route_root.join(format!("{workshop}.conf"));
-        let temporary = state
-            .config
-            .route_root
-            .join(format!("{workshop}.release.tmp"));
+        renew_release_driver_lease(state, lease).await?;
+        let path = selected.join(format!("{workshop}.conf"));
+        let temporary = selected.join(format!("{workshop}.release.tmp"));
         write_gateway_file(&temporary, candidate).map_err(DriverError::internal)?;
         std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
     }
+    let generation_temporary = selected.join(format!("{RELEASE_GATEWAY_GENERATION_FILE}.tmp"));
+    write_gateway_file(
+        &generation_temporary,
+        release_gateway_generation_config(gateway_identity)?,
+    )
+    .map_err(DriverError::internal)?;
+    std::fs::rename(&generation_temporary, &generation_path).map_err(DriverError::internal)?;
+    renew_release_driver_lease(state, lease).await?;
     if let Err(error) = reload_gateway_runtime(state, &digest).await {
         for (workshop, previous, _) in &replacements {
+            renew_release_driver_lease(state, lease).await?;
             let maintenance = previous_route_maintenance(previous)?;
-            write_gateway_file(
-                &state.config.route_root.join(format!("{workshop}.conf")),
-                maintenance,
-            )
-            .map_err(DriverError::internal)?;
+            write_gateway_file(&selected.join(format!("{workshop}.conf")), maintenance)
+                .map_err(DriverError::internal)?;
         }
+        restore_release_gateway_identity(&generation_path, previous_generation.as_deref())?;
         return Err(error);
     }
-    for (workshop, _, _) in &replacements {
-        let backup = state
-            .config
-            .route_root
-            .join(format!("{workshop}.recovery.bak"));
-        std::fs::remove_file(backup).map_err(DriverError::internal)?;
-    }
     Ok(digest)
+}
+
+async fn remove_release_route_backups(
+    state: &DriverState,
+    lease: &ReleaseDriverLease,
+    tenants: &[ReleaseTenant],
+) -> Result<(), DriverError> {
+    let selected = selected_route_root(&state.config.route_root)?;
+    for tenant in tenants {
+        renew_release_driver_lease(state, lease).await?;
+        let backup = selected.join(format!("{}.recovery.bak", tenant.workshop_id));
+        match std::fs::remove_file(backup) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DriverError::internal(error)),
+        }
+    }
+    renew_release_driver_lease(state, lease).await
+}
+
+fn restore_release_gateway_identity(
+    path: &Path,
+    previous: Option<&[u8]>,
+) -> Result<(), DriverError> {
+    if let Some(previous) = previous {
+        write_gateway_file(path, previous).map_err(DriverError::internal)
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DriverError::internal(error)),
+        }
+    }
+}
+
+async fn publish_release_gateway_identity(
+    state: &DriverState,
+    lease: &ReleaseDriverLease,
+    identity: &ReleaseGatewayGenerationIdentity,
+) -> Result<(), DriverError> {
+    let selected = selected_route_root(&state.config.route_root)?;
+    let path = selected.join(RELEASE_GATEWAY_GENERATION_FILE);
+    let temporary = selected.join(format!("{RELEASE_GATEWAY_GENERATION_FILE}.tmp"));
+    let previous = std::fs::read(&path).ok();
+    renew_release_driver_lease(state, lease).await?;
+    write_gateway_file(&temporary, release_gateway_generation_config(identity)?)
+        .map_err(DriverError::internal)?;
+    std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
+    renew_release_driver_lease(state, lease).await?;
+    if let Err(error) = reload_gateway_runtime(state, &identity.gateway_configuration_digest).await
+    {
+        restore_release_gateway_identity(&path, previous.as_deref())?;
+        return Err(error);
+    }
+    renew_release_driver_lease(state, lease).await
+}
+
+fn require_release_route_reservation(
+    lease: &ReleaseDriverLease,
+    workshop: Uuid,
+) -> Result<(), DriverError> {
+    if lease.reserved_workshops.binary_search(&workshop).is_err() {
+        return Err(DriverError::internal(
+            "release attempted a route effect outside its frozen reservation",
+        ));
+    }
+    Ok(())
+}
+
+async fn enter_release_maintenance(
+    state: &DriverState,
+    workshop: Uuid,
+    lease: &ReleaseDriverLease,
+) -> Result<Vec<u8>, DriverError> {
+    require_release_route_reservation(lease, workshop)?;
+    renew_release_driver_lease(state, lease).await?;
+    let previous = enter_workshop_maintenance(state, workshop).await?;
+    renew_release_driver_lease(state, lease).await?;
+    Ok(previous)
+}
+
+async fn leave_release_maintenance(
+    state: &DriverState,
+    workshop: Uuid,
+    previous: &[u8],
+    lease: &ReleaseDriverLease,
+) -> Result<(), DriverError> {
+    require_release_route_reservation(lease, workshop)?;
+    renew_release_driver_lease(state, lease).await?;
+    leave_workshop_maintenance(state, workshop, previous).await?;
+    renew_release_driver_lease(state, lease).await
 }
 
 fn release_tenant_evidence(tenants: &[ReleaseTenant]) -> Value {
@@ -1586,15 +2016,11 @@ fn planned_release_route_digest(
     runtime_container: &str,
     tenants: &[ReleaseTenant],
 ) -> Result<String, DriverError> {
+    let selected = selected_route_root(&state.config.route_root)?;
     let mut routes = Vec::with_capacity(tenants.len());
     for tenant in tenants {
-        let previous = std::fs::read(
-            state
-                .config
-                .route_root
-                .join(format!("{}.recovery.bak", tenant.workshop_id)),
-        )
-        .map_err(DriverError::internal)?;
+        let previous = std::fs::read(selected.join(format!("{}.recovery.bak", tenant.workshop_id)))
+            .map_err(DriverError::internal)?;
         let candidate = select_odoo_route_upstream(
             std::str::from_utf8(&previous)
                 .map_err(|_| DriverError::internal("saved tenant route is not UTF-8"))?,
@@ -1631,12 +2057,10 @@ fn observed_release_route_digest(
     state: &DriverState,
     tenants: &[ReleaseTenant],
 ) -> Result<Option<String>, DriverError> {
+    let selected = selected_route_root(&state.config.route_root)?;
     let mut routes = Vec::with_capacity(tenants.len());
     for tenant in tenants {
-        let path = state
-            .config
-            .route_root
-            .join(format!("{}.conf", tenant.workshop_id));
+        let path = selected.join(format!("{}.conf", tenant.workshop_id));
         let route = std::fs::read(path).map_err(DriverError::internal)?;
         if route
             .windows("Retry-After".len())
@@ -1653,7 +2077,7 @@ fn observed_release_route_digest(
     )))
 }
 
-fn route_set_digest<'a>(routes: impl Iterator<Item = (Uuid, &'a [u8])>) -> String {
+pub(super) fn route_set_digest<'a>(routes: impl Iterator<Item = (Uuid, &'a [u8])>) -> String {
     let digest_input = routes
         .map(|(workshop, route)| format!("{workshop}:{}", String::from_utf8_lossy(route)))
         .collect::<Vec<_>>()
@@ -1681,7 +2105,7 @@ fn previous_route_maintenance(previous: &[u8]) -> Result<Vec<u8>, DriverError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_runtime_inspection_matches, verify_engine_image_identity};
+    use super::*;
     use serde_json::json;
 
     #[test]
@@ -1736,6 +2160,152 @@ mod tests {
         wrong_manifest["Descriptor"]["digest"] = json!(format!("sha256:{}", "d".repeat(64)));
         assert!(
             verify_engine_image_identity(&wrong_manifest, &subject, &manifest, &config).is_err()
+        );
+    }
+
+    #[test]
+    fn release_adoption_reads_and_mutations_use_composite_tenant_identity() {
+        let source = include_str!("release.rs");
+
+        assert!(source.contains(
+            "join control.workshop_recovery_points r\n           on r.id=a.backup_recovery_id and r.workshop_id=a.workshop_id"
+        ));
+        assert!(source.contains(
+            "select state from control.tenant_release_adoptions where id=$1 and workshop_id=$2"
+        ));
+        assert!(source.contains("where id=$1 and workshop_id=$2 and state=$3"));
+        assert_eq!(
+            source
+                .matches("where id=$1 and workshop_id=$2\n           and state in")
+                .count(),
+            2,
+            "rollback evidence and failure transitions must both be tenant scoped"
+        );
+    }
+
+    #[test]
+    fn fleet_snapshot_is_canonical_and_verified_before_external_effects() {
+        let first_workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000202").unwrap();
+        let second_workshop = Uuid::parse_str("00000000-0000-0000-0000-000000000201").unwrap();
+        let tenant = |workshop_id: Uuid, paperless: bool| ReleaseTenant {
+            id: Uuid::new_v4(),
+            workshop_id,
+            database_id: Uuid::new_v4(),
+            database_ref: format!("mb_{}", workshop_id.simple()),
+            public_hostname: format!("{}.example.test", workshop_id.simple()),
+            backup_recovery_id: Uuid::new_v4(),
+            component_scope: if paperless {
+                vec!["odoo".into(), "paperless".into()]
+            } else {
+                vec!["odoo".into()]
+            },
+        };
+        let first = tenant(first_workshop, false);
+        let second = tenant(second_workshop, true);
+        let snapshot = release_tenant_snapshot(&[first, second]);
+        let rows = snapshot.as_array().unwrap();
+        assert_eq!(rows[0]["workshop_id"], json!(second_workshop));
+        assert_eq!(rows[0]["paperless_enabled"], json!(true));
+        assert_eq!(rows[1]["workshop_id"], json!(first_workshop));
+        assert_eq!(rows[1]["paperless_enabled"], json!(false));
+
+        let reservations = release_tenant_workshops(&[
+            tenant(first_workshop, false),
+            tenant(second_workshop, true),
+        ])
+        .unwrap();
+        assert_eq!(reservations, vec![second_workshop, first_workshop]);
+        assert!(
+            release_tenant_workshops(&[
+                tenant(first_workshop, false),
+                tenant(first_workshop, true),
+            ])
+            .is_err()
+        );
+
+        let source = include_str!("release.rs");
+        let fleet = source
+            .split("pub(super) async fn release_fleet(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            fleet.find("release_tenant_snapshot(&tenants)").unwrap()
+                < fleet.find("materialize_extension(").unwrap(),
+            "immutable tenant identity must be checked before Docker or PostgreSQL effects"
+        );
+        assert!(
+            fleet.find("release_tenant_workshops(&tenants)").unwrap()
+                < fleet.find("materialize_extension(").unwrap(),
+            "the admitted route reservation must be verified before external effects"
+        );
+    }
+
+    #[test]
+    fn initial_empty_fleet_precondition_precedes_materialization() {
+        let source = include_str!("release.rs");
+        let initial = source
+            .split("async fn prepare_initial_release(")
+            .nth(1)
+            .unwrap()
+            .split("fn release_runtime_config_digest(")
+            .next()
+            .unwrap();
+        assert!(
+            initial.find("initial_release_preparable").unwrap()
+                < initial
+                    .find("materialize_extension(state, &manifest)")
+                    .unwrap(),
+            "initial runtime materialization must follow the authoritative empty-fleet check"
+        );
+        assert!(initial.contains("lease.reserved_workshops.is_empty()"));
+    }
+
+    #[test]
+    fn release_effects_checkpoint_the_database_lease_and_publish_fenced_evidence() {
+        let source = include_str!("release.rs");
+        let fleet = source
+            .split("pub(super) async fn release_fleet(")
+            .nth(1)
+            .unwrap()
+            .split("async fn rollback_failed_release_tenant(")
+            .next()
+            .unwrap();
+        assert!(
+            fleet
+                .matches("renew_release_driver_lease(state, lease).await?")
+                .count()
+                >= 9,
+            "fleet-wide materialization, tenant, runtime, routing, retirement and evidence boundaries must renew the database lease"
+        );
+        for effect in [
+            "materialize_extension(state, &manifest)",
+            "prepare_release_tenant(",
+            "ensure_release_runtime(",
+            "smoke_release_runtime(",
+            "activate_release_routes(",
+            "docker_stop_container(state, &old_container)",
+        ] {
+            assert!(
+                fleet.contains(effect),
+                "missing release effect boundary {effect}"
+            );
+        }
+        assert!(fleet.contains("\"driver_operation_id\":lease.driver_operation_id"));
+        assert!(fleet.contains("\"driver_fence_token\":lease.fence_token"));
+
+        let tenant = source
+            .split("async fn prepare_release_tenant(")
+            .nth(1)
+            .unwrap()
+            .split("async fn mark_release_tenant_failed(")
+            .next()
+            .unwrap();
+        assert!(
+            tenant
+                .matches("renew_release_driver_lease(state, lease).await?")
+                .count()
+                >= 9,
+            "every resumable tenant phase must renew before and after its external effect"
         );
     }
 }

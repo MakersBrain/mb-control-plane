@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::domain::IntegrationError;
 use crate::integrations::odoo::{OdooClient, WebshopStatusCommand};
-use crate::persistence::{LeasedOperation, Store};
+use crate::persistence::{LeasedOperation, Store, lock_current_operation_lease};
 
 pub(crate) async fn run(
     store: &Store,
@@ -64,11 +64,24 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
+pub(crate) async fn failed(
+    store: &Store,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
     let Some(workshop) = operation.workshop_id else {
-        return;
+        return Err(IntegrationError::ContractDrift);
     };
-    if let Err(error) = sqlx::query(
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    if !lock_current_operation_lease(&mut tx, operation)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+    {
+        return Err(IntegrationError::UnknownOutcome);
+    }
+    let changed = sqlx::query(
         "update control.webshop_onboarding
             set state=case when state='completed' then 'completed' else 'action_required' end,
                 last_error_class='readiness_unavailable',
@@ -77,9 +90,12 @@ pub(crate) async fn failed(store: &Store, operation: &LeasedOperation) {
     )
     .bind(workshop)
     .bind(operation.id)
-    .execute(store.pool())
+    .execute(&mut *tx)
     .await
-    {
-        tracing::error!(operation=%operation.id,error=%error,"could not mark webshop onboarding observation failed");
+    .map_err(|_| IntegrationError::Unavailable)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(IntegrationError::ContractDrift);
     }
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
 }

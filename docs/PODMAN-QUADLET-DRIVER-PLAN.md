@@ -438,6 +438,15 @@ Use per-resource locks. A fleet-wide lock is used only for Odoo route/slot
 activation. Never hold a global lock while waiting for unrelated resource
 health.
 
+The shared-Odoo lock is a hardened cross-process host file lock, acquired
+before release database admission and held until the exact driver receipt is
+finished. No database transaction waits for it. Its file and parent directory
+are driver-owned with closed modes; symlinks, hard links, and identity changes
+are rejected. Process exit or cancellation releases the descriptor by RAII.
+Per-workshop locks remain independent. This serializes cooperating drivers but
+does not replace exact termination/absence observation for a Docker, systemd,
+or PostgreSQL effect already accepted before process death.
+
 ## 9. Release grants and rollback
 
 The native driver may run only images admitted by the active or retained

@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
@@ -6,11 +7,25 @@ use uuid::Uuid;
 
 use crate::domain::IntegrationError;
 use crate::integrations::{bounded_body, classify_status};
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 const ROOT: &str = "https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/domains";
 const WEBHOOK_ROOT: &str =
     "https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/webhooks";
 const MAXIMUM_RESPONSE: usize = 256 * 1024;
+
+static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn shared_http() -> Result<reqwest::Client, IntegrationError> {
+    HTTP.get_or_init(|| {
+        crate::outbound_http::external_api_builder("mb-email-domain-worker")
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .cloned()
+    .map_err(|_| IntegrationError::Unavailable)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmailDomainObservation {
@@ -24,8 +39,10 @@ pub struct EmailDomainObservation {
 #[derive(Clone)]
 pub struct ScalewayTemDomainClient {
     http: reqwest::Client,
+    token: reqwest::header::HeaderValue,
     project_id: Uuid,
     root: Url,
+    timeout: Duration,
 }
 
 impl ScalewayTemDomainClient {
@@ -40,19 +57,20 @@ impl ScalewayTemDomainClient {
         let mut value = reqwest::header::HeaderValue::from_str(&token)
             .map_err(|_| IntegrationError::ContractDrift)?;
         value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("X-Auth-Token", value);
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| IntegrationError::Unavailable)?;
         Ok(Self {
-            http,
+            http: shared_http()?,
+            token: value,
             project_id,
             root: Url::parse(ROOT).expect("static endpoint"),
+            timeout,
         })
+    }
+
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            .header("X-Auth-Token", self.token.clone())
+            .timeout(self.timeout)
     }
 
     fn endpoint(&self, id: Uuid, suffix: Option<&str>) -> Url {
@@ -71,11 +89,11 @@ impl ScalewayTemDomainClient {
 
     pub async fn create(&self, name: &str) -> Result<EmailDomainObservation, IntegrationError> {
         let response = self
-            .http
-            .post(self.root.clone())
+            .request(reqwest::Method::POST, self.root.clone())
             .json(&json!({
                 "project_id": self.project_id, "domain_name": name, "autoconfig": false
             }))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -84,15 +102,18 @@ impl ScalewayTemDomainClient {
 
     pub async fn observe(&self, id: Uuid) -> Result<EmailDomainObservation, IntegrationError> {
         let response = self
-            .http
-            .get(self.endpoint(id, None))
+            .request(reqwest::Method::GET, self.endpoint(id, None))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
         let mut domain = parse_domain(response, None).await?;
         let verification = self
-            .http
-            .get(self.endpoint(id, Some("verification")))
+            .request(
+                reqwest::Method::GET,
+                self.endpoint(id, Some("verification")),
+            )
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -108,9 +129,9 @@ impl ScalewayTemDomainClient {
 
     pub async fn check(&self, id: Uuid) -> Result<(), IntegrationError> {
         let response = self
-            .http
-            .post(self.endpoint(id, Some("check")))
+            .request(reqwest::Method::POST, self.endpoint(id, Some("check")))
             .json(&json!({}))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -123,9 +144,9 @@ impl ScalewayTemDomainClient {
 
     pub async fn revoke(&self, id: Uuid) -> Result<(), IntegrationError> {
         let response = self
-            .http
-            .post(self.endpoint(id, Some("revoke")))
+            .request(reqwest::Method::POST, self.endpoint(id, Some("revoke")))
             .json(&json!({}))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -152,8 +173,8 @@ impl ScalewayTemDomainClient {
             .append_pair("project_id", &self.project_id.to_string())
             .append_pair("domain_id", &domain);
         let response = self
-            .http
-            .get(list)
+            .request(reqwest::Method::GET, list)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -185,7 +206,7 @@ impl ScalewayTemDomainClient {
                 .and_then(|v| Uuid::parse_str(v).ok())
                 .ok_or(IntegrationError::ContractDrift);
         }
-        let response = self.http.post(root).json(&json!({"domain_id":domain_id,"project_id":self.project_id,"name":name,"event_types":["email_queued","email_dropped","email_deferred","email_delivered","email_spam","email_mailbox_not_found","email_blocklisted"],"sns_arn":sns_arn})).send().await.map_err(|_|IntegrationError::Unavailable)?;
+        let response = self.request(reqwest::Method::POST, root).json(&json!({"domain_id":domain_id,"project_id":self.project_id,"name":name,"event_types":["email_queued","email_dropped","email_deferred","email_delivered","email_spam","email_mailbox_not_found","email_blocklisted"],"sns_arn":sns_arn})).with_current_trace_context().send().await.map_err(|_|IntegrationError::Unavailable)?;
         let status = response.status();
         let body = bounded_body(response, MAXIMUM_RESPONSE).await?;
         if !status.is_success() {
@@ -205,8 +226,8 @@ impl ScalewayTemDomainClient {
         let endpoint = Url::parse(&format!("{WEBHOOK_ROOT}/{id}"))
             .map_err(|_| IntegrationError::ContractDrift)?;
         let response = self
-            .http
-            .delete(endpoint)
+            .request(reqwest::Method::DELETE, endpoint)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -308,5 +329,26 @@ mod tests {
             client.endpoint(id, Some("verification")).as_str(),
             "https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/domains/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/verification"
         );
+    }
+
+    #[test]
+    fn pooled_transport_keeps_provider_token_and_timeout_request_local() {
+        let client = ScalewayTemDomainClient::new(
+            "a-valid-transactional-email-token".into(),
+            Uuid::nil(),
+            Duration::from_secs(23),
+        )
+        .unwrap();
+        let request = client
+            .request(reqwest::Method::GET, client.root.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers()["x-auth-token"],
+            "a-valid-transactional-email-token"
+        );
+        assert!(request.headers()["x-auth-token"].is_sensitive());
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(23)));
     }
 }

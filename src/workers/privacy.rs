@@ -1,13 +1,13 @@
-use std::time::Duration;
-
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
-use crate::persistence::{LeasedOperation, Store};
+use crate::outbound_http::TraceRequestBuilderExt as _;
+use crate::persistence::{LeasedOperation, Store, TenantStore};
 use crate::privacy_crypto;
+use crate::worker_config::PrivacyDriverConfig;
 
 type ExportMembership = (
     Uuid,
@@ -18,13 +18,93 @@ type ExportMembership = (
     Option<OffsetDateTime>,
 );
 
+const MAX_EXPORT_WORKSHOPS: usize = 50;
+const MAX_EXPORT_CLEANUP_BATCH: i64 = 100;
+const RETENTION_BATCH_SIZE: i32 = 200;
+
+struct ExportCleanupLease<'a> {
+    owner: &'a str,
+    token: Uuid,
+    fence: i64,
+}
+
+type ExportUser = (
+    String,
+    Option<String>,
+    String,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+);
+type ExportIdentity = (String, String, OffsetDateTime, Option<OffsetDateTime>);
+type ExportRequestHistory = (Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>);
+type ExportProcessorTask = (String, String, String, Option<String>);
+
+struct PrivacyExportSnapshot {
+    user: ExportUser,
+    identity: Option<ExportIdentity>,
+    request_history: Vec<ExportRequestHistory>,
+    processor_tasks: Vec<ExportProcessorTask>,
+    workshop_ids: Vec<Uuid>,
+}
+
 fn export_timestamp(value: OffsetDateTime) -> Result<String, IntegrationError> {
     value
         .format(&Rfc3339)
         .map_err(|_| IntegrationError::ContractDrift)
 }
 
-pub(crate) async fn cleanup_export_artifacts(store: &Store) -> Result<u64, IntegrationError> {
+#[tracing::instrument(name = "worker.privacy.export_cleanup", skip_all)]
+pub(crate) async fn cleanup_export_artifacts(
+    store: &Store,
+    lease_owner: &str,
+) -> Result<u64, IntegrationError> {
+    let Some((token, fence)) =
+        sqlx::query_as::<_, (Uuid, i64)>("select * from control.claim_privacy_export_cleanup($1)")
+            .bind(lease_owner)
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?
+    else {
+        tracing::debug!("privacy export cleanup lease is held by another replica");
+        return Ok(0);
+    };
+    let lease = ExportCleanupLease {
+        owner: lease_owner,
+        token,
+        fence,
+    };
+    let cleanup = cleanup_export_artifacts_with_lease(store, &lease).await;
+    let release = sqlx::query_scalar::<_, bool>(
+        "select control.release_privacy_export_cleanup($1,$2,$3) is true",
+    )
+    .bind(lease.owner)
+    .bind(lease.token)
+    .bind(lease.fence)
+    .fetch_one(store.pool())
+    .await;
+    match (cleanup, release) {
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(_)) => {
+            tracing::warn!("privacy export cleanup failed and its lease could not be released");
+            Err(error)
+        }
+        (Ok(_), Err(_)) => {
+            tracing::warn!("privacy export cleanup lease release failed");
+            Err(IntegrationError::Unavailable)
+        }
+        (Ok(deleted), Ok(false)) => {
+            tracing::warn!("privacy export cleanup lease was not current at release");
+            Ok(deleted)
+        }
+        (Ok(deleted), Ok(true)) => Ok(deleted),
+    }
+}
+
+async fn cleanup_export_artifacts_with_lease(
+    store: &Store,
+    lease: &ExportCleanupLease<'_>,
+) -> Result<u64, IntegrationError> {
+    renew_export_cleanup_lease(store, lease).await?;
     sqlx::query_scalar::<_, i64>("select control.purge_expired_data_subject_exports()")
         .fetch_one(store.pool())
         .await
@@ -32,82 +112,79 @@ pub(crate) async fn cleanup_export_artifacts(store: &Store) -> Result<u64, Integ
     let artifacts = sqlx::query_as::<_, (Uuid, String)>(
         "select id,storage_ref from control.data_subject_exports
          where state in ('consumed','expired','revoked')
-           and storage_ref like 'file:%.aead' order by id",
+           and storage_ref like 'file:%.aead' order by id limit $1",
     )
+    .bind(MAX_EXPORT_CLEANUP_BATCH)
     .fetch_all(store.pool())
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
     let mut deleted = 0_u64;
     for (export_id, storage_ref) in artifacts {
+        renew_export_cleanup_lease(store, lease).await?;
         privacy_crypto::delete_export_artifact(export_id, &storage_ref)?;
-        let changed = sqlx::query(
-            "update control.data_subject_exports
-             set storage_ref=concat('purged:',storage_ref)
-             where id=$1 and state in ('consumed','expired','revoked') and storage_ref=$2",
+        let changed = sqlx::query_scalar::<_, bool>(
+            "select control.mark_privacy_export_artifact_purged($1,$2,$3,$4,$5) is true",
         )
         .bind(export_id)
         .bind(&storage_ref)
-        .execute(store.pool())
+        .bind(lease.owner)
+        .bind(lease.token)
+        .bind(lease.fence)
+        .fetch_one(store.pool())
         .await
-        .map_err(|_| IntegrationError::Unavailable)?
-        .rows_affected();
-        deleted = deleted.saturating_add(changed);
+        .map_err(|_| IntegrationError::Unavailable)?;
+        if !changed {
+            return Err(IntegrationError::Unavailable);
+        }
+        deleted = deleted.saturating_add(1);
     }
     Ok(deleted)
 }
 
+async fn renew_export_cleanup_lease(
+    store: &Store,
+    lease: &ExportCleanupLease<'_>,
+) -> Result<(), IntegrationError> {
+    let renewed = sqlx::query_scalar::<_, bool>(
+        "select control.renew_privacy_export_cleanup($1,$2,$3) is true",
+    )
+    .bind(lease.owner)
+    .bind(lease.token)
+    .bind(lease.fence)
+    .fetch_one(store.pool())
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if !renewed {
+        tracing::warn!("privacy export cleanup lease was lost");
+        return Err(IntegrationError::Unavailable);
+    }
+    Ok(())
+}
+
 async fn processor_exports(
     request_id: Uuid,
-    memberships: &[ExportMembership],
-    scope: &Value,
+    workshop_ids: &[Uuid],
+    driver: &PrivacyDriverConfig,
 ) -> Result<Vec<Value>, IntegrationError> {
-    let scoped = scope
-        .get("workshop_ids")
-        .and_then(Value::as_array)
-        .ok_or(IntegrationError::ContractDrift)?;
-    let scoped = scoped
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or(IntegrationError::ContractDrift)
-        })
-        .collect::<Result<std::collections::HashSet<_>, _>>()?;
-    let base =
-        std::env::var("CONTROL_PRIVACY_DRIVER_URL").map_err(|_| IntegrationError::Unauthorized)?;
-    let base =
-        url::Url::parse(base.trim_end_matches('/')).map_err(|_| IntegrationError::ContractDrift)?;
-    if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
-        return Err(IntegrationError::ContractDrift);
-    }
-    let token = crate::runtime_secret::environment("CONTROL_PRIVACY_DRIVER_TOKEN")
-        .map_err(|_| IntegrationError::Unauthorized)?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(IntegrationError::Unauthorized)?;
-    let socket = crate::deployment_driver_transport::configured_socket()
-        .map_err(|_| IntegrationError::ContractDrift)?;
-    let client = crate::deployment_driver_transport::client(
-        Some(&token),
-        Duration::from_secs(300),
-        socket.as_deref(),
-    )
-    .map_err(|_| IntegrationError::ContractDrift)?;
     let mut result = Vec::new();
     let mut remaining = privacy_crypto::MAX_EXPORT_BYTES - 1024 * 1024;
-    for membership in memberships {
-        if !scoped.is_empty() && !scoped.contains(&membership.0) {
-            continue;
-        }
-        let url = base
-            .join(&format!("/v1/privacy/{}/export", membership.0))
+    for workshop_id in workshop_ids {
+        let url = driver
+            .url()
+            .join(&format!("/v1/privacy/{workshop_id}/export"))
             .map_err(|_| IntegrationError::ContractDrift)?;
-        if url.origin() != base.origin() {
+        if url.origin() != driver.url().origin() {
             return Err(IntegrationError::ContractDrift);
         }
-        let response = client
+        let response = driver
+            .client()
             .post(url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                driver.authorization().clone(),
+            )
             .json(&json!({"request_id":request_id}))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -124,12 +201,142 @@ async fn processor_exports(
     Ok(result)
 }
 
+fn requested_workshops(scope: &Value) -> Result<Vec<Uuid>, IntegrationError> {
+    let values = scope
+        .get("workshop_ids")
+        .and_then(Value::as_array)
+        .ok_or(IntegrationError::ContractDrift)?;
+    if values.len() > MAX_EXPORT_WORKSHOPS {
+        return Err(IntegrationError::TooLarge);
+    }
+    let workshops = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or(IntegrationError::ContractDrift)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if workshops
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != workshops.len()
+    {
+        return Err(IntegrationError::ContractDrift);
+    }
+    Ok(workshops)
+}
+
+async fn privacy_export_snapshot(
+    store: &Store,
+    request_id: Uuid,
+    subject_user_id: Uuid,
+    scope: &Value,
+) -> Result<PrivacyExportSnapshot, IntegrationError> {
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let user = sqlx::query_as::<_, ExportUser>(
+        "select email,display_name,locale,created_at,disabled_at from control.users where id=$1",
+    )
+    .bind(subject_user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let identity = sqlx::query_as::<_, ExportIdentity>(
+        "select issuer,subject,linked_at,disabled_at from control.external_identities
+         where user_id=$1 order by linked_at,id limit 1",
+    )
+    .bind(subject_user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let request_history = sqlx::query_as::<_, ExportRequestHistory>(
+        "select id,request_type,status,requested_at,completed_at
+         from control.data_subject_requests where subject_user_id=$1 order by requested_at,id",
+    )
+    .bind(subject_user_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let processor_tasks = sqlx::query_as::<_, ExportProcessorTask>(
+        "select processor_key,action,state,acknowledgement_ref
+         from control.data_subject_processor_tasks where data_subject_request_id=$1
+         order by processor_key,action",
+    )
+    .bind(request_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    let mut workshop_ids = requested_workshops(scope)?;
+    if workshop_ids.is_empty() {
+        workshop_ids = sqlx::query_scalar::<_, Uuid>(
+            "select workshop_id from control.memberships where user_id=$1
+             order by workshop_id limit $2",
+        )
+        .bind(subject_user_id)
+        .bind(i64::try_from(MAX_EXPORT_WORKSHOPS + 1).expect("bounded export limit"))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+        if workshop_ids.len() > MAX_EXPORT_WORKSHOPS {
+            return Err(IntegrationError::TooLarge);
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    Ok(PrivacyExportSnapshot {
+        user,
+        identity,
+        request_history,
+        processor_tasks,
+        workshop_ids,
+    })
+}
+
+async fn tenant_export_memberships(
+    tenant_store: &TenantStore,
+    subject_user_id: Uuid,
+    workshop_ids: &[Uuid],
+) -> Result<Vec<ExportMembership>, IntegrationError> {
+    let mut memberships = Vec::with_capacity(workshop_ids.len());
+    for workshop_id in workshop_ids {
+        let mut tx = tenant_store
+            .begin(*workshop_id)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        let membership = sqlx::query_as::<_, ExportMembership>(
+            "select m.workshop_id,w.display_name,m.role,m.status,m.created_at,m.revoked_at
+             from control.memberships m join control.workshops w on w.id=m.workshop_id
+             where m.workshop_id=$1 and m.user_id=$2",
+        )
+        .bind(workshop_id)
+        .bind(subject_user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+        .ok_or(IntegrationError::NotFound)?;
+        tx.commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        memberships.push(membership);
+    }
+    Ok(memberships)
+}
+
 async fn prepare_data_subject_export(
     store: &Store,
+    tenant_store: &TenantStore,
     request_id: Uuid,
     subject_user_id: Uuid,
     request_type: &str,
     scope: &Value,
+    driver: &PrivacyDriverConfig,
 ) -> Result<(), IntegrationError> {
     if let Some(state) = sqlx::query_scalar::<_, String>(
         "select state from control.data_subject_exports where data_subject_request_id=$1",
@@ -146,68 +353,21 @@ async fn prepare_data_subject_export(
         };
     }
 
-    let user = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            String,
-            OffsetDateTime,
-            Option<OffsetDateTime>,
-        ),
-    >(
-        "select email,display_name,locale,created_at,disabled_at from control.users where id=$1",
-    )
-    .bind(subject_user_id)
-    .fetch_one(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    let identity = sqlx::query_as::<_, (String, String, OffsetDateTime, Option<OffsetDateTime>)>(
-        "select issuer,subject,linked_at,disabled_at from control.external_identities where user_id=$1",
-    )
-    .bind(subject_user_id)
-    .fetch_optional(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    let memberships = sqlx::query_as::<_, ExportMembership>(
-        "select m.workshop_id,w.display_name,m.role,m.status,m.created_at,m.revoked_at
-         from control.memberships m join control.workshops w on w.id=m.workshop_id
-         where m.user_id=$1 order by m.workshop_id",
-    )
-    .bind(subject_user_id)
-    .fetch_all(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    let request_history =
-        sqlx::query_as::<_, (Uuid, String, String, OffsetDateTime, Option<OffsetDateTime>)>(
-            "select id,request_type,status,requested_at,completed_at
-         from control.data_subject_requests where subject_user_id=$1 order by requested_at,id",
-        )
-        .bind(subject_user_id)
-        .fetch_all(store.pool())
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
-    let processor_tasks = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-        "select processor_key,action,state,acknowledgement_ref
-         from control.data_subject_processor_tasks where data_subject_request_id=$1
-         order by processor_key,action",
-    )
-    .bind(request_id)
-    .fetch_all(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?;
-    let processor_exports = processor_exports(request_id, &memberships, scope).await?;
+    let snapshot = privacy_export_snapshot(store, request_id, subject_user_id, scope).await?;
+    let memberships =
+        tenant_export_memberships(tenant_store, subject_user_id, &snapshot.workshop_ids).await?;
+    let processor_exports = processor_exports(request_id, &snapshot.workshop_ids, driver).await?;
 
     let payload = json!({
         "format":"mb-gdpr-export-v1",
         "generated_at":export_timestamp(OffsetDateTime::now_utc())?,
         "request":{"id":request_id,"type":request_type,"scope":scope},
         "subject":{
-            "id":subject_user_id,"email":user.0,"display_name":user.1,"locale":user.2,
-            "created_at":export_timestamp(user.3)?,
-            "disabled_at":user.4.map(export_timestamp).transpose()?
+            "id":subject_user_id,"email":snapshot.user.0,"display_name":snapshot.user.1,"locale":snapshot.user.2,
+            "created_at":export_timestamp(snapshot.user.3)?,
+            "disabled_at":snapshot.user.4.map(export_timestamp).transpose()?
         },
-        "external_identity":identity.map(|row| -> Result<Value,IntegrationError> { Ok(json!({
+        "external_identity":snapshot.identity.map(|row| -> Result<Value,IntegrationError> { Ok(json!({
             "issuer":row.0,"subject":row.1,"linked_at":export_timestamp(row.2)?,
             "disabled_at":row.3.map(export_timestamp).transpose()?
         }))}).transpose()?,
@@ -215,11 +375,11 @@ async fn prepare_data_subject_export(
             "workshop_id":row.0,"workshop_name":row.1,"role":row.2,"status":row.3,
             "created_at":export_timestamp(row.4)?,"revoked_at":row.5.map(export_timestamp).transpose()?
         }))}).collect::<Result<Vec<_>,_>>()?,
-        "rights_request_history":request_history.into_iter().map(|row| -> Result<Value,IntegrationError> { Ok(json!({
+        "rights_request_history":snapshot.request_history.into_iter().map(|row| -> Result<Value,IntegrationError> { Ok(json!({
             "id":row.0,"type":row.1,"status":row.2,"requested_at":export_timestamp(row.3)?,
             "completed_at":row.4.map(export_timestamp).transpose()?
         }))}).collect::<Result<Vec<_>,_>>()?,
-        "processor_manifest":processor_tasks.into_iter().map(|row| json!({
+        "processor_manifest":snapshot.processor_tasks.into_iter().map(|row| json!({
             "processor":row.0,"action":row.1,"state":row.2,"evidence_ref":row.3
         })).collect::<Vec<_>>(),
         "processor_exports":processor_exports
@@ -326,6 +486,11 @@ async fn ensure_erasure_tombstone(
     Ok(tombstone)
 }
 
+#[tracing::instrument(
+    name = "worker.privacy.retention",
+    skip_all,
+    fields(operation.id = %operation.id, retention.phase = tracing::field::Empty)
+)]
 pub(crate) async fn retention(
     store: &Store,
     operation: &LeasedOperation,
@@ -336,118 +501,81 @@ pub(crate) async fn retention(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
-    let (policy_version,dry_run,state)=sqlx::query_as::<_,(Option<i32>,bool,String)>(
-        "select policy_version,dry_run,state from control.retention_runs where id=$1 and operation_id=$2",
-    ).bind(run_id).bind(operation.id).fetch_optional(store.pool()).await
-        .map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
-    if state == "completed" {
-        return Ok(());
-    }
-    let Some(policy_version) = policy_version else {
-        sqlx::query("update control.retention_runs set state='blocked_approval',evidence=jsonb_build_object('reason','retention_policy_approval_required'),completed_at=now() where id=$1")
-            .bind(run_id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-        return Err(IntegrationError::Rejected);
-    };
-    let policy = sqlx::query_as::<_, (String, Value)>(
-        "select status,policy from control.retention_policy_versions where version=$1",
-    )
-    .bind(policy_version)
-    .fetch_optional(store.pool())
-    .await
-    .map_err(|_| IntegrationError::Unavailable)?
-    .ok_or(IntegrationError::NotFound)?;
-    if !dry_run && policy.0 != "approved" {
-        sqlx::query("update control.retention_runs set state='blocked_approval',evidence=jsonb_build_object('reason','retention_policy_not_approved'),completed_at=now() where id=$1")
-            .bind(run_id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-        return Err(IntegrationError::Rejected);
-    }
-    let duration = |dataset: &str| -> Result<i64, IntegrationError> {
-        policy
-            .1
-            .pointer(&format!("/datasets/{dataset}/duration_days"))
-            .and_then(Value::as_i64)
-            .filter(|days| *days >= 0 && *days <= 36500)
-            .ok_or(IntegrationError::ContractDrift)
-    };
-    let invitation_days = duration("invitations")?;
-    let mail_days = duration("mail-delivery")?;
-    let operation_days = duration("operations")?;
-    let invitations=sqlx::query_scalar::<_,i64>("select count(*) from control.invitations where coalesce(accepted_at,revoked_at,expires_at)<now()-($1::bigint*interval '1 day')")
-        .bind(invitation_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let outbox=sqlx::query_scalar::<_,i64>("select count(*) from control.outbox where state in ('sent','dead_letter') and coalesce(sent_at,created_at)<now()-($1::bigint*interval '1 day')")
-        .bind(mail_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let operations=sqlx::query_scalar::<_,i64>("select count(*) from control.operations where state in ('succeeded','dead_letter') and coalesce(finished_at,created_at)<now()-($1::bigint*interval '1 day') and kind not like 'privacy.%'")
-        .bind(operation_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let deletable_invitations=sqlx::query_scalar::<_,i64>("select count(*) from control.invitations i where coalesce(i.accepted_at,i.revoked_at,i.expires_at)<now()-($1::bigint*interval '1 day') and not control.legal_hold_applies('invitations',i.workshop_id,array[i.invited_by,i.accepted_user_id])")
-        .bind(invitation_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let deletable_outbox=sqlx::query_scalar::<_,i64>("select count(*) from control.outbox o left join control.invitations i on i.id=o.invitation_id where o.state in ('sent','dead_letter') and coalesce(o.sent_at,o.created_at)<now()-($1::bigint*interval '1 day') and not control.legal_hold_applies('mail-delivery',i.workshop_id,array[i.invited_by,i.accepted_user_id])")
-        .bind(mail_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let redactable_operations=sqlx::query_scalar::<_,i64>("select count(*) from control.operations o where o.state in ('succeeded','dead_letter') and coalesce(o.finished_at,o.created_at)<now()-($1::bigint*interval '1 day') and o.kind not like 'privacy.%' and not control.legal_hold_applies('operations',o.workshop_id,array[o.requested_by,o.target_user_id])")
-        .bind(operation_days).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    let held_datasets = [
-        (deletable_invitations < invitations).then_some("invitations"),
-        (deletable_outbox < outbox).then_some("mail-delivery"),
-        (redactable_operations < operations).then_some("operations"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    let deleted_count = if dry_run {
-        0
-    } else {
-        deletable_invitations + deletable_outbox
-    };
-    let redacted_operation_count = if dry_run { 0 } else { redactable_operations };
-    let evidence = json!({
-        "policy_version":policy_version,
-        "dry_run":dry_run,
-        "candidates":{"invitations":invitations,"mail_delivery":outbox,"operation_details":operations},
-        "held":{"invitations":invitations-deletable_invitations,"mail_delivery":outbox-deletable_outbox,"operation_details":operations-redactable_operations},
-        "held_datasets":held_datasets,
-        "deleted_count":deleted_count,
-        "redacted_operation_count":redacted_operation_count
-    });
-    if !dry_run {
-        let mut tx = store
-            .begin()
+    loop {
+        let (outcome, phase, considered, affected, held) =
+            sqlx::query_as::<_, (String, String, i32, i32, i32)>(
+                "select outcome,phase,considered,affected,held
+                   from control.run_privacy_retention_batch($1,$2,$3,$4,$5)",
+            )
+            .bind(run_id)
+            .bind(operation.id)
+            .bind(operation.attempt)
+            .bind(&operation.leased_by)
+            .bind(RETENTION_BATCH_SIZE)
+            .fetch_one(store.pool())
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
-        sqlx::query("delete from control.outbox o using (select o2.id from control.outbox o2 left join control.invitations i on i.id=o2.invitation_id where o2.state in ('sent','dead_letter') and coalesce(o2.sent_at,o2.created_at)<now()-($1::bigint*interval '1 day') and not control.legal_hold_applies('mail-delivery',i.workshop_id,array[i.invited_by,i.accepted_user_id])) deletable where o.id=deletable.id")
-            .bind(mail_days).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-        sqlx::query("update control.invitations i set email=concat('retained-invitation-',i.id,'@invalid'),idempotency_key=concat('retained:',i.id) where coalesce(i.accepted_at,i.revoked_at,i.expires_at)<now()-($1::bigint*interval '1 day') and not control.legal_hold_applies('invitations',i.workshop_id,array[i.invited_by,i.accepted_user_id])")
-            .bind(invitation_days).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-        sqlx::query("update control.operations o set payload='{\"redacted\":true}'::jsonb,checkpoint=null where o.state in ('succeeded','dead_letter') and coalesce(o.finished_at,o.created_at)<now()-($1::bigint*interval '1 day') and o.kind not like 'privacy.%' and not control.legal_hold_applies('operations',o.workshop_id,array[o.requested_by,o.target_user_id])")
-            .bind(operation_days).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
-        tx.commit()
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?;
+        let phase = match phase.as_str() {
+            "invitations" => "invitations",
+            "mail-delivery" => "mail_delivery",
+            "operations" => "operations",
+            "complete" => "complete",
+            _ => return Err(IntegrationError::ContractDrift),
+        };
+        if !(0..=RETENTION_BATCH_SIZE).contains(&considered)
+            || affected < 0
+            || held < 0
+            || affected.saturating_add(held) > considered
+        {
+            return Err(IntegrationError::ContractDrift);
+        }
+        tracing::Span::current().record("retention.phase", phase);
+        tracing::debug!(
+            retention.phase = phase,
+            considered,
+            affected,
+            held,
+            "privacy retention batch committed"
+        );
+        match outcome.as_str() {
+            "more" if phase != "complete" => tokio::task::yield_now().await,
+            "complete" if phase == "complete" => return Ok(()),
+            "blocked" | "failed" if phase == "complete" => {
+                return Err(IntegrationError::Rejected);
+            }
+            _ => return Err(IntegrationError::ContractDrift),
+        }
     }
-    sqlx::query("update control.retention_runs set state='completed',evidence=$2,started_at=coalesce(started_at,now()),completed_at=now() where id=$1")
-        .bind(run_id).bind(evidence).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    Ok(())
 }
 
+#[tracing::instrument(name = "worker.privacy.data_subject_request", skip_all, fields(operation.id = %operation.id))]
 pub(crate) async fn data_subject_request(
     store: &Store,
+    tenant_store: &TenantStore,
     operation: &LeasedOperation,
+    driver: &PrivacyDriverConfig,
 ) -> Result<(), IntegrationError> {
-    cleanup_export_artifacts(store).await?;
     let request_id = operation
         .payload
         .get("request_id")
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
-    let request=sqlx::query_as::<_,(String,String,Uuid,i64,Value)>("select request_type,status,subject_user_id,version,scope from control.data_subject_requests where id=$1")
-        .bind(request_id).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
+    let target_user_id = operation
+        .target_user_id
+        .ok_or(IntegrationError::ContractDrift)?;
+    let request=sqlx::query_as::<_,(String,String,Uuid,i64,Value)>("select request_type,status,subject_user_id,version,scope from control.data_subject_requests where id=$1 and operation_id=$2 and subject_user_id=$3")
+        .bind(request_id).bind(operation.id).bind(target_user_id).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
     if request.1 == "completed" {
         return Ok(());
     }
     if request.1 != "approved" && request.1 != "executing" {
         return Err(IntegrationError::Rejected);
     }
+    verify_operation_lease(store, operation).await?;
+    cleanup_export_artifacts(store, &operation.leased_by).await?;
     if request.1 == "approved" {
-        transition_dsr(store, request_id, "approved", "executing").await?;
+        transition_dsr(store, operation, request_id, "approved", "executing").await?;
     }
     match request.0.as_str() {
         "restriction" => {
@@ -520,30 +648,881 @@ pub(crate) async fn data_subject_request(
         "access" | "portability" | "rectification" | "objection" => {}
         _ => return Err(IntegrationError::ContractDrift),
     }
-    // Processor tasks remain outstanding until there is actual evidence. This
-    // prevents a partial export or erasure from falsely closing a rights request.
-    let outstanding=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.data_subject_processor_tasks where data_subject_request_id=$1 and state not in ('acknowledged','not_applicable'))")
-        .bind(request_id).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
-    if outstanding {
-        return Err(IntegrationError::Unavailable);
-    }
     if matches!(request.0.as_str(), "access" | "portability") {
-        prepare_data_subject_export(store, request_id, request.2, &request.0, &request.4).await?;
+        prepare_data_subject_export(
+            store,
+            tenant_store,
+            request_id,
+            request.2,
+            &request.0,
+            &request.4,
+            driver,
+        )
+        .await?;
     }
-    transition_dsr(store, request_id, "executing", "completed").await
+    complete_dsr(
+        store,
+        operation,
+        request_id,
+        matches!(request.0.as_str(), "access" | "portability"),
+    )
+    .await
 }
 
 async fn transition_dsr(
     store: &Store,
+    operation: &LeasedOperation,
     id: Uuid,
     from: &str,
     to: &str,
 ) -> Result<(), IntegrationError> {
-    let changed=sqlx::query("update control.data_subject_requests set status=$3,completed_at=case when $3='completed' then now() else completed_at end,version=version+1 where id=$1 and status=$2")
-        .bind(id).bind(from).bind(to).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.rows_affected();
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(IntegrationError::UnknownOutcome)
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    lock_operation_lease(&mut tx, operation).await?;
+    let changed=sqlx::query("update control.data_subject_requests set status=$3,version=version+1 where id=$1 and operation_id=$4 and status=$2")
+        .bind(id).bind(from).bind(to).bind(operation.id).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?.rows_affected();
+    if changed != 1 {
+        return Err(IntegrationError::UnknownOutcome);
+    }
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
+}
+
+async fn complete_dsr(
+    store: &Store,
+    operation: &LeasedOperation,
+    request_id: Uuid,
+    acknowledge_export: bool,
+) -> Result<(), IntegrationError> {
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    lock_operation_lease(&mut tx, operation).await?;
+    if acknowledge_export {
+        let evidence_ref = format!("control:subject-export:{request_id}");
+        sqlx::query(
+            "update control.data_subject_processor_tasks
+             set state='acknowledged',acknowledgement_ref=$2,safe_error_class=null,
+                 version=version+1
+             where data_subject_request_id=$1 and action='export'
+               and state in ('pending','sent','failed')",
+        )
+        .bind(request_id)
+        .bind(evidence_ref)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    }
+    let outstanding = sqlx::query_scalar::<_, bool>(
+        "select exists(select 1 from control.data_subject_processor_tasks
+         where data_subject_request_id=$1
+           and state not in ('acknowledged','not_applicable'))",
+    )
+    .bind(request_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?;
+    if outstanding {
+        return Err(IntegrationError::Unavailable);
+    }
+    let changed = sqlx::query(
+        "update control.data_subject_requests
+         set status='completed',completed_at=now(),version=version+1
+         where id=$1 and operation_id=$2 and status='executing'",
+    )
+    .bind(request_id)
+    .bind(operation.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(IntegrationError::UnknownOutcome);
+    }
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
+}
+
+async fn lock_operation_lease(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
+    sqlx::query_scalar::<_, Uuid>(
+        "select id from control.operations
+         where id=$1 and state='in_flight' and leased_by=$2 and attempt=$3
+           and lease_expires_at>now()
+         for update",
+    )
+    .bind(operation.id)
+    .bind(&operation.leased_by)
+    .bind(operation.attempt)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::UnknownOutcome)?;
+    Ok(())
+}
+
+async fn verify_operation_lease(
+    store: &Store,
+    operation: &LeasedOperation,
+) -> Result<(), IntegrationError> {
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    lock_operation_lease(&mut tx, operation).await?;
+    tx.commit().await.map_err(|_| IntegrationError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_scope_is_unique_and_bounded() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let parsed = requested_workshops(&json!({
+            "workshop_ids": [first.to_string(), second.to_string()]
+        }))
+        .unwrap();
+        assert_eq!(parsed, vec![first, second]);
+        assert_eq!(
+            requested_workshops(&json!({
+                "workshop_ids": [first.to_string(), first.to_string()]
+            })),
+            Err(IntegrationError::ContractDrift)
+        );
+        let oversized = (0..=MAX_EXPORT_WORKSHOPS)
+            .map(|_| Value::String(Uuid::new_v4().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested_workshops(&json!({"workshop_ids": oversized})),
+            Err(IntegrationError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn export_cleanup_is_database_leased_and_fenced() {
+        let source = include_str!("privacy.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let cleanup = production
+            .split("pub(crate) async fn cleanup_export_artifacts(")
+            .nth(1)
+            .unwrap()
+            .split("async fn processor_exports(")
+            .next()
+            .unwrap();
+        let claim = cleanup.find("claim_privacy_export_cleanup").unwrap();
+        let purge = cleanup.find("purge_expired_data_subject_exports").unwrap();
+        let deletion = cleanup.find("delete_export_artifact").unwrap();
+        let acknowledgement = cleanup.find("mark_privacy_export_artifact_purged").unwrap();
+        let release = cleanup.find("release_privacy_export_cleanup").unwrap();
+        assert!(claim < purge && purge < deletion && deletion < acknowledgement);
+        assert!(claim < release);
+        assert!(cleanup.contains("renew_privacy_export_cleanup"));
+        assert!(!cleanup.contains("set storage_ref=concat"));
+
+        let migration = include_str!("../../migrations/0017_privacy_export_cleanup_lease.sql");
+        assert!(migration.contains("fence_token = cleanup.fence_token + 1"));
+        assert!(migration.contains("cleanup.lease_expires_at > now()"));
+        assert!(
+            migration.contains("grant execute on function control.claim_privacy_export_cleanup")
+        );
+        assert!(
+            migration
+                .contains("grant execute on function control.mark_privacy_export_artifact_purged")
+        );
+    }
+
+    #[test]
+    fn retention_uses_only_the_bounded_fenced_database_capability() {
+        let source = include_str!("privacy.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let retention = production
+            .split("pub(crate) async fn retention(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) async fn data_subject_request(")
+            .next()
+            .unwrap();
+        assert!(retention.contains("run_privacy_retention_batch"));
+        assert!(retention.contains("RETENTION_BATCH_SIZE"));
+        for forbidden in [
+            "delete from control.outbox",
+            "update control.invitations",
+            "update control.operations",
+            "select count(*) from control.invitations",
+            "legal_hold_applies",
+        ] {
+            assert!(
+                !retention.contains(forbidden),
+                "retention bypassed its database capability with {forbidden}"
+            );
+        }
+
+        let migration = include_str!("../../migrations/0020_privacy_retention_batches.sql");
+        assert!(migration.contains("p_batch_limit>200"));
+        assert!(migration.contains("x.lease_expires_at>clock_timestamp()"));
+        assert!(migration.contains("op.lease_expires_at<=clock_timestamp()"));
+        assert!(migration.contains("for update"));
+        assert!(migration.contains("control.legal_hold_applies("));
+        assert!(migration.contains(
+            "lock table control.invitations,control.outbox,control.operations in share mode"
+        ));
+        assert!(migration.contains("cutoff_at=clock_timestamp()"));
+        assert!(migration.contains("invitation_high_water"));
+        assert!(migration.contains("maintain_retention_sequence"));
+        assert!(
+            migration
+                .contains("revoke all on table control.retention_runs from control_privacy_worker")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn retention_batches_resume_fence_stale_owners_and_preserve_held_rows() {
+        let database_url =
+            std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
+        let store = Store::connect(&database_url).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let operator = Uuid::new_v4();
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(operator)
+            .bind(format!("retention-operator-{operator}@example.test"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let held_workshop = Uuid::new_v4();
+        let free_workshop = Uuid::new_v4();
+        for (workshop, label) in [(held_workshop, "Held"), (free_workshop, "Free")] {
+            sqlx::query(
+                "insert into control.workshops(id,slug,display_name,time_zone)
+                 values($1,$2,$3,'Europe/Paris')",
+            )
+            .bind(workshop)
+            .bind(format!("retention-{}", workshop.simple()))
+            .bind(label)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let policy_version: i32 = sqlx::query_scalar(
+            "select coalesce(max(version),0)+1 from control.retention_policy_versions",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into control.retention_policy_versions(
+               version,status,policy,policy_digest,approval_ref,approved_by,approved_at
+             ) values($1,'approved',$2,$3,'retention-test-approval',$4,now())",
+        )
+        .bind(policy_version)
+        .bind(json!({"datasets":{
+            "invitations":{"duration_days":36500},
+            "mail-delivery":{"duration_days":36500},
+            "operations":{"duration_days":36500}
+        }}))
+        .bind(format!("sha256:{}", "d".repeat(64)))
+        .bind(operator)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let held_invitation = Uuid::new_v4();
+        let free_invitation = Uuid::new_v4();
+        for (invitation, workshop, local) in [
+            (held_invitation, held_workshop, "held"),
+            (free_invitation, free_workshop, "free"),
+        ] {
+            sqlx::query(
+                "insert into control.invitations(
+                   id,workshop_id,email,role,invited_by,idempotency_key,
+                   created_at,expires_at
+                 ) values($1,$2,$3,'viewer',$4,$5,
+                          now()-interval '40002 days',now()-interval '40001 days')",
+            )
+            .bind(invitation)
+            .bind(workshop)
+            .bind(format!("retention-{local}-{invitation}@example.test"))
+            .bind(operator)
+            .bind(format!("retention-test:{invitation}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let held_operation = Uuid::new_v4();
+        let free_operation = Uuid::new_v4();
+        for (candidate, workshop, marker) in [
+            (held_operation, held_workshop, "held-personal-marker"),
+            (free_operation, free_workshop, "free-personal-marker"),
+        ] {
+            sqlx::query(
+                "insert into control.operations(
+                   id,kind,queue,workshop_id,payload,correlation_id,idempotency_key,
+                   state,created_at,finished_at
+                 ) values($1,'tenant.reconcile','tenant-reconciliation',$2,$3,$4,$5,
+                          'succeeded',now()-interval '40002 days',now()-interval '40001 days')",
+            )
+            .bind(candidate)
+            .bind(workshop)
+            .bind(json!({"personal_marker":marker}))
+            .bind(Uuid::new_v4())
+            .bind(format!("retention-candidate:{candidate}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "insert into control.legal_holds(
+               id,scope,reason_code,approval_ref,imposed_by,expires_at
+             ) values($1,$2,'retention_test','retention-test-hold',$3,now()+interval '1 day')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(json!({
+            "datasets":["invitations","operations"],
+            "workshop_ids":[held_workshop]
+        }))
+        .bind(operator)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let run_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let lease_owner = format!("privacy-retention-test-{operation_id}");
+        sqlx::query(
+            "insert into control.operations(
+               id,kind,queue,payload,correlation_id,idempotency_key,state,attempt,
+               leased_by,lease_expires_at
+             ) values($1,'privacy.retention','privacy-operations',$2,$3,$4,
+                      'in_flight',1,$5,now()+interval '10 minutes')",
+        )
+        .bind(operation_id)
+        .bind(json!({"retention_run_id":run_id}))
+        .bind(Uuid::new_v4())
+        .bind(format!("retention-run:{run_id}"))
+        .bind(&lease_owner)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into control.retention_runs(id,policy_version,operation_id,dry_run)
+             values($1,$2,$3,false)",
+        )
+        .bind(run_id)
+        .bind(policy_version)
+        .bind(operation_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let first = sqlx::query_as::<_, (String, String, i32, i32, i32)>(
+            "select * from control.run_privacy_retention_batch($1,$2,1,$3,1)",
+        )
+        .bind(run_id)
+        .bind(operation_id)
+        .bind(&lease_owner)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(first.0, "more");
+        assert_eq!(first.2, 1);
+        let durable_progress = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "select retention_phase,invitation_cursor,invitation_high_water,invitation_candidates
+             from control.retention_runs where id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(durable_progress.0, "invitations");
+        assert!(durable_progress.1 > 0);
+        assert!(durable_progress.1 <= durable_progress.2);
+        assert_eq!(durable_progress.3, 1);
+
+        // This row is deliberately backdated after the run snapshot. Its
+        // monotonic identity exceeds the frozen high-water mark, so it must be
+        // deferred instead of being skipped behind the cursor.
+        let late_invitation = Uuid::new_v4();
+        let late_email = format!("retention-late-{late_invitation}@example.test");
+        let late_sequence: i64 = sqlx::query_scalar(
+            "insert into control.invitations(
+               id,workshop_id,email,role,invited_by,idempotency_key,created_at,expires_at
+             ) values($1,$2,$3,'viewer',$4,$5,
+                      now()-interval '40002 days',now()-interval '40001 days')
+             returning retention_sequence",
+        )
+        .bind(late_invitation)
+        .bind(free_workshop)
+        .bind(&late_email)
+        .bind(operator)
+        .bind(format!("retention-test:{late_invitation}"))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(late_sequence > durable_progress.2);
+
+        let stale = sqlx::query("select * from control.run_privacy_retention_batch($1,$2,1,$3,1)")
+            .bind(run_id)
+            .bind(operation_id)
+            .bind("privacy-retention-stale-owner")
+            .fetch_one(store.pool())
+            .await;
+        assert!(stale.is_err());
+        let after_stale: i64 = sqlx::query_scalar(
+            "select invitation_candidates from control.retention_runs where id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(after_stale, 1);
+
+        for _ in 0..8 {
+            let step = sqlx::query_as::<_, (String, String, i32, i32, i32)>(
+                "select * from control.run_privacy_retention_batch($1,$2,1,$3,1)",
+            )
+            .bind(run_id)
+            .bind(operation_id)
+            .bind(&lease_owner)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            if step.0 == "complete" {
+                break;
+            }
+        }
+        let (state, evidence) = sqlx::query_as::<_, (String, Value)>(
+            "select state,evidence from control.retention_runs where id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(evidence["candidates"]["invitations"], 2);
+        assert_eq!(evidence["held"]["invitations"], 1);
+        assert_eq!(evidence["anonymized_invitation_count"], 1);
+        assert_eq!(evidence["candidates"]["operation_details"], 2);
+        assert_eq!(evidence["held"]["operation_details"], 1);
+        assert_eq!(evidence["redacted_operation_count"], 1);
+
+        let held_email: String =
+            sqlx::query_scalar("select email from control.invitations where id=$1")
+                .bind(held_invitation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(held_email.contains("retention-held"));
+        let free_email: String =
+            sqlx::query_scalar("select email from control.invitations where id=$1")
+                .bind(free_invitation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            free_email,
+            format!("retained-invitation-{free_invitation}@invalid")
+        );
+        let held_payload: Value =
+            sqlx::query_scalar("select payload from control.operations where id=$1")
+                .bind(held_operation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(held_payload["personal_marker"], "held-personal-marker");
+        let free_payload: Value =
+            sqlx::query_scalar("select payload from control.operations where id=$1")
+                .bind(free_operation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(free_payload, json!({"redacted":true}));
+
+        let replay = sqlx::query_as::<_, (String, String, i32, i32, i32)>(
+            "select * from control.run_privacy_retention_batch($1,$2,1,$3,1)",
+        )
+        .bind(run_id)
+        .bind(operation_id)
+        .bind(&lease_owner)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(replay.0, "complete");
+        let replay_candidates: i64 = sqlx::query_scalar(
+            "select invitation_candidates from control.retention_runs where id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(replay_candidates, 2);
+
+        let deferred_email: String =
+            sqlx::query_scalar("select email from control.invitations where id=$1")
+                .bind(late_invitation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(deferred_email, late_email);
+
+        // Held candidates are also intentionally behind this run's cursor.
+        // Releasing the hold makes them eligible only for a new snapshot/run.
+        sqlx::query(
+            "update control.legal_holds set released_at=now(),released_by=$1,version=version+1,
+             release_reason_code='retention_test_release' where approval_ref='retention-test-hold'",
+        )
+        .bind(operator)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let second_run = Uuid::new_v4();
+        let second_operation = Uuid::new_v4();
+        let second_owner = format!("privacy-retention-test-{second_operation}");
+        sqlx::query(
+            "insert into control.operations(
+               id,kind,queue,payload,correlation_id,idempotency_key,state,attempt,leased_by,lease_expires_at
+             ) values($1,'privacy.retention','privacy-operations',$2,$3,$4,'in_flight',1,$5,now()+interval '10 minutes')",
+        )
+        .bind(second_operation)
+        .bind(json!({"retention_run_id":second_run}))
+        .bind(Uuid::new_v4())
+        .bind(format!("retention-run:{second_run}"))
+        .bind(&second_owner)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("insert into control.retention_runs(id,policy_version,operation_id,dry_run) values($1,$2,$3,false)")
+            .bind(second_run).bind(policy_version).bind(second_operation)
+            .execute(store.pool()).await.unwrap();
+        for _ in 0..6 {
+            let step = sqlx::query_as::<_, (String, String, i32, i32, i32)>(
+                "select * from control.run_privacy_retention_batch($1,$2,1,$3,200)",
+            )
+            .bind(second_run)
+            .bind(second_operation)
+            .bind(&second_owner)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            if step.0 == "complete" {
+                break;
+            }
+        }
+        let second_state: String =
+            sqlx::query_scalar("select state from control.retention_runs where id=$1")
+                .bind(second_run)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(second_state, "completed");
+        let (released_email, included_email) = sqlx::query_as::<_, (String, String)>(
+            "select (select email from control.invitations where id=$1),
+                    (select email from control.invitations where id=$2)",
+        )
+        .bind(held_invitation)
+        .bind(late_invitation)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            released_email,
+            format!("retained-invitation-{held_invitation}@invalid")
+        );
+        assert_eq!(
+            included_email,
+            format!("retained-invitation-{late_invitation}@invalid")
+        );
+        let released_payload: Value =
+            sqlx::query_scalar("select payload from control.operations where id=$1")
+                .bind(held_operation)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(released_payload, json!({"redacted":true}));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn export_cleanup_lease_serializes_replicas_and_fences_takeover() {
+        let database_url =
+            std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
+        let store = Store::connect(&database_url).await.unwrap();
+        store.migrate().await.unwrap();
+        sqlx::query(
+            "update control.privacy_export_cleanup_lease
+             set lease_owner=null,lease_token=null,lease_expires_at=null",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let first_owner = format!("privacy-cleanup-first-{}", Uuid::new_v4());
+        let second_owner = format!("privacy-cleanup-second-{}", Uuid::new_v4());
+        let first = sqlx::query_as::<_, (Uuid, i64)>(
+            "select * from control.claim_privacy_export_cleanup($1)",
+        )
+        .bind(&first_owner)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let excluded = sqlx::query_as::<_, (Uuid, i64)>(
+            "select * from control.claim_privacy_export_cleanup($1)",
+        )
+        .bind(&second_owner)
+        .fetch_optional(store.pool())
+        .await
+        .unwrap();
+        assert!(excluded.is_none());
+
+        sqlx::query(
+            "update control.privacy_export_cleanup_lease set lease_expires_at=now()-interval '1 second'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let second = sqlx::query_as::<_, (Uuid, i64)>(
+            "select * from control.claim_privacy_export_cleanup($1)",
+        )
+        .bind(&second_owner)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(second.1, first.1 + 1);
+
+        let stale_renewal: bool =
+            sqlx::query_scalar("select control.renew_privacy_export_cleanup($1,$2,$3) is true")
+                .bind(&first_owner)
+                .bind(first.0)
+                .bind(first.1)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(!stale_renewal);
+        let subject = Uuid::new_v4();
+        let request = Uuid::new_v4();
+        let export = Uuid::new_v4();
+        let storage_ref = format!("file:{export}.aead");
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(subject)
+            .bind(format!("privacy-cleanup-{subject}@example.test"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into control.data_subject_requests(id,subject_user_id,request_type)
+             values($1,$2,'access')",
+        )
+        .bind(request)
+        .bind(subject)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into control.data_subject_exports(
+               id,data_subject_request_id,storage_ref,encryption_key_ref,
+               manifest_digest,state,expires_at
+             ) values($1,$2,$3,'test-key',$4,'expired',now()+interval '1 hour')",
+        )
+        .bind(export)
+        .bind(request)
+        .bind(&storage_ref)
+        .bind(format!("sha256:{}", "a".repeat(64)))
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let stale_mark: bool = sqlx::query_scalar(
+            "select control.mark_privacy_export_artifact_purged($1,$2,$3,$4,$5) is true",
+        )
+        .bind(export)
+        .bind(&storage_ref)
+        .bind(&first_owner)
+        .bind(first.0)
+        .bind(first.1)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(!stale_mark);
+        let current_mark: bool = sqlx::query_scalar(
+            "select control.mark_privacy_export_artifact_purged($1,$2,$3,$4,$5) is true",
+        )
+        .bind(export)
+        .bind(&storage_ref)
+        .bind(&second_owner)
+        .bind(second.0)
+        .bind(second.1)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(current_mark);
+        let recorded_ref: String =
+            sqlx::query_scalar("select storage_ref from control.data_subject_exports where id=$1")
+                .bind(export)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(recorded_ref, format!("purged:{storage_ref}"));
+        let current_release: bool =
+            sqlx::query_scalar("select control.release_privacy_export_cleanup($1,$2,$3) is true")
+                .bind(&second_owner)
+                .bind(second.0)
+                .bind(second.1)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(current_release);
+    }
+
+    #[test]
+    fn export_effects_follow_fleet_and_tenant_snapshots() {
+        let source = include_str!("privacy.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let prepare = production
+            .split("async fn prepare_data_subject_export(")
+            .nth(1)
+            .unwrap()
+            .split("async fn ensure_erasure_tombstone(")
+            .next()
+            .unwrap();
+        let fleet_snapshot = prepare.find("privacy_export_snapshot(").unwrap();
+        let tenant_snapshot = prepare.find("tenant_export_memberships(").unwrap();
+        let processor_effect = prepare.find("processor_exports(").unwrap();
+        assert!(fleet_snapshot < tenant_snapshot && tenant_snapshot < processor_effect);
+
+        let tenant_function = production
+            .split("async fn tenant_export_memberships(")
+            .nth(1)
+            .unwrap()
+            .split("async fn prepare_data_subject_export(")
+            .next()
+            .unwrap();
+        assert!(tenant_function.contains("tenant_store"));
+        assert!(tenant_function.contains(".begin(*workshop_id)"));
+        assert!(tenant_function.contains("m.workshop_id=$1 and m.user_id=$2"));
+        assert!(tenant_function.contains("tx.commit()"));
+
+        let handler = production
+            .split("pub(crate) async fn data_subject_request(")
+            .nth(1)
+            .unwrap();
+        assert!(handler.contains("operation_id=$2 and subject_user_id=$3"));
+        let bound_request = handler
+            .find("operation_id=$2 and subject_user_id=$3")
+            .unwrap();
+        let lease = handler.find("verify_operation_lease(").unwrap();
+        let cleanup = handler.find("cleanup_export_artifacts(").unwrap();
+        assert!(bound_request < lease && lease < cleanup);
+        let export = handler.find("prepare_data_subject_export(").unwrap();
+        assert!(handler[export..].contains("set state='acknowledged'"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn completion_is_fenced_to_the_bound_operation_lease() {
+        let database_url =
+            std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
+        let store = Store::connect(&database_url).await.unwrap();
+        store.migrate().await.unwrap();
+        let subject = Uuid::new_v4();
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(subject)
+            .bind(format!("privacy-fence-{subject}@example.test"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let operation = |id: Uuid, leased_by: String| LeasedOperation {
+            id,
+            kind: "privacy.data_subject_request".into(),
+            workshop_id: None,
+            target_user_id: Some(subject),
+            desired_epoch: None,
+            payload: json!({}),
+            attempt: 1,
+            max_attempts: 3,
+            leased_by,
+            reconciling: false,
+            trace_parent: None,
+            trace_state: None,
+        };
+        let bound_id = Uuid::new_v4();
+        let wrong_id = Uuid::new_v4();
+        let bound = operation(bound_id, format!("privacy-bound-{bound_id}"));
+        let wrong = operation(wrong_id, format!("privacy-wrong-{wrong_id}"));
+        for candidate in [&bound, &wrong] {
+            sqlx::query(
+                "insert into control.operations(
+                   id,kind,queue,target_user_id,payload,correlation_id,idempotency_key,
+                   state,attempt,max_attempts,leased_by,lease_expires_at
+                 ) values($1,'privacy.data_subject_request','privacy-operations',$2,$3,$4,$5,
+                          'in_flight',1,3,$6,now()+interval '10 minutes')",
+            )
+            .bind(candidate.id)
+            .bind(subject)
+            .bind(json!({"request_id": Uuid::new_v4()}))
+            .bind(Uuid::new_v4())
+            .bind(format!("privacy-fence-operation:{}", candidate.id))
+            .bind(&candidate.leased_by)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let request = Uuid::new_v4();
+        sqlx::query(
+            "insert into control.data_subject_requests(
+               id,subject_user_id,request_type,scope,status,operation_id
+             ) values($1,$2,'access','{\"workshop_ids\":[]}'::jsonb,'executing',$3)",
+        )
+        .bind(request)
+        .bind(subject)
+        .bind(bound.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let task = Uuid::new_v4();
+        sqlx::query(
+            "insert into control.data_subject_processor_tasks(
+               id,data_subject_request_id,processor_key,action
+             ) values($1,$2,'control','export')",
+        )
+        .bind(task)
+        .bind(request)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            complete_dsr(&store, &wrong, request, true).await,
+            Err(IntegrationError::UnknownOutcome)
+        );
+        let unchanged = sqlx::query_as::<_, (String, String)>(
+            "select r.status,t.state from control.data_subject_requests r
+             join control.data_subject_processor_tasks t on t.data_subject_request_id=r.id
+             where r.id=$1 and t.id=$2",
+        )
+        .bind(request)
+        .bind(task)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(unchanged, ("executing".into(), "pending".into()));
+
+        complete_dsr(&store, &bound, request, true).await.unwrap();
+        let completed = sqlx::query_as::<_, (String, String)>(
+            "select r.status,t.state from control.data_subject_requests r
+             join control.data_subject_processor_tasks t on t.data_subject_request_id=r.id
+             where r.id=$1 and t.id=$2",
+        )
+        .bind(request)
+        .bind(task)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(completed, ("completed".into(), "acknowledged".into()));
     }
 }

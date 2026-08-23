@@ -8,6 +8,13 @@ check:
 	python3 tools/test_local_secret_bootstrap.py
 	python3 tools/test_dynamic_secret_boundary.py
 	python3 tools/test_privacy_deployment_gate.py
+	python3 tools/test_tenant_query_scope.py
+	python3 tools/test_tenant_execution_scope.py
+	python3 tools/test_worker_execution_scope.py
+	python3 tools/test_release_host_guard.py
+	python3 tools/test_environment_access.py
+	python3 tools/test_http_client_construction.py
+	python3 tools/test_log_safety.py
 	python3 tools/test_topology_odoo_isolation.py --self-test
 	python3 tools/test_workspace_configuration.py
 	cargo clippy --locked --all-targets -- -D warnings

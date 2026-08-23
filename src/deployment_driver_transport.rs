@@ -1,26 +1,17 @@
 use std::path::Path;
 use std::time::Duration;
 
-pub fn client(
-    token: Option<&str>,
-    timeout: Duration,
-    socket: Option<&Path>,
-) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none());
+use crate::outbound_http::TraceRequestBuilderExt as _;
+
+pub fn client(timeout: Duration, socket: Option<&Path>) -> anyhow::Result<reqwest::Client> {
+    let mut builder =
+        crate::outbound_http::internal_service_builder("mb-control-plane/deployment-driver")
+            .timeout(timeout);
     if let Some(socket) = socket {
         if !socket.is_absolute() {
             anyhow::bail!("CONTROL_DEPLOYMENT_DRIVER_SOCKET must be absolute");
         }
         builder = builder.unix_socket(socket);
-    }
-    if let Some(token) = token {
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
-        value.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        builder = builder.default_headers(headers);
     }
     Ok(builder.build()?)
 }
@@ -34,4 +25,13 @@ pub fn configured_socket() -> anyhow::Result<Option<std::path::PathBuf>> {
         anyhow::bail!("CONTROL_DEPLOYMENT_DRIVER_SOCKET must be absolute");
     }
     Ok(socket)
+}
+
+/// Adds request-local trace context to an authenticated deployment-driver call.
+///
+/// The client can use a Unix socket, but the request still crosses the durable
+/// control-plane/driver boundary and is safe to correlate. Docker Engine API
+/// requests use a different client and deliberately do not receive this header.
+pub fn traced(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request.with_current_trace_context()
 }

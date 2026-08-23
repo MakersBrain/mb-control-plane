@@ -14,7 +14,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::api_error::ApiError;
-use crate::domain::WorkshopRole;
+use crate::domain::{WorkshopPermission, WorkshopRole};
+use crate::outbound_http::{TraceRequestBuilderExt as _, external_api_builder};
 use crate::persistence::Store;
 
 const JWKS_MAX_BYTES: usize = 256 * 1024;
@@ -34,6 +35,67 @@ pub struct WorkshopAuthority {
     pub workshop_id: Uuid,
     pub role: WorkshopRole,
     pub epoch: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkshopScope {
+    pub workshop_id: Uuid,
+    pub principal_id: Uuid,
+    pub role: WorkshopRole,
+    pub authority_epoch: i32,
+    pub permission: WorkshopPermission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformPermission {
+    ViewPlatform,
+    AdministerPlatform,
+    OperateFleet,
+    RunRetention,
+    ReviewPrivacy,
+    RespondSecurity,
+    AssessIncident,
+}
+
+impl PlatformPermission {
+    pub(crate) fn allows(self, roles: &[String]) -> bool {
+        let has = |expected: &str| roles.iter().any(|role| role == expected);
+        match self {
+            Self::ViewPlatform => !roles.is_empty(),
+            Self::AdministerPlatform => has("technical_admin"),
+            Self::OperateFleet => has("technical_admin") || has("release_operator"),
+            Self::RunRetention => has("technical_admin") || has("privacy_reviewer"),
+            Self::ReviewPrivacy => has("privacy_reviewer"),
+            Self::RespondSecurity => has("security_responder"),
+            Self::AssessIncident => has("security_responder") || has("privacy_reviewer"),
+        }
+    }
+}
+
+/// Platform identity whose requested capability was authorized by route
+/// middleware. Keeping the principal private prevents handlers from
+/// constructing an authority scope from an authenticated identity alone.
+#[derive(Debug, Clone)]
+pub struct PlatformScope {
+    principal: Principal,
+    permission: PlatformPermission,
+}
+
+impl PlatformScope {
+    pub(crate) fn new(principal: Principal, permission: PlatformPermission) -> Self {
+        Self {
+            principal,
+            permission,
+        }
+    }
+
+    pub(crate) fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    pub(crate) fn permission(&self) -> PlatformPermission {
+        self.permission
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,11 +167,9 @@ pub struct Authenticator {
 
 impl Authenticator {
     pub fn new(issuer: Url, audience: String, discovery_url: Url) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = external_api_builder("mb-control-plane")
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-control-plane")
             .build()?;
         Ok(Self {
             issuer: issuer.to_string(),
@@ -380,6 +440,7 @@ impl Authenticator {
         let response = self
             .http
             .get(url.clone())
+            .with_current_trace_context()
             .send()
             .await?
             .error_for_status()?;

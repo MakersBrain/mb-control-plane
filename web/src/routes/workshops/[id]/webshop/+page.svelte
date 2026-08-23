@@ -5,14 +5,11 @@
 	import OperationCard from '$lib/components/OperationCard.svelte';
 	import { request } from '$lib/session.svelte';
 	import type { WorkshopSummary } from '$lib/types';
-
-	type Check = { key:string; label:string; ready:boolean; count?:number; next_action:string; href?:string };
-	type Issue = { key:string; category:string; state:string; count:number; safe_error_class?:string; next_action:string; href?:string; operation_id?:string; can_retry:boolean };
-	type Dashboard = { state:string; version:number; etag:string; operation_id?:string; operation_state?:string; last_checked_at?:string; completed_at?:string; checks:Check[]; issues:Issue[]; can_manage:boolean; odoo_url?:string };
+	import type { WebshopDashboardResponse, WebshopOnboardingCommandResponse } from '$lib/generated/control-api';
 
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<WorkshopSummary>();
-	let dashboard = $state<Dashboard>();
+	let dashboard = $state<WebshopDashboardResponse>();
 	let error = $state(''); let notice = $state(''); let busy = $state('');
 	const ready = $derived(Boolean(dashboard && dashboard.checks.every((check) => check.ready) && dashboard.issues.length === 0));
 
@@ -21,7 +18,7 @@
 		try {
 			[workshop, dashboard] = await Promise.all([
 				request<WorkshopSummary>(`/v1/workshops/${id}`),
-				request<Dashboard>(`/v1/workshops/${id}/webshop`)
+				request<WebshopDashboardResponse>(`/v1/workshops/${id}/webshop`)
 			]);
 			error = '';
 		} catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
@@ -29,7 +26,7 @@
 	async function refresh() {
 		if (!dashboard) return; busy = 'refresh'; error = ''; notice = '';
 		try {
-			const result = await request<{operation_id?:string}>(`/v1/workshops/${id}/webshop/onboarding/refresh`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID(),'if-match':dashboard.etag} });
+			const result = await request<WebshopOnboardingCommandResponse>(`/v1/workshops/${id}/webshop/onboarding/refresh`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID(),'if-match':dashboard.etag} });
 			notice = 'The readiness observation is running. You can leave this page and resume later.';
 			await load();
 			if (result.operation_id && dashboard) dashboard.operation_id = result.operation_id;

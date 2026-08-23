@@ -48,8 +48,10 @@ fn configured_key_id(environment: &str) -> Result<String, IntegrationError> {
 }
 
 fn retained_export_keys() -> Result<std::collections::BTreeMap<String, String>, IntegrationError> {
-    let path = std::env::var("CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE")
-        .map_err(|_| IntegrationError::Unauthorized)?;
+    let path = crate::runtime_secret::required_configuration(
+        "CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE",
+    )
+    .map_err(|_| IntegrationError::Unauthorized)?;
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(IntegrationError::ContractDrift);
@@ -91,7 +93,10 @@ pub(crate) fn validate_export_configuration() -> Result<(), IntegrationError> {
     let _ = export_key_id()?;
     let _ = key("CONTROL_PRIVACY_EXPORT_KEY")?;
     let _ = export_root()?;
-    if std::env::var_os("CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE").is_some() {
+    if crate::runtime_secret::configuration("CONTROL_PRIVACY_EXPORT_DECRYPTION_KEYS_FILE")
+        .map_err(|_| IntegrationError::Unauthorized)?
+        .is_some()
+    {
         let _ = retained_export_keys()?;
     }
     Ok(())
@@ -125,8 +130,8 @@ pub(crate) fn encrypt_export(
 }
 
 fn export_root() -> Result<PathBuf, IntegrationError> {
-    let configured =
-        std::env::var("CONTROL_PRIVACY_EXPORT_ROOT").map_err(|_| IntegrationError::Unauthorized)?;
+    let configured = crate::runtime_secret::required_configuration("CONTROL_PRIVACY_EXPORT_ROOT")
+        .map_err(|_| IntegrationError::Unauthorized)?;
     let path = PathBuf::from(configured);
     if !path.is_absolute() {
         return Err(IntegrationError::ContractDrift);

@@ -275,7 +275,7 @@ pub fn document() -> Value {
     for route in routes {
         let path = route.path;
         let method = route.method;
-        let secured = route.secured;
+        let security_scheme = route.access.security_scheme();
         let item = paths
             .entry(path)
             .or_insert_with(|| Value::Object(Map::new()))
@@ -333,12 +333,9 @@ pub fn document() -> Value {
         } else {
             "workshops"
         };
-        let security = if !secured {
-            json!([])
-        } else if path.starts_with("/v1/platform/") {
-            json!([{"rauthyOperator":[]}])
-        } else {
-            json!([{"rauthy":[]}])
+        let security = match security_scheme {
+            None => json!([]),
+            Some(scheme) => json!([{scheme: []}]),
         };
         let success_schema = match (path, method) {
             ("/v1/me", "get") => json!({"$ref":"#/components/schemas/MeResponse"}),
@@ -828,6 +825,23 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(contract_operations, router_operations);
+    }
+
+    #[test]
+    fn route_access_drives_openapi_security() {
+        let contract = document();
+        for route in crate::api::routes::specs() {
+            let actual = &contract["paths"][route.path][route.method]["security"];
+            let expected = match route.access.security_scheme() {
+                None => json!([]),
+                Some(scheme) => json!([{scheme: []}]),
+            };
+            assert_eq!(
+                actual, &expected,
+                "{} {} has security metadata inconsistent with its route access policy",
+                route.method, route.path
+            );
+        }
     }
 
     #[test]

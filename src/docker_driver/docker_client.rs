@@ -1,6 +1,12 @@
+use std::collections::BTreeSet;
+
 use super::*;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
+
+// Docker Engine calls may use a Unix socket and are local runtime-control
+// protocol messages rather than service-to-service HTTP. They deliberately do
+// not receive W3C headers; operation IDs already correlate runtime mutations.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DockerRestartPolicy {
@@ -100,6 +106,100 @@ pub(super) async fn docker_exec(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(DriverError::internal("Docker exec timeout"))
+}
+
+/// Execute a fixed, driver-owned command and return bounded stdout.
+///
+/// `Tty=true` makes the Docker Engine return an unframed byte stream. This is
+/// used only for small machine-readable observations; caller-controlled input
+/// must never reach `command`.
+pub(super) async fn docker_exec_capture(
+    state: &DriverState,
+    container: &str,
+    command: &[&str],
+    maximum_output: usize,
+) -> Result<Vec<u8>, DriverError> {
+    let response = state
+        .runtime
+        .client
+        .post(
+            state
+                .runtime
+                .endpoint(&format!("/containers/{container}/exec")),
+        )
+        .json(&json!({
+            "AttachStdout":true,
+            "AttachStderr":true,
+            "Tty":true,
+            "Cmd":command
+        }))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker observation exec create returned {}",
+            response.status()
+        )));
+    }
+    let id = response
+        .json::<Value>()
+        .await
+        .map_err(DriverError::internal)?
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DriverError::internal("Docker observation exec id missing"))?
+        .to_owned();
+    let response = state
+        .runtime
+        .client
+        .post(state.runtime.endpoint(&format!("/exec/{id}/start")))
+        .json(&json!({"Detach":false,"Tty":true}))
+        .send()
+        .await
+        .map_err(DriverError::internal)?;
+    if !response.status().is_success() {
+        return Err(DriverError::internal(format!(
+            "Docker observation exec start returned {}",
+            response.status()
+        )));
+    }
+    let mut output = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(DriverError::internal)?;
+        if output.len().saturating_add(chunk.len()) > maximum_output {
+            return Err(DriverError::internal(
+                "Docker observation output exceeded its bound",
+            ));
+        }
+        output.extend_from_slice(&chunk);
+    }
+    for _ in 0..50 {
+        let value = state
+            .runtime
+            .client
+            .get(state.runtime.endpoint(&format!("/exec/{id}/json")))
+            .send()
+            .await
+            .map_err(DriverError::internal)?
+            .json::<Value>()
+            .await
+            .map_err(DriverError::internal)?;
+        if value.get("Running").and_then(Value::as_bool) == Some(false) {
+            return match value.get("ExitCode").and_then(Value::as_i64) {
+                Some(0) => Ok(output),
+                Some(code) => Err(DriverError::internal(format!(
+                    "container observation command exited with {code}"
+                ))),
+                None => Err(DriverError::internal(
+                    "Docker observation exec exit code missing",
+                )),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(DriverError::internal("Docker observation exec timed out"))
 }
 
 pub(super) async fn docker_container_exists(
@@ -206,17 +306,99 @@ pub(super) async fn docker_inspect_container(
     response.json().await.map_err(DriverError::internal)
 }
 
-pub(super) async fn docker_workspace_containers(
+pub(super) const WORKSPACE_RUNTIME_PAGE_LIMIT: usize = 500;
+const WORKSPACE_RUNTIME_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct WorkspaceRuntimePage {
+    pub(super) names: Vec<String>,
+    pub(super) next_cursor: Option<String>,
+}
+
+fn parse_workspace_runtime_page(
+    rows: Vec<Value>,
+    limit: usize,
+) -> Result<WorkspaceRuntimePage, DriverError> {
+    if !(1..=WORKSPACE_RUNTIME_PAGE_LIMIT).contains(&limit) || rows.len() > limit {
+        return Err(DriverError::internal(
+            "workspace runtime page exceeded its bound",
+        ));
+    }
+    let mut names = Vec::with_capacity(rows.len());
+    let mut ids = BTreeSet::new();
+    let mut next_cursor = None;
+    for row in rows {
+        let id = row
+            .get("Id")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                (12..=64).contains(&value.len())
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| DriverError::internal("workspace runtime cursor is invalid"))?;
+        if !ids.insert(id.to_owned()) {
+            return Err(DriverError::internal(
+                "workspace runtime page contains duplicate cursors",
+            ));
+        }
+        let aliases = row
+            .get("Names")
+            .and_then(Value::as_array)
+            .filter(|values| values.len() == 1)
+            .ok_or_else(|| DriverError::internal("workspace runtime name is ambiguous"))?;
+        let name = aliases[0]
+            .as_str()
+            .and_then(|value| value.strip_prefix('/'))
+            .filter(|value| !value.is_empty())
+            .filter(|value| !value.starts_with('/'))
+            .ok_or_else(|| DriverError::internal("workspace runtime name is invalid"))?;
+        validate_name(name)?;
+        names.push(name.to_owned());
+        next_cursor = Some(id.to_owned());
+    }
+    names.sort();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DriverError::internal(
+            "workspace runtime page contains duplicate names",
+        ));
+    }
+    Ok(WorkspaceRuntimePage { names, next_cursor })
+}
+
+pub(super) async fn docker_workspace_container_page(
     state: &DriverState,
-) -> Result<Vec<String>, DriverError> {
+    before: Option<&str>,
+    limit: usize,
+) -> Result<WorkspaceRuntimePage, DriverError> {
+    if !(1..=WORKSPACE_RUNTIME_PAGE_LIMIT).contains(&limit)
+        || before.is_some_and(|value| {
+            !(12..=64).contains(&value.len())
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(DriverError::internal(
+            "workspace runtime page request is invalid",
+        ));
+    }
     let filters = json!({
         "label": [format!("mb.workspace={}", state.config.workspace_namespace)]
     })
     .to_string();
-    let query: String = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("all", "true")
-        .append_pair("filters", &filters)
-        .finish();
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("all", "true")
+            .append_pair("filters", &filters)
+            .append_pair("limit", &limit.to_string());
+        if let Some(before) = before {
+            query.append_pair("before", before);
+        }
+        query.finish()
+    };
     let response = state
         .runtime
         .client
@@ -230,19 +412,48 @@ pub(super) async fn docker_workspace_containers(
             response.status()
         )));
     }
-    let rows = response
-        .json::<Vec<Value>>()
-        .await
-        .map_err(DriverError::internal)?;
-    let mut names = rows
-        .iter()
-        .filter_map(|row| row.get("Names").and_then(Value::as_array))
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|name| name.trim_start_matches('/').to_owned())
-        .collect::<Vec<_>>();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(DriverError::internal)?;
+        if body.len().saturating_add(chunk.len()) > WORKSPACE_RUNTIME_PAGE_MAX_BYTES {
+            return Err(DriverError::internal(
+                "workspace runtime page body exceeded its bound",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let rows = serde_json::from_slice::<Vec<Value>>(&body).map_err(DriverError::internal)?;
+    parse_workspace_runtime_page(rows, limit)
+}
+
+pub(super) async fn docker_workspace_containers(
+    state: &DriverState,
+) -> Result<Vec<String>, DriverError> {
+    let mut names = Vec::new();
+    let mut before = None;
+    loop {
+        let page =
+            docker_workspace_container_page(state, before.as_deref(), WORKSPACE_RUNTIME_PAGE_LIMIT)
+                .await?;
+        let full = page.names.len() == WORKSPACE_RUNTIME_PAGE_LIMIT;
+        if full && page.next_cursor.as_deref() == before.as_deref() {
+            return Err(DriverError::internal(
+                "workspace runtime cursor did not advance",
+            ));
+        }
+        before = page.next_cursor;
+        names.extend(page.names);
+        if !full {
+            break;
+        }
+    }
     names.sort();
-    names.dedup();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DriverError::internal(
+            "workspace runtime inventory contains duplicate names",
+        ));
+    }
     Ok(names)
 }
 
@@ -699,6 +910,80 @@ mod tests {
         assert_eq!(
             job.pointer("/HostConfig/RestartPolicy/Name"),
             Some(&json!("no"))
+        );
+    }
+
+    #[test]
+    fn workspace_runtime_pages_are_bounded_and_cursor_by_server_order() {
+        let page = parse_workspace_runtime_page(
+            vec![
+                json!({"Id":"bbbbbbbbbbbb", "Names":["/mb-z"]}),
+                json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a"]}),
+            ],
+            2,
+        )
+        .unwrap();
+        assert_eq!(page.names, vec!["mb-a", "mb-z"]);
+        assert_eq!(page.next_cursor.as_deref(), Some("aaaaaaaaaaaa"));
+
+        assert!(
+            parse_workspace_runtime_page(vec![json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a"]})], 0,)
+                .is_err()
+        );
+        assert!(
+            parse_workspace_runtime_page(
+                vec![
+                    json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a"]}),
+                    json!({"Id":"bbbbbbbbbbbb", "Names":["/mb-b"]}),
+                ],
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_runtime_pages_reject_ambiguous_or_duplicate_identity() {
+        assert!(
+            parse_workspace_runtime_page(
+                vec![json!({"Id":"not-a-container-id", "Names":["/mb-a"]})],
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_runtime_page(
+                vec![json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a", "/mb-alias"]})],
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_runtime_page(
+                vec![json!({"Id":"aaaaaaaaaaaa", "Names":["//mb-a"]})],
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_runtime_page(
+                vec![
+                    json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a"]}),
+                    json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-b"]}),
+                ],
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_runtime_page(
+                vec![
+                    json!({"Id":"aaaaaaaaaaaa", "Names":["/mb-a"]}),
+                    json!({"Id":"bbbbbbbbbbbb", "Names":["/mb-a"]}),
+                ],
+                2,
+            )
+            .is_err()
         );
     }
 }
