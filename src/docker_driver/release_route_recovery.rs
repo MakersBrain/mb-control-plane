@@ -258,7 +258,7 @@ pub(super) fn restore_release_prior_authorized(
 }
 
 /// Publish or resume an exact candidate in the forward direction only.
-pub(super) fn publish_release_candidate_forward(
+fn publish_release_candidate_forward(
     _guard: &SharedOdooHostGuard,
     route_root: &Path,
     request: ReleasePublicationRecoveryRequest<'_>,
@@ -337,6 +337,21 @@ pub(super) fn publish_release_candidate_forward(
             Ok(ReleaseMutationOutcome::Applied)
         }
     }
+}
+
+/// Publish only with the opaque capability minted by the 0041 database
+/// adapter after an immutable runtime receipt has authorized this exact
+/// candidate intent.
+pub(super) fn publish_release_candidate_forward_authorized(
+    guard: &SharedOdooHostGuard,
+    route_root: &Path,
+    request: ReleasePublicationRecoveryRequest<'_>,
+    authorization: &super::release_route_recovery_db::ReleaseRecoveryCandidatePublicationAuthorization,
+) -> io::Result<ReleaseMutationOutcome> {
+    authorization
+        .validate_publication_request(&request)
+        .map_err(|error| io::Error::other(error.1))?;
+    publish_release_candidate_forward(guard, route_root, request, || Ok(()))
 }
 
 fn require_running_identity(

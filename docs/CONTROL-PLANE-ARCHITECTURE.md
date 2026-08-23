@@ -267,8 +267,10 @@ sentinels prevent an empty or unauthorized query from being mistaken for end
 of scan. The driver adapter reuses the normal release snapshot validator, so
 projection shape, target slot, digests, fences, and ordering have one policy.
 Only `control_driver_ledger` receives execute permission; no role receives
-direct table access. Runtime expectation/observation, completion receipts,
-independent terminal review, and production recovery dispatch remain absent.
+direct table access. Runtime expectation/observation, completion receipts, and
+the candidate-forward effect path are supplied by the later dormant recovery
+composition; independent terminal review and production dispatch remain
+absent.
 
 Migration 0040 adds a claim-authenticated runtime-expectation boundary without
 turning database state into runtime evidence. It returns the exact release
@@ -298,10 +300,15 @@ response or decision digest. Both receipts are immutable and replay-safe,
 their tables have no runtime-role data privileges, and private compatibility
 primitives have no runtime execute grants. The typed Rust adapters use closed
 outcomes, strict response validation, and tracing that records only safe
-operation identity and outcome fields. These adapters remain private and have
-no scheduler or production call site; 0041 therefore improves the dormant
-recovery protocol without enabling filesystem, container, gateway, or database
-effects.
+operation identity and outcome fields. A private dormant coordinator now
+composes the bounded snapshot, immutable candidate seal, opaque runtime receipt,
+database-issued exact publication authority, guarded selector publication,
+gateway reload, and opaque post-publication route proof. It renews the claim
+around external effects, reopens an exact sealed generation after the
+filesystem-before-database crash window, and stops at an
+`AwaitingIndependentReview` handoff. The adapters and coordinator remain
+private with no scheduler or production call site, so 0041 still does not
+activate recovery effects.
 
 Runtime evidence now has one Rust provenance boundary as well. The private
 `release_runtime_observation` module owns the only constructor for a verified

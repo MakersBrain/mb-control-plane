@@ -596,6 +596,46 @@ fn interrupted_release_runtime_receipt_and_review_are_separate_capabilities() {
     assert!(!migration.contains("grant delete"));
 }
 
+#[test]
+fn candidate_forward_recovery_requires_an_exact_receipted_route_proof() {
+    let recovery = include_str!("../migrations/0037_release_route_publication_recovery.sql");
+    let receipt = include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql");
+
+    for required in [
+        "(select count(*) from jsonb_object_keys(p_observation_evidence))<>11",
+        "'observed_directory_inode','observed_loaded_identity','maintenance_artifact','candidate_artifact'",
+        "v_selector<>v_seal.selector",
+        "v_device is distinct from v_seal.directory_device",
+        "v_inode is distinct from v_seal.directory_inode",
+        "not control.valid_release_route_loaded_identity(v_identity)",
+        "'overlay_kind','candidate','route_set_digest',v_seal.route_set_digest",
+        "recovery_authorization.authorization_kind='publish_candidate' and recovery_authorization.response=p_candidate_response",
+        "p_observation_evidence->'maintenance_artifact' is distinct from jsonb_build_object",
+        "p_observation_evidence->'candidate_artifact' is distinct from jsonb_build_object",
+        "'publication_started',true",
+    ] {
+        assert!(
+            recovery.contains(required),
+            "missing route-proof fence: {required}"
+        );
+    }
+
+    for required in [
+        "if p_authorization_kind='publish_candidate' then return 'runtime_observation_required'",
+        "'candidate',v_observation.completion_response",
+        "if p_candidate_response is not null then return 'runtime_observation_required'",
+        "auth.response=observation.completion_response",
+        "p_observation_evidence,v_observation.completion_response",
+        "resolution.candidate_response=observation.completion_response",
+        "review.decision='accept_candidate'",
+    ] {
+        assert!(
+            receipt.contains(required),
+            "missing receipt/review fence: {required}"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires a PostgreSQL 17 CONTROL_TEST_ADMIN_URL with CREATEDB"]
 async fn interrupted_release_runtime_receipt_review_acl_is_role_separated() {

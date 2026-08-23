@@ -454,6 +454,12 @@ impl ReleaseGenerationDirectory {
         })
     }
 
+    pub(super) fn sealed_evidence(&self) -> io::Result<&SealedReleaseGeneration> {
+        self.sealed
+            .as_ref()
+            .ok_or_else(|| invalid_state("release generation is not sealed"))
+    }
+
     fn finish_seal(
         &mut self,
         hasher: Sha256,
@@ -1054,6 +1060,32 @@ fn fold_evidence(hasher: &mut Sha256, evidence: &ReleaseRouteSealEvidence) -> io
     update_field(hasher, evidence.projection_digest.as_bytes())?;
     update_field(hasher, evidence.applied_rendered_digest.as_bytes())?;
     update_field(hasher, evidence.rendered_digest.as_bytes())
+}
+
+/// Compute the exact digest that sealing will persist, without touching the
+/// filesystem. Recovery uses this only to authenticate a sealed generation
+/// left by a crash before its database seal was recorded.
+pub(super) fn release_route_set_digest(
+    evidence: &[ReleaseRouteSealEvidence],
+) -> io::Result<String> {
+    if !(1..=MAX_RELEASE_ROUTES).contains(&evidence.len()) {
+        return Err(invalid_input(
+            "release generation route count is outside its bound",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"mb-release-route-overlay-v1\0");
+    let mut previous = None;
+    for item in evidence {
+        if previous.is_some_and(|workshop| workshop >= item.workshop_id) {
+            return Err(invalid_input(
+                "release seal evidence must be strictly workshop ordered",
+            ));
+        }
+        fold_evidence(&mut hasher, item)?;
+        previous = Some(item.workshop_id);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn verify_evidence_manifest(

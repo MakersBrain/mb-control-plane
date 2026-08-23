@@ -20,6 +20,7 @@ use super::release_route_publication_db::{
     ReleaseRouteCompletionResponse, ReleaseRouteSnapshotItem, validate_completion_identity,
     validate_release_snapshot_rows,
 };
+use super::release_route_recovery_observation::VerifiedReleaseRecoveryRouteObservation;
 use super::release_runtime_observation::VerifiedReleaseRuntimeObservation;
 use super::route_generation_fs::{PriorSelector, validate_digest, validate_selector_target};
 use super::{ControlOperationLease, DriverError};
@@ -335,6 +336,187 @@ impl ReadReleaseRecoveryRuntimeExpectation {
 pub(super) struct ReleaseRecoveryRuntimeReceipt {
     pub observation_digest: String,
     pub completion_response: ReleaseRouteCompletionResponse,
+}
+
+/// Opaque durable authority to publish the exact candidate selected by a
+/// recovery claim. Only the database adapter can mint this value, and only
+/// after migration 0041 has bound the immutable runtime receipt to the
+/// candidate authorization row.
+#[derive(Clone)]
+pub(super) struct ReleaseRecoveryCandidatePublicationAuthorization {
+    facts: ReleaseRecoveryCandidatePublicationFacts,
+    observation_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseRecoveryCandidatePublicationFacts {
+    driver_operation_id: Uuid,
+    control_operation_id: Uuid,
+    control_operation_attempt: i32,
+    control_operation_owner: String,
+    reconciliation_owner: Uuid,
+    reconciliation_token: Uuid,
+    claim_fence: i64,
+    fleet_run_id: Uuid,
+    original_global_fence_token: i64,
+    target_slot: ReleaseTargetSlot,
+    interrupted_phase: ReleaseRecoveryPhase,
+    candidate_selector: PriorSelector,
+    candidate_identity: ReleaseOverlayGenerationIdentity,
+    route_count: usize,
+    prior_selector: PriorSelector,
+}
+
+impl ReleaseRecoveryCandidatePublicationAuthorization {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        claim: &ReleaseRecoveryClaim,
+        state: &ReleaseRecoveryState,
+        observation_digest: &str,
+    ) -> Self {
+        Self::mint(claim, state, observation_digest).expect("valid test publication authority")
+    }
+
+    fn mint(
+        claim: &ReleaseRecoveryClaim,
+        state: &ReleaseRecoveryState,
+        observation_digest: &str,
+    ) -> Result<Self, DriverError> {
+        if !digest(observation_digest) {
+            return Err(invalid("release recovery observation digest is invalid"));
+        }
+        Ok(Self {
+            facts: candidate_publication_facts(claim, state)?,
+            observation_digest: observation_digest.to_owned(),
+        })
+    }
+
+    pub(super) fn validate_for(
+        &self,
+        claim: &ReleaseRecoveryClaim,
+        state: &ReleaseRecoveryState,
+    ) -> Result<(), DriverError> {
+        if !digest(&self.observation_digest)
+            || self.facts != candidate_publication_facts(claim, state)?
+        {
+            return Err(invalid(
+                "release recovery candidate publication authorization differs",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_publication_request(
+        &self,
+        request: &super::release_route_recovery::ReleasePublicationRecoveryRequest<'_>,
+    ) -> Result<(), DriverError> {
+        let phase_matches = matches!(
+            (self.facts.interrupted_phase, request.phase),
+            (
+                ReleaseRecoveryPhase::CandidateStaging,
+                super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed
+            ) | (
+                ReleaseRecoveryPhase::CandidateSealed,
+                super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed
+            ) | (
+                ReleaseRecoveryPhase::CandidatePublicationStarted,
+                super::release_route_recovery::ReleaseRecoveryPhase::CandidatePublicationStarted
+            ) | (
+                ReleaseRecoveryPhase::AwaitingWorkerFinalize,
+                super::release_route_recovery::ReleaseRecoveryPhase::AwaitingWorkerFinalize
+            )
+        );
+        if !digest(&self.observation_digest)
+            || !phase_matches
+            || request.intent.driver_operation_id != self.facts.driver_operation_id
+            || request.intent.fleet_run_id != self.facts.fleet_run_id
+            || request.intent.original_global_fence_token != self.facts.original_global_fence_token
+            || request.intent.target_slot != self.facts.target_slot
+            || request.intent.overlay_kind != ReleaseOverlayKind::Candidate
+            || request.overlay_identity != &self.facts.candidate_identity
+            || request.route_count != self.facts.route_count
+            || request.overlay_selector != &self.facts.candidate_selector
+            || request.prior_selector != &self.facts.prior_selector
+        {
+            return Err(invalid(
+                "release recovery candidate publication request is unauthorized",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn candidate_publication_facts(
+    claim: &ReleaseRecoveryClaim,
+    state: &ReleaseRecoveryState,
+) -> Result<ReleaseRecoveryCandidatePublicationFacts, DriverError> {
+    validate_claim(claim)?;
+    validate_state_for_claim(claim, state)?;
+    if state.claim_mode != ReleaseRecoveryClaimMode::ForwardOnly
+        || !state.external_effects_started
+        || !matches!(
+            state.interrupted_phase,
+            ReleaseRecoveryPhase::CandidateStaging
+                | ReleaseRecoveryPhase::CandidateSealed
+                | ReleaseRecoveryPhase::CandidatePublicationStarted
+                | ReleaseRecoveryPhase::AwaitingWorkerFinalize
+        )
+        || !(1..=MAX_ROUTES).contains(&state.snapshot_count)
+    {
+        return Err(invalid(
+            "release recovery state cannot authorize candidate publication",
+        ));
+    }
+    let candidate = state
+        .candidate_artifact
+        .as_ref()
+        .ok_or_else(|| invalid("release recovery candidate artifact is absent"))?;
+    candidate.identity.validate()?;
+    if candidate.identity.fleet_run_id != state.fleet_run_id
+        || candidate.identity.driver_operation_id != state.driver_operation_id
+        || candidate.identity.original_global_fence_token != state.original_global_fence_token
+        || candidate.identity.overlay_kind != ReleaseOverlayKind::Candidate
+        || candidate.identity.target_slot != state.target_slot
+        || state.candidate_selector
+            != ReleaseGenerationName::new(state.fleet_run_id, ReleaseOverlayKind::Candidate)
+                .selector_target()
+    {
+        return Err(invalid(
+            "release recovery candidate artifact cannot be authorized",
+        ));
+    }
+    let candidate_selector = PriorSelector::from_recorded(
+        state.candidate_selector.clone(),
+        candidate.directory_device,
+        candidate.directory_inode,
+    )
+    .map_err(DriverError::internal)?;
+    let prior_selector = state
+        .prior
+        .clone()
+        .ok_or_else(|| invalid("release recovery prior selector is absent"))?;
+    if candidate_selector == prior_selector {
+        return Err(invalid(
+            "release recovery candidate and prior selectors are equal",
+        ));
+    }
+    Ok(ReleaseRecoveryCandidatePublicationFacts {
+        driver_operation_id: claim.driver_operation_id,
+        control_operation_id: claim.control_operation.id,
+        control_operation_attempt: claim.control_operation.attempt,
+        control_operation_owner: claim.control_operation.owner.clone(),
+        reconciliation_owner: claim.reconciliation_owner,
+        reconciliation_token: claim.reconciliation_token,
+        claim_fence: claim.claim_fence,
+        fleet_run_id: state.fleet_run_id,
+        original_global_fence_token: state.original_global_fence_token,
+        target_slot: state.target_slot,
+        interrupted_phase: state.interrupted_phase,
+        candidate_selector,
+        candidate_identity: candidate.identity.clone(),
+        route_count: state.snapshot_count,
+        prior_selector,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -847,9 +1029,17 @@ pub(super) async fn authorize_release_recovery_exchange(
 pub(super) async fn authorize_release_recovery_candidate_from_observation(
     ledger: &PgPool,
     claim: &ReleaseRecoveryClaim,
+    state: &ReleaseRecoveryState,
     observation_digest: &str,
-) -> Result<ReleaseRecoveryTransition, DriverError> {
+) -> Result<
+    (
+        ReleaseRecoveryTransition,
+        Option<ReleaseRecoveryCandidatePublicationAuthorization>,
+    ),
+    DriverError,
+> {
     validate_claim(claim)?;
+    validate_state_for_claim(claim, state)?;
     if !digest(observation_digest) {
         return Err(invalid("release recovery observation digest is invalid"));
     }
@@ -861,11 +1051,48 @@ pub(super) async fn authorize_release_recovery_candidate_from_observation(
     record_parsed_outcome("transition.outcome", &parsed, |result| {
         result.trace_outcome()
     });
-    parsed
+    let transition = parsed?;
+    let authorization = if matches!(
+        transition,
+        ReleaseRecoveryTransition::Authorized | ReleaseRecoveryTransition::Replay
+    ) {
+        Some(ReleaseRecoveryCandidatePublicationAuthorization::mint(
+            claim,
+            state,
+            observation_digest,
+        )?)
+    } else {
+        None
+    };
+    Ok((transition, authorization))
 }
 
-#[tracing::instrument(name = "deployment_driver.release_route_recovery.resolve_dormant", skip_all, fields(driver.operation_id = %claim.driver_operation_id, resolution.kind = observation.resolution_kind.as_str(), transition.outcome = tracing::field::Empty))]
-pub(super) async fn resolve_interrupted_release_route_publication(
+/// Candidate resolution accepts only the opaque result of the guarded local /
+/// runtime / local observer. This prevents a coordinator from assembling
+/// positive candidate evidence from individually plausible fields.
+#[tracing::instrument(name = "deployment_driver.release_route_recovery.resolve_candidate_dormant", skip_all, fields(driver.operation_id = %claim.driver_operation_id, resolution.kind = "candidate", transition.outcome = tracing::field::Empty))]
+pub(super) async fn resolve_interrupted_release_candidate_route_observation(
+    ledger: &PgPool,
+    claim: &ReleaseRecoveryClaim,
+    state: &ReleaseRecoveryState,
+    observation: &VerifiedReleaseRecoveryRouteObservation,
+) -> Result<
+    (
+        ReleaseRecoveryTransition,
+        ReleaseRecoveryObservationEvidence,
+    ),
+    DriverError,
+> {
+    resolve_interrupted_release_route_publication(
+        ledger,
+        claim,
+        state,
+        observation.database_observation(),
+    )
+    .await
+}
+
+async fn resolve_interrupted_release_route_publication(
     ledger: &PgPool,
     claim: &ReleaseRecoveryClaim,
     state: &ReleaseRecoveryState,
@@ -1941,6 +2168,157 @@ mod tests {
             claim_mode: state.claim_mode,
             ttl_seconds: 300,
         }
+    }
+
+    fn publication_state() -> ReleaseRecoveryState {
+        let mut state = recovery_state();
+        state.candidate_selector =
+            ReleaseGenerationName::new(state.fleet_run_id, ReleaseOverlayKind::Candidate)
+                .selector_target();
+        state.prior =
+            Some(PriorSelector::from_recorded("generations/boot-live".into(), 10, 11).unwrap());
+        state.candidate_artifact = Some(ReleaseRecoveryArtifact {
+            identity: ReleaseOverlayGenerationIdentity::new(
+                state.fleet_run_id,
+                state.driver_operation_id,
+                state.original_global_fence_token,
+                ReleaseOverlayKind::Candidate,
+                format!("sha256:{}", "a".repeat(64)),
+                state.target_slot.as_str(),
+            )
+            .unwrap(),
+            directory_device: 20,
+            directory_inode: 21,
+        });
+        state
+    }
+
+    #[test]
+    fn candidate_publication_authority_binds_the_whole_request() {
+        let state = publication_state();
+        let claim = recovery_claim(&state);
+        let authorization = ReleaseRecoveryCandidatePublicationAuthorization::for_test(
+            &claim,
+            &state,
+            &format!("sha256:{}", "b".repeat(64)),
+        );
+        authorization.validate_for(&claim, &state).unwrap();
+
+        let candidate = state.candidate_artifact.as_ref().unwrap();
+        let selector = PriorSelector::from_recorded(
+            state.candidate_selector.clone(),
+            candidate.directory_device,
+            candidate.directory_inode,
+        )
+        .unwrap();
+        let prior = state.prior.as_ref().unwrap();
+        let intent = super::super::release_generation_fs::ReleaseGenerationIntent::new(
+            state.fleet_run_id,
+            state.driver_operation_id,
+            state.original_global_fence_token,
+            ReleaseOverlayKind::Candidate,
+            state.target_slot.as_str(),
+        )
+        .unwrap();
+        let exact = super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+            phase: super::super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed,
+            intent: intent.clone(),
+            overlay_identity: &candidate.identity,
+            route_count: state.snapshot_count,
+            overlay_selector: &selector,
+            prior_selector: prior,
+        };
+        authorization.validate_publication_request(&exact).unwrap();
+
+        let route_count_drift =
+            super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+                route_count: exact.route_count + 1,
+                ..exact
+            };
+        assert!(
+            authorization
+                .validate_publication_request(&route_count_drift)
+                .is_err()
+        );
+        let selector_drift = PriorSelector::from_recorded(
+            selector.target().to_owned(),
+            selector.directory_device(),
+            selector.directory_inode() + 1,
+        )
+        .unwrap();
+        let wrong_selector =
+            super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+                phase: super::super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed,
+                intent: intent.clone(),
+                overlay_identity: &candidate.identity,
+                route_count: state.snapshot_count,
+                overlay_selector: &selector_drift,
+                prior_selector: prior,
+            };
+        assert!(
+            authorization
+                .validate_publication_request(&wrong_selector)
+                .is_err()
+        );
+        let prior_drift = PriorSelector::from_recorded(
+            prior.target().to_owned(),
+            prior.directory_device(),
+            prior.directory_inode() + 1,
+        )
+        .unwrap();
+        let wrong_prior = super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+            phase: super::super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed,
+            intent: intent.clone(),
+            overlay_identity: &candidate.identity,
+            route_count: state.snapshot_count,
+            overlay_selector: &selector,
+            prior_selector: &prior_drift,
+        };
+        assert!(
+            authorization
+                .validate_publication_request(&wrong_prior)
+                .is_err()
+        );
+        let wrong_phase = super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+            phase:
+                super::super::release_route_recovery::ReleaseRecoveryPhase::CandidatePublicationStarted,
+            intent: intent.clone(),
+            overlay_identity: &candidate.identity,
+            route_count: state.snapshot_count,
+            overlay_selector: &selector,
+            prior_selector: prior,
+        };
+        assert!(
+            authorization
+                .validate_publication_request(&wrong_phase)
+                .is_err()
+        );
+        let mut identity_drift = candidate.identity.clone();
+        identity_drift.route_set_digest = format!("sha256:{}", "c".repeat(64));
+        let wrong_identity =
+            super::super::release_route_recovery::ReleasePublicationRecoveryRequest {
+                phase: super::super::release_route_recovery::ReleaseRecoveryPhase::CandidateSealed,
+                intent,
+                overlay_identity: &identity_drift,
+                route_count: state.snapshot_count,
+                overlay_selector: &selector,
+                prior_selector: prior,
+            };
+        assert!(
+            authorization
+                .validate_publication_request(&wrong_identity)
+                .is_err()
+        );
+
+        let mut changed = state.clone();
+        changed.candidate_artifact.as_mut().unwrap().directory_inode += 1;
+        assert!(authorization.validate_for(&claim, &changed).is_err());
+        let mut changed = state.clone();
+        changed.snapshot_count += 1;
+        assert!(authorization.validate_for(&claim, &changed).is_err());
+        let mut changed = state;
+        changed.prior = Some(prior_drift);
+        assert!(authorization.validate_for(&claim, &changed).is_err());
     }
 
     #[test]

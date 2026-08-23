@@ -12,7 +12,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::gateway::{ReleaseOverlayKind, ReleaseTargetSlot};
-use super::release_generation_fs::{ReleaseGenerationSealer, ReleaseRouteSealEvidence};
+use super::release_generation_fs::{
+    ReleaseGenerationSealer, ReleaseRouteSealEvidence, release_route_set_digest,
+};
 use super::route_generation_fs::{validate_digest, validate_route_bytes};
 use super::route_projection::{
     PaperlessRouteMode, RouteDisposition, RouteProjection, RouteRuntime,
@@ -65,6 +67,34 @@ impl ReleaseRuntimeNameResolver {
         })
     }
 
+    /// Resolve deterministic candidate upstream names from trusted driver
+    /// configuration and the frozen snapshot membership. Live runtime
+    /// existence is proved separately by the opaque runtime observer before
+    /// recovery publication can be authorized.
+    pub(super) fn candidate_runtime_for_snapshot(
+        &self,
+        target_slot: ReleaseTargetSlot,
+        paperless_workshops: impl IntoIterator<Item = Uuid>,
+    ) -> Result<VerifiedReleaseRuntimeContext, DriverError> {
+        let mut paperless_upstreams = BTreeMap::new();
+        for workshop_id in paperless_workshops {
+            if workshop_id.is_nil()
+                || paperless_upstreams
+                    .insert(workshop_id, self.paperless_upstream(workshop_id))
+                    .is_some()
+            {
+                return Err(DriverError::internal(
+                    "release snapshot Paperless membership is invalid",
+                ));
+            }
+        }
+        Ok(VerifiedReleaseRuntimeContext {
+            target_slot,
+            odoo_upstream: self.odoo_upstream(target_slot),
+            paperless_upstreams,
+        })
+    }
+
     fn odoo_upstream(&self, target_slot: ReleaseTargetSlot) -> String {
         format!("{}-odoo-{}", self.workspace_namespace, target_slot.as_str())
     }
@@ -78,7 +108,7 @@ impl ReleaseRuntimeNameResolver {
     }
 
     #[cfg(test)]
-    fn from_test_namespace(workspace_namespace: &str) -> Self {
+    pub(super) fn from_test_namespace(workspace_namespace: &str) -> Self {
         Self {
             workspace_namespace: workspace_namespace.to_owned(),
         }
@@ -160,6 +190,28 @@ impl PreparedReleaseRouteOverlay {
 
     pub(super) fn is_complete(&self) -> bool {
         self.next_row == self.rows.len()
+    }
+
+    /// Exact records expected from a complete staging pass. Used to replay the
+    /// database rows after authenticating a sealed filesystem generation left
+    /// by a crash before the first database record.
+    pub(super) fn records(&self) -> Vec<ReleaseRoutePublicationRecord> {
+        self.rows.iter().map(|row| row.record.clone()).collect()
+    }
+
+    pub(super) fn expected_route_set_digest(&self) -> Result<String, DriverError> {
+        let evidence = self
+            .rows
+            .iter()
+            .map(|row| ReleaseRouteSealEvidence {
+                workshop_id: row.record.workshop_id,
+                projection_generation: row.record.generation,
+                projection_digest: row.record.projection_digest.clone(),
+                applied_rendered_digest: row.record.applied_rendered_digest.clone(),
+                rendered_digest: row.record.rendered_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        release_route_set_digest(&evidence).map_err(DriverError::internal)
     }
 
     /// Cross exactly one sealer durability boundary and return the identical
