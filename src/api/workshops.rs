@@ -65,6 +65,7 @@ pub(super) async fn create_workshop(
     let paperless_hostname = format!("docs-{}.{}", body.slug, state.config.tenant_domain);
     let operation_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
+    let trace_context = crate::telemetry::current_trace_context();
     let mut tx = state.store.begin().await?;
     let semantic_request = json!({
         "slug": body.slug,
@@ -132,9 +133,9 @@ pub(super) async fn create_workshop(
         .await?;
     sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,routable) values($1,$2,'primary',$3,$4,'Primary database',true)")
         .bind(database_id).bind(workshop_id).bind(&database_ref).bind(&public_hostname).execute(&mut *tx).await?;
-    sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key)
-                 values($1,'tenant.provision','tenant-provisioning',$2,$3,1,$4,$3,$5,$6)")
-        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname,"paperless_enabled":false})).bind(correlation_id).bind(format!("command:{command_id}")).execute(&mut *tx).await?;
+    sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key,trace_parent,trace_state)
+                 values($1,'tenant.provision','tenant-provisioning',$2,$3,1,$4,$3,$5,$6,$7,$8)")
+        .bind(operation_id).bind(workshop_id).bind(who.user_id).bind(json!({"generation":1,"database_id":database_id,"database_ref":database_ref,"public_hostname":public_hostname,"paperless_hostname":paperless_hostname,"paperless_enabled":false})).bind(correlation_id).bind(format!("command:{command_id}")).bind(trace_context.trace_parent).bind(trace_context.trace_state).execute(&mut *tx).await?;
     audit_command(
         &mut tx,
         (Some(who.user_id), Some(workshop_id)),

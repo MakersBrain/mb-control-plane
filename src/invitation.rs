@@ -137,6 +137,20 @@ impl InvitationSigner {
 }
 
 impl InvitationVerifier {
+    #[cfg(test)]
+    pub(crate) fn for_api_route_test() -> Self {
+        let public = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-fixtures/invitation-public.pem"
+        ));
+        Self {
+            keys: HashMap::from([(
+                "test-1".into(),
+                DecodingKey::from_ed_pem(public).expect("test invitation public key"),
+            )]),
+        }
+    }
+
     pub fn from_json_file(path: &Path) -> Result<Self, InvitationTokenError> {
         let bytes = std::fs::read(path).map_err(|_| InvitationTokenError::KeyConfiguration)?;
         let configured: VerificationKeySet =

@@ -33,6 +33,7 @@ impl RouteAccess {
 pub(crate) struct PublicRouteSpec {
     pub path: &'static str,
     pub method: &'static str,
+    pub handler: &'static str,
     pub access: RouteAccess,
 }
 
@@ -51,6 +52,7 @@ pub(crate) enum InternalRouteAccess {
 pub(crate) struct InternalRouteSpec {
     pub path: &'static str,
     pub method: &'static str,
+    pub handler: &'static str,
     pub access: InternalRouteAccess,
 }
 
@@ -380,6 +382,7 @@ macro_rules! public_routes {
                     PublicRouteSpec {
                     path: $path,
                     method: stringify!($method),
+                    handler: stringify!($handler),
                     access: route_access!($access $(($permission))?),
                     },
                 )+)+
@@ -494,6 +497,7 @@ macro_rules! internal_routes {
                 $(InternalRouteSpec {
                     path: $path,
                     method: stringify!($method),
+                    handler: stringify!($handler),
                     access: InternalRouteAccess::$access,
                 },)+
             ]
@@ -827,6 +831,34 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_security_inventory_matches_the_route_registries() {
+        let mut actual = String::from("family\tmethod\tpath\taccess\thandler\n");
+        for route in specs() {
+            actual.push_str(&format!(
+                "public\t{}\t{}\t{:?}\t{}\n",
+                route.method.to_ascii_uppercase(),
+                route.path,
+                route.access,
+                route.handler
+            ));
+        }
+        for route in internal_specs() {
+            actual.push_str(&format!(
+                "internal\t{}\t{}\t{:?}\t{}\n",
+                route.method.to_ascii_uppercase(),
+                route.path,
+                route.access,
+                route.handler
+            ));
+        }
+        assert_eq!(
+            actual,
+            include_str!("../../docs/control-plane-route-security-inventory.tsv"),
+            "regenerate the checked-in route security inventory"
+        );
+    }
+
+    #[test]
     fn internal_route_registry_is_complete_explicit_and_builds_without_overlap() {
         let expected = HashSet::from([
             ("post", "/internal/v1/paperless/{workshop_id}/events"),
@@ -929,7 +961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workshop_route_permissions_have_an_executable_role_matrix() {
+    async fn workshop_route_permission_declarations_have_an_executable_role_matrix() {
         let workshop = Uuid::new_v4();
         let routes = specs()
             .into_iter()
@@ -1015,6 +1047,328 @@ mod tests {
             );
             assert_eq!(state.hits.load(Ordering::SeqCst), 1);
         }
+    }
+
+    fn concrete_route_path(path: &str, workshop: Uuid) -> String {
+        let child = Uuid::new_v4().to_string();
+        path.replace("{id}", &workshop.to_string())
+            .replace("{user_id}", &child)
+            .replace("{secret_id}", &child)
+            .replace("{domain_id}", &child)
+            .replace("{recovery_id}", &child)
+            .replace("{module_key}", "webshop")
+    }
+
+    async fn actual_route_status(
+        route: PublicRouteSpec,
+        lookup: Arc<dyn RouteAuthorizationLookup>,
+        state: Arc<AppState>,
+        workshop: Uuid,
+        authenticated: bool,
+    ) -> StatusCode {
+        let app = build(lookup).with_state(state);
+        let method = Method::from_bytes(route.method.to_ascii_uppercase().as_bytes())
+            .expect("registry method");
+        let mut request = Request::builder()
+            .method(method)
+            .uri(concrete_route_path(route.path, workshop));
+        if authenticated {
+            request = request.header(header::AUTHORIZATION, "Bearer route-matrix-test");
+        }
+        app.oneshot(request.body(Body::empty()).expect("route matrix request"))
+            .await
+            .expect("route matrix response")
+            .status()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn actual_workshop_routes_reject_before_handler_database_or_external_effects() {
+        let database_url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for handler-level route matrix");
+        let state = Arc::new(
+            AppState::for_route_test(&database_url)
+                .await
+                .expect("route matrix application state"),
+        );
+        let operation_count_before: i64 =
+            sqlx::query_scalar("select count(*) from control.operations")
+                .fetch_one(state.store.pool())
+                .await
+                .expect("operation count before denied requests");
+        let workshop = Uuid::new_v4();
+        let routes = specs()
+            .into_iter()
+            .filter_map(|route| match route.access {
+                RouteAccess::Workshop(permission) => Some((route, permission)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (route, permission) in routes {
+            let minimum = match permission {
+                WorkshopPermission::ViewWorkshop => WorkshopRole::Viewer,
+                WorkshopPermission::ManageMembers | WorkshopPermission::ManageModules => {
+                    WorkshopRole::StudioManager
+                }
+                WorkshopPermission::ManageDatabase | WorkshopPermission::TransferOwnership => {
+                    WorkshopRole::Owner
+                }
+            };
+            let (authorized, _) = fake_lookup(workshop, Some(minimum));
+            assert_eq!(
+                actual_route_status(route, authorized, state.clone(), workshop, false).await,
+                StatusCode::UNAUTHORIZED,
+                "{} {} entered its real handler without authentication",
+                route.method,
+                route.path
+            );
+
+            let (non_member, _) = fake_lookup(workshop, None);
+            assert_eq!(
+                actual_route_status(route, non_member, state.clone(), workshop, true).await,
+                StatusCode::NOT_FOUND,
+                "{} {} entered its real handler for a non-member",
+                route.method,
+                route.path
+            );
+
+            let (other_workshop, _) = fake_lookup(Uuid::new_v4(), Some(minimum));
+            assert_eq!(
+                actual_route_status(route, other_workshop, state.clone(), workshop, true).await,
+                StatusCode::NOT_FOUND,
+                "{} {} accepted authority for another workshop",
+                route.method,
+                route.path
+            );
+
+            let insufficient = match permission {
+                WorkshopPermission::ViewWorkshop => None,
+                WorkshopPermission::ManageMembers | WorkshopPermission::ManageModules => {
+                    Some(WorkshopRole::Viewer)
+                }
+                WorkshopPermission::ManageDatabase | WorkshopPermission::TransferOwnership => {
+                    Some(WorkshopRole::StudioManager)
+                }
+            };
+            if let Some(insufficient) = insufficient {
+                let (lookup, _) = fake_lookup(workshop, Some(insufficient));
+                assert_eq!(
+                    actual_route_status(route, lookup, state.clone(), workshop, true).await,
+                    StatusCode::FORBIDDEN,
+                    "{} {} entered its real handler with insufficient authority",
+                    route.method,
+                    route.path
+                );
+            }
+        }
+
+        let other_workshop = Uuid::new_v4();
+        let actor = Uuid::new_v4();
+        let other_member = Uuid::new_v4();
+        let fixture_owner = Uuid::new_v4();
+        for (user, label) in [
+            (actor, "actor"),
+            (other_member, "other-member"),
+            (fixture_owner, "owner"),
+        ] {
+            sqlx::query("insert into control.users(id,email) values($1,$2)")
+                .bind(user)
+                .bind(format!("{label}-{}@example.test", user.simple()))
+                .execute(state.store.pool())
+                .await
+                .expect("route matrix user fixture");
+        }
+        for (id, label) in [(workshop, "authorized"), (other_workshop, "other")] {
+            sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,$3,'Europe/Paris')")
+                .bind(id)
+                .bind(format!("route-matrix-{}", id.simple()))
+                .bind(label)
+                .execute(state.store.pool())
+                .await
+                .expect("route matrix workshop fixture");
+        }
+        for id in [workshop, other_workshop] {
+            sqlx::query(
+                "insert into control.memberships(workshop_id,user_id,role) values($1,$2,'owner')",
+            )
+            .bind(id)
+            .bind(fixture_owner)
+            .execute(state.store.pool())
+            .await
+            .expect("route matrix owner fixture");
+        }
+        sqlx::query("insert into control.memberships(workshop_id,user_id,role,authority_epoch) values($1,$2,'studio_manager',7)")
+            .bind(workshop)
+            .bind(actor)
+            .execute(state.store.pool())
+            .await
+            .expect("authorized membership fixture");
+        sqlx::query("insert into control.memberships(workshop_id,user_id,role) values($1,$2,'studio_manager')")
+            .bind(other_workshop)
+            .bind(other_member)
+            .execute(state.store.pool())
+            .await
+            .expect("other-workshop child fixture");
+        let command_count_before: i64 = sqlx::query_scalar("select count(*) from control.commands")
+            .fetch_one(state.store.pool())
+            .await
+            .expect("command count before cross-workshop requests");
+        let (lookup, _) = fake_lookup(workshop, Some(WorkshopRole::StudioManager));
+        let member_path = format!("/v1/workshops/{workshop}/members/{other_member}");
+        let response = build(lookup.clone())
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&member_path)
+                    .header(header::AUTHORIZATION, "Bearer route-matrix-test")
+                    .body(Body::empty())
+                    .expect("cross-workshop member read"),
+            )
+            .await
+            .expect("cross-workshop member read response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = build(lookup)
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(&member_path)
+                    .header(header::AUTHORIZATION, "Bearer route-matrix-test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .header(
+                        header::IF_MATCH,
+                        format!("\"member-{workshop}-{other_member}-v1\""),
+                    )
+                    .body(Body::from(r#"{"role":"viewer"}"#))
+                    .expect("cross-workshop member mutation"),
+            )
+            .await
+            .expect("cross-workshop member mutation response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let other_role: String = sqlx::query_scalar(
+            "select role from control.memberships where workshop_id=$1 and user_id=$2",
+        )
+        .bind(other_workshop)
+        .bind(other_member)
+        .fetch_one(state.store.pool())
+        .await
+        .expect("other-workshop membership after rejected mutation");
+        assert_eq!(other_role, "studio_manager");
+        let command_count_after: i64 = sqlx::query_scalar("select count(*) from control.commands")
+            .fetch_one(state.store.pool())
+            .await
+            .expect("command count after cross-workshop requests");
+        assert_eq!(command_count_after, command_count_before);
+
+        let operation_count_after: i64 =
+            sqlx::query_scalar("select count(*) from control.operations")
+                .fetch_one(state.store.pool())
+                .await
+                .expect("operation count after denied requests");
+        assert_eq!(
+            operation_count_after, operation_count_before,
+            "rejected production routes admitted a durable operation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn actual_http_admission_continues_into_the_durable_worker_trace() {
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("http-worker-trace-test")),
+        );
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let inbound_trace_parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let expected_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+        let database_url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for HTTP-to-worker trace test");
+        let state = Arc::new(
+            AppState::for_route_test(&database_url)
+                .await
+                .expect("trace test application state"),
+        );
+        let principal = Principal {
+            user_id: Uuid::new_v4(),
+            issuer: "https://identity.example.test".into(),
+            subject: format!("trace-user-{}", Uuid::new_v4()),
+            email: format!("trace-{}@example.test", Uuid::new_v4().simple()),
+            recent_strong_authentication: true,
+        };
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(principal.user_id)
+            .bind(&principal.email)
+            .execute(state.store.pool())
+            .await
+            .expect("trace test principal");
+        let lookup: Arc<dyn RouteAuthorizationLookup> = Arc::new(FakeLookup {
+            principal: principal.clone(),
+            authority: None,
+            platform_roles: Vec::new(),
+            platform_role_lookups: Arc::new(AtomicUsize::new(0)),
+        });
+        let slug = format!("trace-{}", Uuid::new_v4().simple());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/workshops")
+            .header(header::AUTHORIZATION, "Bearer trace-test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", Uuid::new_v4().to_string())
+            .header("traceparent", inbound_trace_parent)
+            .header("tracestate", "vendor=value")
+            .body(Body::from(
+                json!({
+                    "slug": slug,
+                    "display_name": "Trace integration workshop",
+                    "country_code": "FR",
+                    "time_zone": "Europe/Paris"
+                })
+                .to_string(),
+            ))
+            .expect("trace integration request");
+        let response = crate::api::app_with_route_lookup(state.clone(), lookup)
+            .oneshot(request)
+            .await
+            .expect("trace integration response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let persisted = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "select trace_parent,trace_state from control.operations
+             where requested_by=$1 and kind='tenant.provision' order by created_at desc limit 1",
+        )
+        .bind(principal.user_id)
+        .fetch_one(state.store.pool())
+        .await
+        .expect("persisted HTTP trace context");
+        let worker_span = tracing::info_span!("durable_operation_integration");
+        assert_eq!(
+            crate::telemetry::attach_durable_trace_parent(
+                &worker_span,
+                persisted.0.as_deref(),
+                persisted.1.as_deref(),
+            ),
+            Ok(true)
+        );
+        let worker_context = worker_span.context();
+        assert_eq!(
+            worker_context.span().span_context().trace_id().to_string(),
+            expected_trace_id
+        );
+
+        drop(_subscriber);
+        provider.shutdown().unwrap();
     }
 
     #[tokio::test]
