@@ -45,6 +45,7 @@ write_named_secret() {
 
 control_password=$(random_hex)
 control_api_password=$(random_hex)
+control_tenant_api_password=$(random_hex)
 control_membership_password=$(random_hex)
 control_provisioning_password=$(random_hex)
 control_invoice_password=$(random_hex)
@@ -70,6 +71,7 @@ source_commit=$(git rev-parse --verify HEAD 2>/dev/null || printf 'unreleased')
 
 write_secret CONTROL_POSTGRES_PASSWORD "$control_password"
 write_secret CONTROL_API_POSTGRES_PASSWORD "$control_api_password"
+write_secret CONTROL_TENANT_API_POSTGRES_PASSWORD "$control_tenant_api_password"
 write_secret CONTROL_MEMBERSHIP_POSTGRES_PASSWORD "$control_membership_password"
 write_secret CONTROL_PROVISIONING_POSTGRES_PASSWORD "$control_provisioning_password"
 write_secret CONTROL_INVOICE_POSTGRES_PASSWORD "$control_invoice_password"
@@ -119,6 +121,7 @@ done
 
 write_named_secret control_database_url "postgresql://control:$control_password@postgres:5432/mb_control"
 write_named_secret control_api_database_url "postgresql://control_api:$control_api_password@postgres:5432/mb_control"
+write_named_secret control_tenant_api_database_url "postgresql://control_tenant_api:$control_tenant_api_password@postgres:5432/mb_control"
 write_named_secret control_membership_database_url "postgresql://control_membership_worker:$control_membership_password@postgres:5432/mb_control"
 write_named_secret control_provisioning_database_url "postgresql://control_provisioning_worker:$control_provisioning_password@postgres:5432/mb_control"
 write_named_secret control_invoice_database_url "postgresql://control_invoice_worker:$control_invoice_password@postgres:5432/mb_control"
@@ -164,6 +167,7 @@ chmod 0644 "$invitation_public"
   printf '%s\n' \
     "CONTROL_POSTGRES_PASSWORD=$(secret_ref CONTROL_POSTGRES_PASSWORD)" \
     "CONTROL_API_POSTGRES_PASSWORD=$(secret_ref CONTROL_API_POSTGRES_PASSWORD)" \
+    "CONTROL_TENANT_API_POSTGRES_PASSWORD=$(secret_ref CONTROL_TENANT_API_POSTGRES_PASSWORD)" \
     "CONTROL_MEMBERSHIP_POSTGRES_PASSWORD=$(secret_ref CONTROL_MEMBERSHIP_POSTGRES_PASSWORD)" \
     "CONTROL_PROVISIONING_POSTGRES_PASSWORD=$(secret_ref CONTROL_PROVISIONING_POSTGRES_PASSWORD)" \
     "CONTROL_INVOICE_POSTGRES_PASSWORD=$(secret_ref CONTROL_INVOICE_POSTGRES_PASSWORD)" \

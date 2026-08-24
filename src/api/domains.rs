@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::auth::WorkshopScope;
+use crate::outbound_http::TraceRequestBuilderExt as _;
+use axum::extract::Extension;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
 use url::{Host, Url};
@@ -7,6 +10,14 @@ use url::{Host, Url};
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct CustomDomainCreateBody {
     hostname: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct EdgeVerificationRecordResponse {
+    #[serde(rename = "type")]
+    record_type: String,
+    name: String,
+    value: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -27,7 +38,7 @@ pub(crate) struct WebshopDomainResponse {
     last_error_class: Option<String>,
     canonical: bool,
     redirect_target: Option<String>,
-    edge_verification_records: Value,
+    edge_verification_records: Vec<EdgeVerificationRecordResponse>,
     operation_id: Option<Uuid>,
     version: i64,
     can_manage: bool,
@@ -120,14 +131,7 @@ pub(crate) fn normalize_custom_hostname(
     Ok(normalized)
 }
 
-async fn require_webshop_manager(state: &AppState, user: Uuid, workshop: Uuid) -> ApiResult<()> {
-    if !authority(state, user, workshop)
-        .await?
-        .0
-        .can_manage_modules()
-    {
-        return Err(ApiError::Forbidden);
-    }
+async fn require_webshop_enabled(state: &AppState, workshop: Uuid) -> ApiResult<()> {
     let enabled = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.workshop_modules
           where workshop_id=$1 and module_key='webshop' and state='enabled')",
@@ -139,6 +143,30 @@ async fn require_webshop_manager(state: &AppState, user: Uuid, workshop: Uuid) -
         return Err(ApiError::Conflict("The webshop must be enabled first"));
     }
     Ok(())
+}
+
+fn edge_verification_records(value: Value) -> Vec<EdgeVerificationRecordResponse> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(32)
+        .filter_map(|candidate| {
+            let candidate = candidate.as_object()?;
+            let bounded = |key: &str, maximum: usize| {
+                candidate
+                    .get(key)?
+                    .as_str()
+                    .filter(|value| !value.is_empty() && value.len() <= maximum)
+                    .map(ToOwned::to_owned)
+            };
+            Some(EdgeVerificationRecordResponse {
+                record_type: bounded("type", 16)?,
+                name: bounded("name", 253)?,
+                value: bounded("value", 4096)?,
+            })
+        })
+        .collect()
 }
 
 fn response(row: DomainRow, can_manage: bool) -> WebshopDomainResponse {
@@ -159,7 +187,7 @@ fn response(row: DomainRow, can_manage: bool) -> WebshopDomainResponse {
         last_error_class: row.last_error_class,
         canonical: row.canonical,
         redirect_target: row.redirect_target,
-        edge_verification_records: row.edge_verification_records,
+        edge_verification_records: edge_verification_records(row.edge_verification_records),
         operation_id: row.operation_id,
         version: row.version,
         can_manage,
@@ -182,19 +210,21 @@ fn txt_answer_matches(payload: &Value, expected: &str) -> bool {
         })
 }
 
-async fn ownership_txt_present(name: &str, expected: &str) -> ApiResult<bool> {
+async fn ownership_txt_present(
+    client: &reqwest::Client,
+    name: &str,
+    expected: &str,
+) -> ApiResult<bool> {
     let mut endpoint = Url::parse("https://cloudflare-dns.com/dns-query")
         .map_err(|error| ApiError::Internal(error.into()))?;
     endpoint
         .query_pairs_mut()
         .append_pair("name", name)
         .append_pair("type", "TXT");
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| ApiError::Internal(error.into()))?
+    let response = client
         .get(endpoint)
         .header(header::ACCEPT, "application/dns-json")
+        .with_current_trace_context()
         .send()
         .await
         .map_err(|_| ApiError::Conflict("DNS verification is temporarily unavailable"))?;
@@ -212,17 +242,16 @@ async fn ownership_txt_present(name: &str, expected: &str) -> ApiResult<bool> {
 
 pub(super) async fn list(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<WebshopDomainResponse>>> {
-    let who = principal(&state, &headers).await?;
-    let role = authority(&state, who.user_id, workshop).await?.0;
+    let workshop = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(workshop).await?;
     let platform = sqlx::query_scalar::<_, String>(
         "select public_hostname from control.odoo_databases
           where workshop_id=$1 and kind='primary' and deleted_at is null",
     )
     .bind(workshop)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *tx)
     .await?;
     let rows = sqlx::query_as::<_, DomainRow>(
         "select id,hostname,state,desired_state,dns_state,certificate_state,
@@ -234,9 +263,10 @@ pub(super) async fn list(
           order by canonical desc,hostname",
     )
     .bind(workshop)
-    .fetch_all(state.store.pool())
+    .fetch_all(&mut *tx)
     .await?;
-    let can_manage = role.can_manage_modules();
+    tx.commit().await?;
+    let can_manage = scope.role.can_manage_modules();
     let mut result = vec![WebshopDomainResponse {
         id: None,
         hostname: platform.clone(),
@@ -254,7 +284,7 @@ pub(super) async fn list(
         last_error_class: None,
         canonical: rows.iter().all(|row| !row.canonical),
         redirect_target: None,
-        edge_verification_records: json!([]),
+        edge_verification_records: Vec::new(),
         operation_id: None,
         version: 1,
         can_manage,
@@ -265,23 +295,24 @@ pub(super) async fn list(
 
 pub(super) async fn create(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
     Json(body): Json<CustomDomainCreateBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_webshop_manager(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let hostname = normalize_custom_hostname(&body.hostname, &state.config.tenant_domain)
         .map_err(ApiError::Validation)?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({"hostname":hostname});
-    let scope = format!("workshop:{workshop}:webshop-domains");
-    let mut tx = state.store.begin().await?;
+    let command_scope = format!("workshop:{workshop}:webshop-domains");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "webshop-domain.create",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -316,24 +347,9 @@ pub(super) async fn create(
     let verification_name = format!("_mb-challenge.{hostname}");
     let verification_value = format!("mb-verification={token}");
     let routing_target = format!("shops.{}", state.config.tenant_domain);
-    let inserted = sqlx::query_as::<_, (Uuid, i64)>(
-        "insert into control.webshop_domains(
-             id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by
-         ) values($1,$2,$3,$4,$5,$6,$7)
-         on conflict(hostname) do update set
-             workshop_id=excluded.workshop_id,
-             verification_name=excluded.verification_name,
-             verification_value=excluded.verification_value,
-             routing_target=excluded.routing_target,
-             state='ownership_pending',desired_state='active',dns_state='pending',
-             certificate_state='pending',ownership_verified_at=null,dns_observed_at=null,
-             certificate_observed_at=null,last_health_checked_at=null,last_error_class=null,
-             canonical=false,redirect_target=null,provider_ref=null,
-             edge_verification_records='[]'::jsonb,operation_id=null,
-             created_by=excluded.created_by,created_at=now(),updated_at=now(),
-             disconnected_at=null,version=control.webshop_domains.version+1
-         where control.webshop_domains.state='disconnected'
-         returning id,version",
+    let (outcome, id, version) = sqlx::query_as::<_, (String, Option<Uuid>, Option<i64>)>(
+        "select outcome,domain_id,domain_version
+           from control.claim_webshop_domain($1,$2,$3,$4,$5,$6,$7)",
     )
     .bind(proposed_id)
     .bind(workshop)
@@ -341,12 +357,23 @@ pub(super) async fn create(
     .bind(&verification_name)
     .bind(&verification_value)
     .bind(&routing_target)
-    .bind(who.user_id)
-    .fetch_optional(&mut *tx)
+    .bind(scope.principal_id)
+    .fetch_one(&mut *tx)
     .await?;
-    let Some((id, version)) = inserted else {
+    if outcome == "conflict" {
         return Err(ApiError::Conflict("This hostname is already claimed"));
-    };
+    }
+    if !matches!(outcome.as_str(), "created" | "reclaimed") {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "webshop domain claim contract drift"
+        )));
+    }
+    let id = id.ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!("webshop domain claim omitted its identity"))
+    })?;
+    let version = version.ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!("webshop domain claim omitted its version"))
+    })?;
     let public = json!({
         "id":id,"hostname":hostname,"kind":"custom_domain",
         "state":"ownership_pending","desired_state":"active",
@@ -358,7 +385,7 @@ pub(super) async fn create(
     });
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "webshop-domain.create",
         "webshop-domain",
         id.to_string(),
@@ -384,20 +411,22 @@ pub(super) async fn create(
 
 pub(super) async fn verify(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path((workshop, domain_id)): Path<(Uuid, Uuid)>,
+    Path((_workshop, domain_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_webshop_manager(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({"domain_id":domain_id});
-    let scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
-    let mut tx = state.store.begin().await?;
+    let command_scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "webshop-domain.verify-ownership",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -441,8 +470,12 @@ pub(super) async fn verify(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
-    let present =
-        ownership_txt_present(&existing.verification_name, &existing.verification_value).await?;
+    let present = ownership_txt_present(
+        &state.dns_client,
+        &existing.verification_name,
+        &existing.verification_value,
+    )
+    .await?;
     sqlx::query(
         "update control.webshop_domains
             set state=case when $3 then 'dns_pending' else 'ownership_pending' end,
@@ -467,17 +500,20 @@ pub(super) async fn verify(
                 target_user_id: None,
                 desired_epoch: None,
                 payload: &json!({"domain_id":domain_id}),
-                requested_by: Some(who.user_id),
+                requested_by: Some(scope.principal_id),
                 correlation_id: Uuid::new_v4(),
                 idempotency_key: &format!("command:{command_id}"),
             },
         )
         .await?;
-        sqlx::query("update control.webshop_domains set operation_id=$2 where id=$1")
-            .bind(domain_id)
-            .bind(operation_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "update control.webshop_domains set operation_id=$2 where id=$1 and workshop_id=$3",
+        )
+        .bind(domain_id)
+        .bind(operation_id)
+        .bind(workshop)
+        .execute(&mut *tx)
+        .await?;
         Some(operation_id)
     } else {
         None
@@ -497,7 +533,7 @@ pub(super) async fn verify(
         .map_err(|error| ApiError::Internal(error.into()))?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         if present {
             "webshop-domain.ownership-verified"
         } else {
@@ -527,21 +563,23 @@ pub(super) async fn verify(
 
 pub(super) async fn make_canonical(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path((workshop, domain_id)): Path<(Uuid, Uuid)>,
+    Path((_workshop, domain_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_webshop_manager(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let version = expected_version(&headers, &format!("webshop-domain-{domain_id}"))?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({"domain_id":domain_id,"version":version});
-    let scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
-    let mut tx = state.store.begin().await?;
+    let command_scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "webshop-domain.make-canonical",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -597,7 +635,7 @@ pub(super) async fn make_canonical(
             target_user_id: None,
             desired_epoch: None,
             payload: &json!({"domain_id":domain_id,"reason":"canonical_changed"}),
-            requested_by: Some(who.user_id),
+            requested_by: Some(scope.principal_id),
             correlation_id: Uuid::new_v4(),
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -638,7 +676,7 @@ pub(super) async fn make_canonical(
         .map_err(|error| ApiError::Internal(error.into()))?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "webshop-domain.make-canonical",
         "webshop-domain",
         domain_id.to_string(),
@@ -664,21 +702,23 @@ pub(super) async fn make_canonical(
 
 pub(super) async fn disconnect(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path((workshop, domain_id)): Path<(Uuid, Uuid)>,
+    Path((_workshop, domain_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    require_webshop_manager(&state, who.user_id, workshop).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let version = expected_version(&headers, &format!("webshop-domain-{domain_id}"))?;
     let client_key = idempotency(&headers)?;
     let semantic = json!({"domain_id":domain_id,"version":version});
-    let scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
-    let mut tx = state.store.begin().await?;
+    let command_scope = format!("workshop:{workshop}:webshop-domain:{domain_id}");
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: scope.principal_id,
+            scope: &command_scope,
             command_kind: "webshop-domain.disconnect",
             idempotency_key: client_key,
             semantic_request: &semantic,
@@ -738,7 +778,7 @@ pub(super) async fn disconnect(
                 "reason":"disconnect",
                 "restore_platform_canonical":was_canonical
             }),
-            requested_by: Some(who.user_id),
+            requested_by: Some(scope.principal_id),
             correlation_id: Uuid::new_v4(),
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -792,7 +832,7 @@ pub(super) async fn disconnect(
         .map_err(|error| ApiError::Internal(error.into()))?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "webshop-domain.disconnect",
         "webshop-domain",
         domain_id.to_string(),
@@ -852,5 +892,21 @@ mod tests {
         ]});
         assert!(txt_answer_matches(&payload, "mb-verification=abc"));
         assert!(!txt_answer_matches(&payload, "mb-verification=other"));
+    }
+
+    #[test]
+    fn edge_verification_projection_exposes_only_complete_typed_records() {
+        let records = edge_verification_records(json!([
+            {"type":"txt","name":"_acme.example.test","value":"proof","provider_debug":"private"},
+            {"type":"txt","name":"missing-value.example.test"},
+            "invalid"
+        ]));
+
+        assert_eq!(records.len(), 1);
+        let public = serde_json::to_value(&records).unwrap();
+        assert_eq!(
+            public,
+            json!([{"type":"txt","name":"_acme.example.test","value":"proof"}])
+        );
     }
 }

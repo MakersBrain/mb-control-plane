@@ -2,9 +2,8 @@ use super::*;
 
 pub(super) async fn platform_overview(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<PlatformOverviewResponse>> {
-    operator(&state, &headers).await?;
     let workshops = sqlx::query_as::<_, (i64, i64, i64)>(
         "select count(*),count(*) filter(where status in ('active','trial')),count(*) filter(where status in ('past_due','restricted','suspended','deleting')) from control.workshops where status<>'deleted'",
     )
@@ -64,9 +63,8 @@ pub(super) async fn platform_overview(
 
 pub(super) async fn platform_workshops(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<PlatformWorkshopResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid,String,String,String,String,OffsetDateTime,i64,i64)>(
         "select w.id,w.slug,w.display_name,w.status,w.plan,w.created_at,count(distinct m.user_id) filter(where m.status='active'),count(distinct s.id) filter(where s.health in ('degraded','failed')) from control.workshops w left join control.memberships m on m.workshop_id=w.id left join control.service_instances s on s.workshop_id=w.id where w.status<>'deleted' group by w.id order by w.created_at desc,w.id",
     )
@@ -90,10 +88,9 @@ pub(super) async fn platform_workshops(
 
 pub(super) async fn platform_workshop(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<PlatformWorkshopDetailResponse>> {
-    operator(&state, &headers).await?;
     let workshop = sqlx::query_as::<_, (String,String,String,String,Option<String>,Option<String>,OffsetDateTime,i64)>(
         "select slug,display_name,status,plan,legal_name,country_code,created_at,version from control.workshops where id=$1",
     ).bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
@@ -198,11 +195,12 @@ pub(crate) struct DeleteWorkshopBody {
 pub(super) async fn platform_delete_workshop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
     Json(body): Json<DeleteWorkshopBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     confirm_slug(&state, id, &body.confirmation).await?;
     let client_key = idempotency(&headers)?.to_owned();
     let expected = expected_version(&headers, &format!("workshop-{id}"))?;
@@ -210,6 +208,7 @@ pub(super) async fn platform_delete_workshop(
     let correlation = Uuid::new_v4();
     let semantic = json!({"confirmation":body.confirmation});
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -344,13 +343,15 @@ pub(super) async fn platform_delete_workshop(
 pub(super) async fn platform_reconcile_workshop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin", "release_operator"]).await?;
+    let who = scope.principal();
     let key = idempotency(&headers)?.to_owned();
     let semantic = json!({"workshop_id":id});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -390,10 +391,12 @@ pub(super) async fn platform_reconcile_workshop(
             ));
         }
     };
+    let mut snapshot_tx = state.tenant_store.begin(id).await?;
     let tenant=sqlx::query_as::<_,(Uuid,String,String,String)>("select d.id,w.slug,d.database_ref,d.public_hostname from control.workshops w join control.odoo_databases d on d.workshop_id=w.id where w.id=$1 and w.status<>'deleted' and d.kind='primary' and d.deleted_at is null and d.public_hostname is not null")
-        .bind(id).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
-    let paperless_enabled=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')").bind(id).fetch_one(&mut *tx).await?;
-    let custom_hostnames = crate::worker::routable_custom_hostnames(&state.store, id).await?;
+        .bind(id).fetch_optional(&mut *snapshot_tx).await?.ok_or(ApiError::NotFound)?;
+    let paperless_enabled=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')").bind(id).fetch_one(&mut *snapshot_tx).await?;
+    let custom_hostnames = crate::worker::routable_custom_hostnames(&mut snapshot_tx).await?;
+    snapshot_tx.commit().await?;
     let payload = json!({"database_id":tenant.0,"database_ref":tenant.2,"public_hostname":tenant.3,"paperless_hostname":format!("docs-{}.{}",tenant.1,state.config.tenant_domain),"paperless_enabled":paperless_enabled,"custom_hostnames":custom_hostnames});
     let operation_id = Store::enqueue(
         &mut tx,
@@ -446,10 +449,9 @@ pub(super) struct PlatformOperationQuery {
 
 pub(super) async fn platform_operations(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Query(query): Query<PlatformOperationQuery>,
 ) -> ApiResult<Json<Vec<PlatformOperationResponse>>> {
-    operator(&state, &headers).await?;
     if query.state.as_deref().is_some_and(|value| {
         !matches!(
             value,
@@ -500,9 +502,8 @@ async fn platform_operation_rows(
 
 pub(super) async fn platform_users(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<PlatformUserResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,OffsetDateTime,Option<OffsetDateTime>,bool,i64)>(
         "select u.id,u.email,u.display_name,u.locale,u.created_at,u.disabled_at,exists(select 1 from control.external_identities i where i.user_id=u.id and i.disabled_at is null),count(m.workshop_id) filter(where m.status='active') from control.users u left join control.memberships m on m.user_id=u.id group by u.id order by u.created_at desc,u.id",
     ).fetch_all(state.store.pool()).await?;
@@ -524,9 +525,8 @@ pub(super) async fn platform_users(
 
 pub(super) async fn platform_status(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<PlatformStatusResponse>> {
-    operator(&state, &headers).await?;
     let queues = sqlx::query_as::<_, (String,i64,i64,i64,Option<OffsetDateTime>,Option<OffsetDateTime>)>(
         "with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),min(o.created_at) filter(where o.state in ('pending','in_flight','awaiting_reconciliation')),max(o.finished_at) from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue",
     ).fetch_all(state.store.pool()).await?;
@@ -598,9 +598,8 @@ pub(super) async fn platform_status(
 
 pub(super) async fn platform_releases(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<ApplicationReleaseResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (String,String,String,String,String,String,String,i64,OffsetDateTime,OffsetDateTime)>(
         "select id,status,source_commit,odoo_subject_digest,extension_subject_digest,change_class,odoo_version,version,published_at,updated_at
          from control.application_releases order by published_at desc,id desc",
@@ -766,10 +765,9 @@ pub(super) async fn publish_release(
 
 pub(super) async fn platform_release(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Path(id): Path<String>,
 ) -> ApiResult<(HeaderMap, Json<ApplicationReleaseDetailResponse>)> {
-    operator(&state, &headers).await?;
     let row = sqlx::query_as::<
         _,
         (
@@ -848,10 +846,9 @@ pub(super) async fn platform_release(
 
 pub(super) async fn platform_release_tenants(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<TenantReleaseAdoptionResponse>>> {
-    operator(&state, &headers).await?;
     let exists = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.application_releases where id=$1)",
     )
@@ -890,15 +887,17 @@ pub(super) async fn platform_release_tenants(
 pub(super) async fn platform_release_preflight(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin", "release_operator"]).await?;
+    let who = scope.principal();
     let key = idempotency(&headers)?.to_owned();
     let resource = format!("release-{id}");
     let expected = expected_version(&headers, &resource)?;
     let semantic = json!({"release_id":id,"phase":"preflight"});
     let correlation = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1016,11 +1015,12 @@ pub(crate) struct AdoptReleaseBody {
 pub(super) async fn platform_release_adopt(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(scope): Extension<PlatformScope>,
     Path(id): Path<String>,
     Json(body): Json<AdoptReleaseBody>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = platform_role(&state, &headers, &["technical_admin", "release_operator"]).await?;
-    require_step_up(&who)?;
+    let who = scope.principal();
+    require_step_up(who)?;
     if body.confirmation != id {
         return Err(ApiError::Validation(
             "confirmation must exactly match the release id",
@@ -1034,6 +1034,7 @@ pub(super) async fn platform_release_adopt(
     let operation_id = Uuid::new_v4();
     let fleet_run_id = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
+    revalidate_platform_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
@@ -1086,8 +1087,14 @@ pub(super) async fn platform_release_adopt(
             "release preflight must be prepared before adoption",
         ));
     }
-    let tenants=sqlx::query_as::<_,(Uuid,Uuid,String,bool)>("select w.id,d.id,d.database_ref,exists(select 1 from control.workshop_modules m where m.workshop_id=w.id and m.module_key='documents' and m.state='enabled') from control.workshops w join control.odoo_databases d on d.workshop_id=w.id where w.status<>'deleted' and d.kind='primary' and d.deleted_at is null order by w.created_at,w.id for share of w,d")
+    let tenants=sqlx::query_as::<_,(Uuid,Uuid,String,bool)>("select w.id,d.id,d.database_ref,exists(select 1 from control.workshop_modules m where m.workshop_id=w.id and m.module_key='documents' and m.state='enabled') from control.workshops w join control.odoo_databases d on d.workshop_id=w.id where w.status<>'deleted' and d.kind='primary' and d.deleted_at is null order by w.created_at,w.id limit $1 for share of w,d")
+        .bind(i64::try_from(crate::release::MAX_FLEET_TENANTS + 1).map_err(|error|ApiError::Internal(error.into()))?)
         .fetch_all(&mut *tx).await?;
+    if tenants.len() > crate::release::MAX_FLEET_TENANTS {
+        return Err(ApiError::Conflict(
+            "fleet release exceeds the bounded tenant snapshot; chunked adoption is required",
+        ));
+    }
     if tenants.is_empty() {
         let activation = crate::persistence::activate_initial_release(&mut tx, &id)
             .await
@@ -1154,7 +1161,13 @@ pub(super) async fn platform_release_adopt(
     )
     .fetch_one(&mut *tx)
     .await?;
-    let snapshot=Value::Array(tenants.iter().map(|tenant|json!({"workshop_id":tenant.0,"database_id":tenant.1,"database_ref":tenant.2,"paperless_enabled":tenant.3})).collect());
+    let mut snapshot_tenants = tenants.iter().collect::<Vec<_>>();
+    snapshot_tenants.sort_by_key(|tenant| (tenant.0, tenant.1));
+    let snapshot = snapshot_tenants
+        .into_iter()
+        .map(|tenant|json!({"workshop_id":tenant.0,"database_id":tenant.1,"database_ref":tenant.2,"paperless_enabled":tenant.3}))
+        .collect::<Vec<_>>();
+    let snapshot = Value::Array(snapshot);
     sqlx::query("insert into control.release_fleet_runs(id,release_id,operation_id,fleet_generation,state,tenant_snapshot,canary_workshop_id) values($1,$2,$3,$4,'preparing',$5,$6)")
         .bind(fleet_run_id).bind(&id).bind(operation_id).bind(generation).bind(&snapshot).bind(tenants[0].0).execute(&mut *tx).await?;
     for tenant in &tenants {
@@ -1206,9 +1219,9 @@ pub(super) async fn platform_release_adopt(
 pub(super) async fn platform_release_retry_failed(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    platform_role(&state, &headers, &["technical_admin", "release_operator"]).await?;
     let _ = idempotency(&headers)?;
     let resource = format!("release-{id}");
     let _ = expected_version(&headers, &resource)?;
@@ -1223,9 +1236,8 @@ pub(super) async fn platform_release_retry_failed(
 
 pub(super) async fn platform_email_deliveries(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
 ) -> ApiResult<Json<Vec<EmailDeliveryResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid,String,String,String,i32,OffsetDateTime,OffsetDateTime,Option<OffsetDateTime>)>(
         "select id,recipient,template,state,attempts,next_attempt_at,created_at,sent_at from control.outbox order by created_at desc,id desc limit 200",
     ).fetch_all(state.store.pool()).await?;
@@ -1252,10 +1264,9 @@ pub(super) struct PlatformAuditQuery {
 
 pub(super) async fn platform_audit_events(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Query(query): Query<PlatformAuditQuery>,
 ) -> ApiResult<Json<Vec<AuditEventResponse>>> {
-    operator(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid,Option<String>,Option<Uuid>,Option<String>,String,Option<String>,Option<String>,Uuid,String,Value,OffsetDateTime)>(
         "select a.id,u.email,a.workshop_id,w.display_name,a.action,a.target_type,a.target_id,a.correlation_id,a.outcome,a.detail,a.created_at from control.audit_events a left join control.users u on u.audit_subject_id=a.actor_audit_subject_id left join control.workshops w on w.id=a.workshop_id order by a.created_at desc,a.id desc limit $1",
     ).bind(query.limit.unwrap_or(100).clamp(1,200)).fetch_all(state.store.pool()).await?;

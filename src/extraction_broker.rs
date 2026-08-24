@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -18,6 +19,25 @@ use crate::integrations::inventory_vision::{InventoryVisionClient, VisionProvide
 use crate::integrations::product_lookup::UpcItemDbClient;
 
 const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_AZURE_API_VERSION: &str = "2024-11-30";
+const DEFAULT_AZURE_POLL_INTERVAL: Duration = Duration::from_millis(2_000);
+const MAX_AZURE_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+pub struct BrokerConfig {
+    pub listen: SocketAddr,
+    token: String,
+    azure: Option<AzureInvoiceClient>,
+    azure_version: String,
+    vision: Vec<InventoryVisionClient>,
+    product_lookup: Option<UpcItemDbClient>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BrokerNetworkConfig {
+    listen: SocketAddr,
+    azure_api_version: String,
+    azure_poll_interval: Duration,
+}
 
 pub struct BrokerState {
     token: String,
@@ -70,30 +90,24 @@ struct ProductLookupRequest {
     gtin14: String,
 }
 
-impl BrokerState {
+impl BrokerConfig {
     pub fn from_env() -> anyhow::Result<Self> {
+        let network = broker_network_config_with(broker_configuration)?;
+        let token = crate::runtime_secret::required("BROKER_TOKEN").map_err(anyhow::Error::msg)?;
         let endpoint = broker_configuration("BROKER_AZURE_ENDPOINT")?.unwrap_or_default();
         let key = broker_secret("BROKER_AZURE_KEY")?.unwrap_or_default();
         if endpoint.trim().is_empty() != key.trim().is_empty() {
             anyhow::bail!("both Azure endpoint and key must be configured together");
         }
-        let azure_version =
-            std::env::var("BROKER_AZURE_API_VERSION").unwrap_or_else(|_| "2024-11-30".into());
         let azure = if endpoint.trim().is_empty() {
             None
         } else {
             Some(AzureInvoiceClient::new(
                 &endpoint,
                 &key,
-                &azure_version,
+                &network.azure_api_version,
                 Duration::from_secs(45),
-                Duration::from_millis(
-                    std::env::var("BROKER_AZURE_POLL_INTERVAL_MS")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(2_000_u64)
-                        .max(2_000),
-                ),
+                network.azure_poll_interval,
             )?)
         };
         let vision = vision_clients_from_env()?;
@@ -109,14 +123,76 @@ impl BrokerState {
             )?)
         };
         Ok(Self {
-            token: crate::runtime_secret::required("BROKER_TOKEN").map_err(anyhow::Error::msg)?,
+            listen: network.listen,
+            token,
             azure,
-            azure_version,
+            azure_version: network.azure_api_version,
             vision,
             product_lookup,
-            metrics: Mutex::new(BTreeMap::new()),
         })
     }
+}
+
+impl From<BrokerConfig> for BrokerState {
+    fn from(config: BrokerConfig) -> Self {
+        Self {
+            token: config.token,
+            azure: config.azure,
+            azure_version: config.azure_version,
+            vision: config.vision,
+            product_lookup: config.product_lookup,
+            metrics: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+fn broker_network_config_with(
+    lookup: impl Fn(&str) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<BrokerNetworkConfig> {
+    let listen = lookup("BROKER_LISTEN")?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("BROKER_LISTEN is required"))?
+        .parse::<SocketAddr>()
+        .map_err(|error| anyhow::anyhow!("BROKER_LISTEN must be a socket address: {error}"))?;
+
+    let azure_api_version = lookup("BROKER_AZURE_API_VERSION")?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_AZURE_API_VERSION.into());
+    if !valid_api_version(&azure_api_version) {
+        anyhow::bail!("BROKER_AZURE_API_VERSION must use YYYY-MM-DD format");
+    }
+
+    let azure_poll_interval = match lookup("BROKER_AZURE_POLL_INTERVAL_MS")?
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(value) => {
+            let milliseconds = value.parse::<u64>().map_err(|error| {
+                anyhow::anyhow!(
+                    "BROKER_AZURE_POLL_INTERVAL_MS must be an integer number of milliseconds: {error}"
+                )
+            })?;
+            let interval = Duration::from_millis(milliseconds);
+            if !(DEFAULT_AZURE_POLL_INTERVAL..=MAX_AZURE_POLL_INTERVAL).contains(&interval) {
+                anyhow::bail!("BROKER_AZURE_POLL_INTERVAL_MS must be between 2000 and 300000");
+            }
+            interval
+        }
+        None => DEFAULT_AZURE_POLL_INTERVAL,
+    };
+
+    Ok(BrokerNetworkConfig {
+        listen,
+        azure_api_version,
+        azure_poll_interval,
+    })
+}
+
+fn valid_api_version(value: &str) -> bool {
+    value.len() == 10
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
 }
 
 pub fn app(state: BrokerState) -> Router {
@@ -139,12 +215,47 @@ pub fn app(state: BrokerState) -> Router {
             |request: &axum::http::Request<axum::body::Body>| {
                 tracing::info_span!(
                     "broker_http_request",
-                    http_request_method = %request.method(),
-                    http_route = %request.uri().path()
+                    http_request_method = http_method_label(request.method()),
+                    http_route = broker_route_label(request.uri().path())
                 )
             },
         ))
         .with_state(Arc::new(state))
+}
+
+fn http_method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        _ => "other",
+    }
+}
+
+fn broker_route_label(path: &str) -> &'static str {
+    match path {
+        "/health/live" => "/health/live",
+        "/health/ready" => "/health/ready",
+        "/health/vision-ready" => "/health/vision-ready",
+        "/internal/metrics" => "/internal/metrics",
+        "/v1/extract" => "/v1/extract",
+        "/v1/inventory-label/vision" => "/v1/inventory-label/vision",
+        "/v1/products/lookup" => "/v1/products/lookup",
+        _ => "unmatched",
+    }
+}
+
+fn record_provider_failure(
+    provider: &'static str,
+    operation: &'static str,
+    error: &crate::domain::IntegrationError,
+) {
+    tracing::warn!(
+        provider,
+        operation,
+        outcome = "failure",
+        error_class = crate::error_reporting::safe_error_class(error),
+        "extraction provider call failed"
+    );
 }
 
 fn record_provider_metric(
@@ -282,6 +393,9 @@ async fn extract(
                 if result.is_ok() { "success" } else { "failure" },
                 started.elapsed(),
             );
+            if let Err(error) = &result {
+                record_provider_failure("azure-document-intelligence", "invoice", error);
+            }
             let result = result.map_err(|_| StatusCode::BAD_GATEWAY)?;
             let (invoice, confidence, pages) =
                 crate::invoice::normalize_azure(&result).map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -308,6 +422,9 @@ async fn extract(
                 if result.is_ok() { "success" } else { "failure" },
                 started.elapsed(),
             );
+            if let Err(error) = &result {
+                record_provider_failure("azure-document-intelligence", "inventory-ocr", error);
+            }
             let result = result.map_err(|_| StatusCode::BAD_GATEWAY)?;
             let normalized = crate::inventory_label::normalize_azure_read(&result, asset_id)
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -377,6 +494,9 @@ async fn inventory_vision(
             if result.is_ok() { "success" } else { "failure" },
             started.elapsed(),
         );
+        if let Err(error) = &result {
+            record_provider_failure(vision.provider(), "inventory-vision", error);
+        }
         let analysis = match result {
             Ok(result) => result,
             Err(error @ crate::domain::IntegrationError::TooLarge) => {
@@ -440,6 +560,9 @@ async fn product_lookup(
         if result.is_ok() { "success" } else { "failure" },
         started.elapsed(),
     );
+    if let Err(error) = &result {
+        record_provider_failure("upcitemdb", "product-lookup", error);
+    }
     let candidates = result.map_err(|error| match error {
         crate::domain::IntegrationError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         crate::domain::IntegrationError::Unauthorized => StatusCode::BAD_GATEWAY,
@@ -521,6 +644,162 @@ fn broker_secret(name: &str) -> anyhow::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct RecordedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct LogVisitor<'a>(&'a mut String);
+
+    impl Visit for LogVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for RecordedLogs {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut rendered = format!("span={};", attributes.metadata().name());
+            attributes.record(&mut LogVisitor(&mut rendered));
+            self.0.lock().unwrap().push(rendered);
+        }
+
+        fn on_event(&self, event: &Event<'_>, _context: tracing_subscriber::layer::Context<'_, S>) {
+            let mut rendered = String::new();
+            event.record(&mut LogVisitor(&mut rendered));
+            self.0.lock().unwrap().push(rendered);
+        }
+    }
+
+    fn network_config(values: &[(&str, &str)]) -> anyhow::Result<BrokerNetworkConfig> {
+        broker_network_config_with(|name| {
+            Ok(values
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == name).then(|| (*value).into())))
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_tracing_never_records_broker_secrets_or_model_content() {
+        const TOKEN: &str = "broker-bearer-canary-never-log";
+        const EMAIL: &str = "private-broker-canary@example.test";
+        const PAYLOAD: &str = "prompt-and-model-result-payload-canary";
+        const SECRET_PATH: &str = "/run/secrets/broker-provider-key-canary";
+
+        let recorded = RecordedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(recorded.clone());
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let router = app(BrokerState {
+            token: TOKEN.into(),
+            azure: None,
+            azure_version: "fixture".into(),
+            vision: Vec::new(),
+            product_lookup: None,
+            metrics: Mutex::new(BTreeMap::new()),
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/extract")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "task": "invoice",
+                            "mimetype": "image/png",
+                            "source_base64": "cGF5bG9hZA==",
+                            "asset_id": EMAIL,
+                            "prompt": PAYLOAD,
+                            "secret_path": SECRET_PATH
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unmatched = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(SECRET_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let rendered = recorded.0.lock().unwrap().join("\n");
+        assert!(rendered.contains("broker_http_request"));
+        assert!(rendered.contains("/v1/extract"));
+        assert!(rendered.contains("unmatched"));
+        for canary in [TOKEN, EMAIL, PAYLOAD, SECRET_PATH] {
+            assert!(
+                !rendered.contains(canary),
+                "logged private canary: {canary}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_network_configuration_has_typed_documented_defaults() {
+        let config = network_config(&[("BROKER_LISTEN", "127.0.0.1:8080")]).unwrap();
+        assert_eq!(config.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.azure_api_version, DEFAULT_AZURE_API_VERSION);
+        assert_eq!(config.azure_poll_interval, Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn broker_network_configuration_rejects_invalid_values_at_startup() {
+        assert!(network_config(&[]).is_err());
+        assert!(network_config(&[("BROKER_LISTEN", "localhost:8080")]).is_err());
+        assert!(
+            network_config(&[
+                ("BROKER_LISTEN", "127.0.0.1:8080"),
+                ("BROKER_AZURE_API_VERSION", "latest"),
+            ])
+            .is_err()
+        );
+        for interval in ["fast", "1999", "300001"] {
+            assert!(
+                network_config(&[
+                    ("BROKER_LISTEN", "127.0.0.1:8080"),
+                    ("BROKER_AZURE_POLL_INTERVAL_MS", interval),
+                ])
+                .is_err(),
+                "accepted invalid interval {interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_network_configuration_accepts_explicit_tuning() {
+        let config = network_config(&[
+            ("BROKER_LISTEN", "0.0.0.0:9080"),
+            ("BROKER_AZURE_API_VERSION", "2025-05-01"),
+            ("BROKER_AZURE_POLL_INTERVAL_MS", "5000"),
+        ])
+        .unwrap();
+        assert_eq!(config.listen, "0.0.0.0:9080".parse().unwrap());
+        assert_eq!(config.azure_api_version, "2025-05-01");
+        assert_eq!(config.azure_poll_interval, Duration::from_secs(5));
+    }
 
     fn requested_vision<'a>(
         configured: &'a [InventoryVisionClient],

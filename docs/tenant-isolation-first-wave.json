@@ -1,0 +1,407 @@
+{
+  "schema_version": 1,
+  "status": "staged_policies_enforced",
+  "decision": "docs/adr/0008-staged-hybrid-tenant-isolation.md",
+  "scope": "first-wave candidate tables only; ownership_transfers and workshop_recovery_components are enforced candidates and this inventory is not evidence of complete database-enforced tenant isolation",
+  "deployed_runtime_roles": [
+    "control_api",
+    "control_tenant_api",
+    "control_membership_worker",
+    "control_provisioning_worker",
+    "control_invoice_worker",
+    "control_inventory_worker",
+    "control_email_worker",
+    "control_reconciliation_worker",
+    "control_lifecycle_worker",
+    "control_backup_scheduler",
+    "control_driver_ledger",
+    "control_release_worker",
+    "control_privacy_worker"
+  ],
+  "common_readiness_blockers": [
+    "worker fleet and tenant execution scopes are separated for membership-provisioning, email-delivery, and tenant-lifecycle; other queues and non-lifecycle consumers of recovery tables are pending",
+    "the remaining candidate tables do not have reviewed fail-closed policies",
+    "future protected tables and worker scopes are not yet covered by the live direct SQL and production-pool CI matrix"
+  ],
+  "tables": [
+    {
+      "name": "memberships",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/workshops.rs", "src/api/governance.rs", "src/api/platform.rs"],
+        "workers": ["src/worker.rs", "src/workers/privacy.rs", "src/integrations/odoo.rs"],
+        "schedulers": ["src/backup_scheduler.rs"],
+        "drivers": ["src/docker_driver/privacy.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [{"name": "memberships_keep_owner", "function": "control.assert_last_owner", "security_definer": false}],
+        "foreign_keys": [
+          {"constraint": "memberships_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "memberships_user_id_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "membership_targets_workshop_id_user_id_fkey", "direction": "inbound", "related_table": "membership_targets"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "UPDATE"],
+        "control_membership_worker": ["SELECT"],
+        "control_provisioning_worker": ["SELECT"],
+        "control_invoice_worker": ["SELECT"],
+        "control_inventory_worker": ["SELECT"],
+        "control_reconciliation_worker": ["SELECT"],
+        "control_privacy_worker": ["SELECT"],
+        "control_driver_ledger": ["SELECT"],
+        "control_backup_scheduler": ["SELECT"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "split API scopes and classify fleet reads used by backup, privacy, and driver workflows"}
+    },
+    {
+      "name": "invitations",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/workshops.rs", "src/api/internal.rs"],
+        "workers": ["src/workers/email.rs", "src/workers/privacy.rs"],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "invitations_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "invitations_invited_by_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "invitations_accepted_user_id_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "outbox_invitation_id_fkey", "direction": "inbound", "related_table": "outbox"},
+          {"constraint": "outbox_invitation_tenant_recipient_fkey", "direction": "inbound", "related_table": "outbox"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_email_worker": ["SELECT"],
+        "control_privacy_worker": ["SELECT", "UPDATE", "DELETE"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "separate bearer-bootstrap and internal-machine paths from human tenant transactions"}
+    },
+    {
+      "name": "ownership_transfers",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/workshops.rs"],
+        "workers": [],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "ownership_transfers_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "ownership_transfers_from_user_id_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "ownership_transfers_to_user_id_fkey", "direction": "outbound", "related_table": "users"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"]
+      },
+      "rls": {
+        "state": "enforced",
+        "migration": "migrations/0005_tenant_api_identity.sql",
+        "context_helper": "control.current_workshop_id",
+        "enabled": true,
+        "forced": true,
+        "policies": [
+          {"name": "ownership_transfers_migration_owner", "role": "migration owner", "scope": "all rows"},
+          {"name": "ownership_transfers_platform_api", "role": "control_api", "scope": "all rows for platform discovery"},
+          {"name": "ownership_transfers_tenant_api", "role": "control_tenant_api", "scope": "workshop_id equals fail-closed transaction context"}
+        ]
+      },
+      "migration_readiness": {"ready": true, "next_review": "extend the live direct-SQL and production-pool CI matrix to each future protected table and worker scope"}
+    },
+    {
+      "name": "carrier_secrets",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/carrier_secrets.rs"],
+        "workers": ["src/worker.rs", "src/workers/lifecycle.rs"],
+        "schedulers": [],
+        "drivers": ["src/docker_driver/recovery.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "carrier_secrets_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "carrier_secrets_created_by_fkey", "direction": "outbound", "related_table": "users"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_reconciliation_worker": ["SELECT", "UPDATE"],
+        "control_provisioning_worker": ["SELECT", "UPDATE"],
+        "control_lifecycle_worker": ["SELECT", "UPDATE"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "classify secret resolution and lifecycle cleanup as tenant or bounded machine operations"}
+    },
+    {
+      "name": "webshop_domains",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/domains.rs", "src/api/webshop.rs"],
+        "workers": ["src/worker.rs", "src/workers/domains.rs", "src/workers/routes.rs"],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "webshop_domains_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "webshop_domains_created_by_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "webshop_domains_operation_workshop_fkey", "direction": "outbound", "related_table": "operations"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.admit_due_webshop_domain_reconciliations", "reason": "bounded periodic fleet claim atomically returns workshop-owned work"},
+          {"name": "control.admit_due_tenant_reconciliations", "reason": "bounded periodic tenant claim includes the workshop-owned hostname projection"},
+          {"name": "control.advance_webshop_domain_provider_deletion", "reason": "exact live operation lease advances bounded provider-deletion evidence"},
+          {"name": "control.claim_webshop_domain", "reason": "workshop-context and active-manager checked compatibility boundary for the staged hostname uniqueness transition"},
+          {"name": "control.read_startup_route_projection_source", "reason": "exact leased route-rebuild capability projects bounded driver input without direct fleet-table access"}
+        ]
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_reconciliation_worker": ["SELECT", "UPDATE"],
+        "control_lifecycle_worker": ["SELECT", "UPDATE"]
+      },
+      "compatibility_preparation": {
+        "state": "implemented",
+        "evidence": [
+          "all application route-projection reads use WorkshopTransaction",
+          "hostname claims use a stable fixed-path capability and preserve unique-conflict responses",
+          "the compatibility capability preserves disconnected-hostname reuse until the staged partial-index migration redefines it to insert a fresh row"
+        ]
+      },
+      "migration_readiness": {"ready": false, "next_review": "deploy the compatibility preparation, then replace global hostname uniqueness, remove stale direct role grants, and enforce the reviewed tenant policy"}
+    },
+    {
+      "name": "webshop_email_domains",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/email_domains.rs", "src/api/internal.rs", "src/api/webshop.rs"],
+        "workers": ["src/worker.rs", "src/workers/email.rs", "src/workers/email_domains.rs"],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "webshop_email_domains_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "webshop_email_domains_created_by_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "webshop_email_domains_operation_id_fkey", "direction": "outbound", "related_table": "operations"},
+          {"constraint": "webshop_email_domains_test_outbox_id_fkey", "direction": "outbound", "related_table": "outbox"},
+          {"constraint": "webshop_email_domains_test_outbox_tenant_fkey", "direction": "outbound", "related_table": "outbox"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_reconciliation_worker": ["SELECT", "UPDATE"],
+        "control_email_worker": ["SELECT"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "classify internal delivery events and replace fleet reconciliation scans"}
+    },
+    {
+      "name": "workshop_modules",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/carrier_secrets.rs", "src/api/domains.rs", "src/api/email_domains.rs", "src/api/internal.rs", "src/api/platform.rs", "src/api/recovery.rs", "src/api/smtp.rs", "src/api/webshop.rs"],
+        "workers": ["src/worker.rs", "src/workers/extraction.rs", "src/workers/privacy.rs", "src/workers/routes.rs"],
+        "schedulers": ["src/backup_scheduler.rs"],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [{"name": "workshop_module_update", "function": "control.validate_workshop_module_update", "security_definer": false}],
+        "foreign_keys": [
+          {"constraint": "workshop_modules_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "workshop_modules_operation_id_fkey", "direction": "outbound", "related_table": "operations"},
+          {"constraint": "workshop_modules_requested_by_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "workshop_modules_application_release_id_fkey", "direction": "outbound", "related_table": "application_releases"},
+          {"constraint": "workshop_modules_registry_entry_fk", "direction": "outbound", "related_table": "capability_registry_entries"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.read_startup_route_projection_source", "reason": "exact leased route-rebuild capability projects bounded driver input without direct fleet-table access"}
+        ]
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_membership_worker": ["SELECT"],
+        "control_invoice_worker": ["SELECT"],
+        "control_inventory_worker": ["SELECT"],
+        "control_reconciliation_worker": ["SELECT", "UPDATE"],
+        "control_release_worker": ["SELECT", "UPDATE"],
+        "control_backup_scheduler": ["SELECT"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "separate human, internal, platform, scheduler, release, and reconciliation workflows"}
+    },
+    {
+      "name": "service_instances",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/internal.rs", "src/api/platform.rs", "src/api/webshop.rs"],
+        "workers": ["src/worker.rs", "src/workers/lifecycle.rs"],
+        "schedulers": [],
+        "drivers": ["src/docker_driver/privacy.rs", "src/docker_driver/recovery.rs", "src/docker_driver/services.rs", "src/docker_driver/startup.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "service_instances_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "odoo_databases_service_instance_workshop_fkey", "direction": "inbound", "related_table": "odoo_databases"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT"],
+        "control_membership_worker": ["SELECT"],
+        "control_provisioning_worker": ["SELECT", "INSERT", "UPDATE"],
+        "control_invoice_worker": ["SELECT"],
+        "control_inventory_worker": ["SELECT"],
+        "control_reconciliation_worker": ["SELECT", "INSERT", "UPDATE"],
+        "control_lifecycle_worker": ["SELECT", "UPDATE"],
+        "control_release_worker": ["SELECT", "UPDATE"],
+        "control_driver_ledger": ["SELECT", "UPDATE(runtime_spec)"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "model internal callbacks and driver ledger updates as bounded machine operations"}
+    },
+    {
+      "name": "odoo_databases",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/domains.rs", "src/api/internal.rs", "src/api/platform.rs", "src/api/recovery.rs", "src/api/webshop.rs", "src/api/workshops.rs"],
+        "workers": ["src/persistence.rs", "src/worker.rs", "src/workers/extraction.rs", "src/workers/lifecycle.rs", "src/workers/release.rs", "src/workers/routes.rs"],
+        "schedulers": ["src/backup_scheduler.rs"],
+        "drivers": ["src/docker_driver.rs", "src/docker_driver/privacy.rs", "src/docker_driver/recovery.rs", "src/docker_driver/release.rs", "src/docker_driver/startup.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "odoo_databases_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "odoo_databases_service_instance_workshop_fkey", "direction": "outbound", "related_table": "service_instances"},
+          {"constraint": "odoo_databases_source_database_id_workshop_id_fkey", "direction": "self", "related_table": "odoo_databases"},
+          {"constraint": "odoo_recovery_points_database_id_workshop_id_fkey", "direction": "inbound", "related_table": "workshop_recovery_points"},
+          {"constraint": "tenant_release_adoptions_database_workshop_fkey", "direction": "inbound", "related_table": "tenant_release_adoptions"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.initial_release_preparable", "reason": "fleet-empty bootstrap check reads the database registry"}
+        ]
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_provisioning_worker": ["SELECT"],
+        "control_reconciliation_worker": ["SELECT"],
+        "control_lifecycle_worker": ["SELECT", "UPDATE"],
+        "control_backup_scheduler": ["SELECT"],
+        "control_driver_ledger": ["SELECT", "UPDATE"],
+        "control_release_worker": ["SELECT", "UPDATE"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "classify remaining privacy and fleet release coordination after scoped driver-ledger mutations and bounded startup recovery"}
+    },
+    {
+      "name": "workshop_recovery_points",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/platform.rs", "src/api/recovery.rs"],
+        "workers": ["src/workers/lifecycle.rs"],
+        "schedulers": ["src/backup_scheduler.rs"],
+        "drivers": ["src/docker_driver/recovery.rs", "src/docker_driver/release.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "odoo_recovery_points_database_id_workshop_id_fkey", "direction": "outbound", "related_table": "odoo_databases"},
+          {"constraint": "odoo_recovery_points_operation_id_fkey", "direction": "outbound", "related_table": "operations"},
+          {"constraint": "odoo_recovery_points_requested_by_fkey", "direction": "outbound", "related_table": "users"},
+          {"constraint": "odoo_recovery_points_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "workshop_recovery_components_recovery_workshop_fkey", "direction": "inbound", "related_table": "workshop_recovery_components"},
+          {"constraint": "workshop_recovery_rehearsals_recovery_workshop_fkey", "direction": "inbound", "related_table": "workshop_recovery_rehearsals"},
+          {"constraint": "erasure_restore_replays_recovery_workshop_fkey", "direction": "inbound", "related_table": "erasure_restore_replays"},
+          {"constraint": "tenant_release_adoptions_backup_recovery_workshop_fkey", "direction": "inbound", "related_table": "tenant_release_adoptions"},
+          {"constraint": "workshop_deletions_final_recovery_workshop_fkey", "direction": "inbound", "related_table": "workshop_deletions"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_tenant_api": ["SELECT", "INSERT"],
+        "control_lifecycle_worker": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_backup_scheduler": ["SELECT", "INSERT"],
+        "control_driver_ledger": ["SELECT", "UPDATE"],
+        "control_release_worker": ["SELECT", "INSERT", "UPDATE"],
+        "control_privacy_worker": ["SELECT"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "classify remaining privacy and release-worker claims; scheduler and driver recovery mutations are now scoped capabilities"}
+    },
+    {
+      "name": "workshop_recovery_components",
+      "tenant_key": { "kind": "direct_and_parent", "columns": ["workshop_id"], "parent_table": "workshop_recovery_points", "parent_columns": ["recovery_point_id"] },
+      "application_touch_paths": {
+        "api": [],
+        "workers": ["src/workers/lifecycle.rs"],
+        "schedulers": [],
+        "drivers": ["src/docker_driver/recovery.rs"]
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [{"constraint": "workshop_recovery_components_recovery_workshop_fkey", "direction": "outbound", "related_table": "workshop_recovery_points"}],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_lifecycle_worker": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_driver_ledger": ["SELECT", "INSERT", "DELETE"]
+      },
+      "migration_readiness": {"ready": true, "next_review": "extend the same production-role RLS matrix to the recovery parent after scheduler, release, and privacy access is split"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0016_recovery_component_tenant_rls.sql",
+        "policies": [
+          {"name": "workshop_recovery_components_migration_owner", "scope": "migration_owner"},
+          {"name": "workshop_recovery_components_lifecycle_tenant", "scope": "worker_tenant"},
+          {"name": "workshop_recovery_components_driver_tenant", "scope": "driver_tenant"}
+        ]
+      }
+    },
+    {
+      "name": "workshop_recovery_rehearsals",
+      "tenant_key": { "kind": "direct_and_parent", "columns": ["workshop_id"], "parent_table": "workshop_recovery_points", "parent_columns": ["recovery_point_id"] },
+      "application_touch_paths": {
+        "api": ["src/api.rs", "src/api/platform.rs"],
+        "workers": [],
+        "schedulers": ["src/backup_scheduler.rs"],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "workshop_recovery_rehearsals_recovery_workshop_fkey", "direction": "outbound", "related_table": "workshop_recovery_points"},
+          {"constraint": "workshop_recovery_rehearsals_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"}
+        ],
+        "security_definer_functions": []
+      },
+      "current_grants": {
+        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_backup_scheduler": ["SELECT", "INSERT", "UPDATE"]
+      },
+      "migration_readiness": {"ready": false, "next_review": "validate bounded scheduler discovery and scoped claim paths under production load, then design the rehearsal row policy"}
+    }
+  ]
+}

@@ -7,6 +7,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 use super::{bounded_body, classify_status};
 
@@ -19,6 +20,8 @@ const MAX_PRIVACY_DOCUMENTS: usize = 1000;
 pub struct PaperlessClient {
     http: reqwest::Client,
     base_url: Url,
+    authorization: reqwest::header::HeaderValue,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +64,20 @@ fn decode_document(body: &[u8], expected_id: i64) -> Result<Document, Integratio
 
 impl PaperlessClient {
     pub fn new(base_url: &str, token: &str, timeout: Duration) -> anyhow::Result<Self> {
+        Self::with_http(
+            crate::outbound_http::paperless_service_client()?,
+            base_url,
+            token,
+            timeout,
+        )
+    }
+
+    fn with_http(
+        http: reqwest::Client,
+        base_url: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
         if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
             anyhow::bail!("Paperless URL must be absolute HTTP(S)");
@@ -78,16 +95,19 @@ impl PaperlessClient {
         };
         let mut authorization = reqwest::header::HeaderValue::from_str(&authorization_value)?;
         authorization.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-invoice-worker")
-            .build()?;
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http,
+            base_url,
+            authorization,
+            timeout,
+        })
+    }
+
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .timeout(self.timeout)
     }
 
     async fn get(&self, path: &str, maximum: usize) -> Result<(String, Vec<u8>), IntegrationError> {
@@ -96,8 +116,8 @@ impl PaperlessClient {
             .join(path)
             .map_err(|_| IntegrationError::ContractDrift)?;
         let response = self
-            .http
-            .get(url)
+            .request(reqwest::Method::GET, url)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -153,8 +173,8 @@ impl PaperlessClient {
             .query_pairs_mut()
             .append_pair("username__iexact", username);
         let response = self
-            .http
-            .get(users_url)
+            .request(reqwest::Method::GET, users_url)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -279,8 +299,8 @@ impl PaperlessClient {
             return Err(IntegrationError::ContractDrift);
         }
         let response = self
-            .http
-            .get(url)
+            .request(reqwest::Method::GET, url)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -302,11 +322,12 @@ impl PaperlessClient {
             .base_url
             .join(path)
             .map_err(|_| IntegrationError::ContractDrift)?;
-        let mut request = self.http.request(method, url);
+        let mut request = self.request(method, url);
         if let Some(body) = body {
             request = request.json(body);
         }
         let response = request
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -340,8 +361,8 @@ impl PaperlessClient {
             .query_pairs_mut()
             .append_pair("username__iexact", username);
         let response = self
-            .http
-            .get(lookup)
+            .request(reqwest::Method::GET, lookup)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -406,8 +427,8 @@ impl PaperlessClient {
             .query_pairs_mut()
             .append_pair("username__iexact", username);
         let response = self
-            .http
-            .get(lookup)
+            .request(reqwest::Method::GET, lookup)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -546,8 +567,66 @@ impl PaperlessClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn shared_transport_keeps_paperless_credentials_request_scoped() {
+        let shared = crate::outbound_http::internal_service_builder("mb-invoice-worker")
+            .build()
+            .unwrap();
+        let token_client = PaperlessClient::with_http(
+            shared.clone(),
+            "https://paperless.example.test",
+            "tenant-token",
+            Duration::from_secs(17),
+        )
+        .unwrap();
+        let basic_client = PaperlessClient::with_http(
+            shared.clone(),
+            "https://paperless.example.test",
+            "basic:user:password",
+            Duration::from_secs(23),
+        )
+        .unwrap();
+
+        let token_request = token_client
+            .request(
+                reqwest::Method::GET,
+                Url::parse("https://paperless.example.test/api/documents/").unwrap(),
+            )
+            .build()
+            .unwrap();
+        let basic_request = basic_client
+            .request(
+                reqwest::Method::GET,
+                Url::parse("https://paperless.example.test/api/documents/").unwrap(),
+            )
+            .build()
+            .unwrap();
+        let bare_transport_request = shared
+            .get("https://paperless.example.test/api/documents/")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            token_request.headers()[reqwest::header::AUTHORIZATION],
+            "Token tenant-token"
+        );
+        assert_eq!(token_request.timeout(), Some(&Duration::from_secs(17)));
+        assert_eq!(
+            basic_request.headers()[reqwest::header::AUTHORIZATION],
+            "Basic dXNlcjpwYXNzd29yZA=="
+        );
+        assert_eq!(basic_request.timeout(), Some(&Duration::from_secs(23)));
+        assert!(
+            bare_transport_request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
+        assert_eq!(bare_transport_request.timeout(), None);
+    }
 
     #[test]
     fn paperless_original_filename_is_used_when_archive_filename_is_null() {
@@ -567,6 +646,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/users/"))
             .and(query_param("username__iexact", "rauthy-subject"))
+            .and(header("user-agent", "mb-invoice-worker"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "count":1,"results":[{"id":42,"username":"rauthy-subject"}]
             })))

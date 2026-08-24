@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::auth::WorkshopScope;
+use axum::extract::Extension;
 use serde::Serialize;
 use url::Host;
 
@@ -15,17 +17,7 @@ pub(crate) struct WebshopSmtpBody {
     from_email: String,
 }
 
-async fn require_access(
-    state: &AppState,
-    headers: &HeaderMap,
-    workshop: Uuid,
-    manage: bool,
-) -> ApiResult<()> {
-    let who = principal(state, headers).await?;
-    let role = authority(state, who.user_id, workshop).await?.0;
-    if manage && !role.can_manage_modules() {
-        return Err(ApiError::Forbidden);
-    }
+async fn require_webshop_enabled(state: &AppState, workshop: Uuid) -> ApiResult<()> {
     let enabled = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.workshop_modules
           where workshop_id=$1 and module_key='webshop' and state='enabled')",
@@ -91,10 +83,10 @@ fn no_store(status: WebshopSmtpResponse) -> ApiResult<(HeaderMap, Json<WebshopSm
 
 pub(super) async fn get(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<(HeaderMap, Json<WebshopSmtpResponse>)> {
-    require_access(&state, &headers, workshop, false).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let status = odoo(&state, workshop)
         .await?
         .webshop_smtp_status(&crate::integrations::odoo::WebshopSmtpStatusCommand {
@@ -107,13 +99,16 @@ pub(super) async fn get(
 
 pub(super) async fn configure(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
     Json(body): Json<WebshopSmtpBody>,
 ) -> ApiResult<(HeaderMap, Json<WebshopSmtpResponse>)> {
+    let workshop = scope.workshop_id;
     let (host, from_email) = validate(&body)?;
-    require_access(&state, &headers, workshop, true).await?;
+    require_webshop_enabled(&state, workshop).await?;
     let key = idempotency(&headers)?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let status = odoo(&state, workshop)
         .await?
         .configure_webshop_smtp(&crate::integrations::odoo::WebshopSmtpConfigureCommand {
@@ -128,16 +123,20 @@ pub(super) async fn configure(
         })
         .await
         .map_err(|_| ApiError::Conflict("The SMTP connection test failed"))?;
+    tx.commit().await?;
     no_store(status)
 }
 
 pub(super) async fn reset(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
 ) -> ApiResult<(HeaderMap, Json<WebshopSmtpResponse>)> {
-    require_access(&state, &headers, workshop, true).await?;
+    let workshop = scope.workshop_id;
+    require_webshop_enabled(&state, workshop).await?;
     let key = idempotency(&headers)?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let status = odoo(&state, workshop)
         .await?
         .reset_webshop_smtp(&crate::integrations::odoo::WebshopSmtpResetCommand {
@@ -146,6 +145,7 @@ pub(super) async fn reset(
         })
         .await
         .map_err(|_| ApiError::Conflict("Odoo SMTP configuration is unavailable"))?;
+    tx.commit().await?;
     no_store(status)
 }
 

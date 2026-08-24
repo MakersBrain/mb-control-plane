@@ -97,10 +97,19 @@ mod tests {
     use super::*;
 
     fn valid_api_values() -> HashMap<String, String> {
-        specification().unwrap().required_environment["api"]
+        let mut values = specification().unwrap().required_environment["api"]
             .iter()
             .map(|name| (name.clone(), format!("valid-{name}")))
-            .collect()
+            .collect::<HashMap<_, _>>();
+        values.insert(
+            "CONTROL_DATABASE_URL".into(),
+            "postgresql://control_api:secret@postgres/control".into(),
+        );
+        values.insert(
+            "CONTROL_TENANT_DATABASE_URL".into(),
+            "postgresql://control_tenant_api:secret@postgres/control".into(),
+        );
+        values
     }
 
     #[test]
@@ -177,10 +186,18 @@ mod tests {
             "CONTROL_DATABASE_URL".into(),
             "postgresql://control:secret@db.internal/control".into(),
         );
+        values.insert(
+            "CONTROL_TENANT_DATABASE_URL".into(),
+            "postgresql://control_tenant_api:secret@db.internal/control".into(),
+        );
         assert!(validate_with("api", |name| values.get(name).cloned()).is_err());
         values.insert(
             "CONTROL_DATABASE_URL".into(),
             "postgresql://control:secret@db.internal/control?sslmode=verify-full&sslrootcert=%2Frun%2Fsecrets%2Fpostgres-ca.crt".into(),
+        );
+        values.insert(
+            "CONTROL_TENANT_DATABASE_URL".into(),
+            "postgresql://control_tenant_api:secret@db.internal/control?sslmode=verify-full&sslrootcert=%2Frun%2Fsecrets%2Fpostgres-ca.crt".into(),
         );
         validate_with("api", |name| values.get(name).cloned()).unwrap();
     }

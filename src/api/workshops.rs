@@ -2,9 +2,8 @@ use super::*;
 
 pub(super) async fn workshops(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(who): Extension<Principal>,
 ) -> ApiResult<Json<Vec<WorkshopSummaryResponse>>> {
-    let who = principal(&state, &headers).await?;
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, String, i64, String, i32)>(
         "select w.id,w.slug,w.display_name,w.status,w.plan,w.version,m.role,m.authority_epoch
          from control.workshops w join control.memberships m on m.workshop_id=w.id
@@ -41,9 +40,9 @@ pub(crate) struct CreateWorkshop {
 pub(super) async fn create_workshop(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Json(body): Json<CreateWorkshop>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
     let key = idempotency(&headers)?.to_owned();
     let fleet_fenced = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.release_fleet_runs
@@ -165,17 +164,17 @@ pub(super) async fn create_workshop(
 
 pub(super) async fn workshop(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<(HeaderMap, Json<WorkshopSummaryResponse>)> {
-    let who = principal(&state, &headers).await?;
-    let (role, epoch) = authority(&state, who.user_id, id).await?;
+    let id = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(id).await?;
     let row = sqlx::query_as::<_, (String, String, String, String, i64)>(
         "select slug,display_name,status,plan,version from control.workshops where id=$1",
     )
     .bind(id)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok((
         etag(&format!("workshop-{id}"), row.4)?,
         Json(WorkshopSummaryResponse {
@@ -185,19 +184,18 @@ pub(super) async fn workshop(
             status: row.2,
             plan: row.3,
             version: row.4,
-            role,
-            authority_epoch: epoch,
+            role: scope.role,
+            authority_epoch: scope.authority_epoch,
         }),
     ))
 }
 
 pub(super) async fn members(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<MemberResponse>>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
+    let id = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(id).await?;
     let rows = sqlx::query_as::<_, (Uuid,String,Option<String>,String,String,i32,i64,Value,Option<Uuid>,Option<String>)>(
         "select u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,m.version,
            coalesce(jsonb_object_agg(t.target,jsonb_build_object('state',t.state,'desired_epoch',t.desired_epoch,'applied_epoch',t.applied_epoch,'error',t.safe_error_class,'observed_at',t.observed_at)) filter(where t.target is not null),'{}'),
@@ -206,7 +204,8 @@ pub(super) async fn members(
          left join control.membership_targets t on t.workshop_id=m.workshop_id and t.user_id=m.user_id
          left join lateral (select id,state from control.operations where workshop_id=m.workshop_id and target_user_id=m.user_id and kind='membership.reconcile' order by created_at desc,id desc limit 1) latest on true
          where m.workshop_id=$1 group by u.id,u.email,u.display_name,m.role,m.status,m.authority_epoch,m.version,latest.id,latest.state order by u.email",
-    ).bind(id).fetch_all(state.store.pool()).await?;
+    ).bind(id).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         rows.into_iter()
             .map(|row| {
@@ -244,20 +243,14 @@ fn default_locale() -> String {
 
 pub(super) async fn invitations(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<InvitationResponse>>> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, id)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
+    let id = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(id).await?;
     let rows = sqlx::query_as::<_, (Uuid, String, String, String, OffsetDateTime, i32, OffsetDateTime)>(
         "select id,email,role,locale,expires_at,sent_count,last_sent_at from control.invitations where workshop_id=$1 and accepted_at is null and revoked_at is null order by created_at desc",
-    ).bind(id).fetch_all(state.store.pool()).await?;
+    ).bind(id).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         rows.into_iter()
             .map(|row| {
@@ -280,12 +273,12 @@ pub(super) async fn invitations(
 pub(super) async fn invite(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
     Json(body): Json<InviteBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let (role, _) = authority(&state, who.user_id, id).await?;
-    if !role.can_manage_members() || !body.role.can_invite() {
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
+    if !body.role.can_invite() {
         return Err(ApiError::Forbidden);
     }
     if !matches!(body.locale.as_str(), "en" | "fr") {
@@ -300,19 +293,20 @@ pub(super) async fn invite(
         .replace_nanosecond(0)
         .map_err(|error| ApiError::Internal(error.into()))?;
     let expires_at = issued_at + time::Duration::days(7);
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let semantic_request = json!({
         "workshop_id": id,
         "email": email,
         "role": body.role,
         "locale": body.locale,
     });
-    let scope = format!("workshop:{id}");
+    let command_scope = format!("workshop:{id}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: actor,
+            scope: &command_scope,
             command_kind: "invitation.create",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -355,9 +349,9 @@ pub(super) async fn invite(
         return Err(ApiError::Conflict("a pending invitation already exists"));
     }
     sqlx::query("insert into control.invitations(id,workshop_id,email,role,locale,invited_by,idempotency_key,expires_at) values($1,$2,$3,$4,$5,$6,$7,$8)")
-        .bind(invitation_id).bind(id).bind(&email).bind(body.role.as_str()).bind(&body.locale).bind(who.user_id).bind(&key).bind(expires_at).execute(&mut *tx).await?;
-    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,invitation_id,token_generation,capability_issued_at,capability_expires_at,signing_key_id) values($1,'invitation',$2,'workshop-invitation',$3,$4,1,$5,$6,$7)")
-        .bind(outbox_id).bind(&email).bind(json!({"invitation_id":invitation_id,"workshop_id":id,"role":body.role,"locale":body.locale,"idempotency_key":key})).bind(invitation_id).bind(issued_at).bind(expires_at).bind(&state.config.invitation_signing_key_id).execute(&mut *tx).await?;
+        .bind(invitation_id).bind(id).bind(&email).bind(body.role.as_str()).bind(&body.locale).bind(actor).bind(&key).bind(expires_at).execute(&mut *tx).await?;
+    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,invitation_id,token_generation,capability_issued_at,capability_expires_at,signing_key_id,workshop_id) values($1,'invitation',$2,'workshop-invitation',$3,$4,1,$5,$6,$7,$8)")
+        .bind(outbox_id).bind(&email).bind(json!({"invitation_id":invitation_id,"workshop_id":id,"role":body.role,"locale":body.locale,"idempotency_key":key})).bind(invitation_id).bind(issued_at).bind(expires_at).bind(&state.config.invitation_signing_key_id).bind(id).execute(&mut *tx).await?;
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -366,7 +360,7 @@ pub(super) async fn invite(
             target_user_id: None,
             desired_epoch: None,
             payload: &json!({"outbox_id":outbox_id}),
-            requested_by: Some(who.user_id),
+            requested_by: Some(actor),
             correlation_id,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -374,7 +368,7 @@ pub(super) async fn invite(
     .await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(actor), Some(id)),
         "invitation.create",
         "invitation",
         invitation_id.to_string(),
@@ -403,33 +397,41 @@ pub(super) async fn invite(
 pub(super) async fn resend_invitation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
     let key = idempotency(&headers)?.to_owned();
     let row=sqlx::query_as::<_,(Uuid,String,String,String)>("select workshop_id,email,role,locale from control.invitations where id=$1 and accepted_at is null and revoked_at is null and expires_at>now()")
         .bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    if !authority(&state, who.user_id, row.0)
-        .await?
-        .0
-        .can_manage_members()
-    {
+    let (role, authority_epoch) = authority(&state, who.user_id, row.0).await?;
+    if !role.can_manage_members() {
         return Err(ApiError::Forbidden);
     }
+    let authority_scope = WorkshopScope {
+        workshop_id: row.0,
+        principal_id: who.user_id,
+        role,
+        authority_epoch,
+        permission: crate::domain::WorkshopPermission::ManageMembers,
+    };
     let outbox_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
     let issued_at = OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .map_err(|error| ApiError::Internal(error.into()))?;
     let expires_at = issued_at + time::Duration::days(7);
-    let mut tx = state.store.begin().await?;
+    let mut tx = state
+        .tenant_store
+        .begin(authority_scope.workshop_id)
+        .await?;
+    revalidate_workshop_scope(&mut tx, &authority_scope).await?;
     let semantic_request = json!({"invitation_id": id});
-    let scope = format!("workshop:{}", row.0);
+    let command_scope = format!("workshop:{}", row.0);
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
             actor_user_id: who.user_id,
-            scope: &scope,
+            scope: &command_scope,
             command_kind: "invitation.resend",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -464,10 +466,10 @@ pub(super) async fn resend_invitation(
             ));
         }
     };
-    let generation = sqlx::query_scalar::<_, i32>("update control.invitations set token_generation=token_generation+1,sent_count=sent_count+1,last_sent_at=$2,expires_at=$3 where id=$1 and accepted_at is null and revoked_at is null and expires_at>now() returning token_generation")
-        .bind(id).bind(issued_at).bind(expires_at).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
-    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,invitation_id,token_generation,capability_issued_at,capability_expires_at,signing_key_id) values($1,'invitation',$2,'workshop-invitation',$3,$4,$5,$6,$7,$8)")
-        .bind(outbox_id).bind(&row.1).bind(json!({"invitation_id":id,"workshop_id":row.0,"role":row.2,"locale":row.3})).bind(id).bind(generation).bind(issued_at).bind(expires_at).bind(&state.config.invitation_signing_key_id).execute(&mut *tx).await?;
+    let generation = sqlx::query_scalar::<_, i32>("update control.invitations set token_generation=token_generation+1,sent_count=sent_count+1,last_sent_at=$2,expires_at=$3 where id=$1 and workshop_id=$4 and accepted_at is null and revoked_at is null and expires_at>now() returning token_generation")
+        .bind(id).bind(issued_at).bind(expires_at).bind(row.0).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
+    sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,invitation_id,token_generation,capability_issued_at,capability_expires_at,signing_key_id,workshop_id) values($1,'invitation',$2,'workshop-invitation',$3,$4,$5,$6,$7,$8,$9)")
+        .bind(outbox_id).bind(&row.1).bind(json!({"invitation_id":id,"workshop_id":row.0,"role":row.2,"locale":row.3})).bind(id).bind(generation).bind(issued_at).bind(expires_at).bind(&state.config.invitation_signing_key_id).bind(row.0).execute(&mut *tx).await?;
     let operation_id = Store::enqueue(
         &mut tx,
         NewOperation {
@@ -512,26 +514,34 @@ pub(super) async fn resend_invitation(
 pub(super) async fn revoke_invitation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    let who = principal(&state, &headers).await?;
     let key = idempotency(&headers)?.to_owned();
     let workshop=sqlx::query_scalar::<_,Uuid>("select workshop_id from control.invitations where id=$1 and accepted_at is null and revoked_at is null").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
-    if !authority(&state, who.user_id, workshop)
-        .await?
-        .0
-        .can_manage_members()
-    {
+    let (role, authority_epoch) = authority(&state, who.user_id, workshop).await?;
+    if !role.can_manage_members() {
         return Err(ApiError::Forbidden);
     }
-    let mut tx = state.store.begin().await?;
+    let authority_scope = WorkshopScope {
+        workshop_id: workshop,
+        principal_id: who.user_id,
+        role,
+        authority_epoch,
+        permission: crate::domain::WorkshopPermission::ManageMembers,
+    };
+    let mut tx = state
+        .tenant_store
+        .begin(authority_scope.workshop_id)
+        .await?;
+    revalidate_workshop_scope(&mut tx, &authority_scope).await?;
     let semantic_request = json!({"invitation_id": id});
-    let scope = format!("workshop:{workshop}");
+    let command_scope = format!("workshop:{workshop}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
             actor_user_id: who.user_id,
-            scope: &scope,
+            scope: &command_scope,
             command_kind: "invitation.revoke",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -555,9 +565,10 @@ pub(super) async fn revoke_invitation(
     };
     let changed = sqlx::query(
         "update control.invitations set revoked_at=now()
-         where id=$1 and accepted_at is null and revoked_at is null",
+         where id=$1 and workshop_id=$2 and accepted_at is null and revoked_at is null",
     )
     .bind(id)
+    .bind(workshop)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -615,9 +626,9 @@ pub(super) async fn validate_invitation(
 pub(super) async fn accept_invitation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(verified): Extension<VerifiedToken>,
     Json(body): Json<InvitationTokenBody>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let verified = state.auth.verify_headers(&headers).await?;
     let key = idempotency(&headers)?.to_owned();
     let claims = state
         .invitation_verifier
@@ -699,9 +710,10 @@ pub(super) async fn accept_invitation(
     .bind(user_id)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("update control.invitations set accepted_at=now(),accepted_user_id=$2 where id=$1")
+    sqlx::query("update control.invitations set accepted_at=now(),accepted_user_id=$2 where id=$1 and workshop_id=$3")
         .bind(invitation.0)
         .bind(user_id)
+        .bind(invitation.1)
         .execute(&mut *tx)
         .await?;
     seed_targets(&mut tx, invitation.1, user_id, epoch).await?;
@@ -766,13 +778,18 @@ pub(crate) struct RoleBody {
     role: WorkshopRole,
 }
 
+#[derive(Deserialize)]
+pub(super) struct MemberPath {
+    user_id: Uuid,
+}
+
 pub(super) async fn member(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    Extension(scope): Extension<WorkshopScope>,
+    Path(MemberPath { user_id }): Path<MemberPath>,
 ) -> ApiResult<(HeaderMap, Json<MemberDetailResponse>)> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
+    let id = scope.workshop_id;
+    let mut tx = state.tenant_store.begin(id).await?;
     let row = sqlx::query_as::<_, (String, Option<String>, String, String, i32, i64)>(
         "select u.email,u.display_name,m.role,m.status,m.authority_epoch,m.version
          from control.memberships m join control.users u on u.id=m.user_id
@@ -780,9 +797,10 @@ pub(super) async fn member(
     )
     .bind(id)
     .bind(user_id)
-    .fetch_optional(state.store.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
+    tx.commit().await?;
     let prefix = format!("member-{id}-{user_id}");
     Ok((
         etag(&prefix, row.5)?,
@@ -802,26 +820,28 @@ pub(super) async fn member(
 pub(super) async fn update_member(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    Extension(scope): Extension<WorkshopScope>,
+    Path(MemberPath { user_id }): Path<MemberPath>,
     Json(body): Json<RoleBody>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let role = authority(&state, who.user_id, id).await?.0;
-    if !role.can_manage_members() || matches!(body.role, WorkshopRole::Owner) {
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
+    if matches!(body.role, WorkshopRole::Owner) {
         return Err(ApiError::Forbidden);
     }
     let key = idempotency(&headers)?.to_owned();
     let resource = format!("member-{id}-{user_id}");
     let expected = expected_version(&headers, &resource)?;
     let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let semantic_request = json!({"workshop_id":id,"user_id":user_id,"role":body.role});
-    let scope = format!("workshop:{id}:member:{user_id}");
+    let command_scope = format!("workshop:{id}:member:{user_id}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: actor,
+            scope: &command_scope,
             command_kind: "member.role.update",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -883,7 +903,7 @@ pub(super) async fn update_member(
             target_user_id: Some(user_id),
             desired_epoch: Some(epoch),
             payload: &json!({"active":true,"role":body.role}),
-            requested_by: Some(who.user_id),
+            requested_by: Some(actor),
             correlation_id,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -891,7 +911,7 @@ pub(super) async fn update_member(
     .await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(actor), Some(id)),
         "member.role.update",
         "membership",
         user_id.to_string(),
@@ -919,28 +939,24 @@ pub(super) async fn update_member(
 pub(super) async fn remove_member(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, user_id)): Path<(Uuid, Uuid)>,
+    Extension(scope): Extension<WorkshopScope>,
+    Path(MemberPath { user_id }): Path<MemberPath>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, id)
-        .await?
-        .0
-        .can_manage_members()
-    {
-        return Err(ApiError::Forbidden);
-    }
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
     let key = idempotency(&headers)?.to_owned();
     let resource = format!("member-{id}-{user_id}");
     let expected = expected_version(&headers, &resource)?;
     let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let semantic_request = json!({"workshop_id":id,"user_id":user_id,"active":false});
-    let scope = format!("workshop:{id}:member:{user_id}");
+    let command_scope = format!("workshop:{id}:member:{user_id}");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: actor,
+            scope: &command_scope,
             command_kind: "member.remove",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -1005,7 +1021,7 @@ pub(super) async fn remove_member(
             target_user_id: Some(user_id),
             desired_epoch: Some(epoch),
             payload: &json!({"active":false}),
-            requested_by: Some(who.user_id),
+            requested_by: Some(actor),
             correlation_id,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -1013,7 +1029,7 @@ pub(super) async fn remove_member(
     .await?;
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(actor), Some(id)),
         "member.remove",
         "membership",
         user_id.to_string(),
@@ -1044,12 +1060,13 @@ pub(crate) struct TransferBody {
 }
 pub(super) async fn ownership_transfers(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<Vec<OwnershipTransferResponse>>> {
-    let who = principal(&state, &headers).await?;
-    authority(&state, who.user_id, id).await?;
-    let rows=sqlx::query_as::<_,(Uuid,Uuid,Uuid,OffsetDateTime,i64)>("select t.id,t.from_user_id,t.to_user_id,t.expires_at,w.version from control.ownership_transfers t join control.workshops w on w.id=t.workshop_id where t.workshop_id=$1 and t.accepted_at is null and t.revoked_at is null and t.expires_at>now() and (t.from_user_id=$2 or t.to_user_id=$2) order by t.created_at desc").bind(id).bind(who.user_id).fetch_all(state.store.pool()).await?;
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
+    let mut tx = state.tenant_store.begin(id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,Uuid,Uuid,OffsetDateTime,i64)>("select t.id,t.from_user_id,t.to_user_id,t.expires_at,w.version from control.ownership_transfers t join control.workshops w on w.id=t.workshop_id where t.workshop_id=$1 and t.accepted_at is null and t.revoked_at is null and t.expires_at>now() and (t.from_user_id=$2 or t.to_user_id=$2) order by t.created_at desc").bind(id).bind(actor).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         rows.into_iter()
             .map(|row| OwnershipTransferResponse {
@@ -1057,7 +1074,7 @@ pub(super) async fn ownership_transfers(
                 from_user_id: row.1,
                 to_user_id: row.2,
                 expires_at: api_timestamp(row.3),
-                can_accept: row.2 == who.user_id,
+                can_accept: row.2 == actor,
                 etag: format!("\"workshop-{id}-v{}\"", row.4),
             })
             .collect(),
@@ -1067,26 +1084,33 @@ pub(super) async fn ownership_transfers(
 pub(super) async fn create_ownership_transfer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
     Json(body): Json<TransferBody>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if authority(&state, who.user_id, id).await?.0 != WorkshopRole::Owner {
-        return Err(ApiError::Forbidden);
-    }
+    let id = scope.workshop_id;
+    let actor = scope.principal_id;
     let key = idempotency(&headers)?.to_owned();
     let resource = format!("workshop-{id}");
     let expected = expected_version(&headers, &resource)?;
-    authority(&state, body.to_user_id, id).await?;
     let transfer = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
+    sqlx::query_scalar::<_, i32>(
+        "select authority_epoch from control.memberships
+         where workshop_id=$1 and user_id=$2 and status='active' for share",
+    )
+    .bind(id)
+    .bind(body.to_user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let semantic_request = json!({"workshop_id":id,"to_user_id":body.to_user_id});
-    let scope = format!("workshop:{id}:ownership");
+    let command_scope = format!("workshop:{id}:ownership");
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
-            scope: &scope,
+            actor_user_id: actor,
+            scope: &command_scope,
             command_kind: "ownership.transfer.create",
             idempotency_key: &key,
             semantic_request: &semantic_request,
@@ -1131,11 +1155,11 @@ pub(super) async fn create_ownership_transfer(
         return Err(ApiError::PreconditionFailed("If-Match is stale"));
     }
     sqlx::query("insert into control.ownership_transfers(id,workshop_id,from_user_id,to_user_id,idempotency_key,expires_at) values($1,$2,$3,$4,$5,now()+interval '48 hours')")
-        .bind(transfer).bind(id).bind(who.user_id).bind(body.to_user_id).bind(format!("command:{command_id}")).execute(&mut *tx).await?;
+        .bind(transfer).bind(id).bind(actor).bind(body.to_user_id).bind(format!("command:{command_id}")).execute(&mut *tx).await?;
     let correlation = Uuid::new_v4();
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(id)),
+        (Some(actor), Some(id)),
         "ownership.transfer.create",
         "ownership_transfer",
         transfer.to_string(),
@@ -1167,11 +1191,27 @@ pub(super) async fn create_ownership_transfer(
 pub(super) async fn accept_ownership_transfer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(who): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<(HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
     let key = idempotency(&headers)?.to_owned();
-    let transfer = sqlx::query_as::<
+    let correlation_id = Uuid::new_v4();
+    // This opaque-ID endpoint does not carry a workshop path. Use the
+    // separately reviewed platform identity only to discover the immutable
+    // tenant and intended recipient, authorize the principal, then perform
+    // the locked mutation through the tenant-scoped pool.
+    let discovered = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "select workshop_id,to_user_id from control.ownership_transfers where id=$1",
+    )
+    .bind(id)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    if discovered.1 != who.user_id {
+        return Err(ApiError::Forbidden);
+    }
+    let mut tx = state.tenant_store.begin(discovered.0).await?;
+    let row = sqlx::query_as::<
         _,
         (
             Uuid,
@@ -1186,20 +1226,18 @@ pub(super) async fn accept_ownership_transfer(
         "select t.workshop_id,t.from_user_id,t.to_user_id,t.accepted_at,t.revoked_at,
                 t.expires_at,w.version
          from control.ownership_transfers t join control.workshops w on w.id=t.workshop_id
-         where t.id=$1",
+         where t.id=$1 and t.workshop_id=$2 for update of t",
     )
     .bind(id)
-    .fetch_optional(state.store.pool())
+    .bind(discovered.0)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
-    if transfer.2 != who.user_id {
+    if row.2 != who.user_id || row.0 != discovered.0 {
         return Err(ApiError::Forbidden);
     }
-    let resource = format!("workshop-{}", transfer.0);
+    let resource = format!("workshop-{}", row.0);
     let expected = expected_version(&headers, &resource)?;
-    let correlation_id = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
-    let row=sqlx::query_as::<_,(Uuid,Uuid,Uuid,Option<OffsetDateTime>,Option<OffsetDateTime>,OffsetDateTime)>("select workshop_id,from_user_id,to_user_id,accepted_at,revoked_at,expires_at from control.ownership_transfers where id=$1 for update").bind(id).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
     let semantic_request = json!({"ownership_transfer_id":id,"workshop_id":row.0});
     let scope = format!("workshop:{}:ownership", row.0);
     let command_id = match admit_command(
@@ -1255,8 +1293,9 @@ pub(super) async fn accept_ownership_transfer(
             "ownership transfer members are not both active",
         ));
     }
-    sqlx::query("update control.ownership_transfers set accepted_at=now() where id=$1 and accepted_at is null and revoked_at is null")
+    sqlx::query("update control.ownership_transfers set accepted_at=now() where id=$1 and workshop_id=$2 and accepted_at is null and revoked_at is null")
         .bind(id)
+        .bind(row.0)
         .execute(&mut *tx)
         .await?;
     let mut operation_ids = Vec::new();

@@ -90,6 +90,24 @@ decrypting and restoring its database dumps into disposable databases. The
 result is persisted in `workshop_recovery_rehearsals` and the live workshop is
 never modified.
 
+Fleet discovery is bounded, but each selected recovery is claimed in a short
+workshop-scoped transaction before the driver request. The transaction is
+committed before network I/O. A claim carries an opaque fencing token, a
+20-minute lease, and a durable maximum of six attempts. Expired leases can be
+reclaimed; only the current token may finalize a result. Transport failures,
+HTTP 408/429, and server failures receive bounded exponential retry delays;
+other driver rejections are terminal. Result and audit-event persistence commit
+atomically in a fresh workshop transaction.
+
+The scheduler parses its complete immutable configuration before telemetry,
+PostgreSQL, or deployment-driver initialization. Scheduling is disabled by
+default (`CONTROL_BACKUP_SCHEDULER_ENABLED=false`) and its poll interval defaults
+to 3,600 seconds. Explicit enablement accepts only `true` or `false`; an explicit
+interval must be an integer between 60 and 86,400 seconds. Database and driver
+URLs, the release identity, and the optional absolute Unix-socket path are
+validated at that same startup boundary, so malformed tuning never silently
+falls back.
+
 Lifecycle progress is persisted on the operation as phase, message and
 percentage. The control UI refreshes active operations once per second, so
 capture, encryption, packaging, S3 upload and verification remain visible after

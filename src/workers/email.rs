@@ -1,40 +1,44 @@
-use std::time::Duration;
-
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
-use crate::invitation::InvitationSigner;
-use crate::persistence::{LeasedOperation, Store};
+use crate::outbound_http::TraceRequestBuilderExt as _;
+use crate::persistence::{LeasedOperation, TenantStore};
+use crate::worker_config::EmailDeliveryConfig;
 
-fn secret(name: &str) -> Result<String, IntegrationError> {
-    crate::runtime_secret::environment(name)
-        .map_err(|_| IntegrationError::Unauthorized)?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(IntegrationError::Unauthorized)
-}
-
-fn configured(name: &str) -> Result<String, IntegrationError> {
-    crate::runtime_secret::required_configuration(name).map_err(|_| IntegrationError::Unauthorized)
-}
-
-fn client(token: &str) -> Result<reqwest::Client, IntegrationError> {
-    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-        .map_err(|_| IntegrationError::ContractDrift)?;
-    value.set_sensitive(true);
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, value);
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| IntegrationError::ContractDrift)
+async fn owned_outbox(
+    tenant_store: &TenantStore,
+    workshop: Uuid,
+    outbox: Uuid,
+) -> Result<(String, String), IntegrationError> {
+    let mut tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let owned = sqlx::query_as::<_, (String, String)>(
+        "select o.kind,o.state
+           from control.outbox o
+           left join control.invitations i on i.id=o.invitation_id
+          where o.id=$1 and o.workshop_id=$2
+            and (o.kind<>'invitation' or i.workshop_id=$2)",
+    )
+    .bind(outbox)
+    .bind(workshop)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)?
+    .ok_or(IntegrationError::NotFound)?;
+    tx.commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    Ok(owned)
 }
 
 pub(crate) async fn deliver(
-    store: &Store,
+    tenant_store: &TenantStore,
+    workshop: Uuid,
     operation: &LeasedOperation,
+    config: &EmailDeliveryConfig,
 ) -> Result<(), IntegrationError> {
     let outbox = operation
         .payload
@@ -42,26 +46,21 @@ pub(crate) async fn deliver(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
+    let owned = owned_outbox(tenant_store, workshop, outbox).await?;
     // A timed-out submission is reconciled by the authenticated provider event,
     // which fills the provider identifiers and advances the outbox to `sent`.
     // Until that evidence arrives, replay remains fenced to avoid duplicates.
     if operation.reconciling {
-        let state = sqlx::query_scalar::<_, String>("select state from control.outbox where id=$1")
-            .bind(outbox)
-            .fetch_optional(store.pool())
-            .await
-            .map_err(|_| IntegrationError::Unavailable)?
-            .ok_or(IntegrationError::NotFound)?;
-        return if matches!(state.as_str(), "sent" | "dead_letter") {
+        return if matches!(owned.1.as_str(), "sent" | "dead_letter") {
             Ok(())
         } else {
             Err(IntegrationError::UnknownOutcome)
         };
     }
-    // Validate the gateway before claiming the row. Broken secret mounts must
-    // not strand durable mail in `sending`.
-    let client = client(&secret("CONTROL_MAIL_WEBHOOK_TOKEN")?)?;
-    let webhook_url = configured("CONTROL_MAIL_WEBHOOK_URL")?;
+    let mut read_tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     let row = sqlx::query_as::<
         _,
         (
@@ -76,18 +75,25 @@ pub(crate) async fn deliver(
             Option<String>,
             Option<String>,
             Option<Uuid>,
+            Option<String>,
+            Option<String>,
         ),
     >(
         "select o.kind,o.recipient,o.template,o.payload,o.invitation_id,
            o.token_generation,o.capability_issued_at,o.capability_expires_at,o.signing_key_id,
            case when ed.provider_status='checked' then ed.sender_local_part||'@'||ed.domain_name end,
-           case when ed.provider_status='checked' then ed.provider_ref end
+           case when ed.provider_status='checked' then ed.provider_ref end,
+           invitation.role,invitation.locale
          from control.outbox o
+         left join control.invitations invitation on invitation.id=o.invitation_id
          left join lateral (select d.* from control.webshop_email_domains d
              where d.workshop_id=o.workshop_id and d.desired_state='active'
                and (d.state='active' or d.test_outbox_id=o.id)
              order by (d.test_outbox_id=o.id) desc,d.updated_at desc limit 1) ed on true
-         where o.id=$1 and o.state in('queued','deferred')
+         where o.id=$1 and (
+             (o.kind='odoo_transactional' and o.workshop_id=$2)
+             or (o.kind='invitation' and o.workshop_id=$2 and invitation.workshop_id=$2)
+         ) and o.state in('queued','deferred')
            and (o.kind<>'invitation' or exists (
              select 1 from control.invitations i
              where o.invitation_id=i.id and o.token_generation=i.token_generation
@@ -95,7 +101,8 @@ pub(crate) async fn deliver(
            ))",
     )
     .bind(outbox)
-    .fetch_optional(store.pool())
+    .bind(workshop)
+    .fetch_optional(&mut *read_tx)
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
     let Some((
@@ -110,20 +117,32 @@ pub(crate) async fn deliver(
         key_id,
         sender_email,
         sender_domain_id,
+        invitation_role,
+        invitation_locale,
     )) = row
     else {
-        sqlx::query("update control.outbox set state='dead_letter' where id=$1 and kind='invitation' and state in ('queued','deferred')")
-            .bind(outbox).execute(store.pool()).await.map_err(|_| IntegrationError::Unavailable)?;
+        sqlx::query("update control.outbox o set state='dead_letter' where o.id=$1 and o.kind='invitation' and o.workshop_id=$2 and o.state in ('queued','deferred') and exists(select 1 from control.invitations i where i.id=o.invitation_id and i.workshop_id=$2)")
+            .bind(outbox).bind(workshop).execute(&mut *read_tx).await.map_err(|_| IntegrationError::Unavailable)?;
+        read_tx
+            .commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         return Ok(());
     };
+    read_tx
+        .commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     let (sender_name, reply_to, attachments) = if kind == "invitation" {
-        let signer = InvitationSigner::from_json_file(
-            configured("CONTROL_INVITATION_SIGNING_KEY_ID")?,
-            std::path::Path::new(&configured("CONTROL_INVITATION_SIGNING_KEYS_FILE")?),
-        )
-        .map_err(|_| IntegrationError::ContractDrift)?;
-        let mut invitation_origin = url::Url::parse(&configured("CONTROL_PUBLIC_ORIGIN")?)
-            .and_then(|origin| origin.join("invitations/accept"))
+        data = json!({
+            "invitation_id": invitation.ok_or(IntegrationError::ContractDrift)?,
+            "workshop_id": workshop,
+            "role": invitation_role.ok_or(IntegrationError::ContractDrift)?,
+            "locale": invitation_locale.ok_or(IntegrationError::ContractDrift)?,
+        });
+        let mut invitation_origin = config.invitation_accept_url().clone();
+        let signer = config
+            .load_invitation_signer()
             .map_err(|_| IntegrationError::ContractDrift)?;
         let token = signer
             .sign_with_key_id(
@@ -165,9 +184,17 @@ pub(crate) async fn deliver(
     } else {
         return Err(IntegrationError::ContractDrift);
     };
+    let mut claim_tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     let claimed = sqlx::query(
         "update control.outbox o set state='sending',attempts=attempts+1
          where o.id=$1 and o.state in('queued','deferred')
+           and o.workshop_id=$2
+           and (o.kind<>'invitation' or exists (
+                    select 1 from control.invitations owner
+                    where owner.id=o.invitation_id and owner.workshop_id=$2))
            and (o.kind<>'invitation' or exists (
              select 1 from control.invitations i
              where o.invitation_id=i.id and o.token_generation=i.token_generation
@@ -175,20 +202,35 @@ pub(crate) async fn deliver(
            ))",
     )
     .bind(outbox)
-    .execute(store.pool())
+    .bind(workshop)
+    .execute(&mut *claim_tx)
     .await
     .map_err(|_| IntegrationError::Unavailable)?
     .rows_affected();
     if claimed != 1 {
+        claim_tx
+            .commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         return Ok(());
     }
-    let response = match client
-        .post(webhook_url)
+    claim_tx
+        .commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let response = match config
+        .client()
+        .post(config.webhook_url().clone())
+        .header(
+            reqwest::header::AUTHORIZATION,
+            config.authorization().clone(),
+        )
         .json(&json!({
             "delivery_id":outbox,"to":recipient,"template":template,"data":data,
             "sender_name":sender_name,"reply_to":reply_to,"attachments":attachments,
             "sender_email":sender_email,"sender_domain_id":sender_domain_id
         }))
+        .with_current_trace_context()
         .send()
         .await
     {
@@ -196,13 +238,20 @@ pub(crate) async fn deliver(
         Err(error) if error.is_connect() => {
             // DNS, TCP and TLS connection failures happen before the gateway can
             // accept the delivery. Put the row back into the selectable retry set.
+            let mut tx = tenant_store
+                .begin(workshop)
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
             sqlx::query(
-                "update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1 and state='sending'",
+                "update control.outbox o set state='deferred',next_attempt_at=now()+interval '1 minute' where o.id=$1 and o.state='sending' and o.workshop_id=$2 and (o.kind<>'invitation' or exists(select 1 from control.invitations i where i.id=o.invitation_id and i.workshop_id=$2))",
             )
-            .bind(outbox)
-            .execute(store.pool())
+            .bind(outbox).bind(workshop)
+            .execute(&mut *tx)
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
+            tx.commit()
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
             return Err(IntegrationError::Unavailable);
         }
         Err(_) => return Err(IntegrationError::UnknownOutcome),
@@ -213,18 +262,23 @@ pub(crate) async fn deliver(
     }
     if !status.is_success() {
         let error = crate::integrations::classify_status(status);
+        let mut tx = tenant_store
+            .begin(workshop)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         if error.retryable() {
-            sqlx::query("update control.outbox set state='deferred',next_attempt_at=now()+interval '1 minute' where id=$1")
-                .bind(outbox).execute(store.pool()).await.ok();
+            sqlx::query("update control.outbox o set state='deferred',next_attempt_at=now()+interval '1 minute' where o.id=$1 and o.workshop_id=$2 and (o.kind<>'invitation' or exists(select 1 from control.invitations i where i.id=o.invitation_id and i.workshop_id=$2))")
+                .bind(outbox).bind(workshop).execute(&mut *tx).await.ok();
         } else {
             sqlx::query(
-                "update control.outbox set state='dead_letter',next_attempt_at=null where id=$1",
+                "update control.outbox o set state='dead_letter',next_attempt_at=null where o.id=$1 and o.workshop_id=$2 and (o.kind<>'invitation' or exists(select 1 from control.invitations i where i.id=o.invitation_id and i.workshop_id=$2))",
             )
-            .bind(outbox)
-            .execute(store.pool())
+            .bind(outbox).bind(workshop)
+            .execute(&mut *tx)
             .await
             .ok();
         }
+        tx.commit().await.ok();
         return Err(error);
     }
     let body = crate::integrations::bounded_body(response, 4096).await?;
@@ -241,12 +295,80 @@ pub(crate) async fn deliver(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(IntegrationError::ContractDrift)?;
-    sqlx::query("update control.outbox set state='sent',sent_at=now(),delivery_state='submitted',provider_message_id=$2,provider_domain_id=$3 where id=$1")
+    if sender_domain_id.is_some_and(|expected| expected != provider_domain_id) {
+        return Err(IntegrationError::ContractDrift);
+    }
+    let mut tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let changed = sqlx::query("update control.outbox o set state='sent',sent_at=now(),delivery_state='submitted',provider_message_id=$2,provider_domain_id=$3 where o.id=$1 and o.state='sending' and o.workshop_id=$4 and (o.kind<>'invitation' or exists(select 1 from control.invitations i where i.id=o.invitation_id and i.workshop_id=$4))")
         .bind(outbox)
         .bind(provider_message_id)
         .bind(provider_domain_id)
-        .execute(store.pool())
+        .bind(workshop)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?
+        .rows_affected();
+    tx.commit()
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
+    if changed != 1 {
+        return Err(IntegrationError::UnknownOutcome);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::Store;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn cross_workshop_outbox_is_rejected_before_delivery_configuration() {
+        let url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for disposable PostgreSQL");
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for (workshop, label) in [(first, "first"), (second, "second")] {
+            sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,$3,'Europe/Paris')")
+                .bind(workshop)
+                .bind(format!("email-scope-{}", workshop.simple()))
+                .bind(label)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let outbox = Uuid::new_v4();
+        sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional','customer@example.test','odoo-rendered-v1',$2,$3,$4)")
+            .bind(outbox)
+            .bind(json!({"sender_name":Value::Null,"reply_to":Value::Null,"attachments":[],"content":{"subject":"scope test","text":"scope test","html":"<p>scope test</p>"}}))
+            .bind(second)
+            .bind(format!("scope-test:{outbox}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let tenant_store = store.worker_tenant_scope();
+        assert_eq!(
+            owned_outbox(&tenant_store, first, outbox).await,
+            Err(IntegrationError::NotFound)
+        );
+        let unchanged = sqlx::query_as::<_, (String, i32)>(
+            "select state,attempts from control.outbox where id=$1",
+        )
+        .bind(outbox)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(unchanged, ("queued".into(), 0));
+        assert_eq!(
+            owned_outbox(&tenant_store, second, outbox).await.unwrap(),
+            ("odoo_transactional".into(), "queued".into())
+        );
+    }
 }

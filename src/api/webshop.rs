@@ -1,4 +1,6 @@
 use super::*;
+use crate::auth::WorkshopScope;
+use axum::Extension;
 use serde::Serialize;
 
 #[derive(Serialize, ToSchema)]
@@ -250,10 +252,12 @@ async fn dashboard(
             can_retry: true,
         });
     }
+    let mut domain_tx = state.tenant_store.begin(workshop).await?;
     let domains = sqlx::query_as::<_, (i64, Option<Uuid>, Option<String>)>(
         "select count(*),(array_agg(operation_id) filter (where operation_id is not null))[1],max(last_error_class)
            from control.webshop_domains where workshop_id=$1 and state='action_required'",
-    ).bind(workshop).fetch_one(state.store.pool()).await?;
+    ).bind(workshop).fetch_one(&mut *domain_tx).await?;
+    domain_tx.commit().await?;
     if domains.0 > 0 {
         issues.push(WebshopIssueResponse {
             key: "domains".into(),
@@ -346,43 +350,36 @@ async fn dashboard(
 
 pub(super) async fn get(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
+    Extension(scope): Extension<WorkshopScope>,
 ) -> ApiResult<Json<WebshopDashboardResponse>> {
-    let who = principal(&state, &headers).await?;
-    let role = authority(&state, who.user_id, workshop).await?.0;
     Ok(Json(
-        dashboard(&state, workshop, role.can_manage_modules()).await?,
+        dashboard(&state, scope.workshop_id, scope.role.can_manage_modules()).await?,
     ))
 }
 
 pub(super) async fn platform_get(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(_scope): Extension<PlatformScope>,
     Path(workshop): Path<Uuid>,
 ) -> ApiResult<Json<WebshopDashboardResponse>> {
-    operator(&state, &headers).await?;
     Ok(Json(dashboard(&state, workshop, true).await?))
 }
 
 pub(super) async fn refresh(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, workshop)
-        .await?
-        .0
-        .can_manage_modules()
-    {
+    if !scope.role.can_manage_modules() {
         return Err(ApiError::Forbidden);
     }
+    let workshop = scope.workshop_id;
     let key = idempotency(&headers)?.to_owned();
     let expected = expected_version(&headers, &format!("webshop-onboarding-{workshop}"))?;
     let semantic = json!({"workshop_id":workshop});
     let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let enabled = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.workshop_modules
           where workshop_id=$1 and module_key='webshop' and state='enabled')",
@@ -402,7 +399,7 @@ pub(super) async fn refresh(
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: scope.principal_id,
             scope: &format!("workshop:{workshop}:webshop-onboarding"),
             command_kind: "webshop-onboarding.refresh",
             idempotency_key: &key,
@@ -457,7 +454,7 @@ pub(super) async fn refresh(
             target_user_id: None,
             desired_epoch: None,
             payload: &json!({"version":version}),
-            requested_by: Some(who.user_id),
+            requested_by: Some(scope.principal_id),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -477,7 +474,7 @@ pub(super) async fn refresh(
     let response = json!({"operation_id":operation,"state":"in_progress","version":next});
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "webshop-onboarding.refresh",
         "webshop-onboarding",
         workshop.to_string(),
@@ -507,23 +504,23 @@ pub(super) async fn refresh(
 
 pub(super) async fn complete(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    let role = authority(&state, who.user_id, workshop).await?.0;
-    if !role.can_manage_modules() {
+    if !scope.role.can_manage_modules() {
         return Err(ApiError::Forbidden);
     }
+    let workshop = scope.workshop_id;
     let key = idempotency(&headers)?.to_owned();
     let expected = expected_version(&headers, &format!("webshop-onboarding-{workshop}"))?;
     let semantic = json!({"workshop_id":workshop,"complete":true});
     let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: scope.principal_id,
             scope: &format!("workshop:{workshop}:webshop-onboarding"),
             command_kind: "webshop-onboarding.complete",
             idempotency_key: &key,
@@ -600,7 +597,7 @@ pub(super) async fn complete(
     let response = json!({"state":"completed","version":next});
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "webshop-onboarding.complete",
         "webshop-onboarding",
         workshop.to_string(),
@@ -630,27 +627,24 @@ pub(super) async fn complete(
 
 pub(super) async fn deactivate(
     State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<WorkshopScope>,
     headers: HeaderMap,
-    Path(workshop): Path<Uuid>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    let who = principal(&state, &headers).await?;
-    if !authority(&state, who.user_id, workshop)
-        .await?
-        .0
-        .can_manage_modules()
-    {
+    if !scope.role.can_manage_modules() {
         return Err(ApiError::Forbidden);
     }
+    let workshop = scope.workshop_id;
     let key = idempotency(&headers)?.to_owned();
     let resource = format!("capability-{workshop}-webshop");
     let expected = expected_version(&headers, &resource)?;
     let semantic = json!({"module_key":"webshop","reason":"merchant_deactivated"});
     let correlation = Uuid::new_v4();
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(scope.workshop_id).await?;
+    revalidate_workshop_scope(&mut tx, &scope).await?;
     let command_id = match admit_command(
         &mut tx,
         NewCommand {
-            actor_user_id: who.user_id,
+            actor_user_id: scope.principal_id,
             scope: &format!("workshop:{workshop}:capability:webshop"),
             command_kind: "capability.deactivate",
             idempotency_key: &key,
@@ -753,7 +747,7 @@ pub(super) async fn deactivate(
             target_user_id: None,
             desired_epoch: None,
             payload: &payload,
-            requested_by: Some(who.user_id),
+            requested_by: Some(scope.principal_id),
             correlation_id: correlation,
             idempotency_key: &format!("command:{command_id}"),
         },
@@ -778,7 +772,7 @@ pub(super) async fn deactivate(
     let response = json!({"operation_id":operation,"version":version,"state":"restricting"});
     audit_command(
         &mut tx,
-        (Some(who.user_id), Some(workshop)),
+        (Some(scope.principal_id), Some(workshop)),
         "module.deactivate",
         "workshop_module",
         "webshop".into(),

@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 use super::{bounded_body, classify_status};
 
@@ -29,13 +30,12 @@ impl UpcItemDbClient {
             headers.insert("key_type", "3scale".parse()?);
         }
         Ok(Self {
-            http: reqwest::Client::builder()
-                .default_headers(headers)
-                .timeout(Duration::from_secs(10))
-                .connect_timeout(Duration::from_secs(3))
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent("Makersbrain inventory product lookup")
-                .build()?,
+            http: crate::outbound_http::external_api_builder(
+                "Makersbrain inventory product lookup",
+            )
+            .default_headers(headers)
+            .timeout(Duration::from_secs(10))
+            .build()?,
             endpoint,
         })
     }
@@ -43,13 +43,19 @@ impl UpcItemDbClient {
     pub async fn lookup(&self, gtin14: &str) -> Result<Vec<Value>, IntegrationError> {
         let mut url = self.endpoint.clone();
         url.query_pairs_mut().append_pair("upc", gtin14);
-        let response = self.http.get(url).send().await.map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
+        let response = self
+            .http
+            .get(url)
+            .with_current_trace_context()
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    IntegrationError::UnknownOutcome
+                } else {
+                    IntegrationError::Unavailable
+                }
+            })?;
         let status = response.status();
         let body = bounded_body(response, MAX_RESPONSE_BYTES).await?;
         if !status.is_success() {

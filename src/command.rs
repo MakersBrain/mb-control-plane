@@ -1,6 +1,6 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
+use sqlx::postgres::PgConnection;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub fn request_digest(request: &Value) -> [u8; 32] {
 }
 
 pub async fn admit_command(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut PgConnection,
     command: NewCommand<'_>,
 ) -> Result<CommandAdmission, CommandError> {
     if !valid_idempotency_key(command.idempotency_key) {
@@ -69,7 +69,7 @@ pub async fn admit_command(
     .bind(command.idempotency_key)
     .bind(digest.as_slice())
     .bind(command.expected_version)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
         == 1;
@@ -97,7 +97,7 @@ pub async fn admit_command(
     .bind(command.scope)
     .bind(command.command_kind)
     .bind(command.idempotency_key)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
 
     if row.1.as_slice() != digest || row.2 != command.expected_version {
@@ -129,7 +129,7 @@ pub struct CommandResult<'a> {
 }
 
 pub async fn complete_command(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut PgConnection,
     command_id: Uuid,
     result: CommandResult<'_>,
 ) -> Result<(), CommandError> {
@@ -143,7 +143,7 @@ pub async fn complete_command(
     .bind(i32::from(result.response_status))
     .bind(result.response_body)
     .bind(result.result_ref)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if changed != 1 {

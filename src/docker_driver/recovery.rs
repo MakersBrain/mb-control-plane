@@ -1,5 +1,21 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct WorkshopRecoveryLedger<'a> {
+    store: &'a TenantStore,
+    workshop: Uuid,
+}
+
+impl<'a> WorkshopRecoveryLedger<'a> {
+    pub(super) const fn new(state: &'a DriverState, workshop: Uuid) -> Self {
+        Self::from_store(&state.tenant_ledger, workshop)
+    }
+
+    const fn from_store(store: &'a TenantStore, workshop: Uuid) -> Self {
+        Self { store, workshop }
+    }
+}
+
 async fn release_odoo_ref(state: &DriverState, release_id: &str) -> Result<String, DriverError> {
     let manifest = sqlx::query_scalar::<_, Value>(
         "select manifest from control.application_releases where id=$1",
@@ -23,6 +39,11 @@ pub(super) async fn download_backup(
     payload: &Value,
 ) -> Result<Value, DriverError> {
     let recovery = payload_uuid(payload, "recovery_point_id")?;
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
     let object_key = sqlx::query_scalar::<_, String>(
         "select archive_object_key from control.workshop_recovery_points
          where id=$1 and workshop_id=$2 and kind='backup' and state='ready'
@@ -30,10 +51,11 @@ pub(super) async fn download_backup(
     )
     .bind(recovery)
     .bind(workshop)
-    .fetch_optional(&state.ledger)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError::bad("backup archive is not ready for download"))?;
+    tx.commit().await.map_err(DriverError::internal)?;
     let s3 = state
         .config
         .s3_backup
@@ -82,7 +104,8 @@ pub(super) async fn rehearse(
     payload: &Value,
 ) -> Result<Value, DriverError> {
     let recovery = payload_uuid(payload, "recovery_point_id")?;
-    let stored = resolve_stored_recovery(state, workshop, recovery).await?;
+    let stored =
+        resolve_stored_recovery(WorkshopRecoveryLedger::new(state, workshop), recovery).await?;
     if !stored.storage_ref.starts_with("s3://") || stored.format_version != RECOVERY_FORMAT_V2 {
         return Err(DriverError::bad(
             "only verified portable recovery sets can be rehearsed",
@@ -105,7 +128,18 @@ pub(super) async fn lifecycle(
     workshop: Uuid,
     payload: &Value,
 ) -> Result<Value, DriverError> {
-    let deleting = payload.get("action").and_then(Value::as_str) == Some("delete");
+    let action = payload.get("action").and_then(Value::as_str);
+    let deleting = action == Some("delete");
+    let duplicate_target = if action == Some("duplicate") {
+        let source = payload_uuid(payload, "database_id")?;
+        let target = payload_uuid(payload, "target_database_id")?;
+        Some(
+            duplicate_target_ref(WorkshopRecoveryLedger::new(state, workshop), source, target)
+                .await?,
+        )
+    } else {
+        None
+    };
     let paperless_container = state
         .config
         .docker_resource(format!("paperless-{}", tenant_key(workshop)));
@@ -119,7 +153,6 @@ pub(super) async fn lifecycle(
     } else {
         false
     };
-    let previous_routes = enter_workshop_maintenance(state, workshop).await?;
     let result = async {
         let operation = async {
             if paperless_running {
@@ -141,7 +174,7 @@ pub(super) async fn lifecycle(
                 }
             }
             drain_workshop_operations(state, workshop).await?;
-            lifecycle_quiesced(state, workshop, payload).await
+            lifecycle_quiesced(state, workshop, payload, duplicate_target.as_deref()).await
         }
         .await;
         let restart = if paperless_running && !(deleting && operation.is_ok()) {
@@ -177,15 +210,6 @@ pub(super) async fn lifecycle(
         }
     }
     .await;
-    let is_restore = payload.get("action").and_then(Value::as_str) == Some("restore");
-    if is_restore && result.is_err() {
-        tracing::error!(%workshop, "leaving workshop route in maintenance after unresolved restore failure");
-        return result;
-    }
-    if is_restore && result.is_ok() && requires_erasure_replay_fence(payload) {
-        tracing::info!(%workshop, "retaining maintenance route until erasure replay is evidenced");
-        return result;
-    }
     if deleting && result.is_ok() {
         if paperless_exists {
             match &state.backend {
@@ -216,64 +240,7 @@ pub(super) async fn lifecycle(
         tracing::info!(%workshop, "workshop final backup verified; retaining maintenance quarantine");
         return result;
     }
-    let route_restore = leave_workshop_maintenance(state, workshop, &previous_routes).await;
-    match (result, route_restore) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (_, Err(error)) => Err(error),
-    }
-}
-
-pub(super) fn requires_erasure_replay_fence(payload: &Value) -> bool {
-    payload
-        .get("action")
-        .and_then(Value::as_str)
-        .is_some_and(|action| action == "restore")
-        && payload
-            .get("erasure_replay_required")
-            .and_then(Value::as_bool)
-            == Some(true)
-}
-
-pub(super) async fn resume_after_erasure_replay(
-    state: &DriverState,
-    workshop: Uuid,
-    payload: &Value,
-) -> Result<Value, DriverError> {
-    let operation = payload_uuid(payload, "restore_operation_id")?;
-    let database = payload_uuid(payload, "database_id")?;
-    let safe = sqlx::query_scalar::<_, bool>(
-        "select exists(
-             select 1 from control.odoo_databases
-             where id=$1 and workshop_id=$2 and kind='primary' and state='ready'
-         ) and exists(
-             select 1 from control.operations
-             where id=$3 and workshop_id=$2 and kind='tenant.lifecycle'
-         ) and not exists(
-             select 1 from control.erasure_restore_replays
-             where operation_id=$3 and state<>'complete'
-         )",
-    )
-    .bind(database)
-    .bind(workshop)
-    .bind(operation)
-    .fetch_one(&state.ledger)
-    .await
-    .map_err(DriverError::internal)?;
-    if !safe {
-        return Err(DriverError::bad(
-            "restore erasure replay is not complete; maintenance must remain active",
-        ));
-    }
-    let backup = state
-        .config
-        .route_root
-        .join(format!("{workshop}.recovery.bak"));
-    if backup.is_file() {
-        let previous = std::fs::read(&backup).map_err(DriverError::internal)?;
-        leave_workshop_maintenance(state, workshop, &previous).await?;
-    }
-    Ok(json!({"action":"resume","routable":true,"restore_operation_id":operation}))
+    result
 }
 
 pub(super) async fn apply_restored_erasure(
@@ -296,12 +263,18 @@ pub(super) async fn apply_restored_erasure(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 255)
         .ok_or_else(|| DriverError::bad("invalid erasure subject lookup"))?;
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
     let authorized = sqlx::query_scalar::<_, bool>(
         "select exists(
              select 1 from control.erasure_restore_replays r
              join control.erasure_tombstones t on t.id=r.tombstone_id
              where r.id=$1 and r.tombstone_id=$2 and r.operation_id=$3
-               and t.workshop_id=$4 and r.state='applying' and $5=any(r.required_locations)
+               and r.workshop_id=$4 and t.workshop_id=r.workshop_id
+               and r.state='applying' and $5=any(r.required_locations)
          )",
     )
     .bind(replay)
@@ -309,7 +282,7 @@ pub(super) async fn apply_restored_erasure(
     .bind(restore_operation)
     .bind(workshop)
     .bind(location)
-    .fetch_one(&state.ledger)
+    .fetch_one(&mut *tx)
     .await
     .map_err(DriverError::internal)?;
     if !authorized {
@@ -324,10 +297,11 @@ pub(super) async fn apply_restored_erasure(
     )
     .bind(workshop)
     .bind(location)
-    .fetch_optional(&state.ledger)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "processor service not found".into()))?;
+    tx.commit().await.map_err(DriverError::internal)?;
     let expected_reference = format!("docker/{workshop}/{location}");
     if row.1 != expected_reference {
         return Err(DriverError::bad(
@@ -381,34 +355,51 @@ async fn lifecycle_quiesced(
     state: &DriverState,
     workshop: Uuid,
     payload: &Value,
+    duplicate_target: Option<&str>,
 ) -> Result<Value, DriverError> {
     let action = payload
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| DriverError::bad("lifecycle action is required"))?;
     let database_id = payload_uuid(payload, "database_id")?;
-    let database_ref = database_ref(state, workshop, database_id).await?;
+    let database_ref =
+        database_ref(WorkshopRecoveryLedger::new(state, workshop), database_id).await?;
     let previous_limit =
         sqlx::query_scalar::<_, i32>("select datconnlimit from pg_database where datname=$1")
             .bind(&database_ref)
             .fetch_one(&state.postgres)
             .await
             .map_err(DriverError::internal)?;
-    sqlx::query(
-        "update control.odoo_databases set connection_limit_before_lifecycle=$2 where id=$1",
+    let mut marker_tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let changed = sqlx::query(
+        "update control.odoo_databases
+            set connection_limit_before_lifecycle=$3
+          where id=$1 and workshop_id=$2",
     )
     .bind(database_id)
+    .bind(workshop)
     .bind(previous_limit)
-    .execute(&state.ledger)
+    .execute(&mut *marker_tx)
     .await
-    .map_err(DriverError::internal)?;
+    .map_err(DriverError::internal)?
+    .rows_affected();
+    if changed != 1 {
+        return Err(DriverError::internal(
+            "scoped lifecycle database target was lost",
+        ));
+    }
+    marker_tx.commit().await.map_err(DriverError::internal)?;
     set_database_connection_limit(state, &database_ref, 0).await?;
     let result = async {
         drain_database_sessions(state, &database_ref).await?;
         match action {
         "snapshot" | "backup" | "delete" => {
             let recovery = payload_uuid(payload, "recovery_point_id")?;
-            let scope = recovery_scope(state, workshop, recovery).await?;
+            let scope = recovery_scope(WorkshopRecoveryLedger::new(state, workshop), recovery).await?;
             let recovery_point =
                 create_recovery_set(state, workshop, recovery, &database_ref, if action == "delete" { "backup" } else { action }, &scope)
                     .await?;
@@ -416,7 +407,7 @@ async fn lifecycle_quiesced(
         }
         "restore" => {
             let safety = payload_uuid(payload, "safety_recovery_point_id")?;
-            let safety_scope = recovery_scope(state, workshop, safety).await?;
+            let safety_scope = recovery_scope(WorkshopRecoveryLedger::new(state, workshop), safety).await?;
             let safety_recovery_point = create_recovery_set(
                 state,
                 workshop,
@@ -426,9 +417,18 @@ async fn lifecycle_quiesced(
                 &safety_scope,
             )
             .await?;
-            mark_recovery_ready_in_driver(state, safety, &safety_recovery_point).await?;
+            mark_recovery_ready_in_driver(
+                WorkshopRecoveryLedger::new(state, workshop),
+                safety,
+                &safety_recovery_point,
+            )
+            .await?;
             let recovery_id = payload_uuid(payload, "recovery_point_id")?;
-            let stored = resolve_stored_recovery(state, workshop, recovery_id).await?;
+            let stored = resolve_stored_recovery(
+                WorkshopRecoveryLedger::new(state, workshop),
+                recovery_id,
+            )
+            .await?;
             let restored = restore_recovery_set(
                 state,
                 workshop,
@@ -460,15 +460,36 @@ async fn lifecycle_quiesced(
                     .await
                     {
                         Ok(()) => {
-                            sqlx::query("update control.odoo_databases set state='ready' where id=$1 and workshop_id=$2")
-                                .bind(database_id).bind(workshop).execute(&state.ledger).await.map_err(DriverError::internal)?;
-                            tracing::error!(workshop=%workshop,recovery=%recovery_id,"restore failed and was rolled back to the verified safety backup");
+                            let mut tx = state
+                                .tenant_ledger
+                                .begin(workshop)
+                                .await
+                                .map_err(DriverError::internal)?;
+                            let changed = sqlx::query("update control.odoo_databases set state='ready' where id=$1 and workshop_id=$2")
+                                .bind(database_id)
+                                .bind(workshop)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(DriverError::internal)?
+                                .rows_affected();
+                            if changed != 1 {
+                                return Err(DriverError::internal(
+                                    "scoped rollback database target was lost",
+                                ));
+                            }
+                            tx.commit().await.map_err(DriverError::internal)?;
+                            tracing::error!(recovery=%recovery_id,"restore failed and was rolled back to the verified safety backup");
                             Ok(
                                 json!({"action":"restore","restore_status":"rolled_back","safe_error":"restore_failed_rolled_back","safety_recovery_point":safety_recovery_point}),
                             )
                         }
                         Err(rollback_error) => {
-                            tracing::error!(workshop=%workshop,recovery=%recovery_id,error=%rollback_error.1,"restore and automatic rollback both failed");
+                            tracing::error!(
+                                workshop=%workshop,
+                                recovery=%recovery_id,
+                                error_class=rollback_error.safe_class(),
+                                "restore and automatic rollback both failed"
+                            );
                             Err(original_error)
                         }
                     }
@@ -480,7 +501,9 @@ async fn lifecycle_quiesced(
                 return Err(DriverError::bad("database duplicates must be non-routable"));
             }
             let target_id = payload_uuid(payload, "target_database_id")?;
-            let target_ref = opaque_database(payload, "target_database_ref")?;
+            let target_ref = duplicate_target.ok_or_else(|| {
+                DriverError::internal("duplicate target preflight was not retained")
+            })?;
             let temporary = create_recovery_set(
                 state,
                 workshop,
@@ -518,13 +541,30 @@ async fn lifecycle_quiesced(
         set_database_connection_limit(state, &database_ref, previous_limit).await
     };
     if resume.is_ok() && !retain_quarantine {
-        sqlx::query(
-            "update control.odoo_databases set connection_limit_before_lifecycle=null where id=$1",
+        let mut marker_tx = state
+            .tenant_ledger
+            .begin(workshop)
+            .await
+            .map_err(DriverError::internal)?;
+        let changed = sqlx::query(
+            "update control.odoo_databases
+                set connection_limit_before_lifecycle=null
+              where id=$1 and workshop_id=$2
+                and connection_limit_before_lifecycle=$3",
         )
         .bind(database_id)
-        .execute(&state.ledger)
+        .bind(workshop)
+        .bind(previous_limit)
+        .execute(&mut *marker_tx)
         .await
-        .map_err(DriverError::internal)?;
+        .map_err(DriverError::internal)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(DriverError::internal(
+                "scoped lifecycle marker clear lost its compare-and-set",
+            ));
+        }
+        marker_tx.commit().await.map_err(DriverError::internal)?;
     }
     match (result, resume) {
         (Ok(value), Ok(())) => Ok(value),
@@ -598,13 +638,19 @@ pub(super) async fn drain_workshop_operations(
     workshop: Uuid,
 ) -> Result<(), DriverError> {
     for _ in 0..60 {
+        let mut tx = state
+            .tenant_ledger
+            .begin(workshop)
+            .await
+            .map_err(DriverError::internal)?;
         let active = sqlx::query_scalar::<_, i64>(
             "select count(*) from control.operations where workshop_id=$1 and kind='invoice.capture' and state='in_flight'",
         )
         .bind(workshop)
-        .fetch_one(&state.ledger)
+        .fetch_one(&mut *tx)
         .await
         .map_err(DriverError::internal)?;
+        tx.commit().await.map_err(DriverError::internal)?;
         if active == 0 {
             return Ok(());
         }
@@ -619,11 +665,9 @@ pub(super) async fn enter_workshop_maintenance(
     state: &DriverState,
     workshop: Uuid,
 ) -> Result<Vec<u8>, DriverError> {
-    let path = state.config.route_root.join(format!("{workshop}.conf"));
-    let backup = state
-        .config
-        .route_root
-        .join(format!("{workshop}.recovery.bak"));
+    let selected = selected_route_root(&state.config.route_root)?;
+    let path = selected.join(format!("{workshop}.conf"));
+    let backup = selected.join(format!("{workshop}.recovery.bak"));
     let previous = if backup.is_file() {
         std::fs::read(&backup).map_err(DriverError::internal)?
     } else {
@@ -664,16 +708,150 @@ pub(super) async fn enter_workshop_maintenance(
     Ok(previous)
 }
 
+async fn apply_recovery_route_effect(
+    state: &DriverState,
+    lease: &RecoveryRouteEffectLease,
+    contents: Option<&[u8]>,
+) -> Result<String, DriverError> {
+    if lease.workshop.is_nil() {
+        return Err(DriverError::internal(
+            "recovery route effect has no workshop",
+        ));
+    }
+    let selected = selected_route_root(&state.config.route_root)?;
+    let path = selected.join(format!("{}.conf", lease.workshop));
+    let temporary = selected.join(format!("{}.recovery-effect.tmp", lease.workshop));
+    renew_recovery_route_effect(state, lease).await?;
+    let digest = if let Some(contents) = contents {
+        write_gateway_file(&temporary, contents).map_err(DriverError::internal)?;
+        std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
+        format!("sha256:{:x}", Sha256::digest(contents))
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DriverError::internal(error)),
+        }
+        format!("sha256:{:x}", Sha256::digest([]))
+    };
+    renew_recovery_route_effect(state, lease).await?;
+    reload_gateway_runtime(state, &digest).await?;
+    renew_recovery_route_effect(state, lease).await?;
+    Ok(digest)
+}
+
+#[tracing::instrument(
+    name = "deployment_driver.recovery_route.enter",
+    skip_all,
+    fields(workshop_id = %lease.workshop, route.effect_run_id = %lease.effect_run_id,
+        route.generation = lease.generation)
+)]
+pub(super) async fn apply_recovery_maintenance_entry(
+    state: &DriverState,
+    lease: &RecoveryRouteEffectLease,
+    projection: &Value,
+) -> Result<(String, Value), DriverError> {
+    if lease.disposition != "present" {
+        return Err(DriverError::internal(
+            "recovery maintenance requires a present applied projection",
+        ));
+    }
+    let projection = route_projection::RouteProjection::parse(
+        projection,
+        &lease.projection_digest,
+        route_projection::RouteDisposition::Present,
+    )?;
+    let rendered = projection.render_maintenance()?;
+    let expected_rendered_digest = rendered.rendered_digest().to_owned();
+    let rendered_digest =
+        apply_recovery_route_effect(state, lease, rendered.contents().map(str::as_bytes)).await?;
+    if rendered_digest != expected_rendered_digest {
+        return Err(DriverError::internal(
+            "recovery maintenance rendered digest changed while applying",
+        ));
+    }
+    let evidence = json!({
+        "effect_run_id":lease.effect_run_id,
+        "workshop_id":lease.workshop,
+        "generation":lease.generation,
+        "projection_digest":lease.projection_digest,
+        "disposition":lease.disposition,
+        "rendered_digest":rendered_digest,
+        "route_fence_token":lease.fence_token,
+        "mode":"maintenance",
+    });
+    Ok((rendered_digest, evidence))
+}
+
+#[tracing::instrument(
+    name = "deployment_driver.recovery_route.exit",
+    skip_all,
+    fields(workshop_id = %lease.workshop, route.effect_run_id = %lease.effect_run_id,
+        route.generation = lease.generation, route.disposition = %lease.disposition)
+)]
+pub(super) async fn apply_recovery_maintenance_exit(
+    state: &DriverState,
+    lease: &RecoveryRouteEffectLease,
+    projection: Option<&Value>,
+) -> Result<(String, Value), DriverError> {
+    let disposition = route_projection::RouteDisposition::parse(&lease.disposition)?;
+    let projection =
+        parse_recovery_exit_projection(projection, &lease.projection_digest, disposition)?;
+    let paperless_container =
+        (projection.paperless_mode() != route_projection::PaperlessRouteMode::Absent).then(|| {
+            state
+                .config
+                .docker_resource(format!("paperless-{}", tenant_key(lease.workshop)))
+        });
+    let odoo_container = match disposition {
+        route_projection::RouteDisposition::Present => {
+            Some(active_odoo_runtime_container(state).await?)
+        }
+        route_projection::RouteDisposition::Absent => None,
+    };
+    let rendered = projection.render(odoo_container.as_deref().map(|odoo_upstream| {
+        route_projection::RouteRuntime {
+            odoo_upstream,
+            paperless_upstream: paperless_container.as_deref(),
+        }
+    }))?;
+    let expected_rendered_digest = rendered.rendered_digest().to_owned();
+    let rendered_digest =
+        apply_recovery_route_effect(state, lease, rendered.contents().map(str::as_bytes)).await?;
+    if rendered_digest != expected_rendered_digest {
+        return Err(DriverError::internal(
+            "recovery exit rendered digest changed while applying",
+        ));
+    }
+    let evidence = json!({
+        "effect_run_id":lease.effect_run_id,
+        "workshop_id":lease.workshop,
+        "generation":lease.generation,
+        "projection_digest":lease.projection_digest,
+        "disposition":lease.disposition,
+        "rendered_digest":rendered_digest,
+        "route_fence_token":lease.fence_token,
+        "mode":"restored",
+    });
+    Ok((rendered_digest, evidence))
+}
+
+fn parse_recovery_exit_projection(
+    projection: Option<&Value>,
+    projection_digest: &str,
+    disposition: route_projection::RouteDisposition,
+) -> Result<route_projection::RouteProjection, DriverError> {
+    route_projection::RouteProjection::parse_optional(projection, projection_digest, disposition)
+}
+
 pub(super) async fn leave_workshop_maintenance(
     state: &DriverState,
     workshop: Uuid,
     previous: &[u8],
 ) -> Result<(), DriverError> {
     replace_route_config(state, workshop, previous).await?;
-    let backup = state
-        .config
-        .route_root
-        .join(format!("{workshop}.recovery.bak"));
+    let selected = selected_route_root(&state.config.route_root)?;
+    let backup = selected.join(format!("{workshop}.recovery.bak"));
     if backup.exists() {
         std::fs::remove_file(backup).map_err(DriverError::internal)?;
     }
@@ -685,11 +863,9 @@ pub(super) async fn replace_route_config(
     workshop: Uuid,
     contents: &[u8],
 ) -> Result<(), DriverError> {
-    let path = state.config.route_root.join(format!("{workshop}.conf"));
-    let temporary = state
-        .config
-        .route_root
-        .join(format!("{workshop}.recovery.tmp"));
+    let selected = selected_route_root(&state.config.route_root)?;
+    let path = selected.join(format!("{workshop}.conf"));
+    let temporary = selected.join(format!("{workshop}.recovery.tmp"));
     write_gateway_file(&temporary, contents).map_err(DriverError::internal)?;
     std::fs::rename(&temporary, &path).map_err(DriverError::internal)?;
     let digest = format!("sha256:{:x}", Sha256::digest(contents));
@@ -698,7 +874,7 @@ pub(super) async fn replace_route_config(
 }
 
 async fn mark_recovery_ready_in_driver(
-    state: &DriverState,
+    ledger: WorkshopRecoveryLedger<'_>,
     recovery: Uuid,
     result: &Value,
 ) -> Result<(), DriverError> {
@@ -716,13 +892,19 @@ async fn mark_recovery_ready_in_driver(
         .get("components")
         .and_then(Value::as_array)
         .ok_or_else(|| DriverError::internal("recovery result missing components"))?;
-    let mut tx = state.ledger.begin().await.map_err(DriverError::internal)?;
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let workshop = ledger.workshop;
     let retention_days = result
         .get("retention_days")
         .and_then(Value::as_i64)
         .unwrap_or(35);
-    sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$2,size_bytes=$3,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$4,format_version=$5,storage_location=$6,source_release=$7,paperless_version=$8,encryption_key_id=$9,object_prefix=$10,expires_at=now()+make_interval(days=>$11) where id=$1")
+    let changed = sqlx::query("update control.workshop_recovery_points set state='ready',storage_ref=$3,size_bytes=$4,ready_at=now(),verification_state='verified',verified_at=now(),manifest_digest=$5,format_version=$6,storage_location=$7,source_release=$8,paperless_version=$9,encryption_key_id=$10,object_prefix=$11,expires_at=now()+make_interval(days=>$12) where id=$1 and workshop_id=$2")
         .bind(recovery)
+        .bind(workshop)
         .bind(get("storage_ref")?)
         .bind(size)
         .bind(get("manifest_digest")?)
@@ -735,9 +917,16 @@ async fn mark_recovery_ready_in_driver(
         .bind(i32::try_from(retention_days).map_err(DriverError::internal)?)
         .execute(&mut *tx)
         .await
-        .map_err(DriverError::internal)?;
-    sqlx::query("delete from control.workshop_recovery_components where recovery_point_id=$1")
+        .map_err(DriverError::internal)?
+        .rows_affected();
+    if changed != 1 {
+        return Err(DriverError::internal(
+            "scoped recovery result target was lost",
+        ));
+    }
+    sqlx::query("delete from control.workshop_recovery_components where recovery_point_id=$1 and workshop_id=$2")
         .bind(recovery)
+        .bind(workshop)
         .execute(&mut *tx)
         .await
         .map_err(DriverError::internal)?;
@@ -752,47 +941,58 @@ async fn mark_recovery_ready_in_driver(
             .get("size_bytes")
             .and_then(Value::as_i64)
             .ok_or_else(|| DriverError::internal("recovery component missing size_bytes"))?;
-        sqlx::query("insert into control.workshop_recovery_components(recovery_point_id,component,object_key,size_bytes,digest,plaintext_digest,state,verified_at) values($1,$2,$3,$4,$5,$6,'verified',now())")
-            .bind(recovery).bind(string("name")?).bind(string("path")?).bind(bytes).bind(string("sha256")?).bind(component.get("plaintext_sha256").and_then(Value::as_str)).execute(&mut *tx).await.map_err(DriverError::internal)?;
+        sqlx::query("insert into control.workshop_recovery_components(recovery_point_id,workshop_id,component,object_key,size_bytes,digest,plaintext_digest,state,verified_at) values($1,$2,$3,$4,$5,$6,$7,'verified',now())")
+            .bind(recovery).bind(workshop).bind(string("name")?).bind(string("path")?).bind(bytes).bind(string("sha256")?).bind(component.get("plaintext_sha256").and_then(Value::as_str)).execute(&mut *tx).await.map_err(DriverError::internal)?;
     }
     tx.commit().await.map_err(DriverError::internal)
 }
 
 async fn recovery_scope(
-    state: &DriverState,
-    workshop: Uuid,
+    ledger: WorkshopRecoveryLedger<'_>,
     recovery: Uuid,
 ) -> Result<Vec<String>, DriverError> {
-    sqlx::query_scalar(
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let result = sqlx::query_scalar(
         "select component_scope from control.workshop_recovery_points where id=$1 and workshop_id=$2",
     )
     .bind(recovery)
-    .bind(workshop)
-    .fetch_optional(&state.ledger)
+    .bind(ledger.workshop)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(DriverError::internal)?
-    .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "recovery point not found".into()))
+    .map_err(DriverError::internal)?;
+    tx.commit().await.map_err(DriverError::internal)?;
+    result.ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "recovery point not found".into()))
 }
 
 pub(super) async fn resolve_stored_recovery(
-    state: &DriverState,
-    workshop: Uuid,
+    ledger: WorkshopRecoveryLedger<'_>,
     recovery: Uuid,
 ) -> Result<StoredRecovery, DriverError> {
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
     let row = sqlx::query(
         "select storage_ref,component_scope,format_version from control.workshop_recovery_points where id=$1 and workshop_id=$2 and state='ready' and verification_state='verified' and storage_ref is not null and (expires_at is null or expires_at > now())",
     )
     .bind(recovery)
-    .bind(workshop)
-    .fetch_optional(&state.ledger)
+    .bind(ledger.workshop)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DriverError::internal)?
     .ok_or_else(|| DriverError::bad("recovery point is not ready and verified"))?;
-    Ok(StoredRecovery {
+    let stored = StoredRecovery {
         storage_ref: row.get("storage_ref"),
         component_scope: row.get("component_scope"),
         format_version: row.get("format_version"),
-    })
+    };
+    tx.commit().await.map_err(DriverError::internal)?;
+    Ok(stored)
 }
 
 pub(super) fn payload_uuid(payload: &Value, key: &str) -> Result<Uuid, DriverError> {
@@ -804,20 +1004,57 @@ pub(super) fn payload_uuid(payload: &Value, key: &str) -> Result<Uuid, DriverErr
         .map_err(|_| DriverError::bad(format!("{key} is invalid")))
 }
 
-async fn database_ref(
-    state: &DriverState,
-    workshop: Uuid,
+pub(super) async fn database_ref(
+    ledger: WorkshopRecoveryLedger<'_>,
     database_id: Uuid,
 ) -> Result<String, DriverError> {
-    sqlx::query_scalar(
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let result = sqlx::query_scalar(
         "select database_ref from control.odoo_databases where id=$1 and workshop_id=$2 and deleted_at is null",
     )
     .bind(database_id)
-    .bind(workshop)
-    .fetch_optional(&state.ledger)
+    .bind(ledger.workshop)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(DriverError::internal)?
-    .ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "database not found".into()))
+    .map_err(DriverError::internal)?;
+    tx.commit().await.map_err(DriverError::internal)?;
+    result.ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "database not found".into()))
+}
+
+async fn duplicate_target_ref(
+    ledger: WorkshopRecoveryLedger<'_>,
+    source_database: Uuid,
+    target_database: Uuid,
+) -> Result<String, DriverError> {
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let result = sqlx::query_scalar(
+        "select target.database_ref
+           from control.odoo_databases source
+           join control.odoo_databases target
+             on target.source_database_id=source.id
+            and target.workshop_id=source.workshop_id
+          where source.id=$1 and source.workshop_id=$2
+            and source.kind='primary' and source.deleted_at is null
+            and target.id=$3 and target.kind='duplicate'
+            and target.state='duplicating' and target.routable=false
+            and target.deleted_at is null",
+    )
+    .bind(source_database)
+    .bind(ledger.workshop)
+    .bind(target_database)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DriverError::internal)?;
+    tx.commit().await.map_err(DriverError::internal)?;
+    result.ok_or_else(|| DriverError(StatusCode::NOT_FOUND, "duplicate target not found".into()))
 }
 
 pub(super) async fn active_platform_release(state: &DriverState) -> Result<String, DriverError> {
@@ -833,7 +1070,12 @@ async fn source_workshop_release(
     workshop: Uuid,
     database_ref: &str,
 ) -> Result<String, DriverError> {
-    sqlx::query_scalar(
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let release = sqlx::query_scalar(
         "select coalesce(
             (select a.source_release_id from control.tenant_release_adoptions a
              join control.odoo_databases d on d.id=a.database_id
@@ -851,11 +1093,12 @@ async fn source_workshop_release(
     )
     .bind(workshop)
     .bind(database_ref)
-    .fetch_optional(&state.ledger)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DriverError::internal)?
-    .flatten()
-    .ok_or_else(|| {
+    .flatten();
+    tx.commit().await.map_err(DriverError::internal)?;
+    release.ok_or_else(|| {
         DriverError::bad("the workshop has no recorded immutable application release")
     })
 }
@@ -871,7 +1114,9 @@ pub(super) async fn create_recovery_set(
     if !safe_pg_identifier(database_ref) {
         return Err(DriverError::bad("unsafe database reference"));
     }
-    if let Some(existing) = existing_recovery_response(state, recovery).await? {
+    if let Some(existing) =
+        existing_recovery_response(WorkshopRecoveryLedger::new(state, workshop), recovery).await?
+    {
         return Ok(existing);
     }
     if kind == "backup" {
@@ -991,20 +1236,28 @@ pub(super) async fn create_recovery_set(
 }
 
 async fn existing_recovery_response(
-    state: &DriverState,
+    ledger: WorkshopRecoveryLedger<'_>,
     recovery: Uuid,
 ) -> Result<Option<Value>, DriverError> {
-    let row = sqlx::query("select storage_ref,storage_location,size_bytes,manifest_digest,format_version,source_release,paperless_version,encryption_key_id,object_prefix from control.workshop_recovery_points where id=$1 and state='ready' and verification_state='verified' and storage_ref is not null")
+    let mut tx = ledger
+        .store
+        .begin(ledger.workshop)
+        .await
+        .map_err(DriverError::internal)?;
+    let row = sqlx::query("select storage_ref,storage_location,size_bytes,manifest_digest,format_version,source_release,paperless_version,encryption_key_id,object_prefix from control.workshop_recovery_points where id=$1 and workshop_id=$2 and state='ready' and verification_state='verified' and storage_ref is not null")
         .bind(recovery)
-        .fetch_optional(&state.ledger)
+        .bind(ledger.workshop)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(DriverError::internal)?;
     let Some(row) = row else {
+        tx.commit().await.map_err(DriverError::internal)?;
         return Ok(None);
     };
-    let components = sqlx::query("select component,object_key,size_bytes,digest,plaintext_digest from control.workshop_recovery_components where recovery_point_id=$1 order by component")
+    let components = sqlx::query("select component,object_key,size_bytes,digest,plaintext_digest from control.workshop_recovery_components where recovery_point_id=$1 and workshop_id=$2 order by component")
         .bind(recovery)
-        .fetch_all(&state.ledger)
+        .bind(ledger.workshop)
+        .fetch_all(&mut *tx)
         .await
         .map_err(DriverError::internal)?
         .into_iter()
@@ -1016,7 +1269,7 @@ async fn existing_recovery_response(
             "plaintext_sha256": component.get::<Option<String>,_>("plaintext_digest"),
         }))
         .collect::<Vec<_>>();
-    Ok(Some(json!({
+    let response = json!({
         "storage_ref": row.get::<String,_>("storage_ref"),
         "storage_location": row.get::<String,_>("storage_location"),
         "size_bytes": row.get::<Option<i64>,_>("size_bytes").ok_or_else(|| DriverError::internal("ready recovery is missing size_bytes"))?,
@@ -1027,7 +1280,9 @@ async fn existing_recovery_response(
         "encryption_key_id": row.get::<Option<String>,_>("encryption_key_id"),
         "object_prefix": row.get::<Option<String>,_>("object_prefix"),
         "components": components,
-    })))
+    });
+    tx.commit().await.map_err(DriverError::internal)?;
+    Ok(Some(response))
 }
 
 pub(super) async fn restore_recovery_set(
@@ -1133,6 +1388,7 @@ async fn create_remote_recovery_set(
     let source_release = source_workshop_release(state, workshop, database_ref).await?;
     update_recovery_progress(
         state,
+        workshop,
         recovery,
         10,
         "capturing",
@@ -1200,6 +1456,7 @@ async fn create_remote_recovery_set(
     .await?;
     update_recovery_progress(
         state,
+        workshop,
         recovery,
         45,
         "encrypting",
@@ -1308,6 +1565,7 @@ async fn create_remote_recovery_set(
     .map_err(DriverError::internal)?;
     update_recovery_progress(
         state,
+        workshop,
         recovery,
         60,
         "packaging",
@@ -1332,6 +1590,7 @@ async fn create_remote_recovery_set(
     let object_prefix = format!("workshops/{workshop}/recovery/{recovery}");
     update_recovery_progress(
         state,
+        workshop,
         recovery,
         72,
         "uploading",
@@ -1341,6 +1600,7 @@ async fn create_remote_recovery_set(
     upload_and_verify_s3(state, &relative, &object_prefix, &manifest).await?;
     update_recovery_progress(
         state,
+        workshop,
         recovery,
         92,
         "verifying",
@@ -1400,26 +1660,41 @@ fn backup_writer_binds(
     binds
 }
 
+#[tracing::instrument(
+    name = "driver.recovery.update_progress",
+    skip_all,
+    fields(scope.kind = "tenant")
+)]
 async fn update_recovery_progress(
     state: &DriverState,
+    workshop: Uuid,
     recovery: Uuid,
     percent: i16,
     phase: &str,
     message: &str,
 ) -> Result<(), DriverError> {
+    let mut tx = state
+        .tenant_ledger
+        .begin(workshop)
+        .await
+        .map_err(DriverError::internal)?;
     sqlx::query(
-        "update control.operations o set progress_percent=$2,progress_phase=$3,
-                progress_message=$4,progress_updated_at=now()
+        "update control.operations o set progress_percent=$3,progress_phase=$4,
+                progress_message=$5,progress_updated_at=now()
          from control.workshop_recovery_points r
-         where r.id=$1 and r.operation_id=o.id and o.state='in_flight'",
+         where r.id=$1 and r.workshop_id=$2
+           and r.operation_id=o.id and o.workshop_id=r.workshop_id
+           and o.state='in_flight'",
     )
     .bind(recovery)
+    .bind(workshop)
     .bind(percent)
     .bind(phase)
     .bind(message)
-    .execute(&state.ledger)
+    .execute(&mut *tx)
     .await
     .map_err(DriverError::internal)?;
+    tx.commit().await.map_err(DriverError::internal)?;
     Ok(())
 }
 
@@ -2435,6 +2710,177 @@ async fn validate_local_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_recovery_exit_accepts_omitted_projection_with_exact_digest() {
+        let absent = json!({"database_id":null,"database_ref":null,
+            "public_hostname":null,"paperless_mode":"absent",
+            "paperless_hostname":null,"custom_hostnames":[]});
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_jcs::to_vec(&absent).unwrap())
+        );
+        let parsed = parse_recovery_exit_projection(
+            None,
+            &digest,
+            route_projection::RouteDisposition::Absent,
+        )
+        .unwrap();
+        assert!(parsed.render(None).unwrap().contents().is_none());
+        assert!(
+            parse_recovery_exit_projection(
+                None,
+                &digest,
+                route_projection::RouteDisposition::Present,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_target_is_resolved_before_any_recovery_side_effect() {
+        let source = include_str!("recovery.rs");
+        let lifecycle = source
+            .split("pub(super) async fn lifecycle(")
+            .nth(1)
+            .unwrap();
+        let resolve = lifecycle.find("duplicate_target_ref(").unwrap();
+        let first_effect = lifecycle.find("let paperless_container").unwrap();
+        assert!(
+            resolve < first_effect,
+            "ledger ownership must be resolved before maintenance, Docker, or PostgreSQL effects"
+        );
+        assert!(!lifecycle[..first_effect].contains("target_database_ref"));
+    }
+
+    #[test]
+    fn workshop_owned_recovery_sql_uses_the_tenant_capability() {
+        let source = include_str!("recovery.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production.matches("&state.ledger").count(),
+            2,
+            "only immutable application-release discovery may use the fleet ledger"
+        );
+        assert!(
+            production
+                .split("async fn release_odoo_ref(")
+                .nth(1)
+                .unwrap()
+                .split("pub(super) async fn download_backup(")
+                .next()
+                .unwrap()
+                .contains("&state.ledger")
+        );
+        assert!(
+            production
+                .split("pub(super) async fn active_platform_release(")
+                .nth(1)
+                .unwrap()
+                .split("async fn source_workshop_release(")
+                .next()
+                .unwrap()
+                .contains("&state.ledger")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn duplicate_target_resolution_rejects_cross_workshop_database_ids() {
+        let database_url =
+            std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
+        let store = crate::persistence::Store::connect(&database_url)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for workshop in [first, second] {
+            sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Driver duplicate fixture','Europe/Paris')")
+                .bind(workshop).bind(format!("driver-duplicate-{}",workshop.simple()))
+                .execute(store.pool()).await.unwrap();
+        }
+        let first_source = Uuid::new_v4();
+        let second_source = Uuid::new_v4();
+        for (workshop, source) in [(first, first_source), (second, second_source)] {
+            sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,state,routable) values($1,$2,'primary',$3,$4,'Primary','ready',true)")
+                .bind(source).bind(workshop).bind(crate::domain::opaque_database_ref(source))
+                .bind(format!("{}.example.test",source.simple())).execute(store.pool()).await.unwrap();
+        }
+        let first_target = Uuid::new_v4();
+        let second_target = Uuid::new_v4();
+        for (workshop, source, target) in [
+            (first, first_source, first_target),
+            (second, second_source, second_target),
+        ] {
+            sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,label,state,source_database_id,routable) values($1,$2,'duplicate',$3,'Duplicate','duplicating',$4,false)")
+                .bind(target).bind(workshop).bind(crate::domain::opaque_database_ref(target))
+                .bind(source).execute(store.pool()).await.unwrap();
+        }
+
+        let tenant_store = store.worker_tenant_scope();
+
+        assert_eq!(
+            duplicate_target_ref(
+                WorkshopRecoveryLedger::from_store(&tenant_store, second),
+                second_source,
+                second_target,
+            )
+            .await
+            .unwrap(),
+            crate::domain::opaque_database_ref(second_target)
+        );
+        let crossed = duplicate_target_ref(
+            WorkshopRecoveryLedger::from_store(&tenant_store, second),
+            second_source,
+            first_target,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crossed.0, StatusCode::NOT_FOUND);
+        let mismatched_source = duplicate_target_ref(
+            WorkshopRecoveryLedger::from_store(&tenant_store, second),
+            first_source,
+            second_target,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched_source.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn database_ref_resolution_rejects_cross_workshop_database_ids() {
+        let database_url =
+            std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
+        let store = crate::persistence::Store::connect(&database_url)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for workshop in [first, second] {
+            sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Driver database fixture','Europe/Paris')")
+                .bind(workshop).bind(format!("driver-database-{}",workshop.simple()))
+                .execute(store.pool()).await.unwrap();
+        }
+        let first_database = Uuid::new_v4();
+        let second_database = Uuid::new_v4();
+        for (workshop, database) in [(first, first_database), (second, second_database)] {
+            sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,state,routable) values($1,$2,'primary',$3,$4,'Primary','ready',true)")
+                .bind(database).bind(workshop).bind(crate::domain::opaque_database_ref(database))
+                .bind(format!("{}.example.test",database.simple())).execute(store.pool()).await.unwrap();
+        }
+        let tenant_store = store.worker_tenant_scope();
+        let scoped = WorkshopRecoveryLedger::from_store(&tenant_store, second);
+
+        assert_eq!(
+            database_ref(scoped, second_database).await.unwrap(),
+            crate::domain::opaque_database_ref(second_database)
+        );
+        let crossed = database_ref(scoped, first_database).await.unwrap_err();
+        assert_eq!(crossed.0, StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn backup_writer_never_receives_recovery_secret_bind() {

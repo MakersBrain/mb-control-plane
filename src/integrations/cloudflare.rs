@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -5,8 +6,22 @@ use serde_json::{Value, json};
 
 use crate::domain::IntegrationError;
 use crate::integrations::{bounded_body, classify_status};
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 const MAXIMUM_RESPONSE: usize = 256 * 1024;
+
+static HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn shared_http() -> Result<reqwest::Client, IntegrationError> {
+    HTTP.get_or_init(|| {
+        crate::outbound_http::external_api_builder("mb-domain-worker")
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .cloned()
+    .map_err(|_| IntegrationError::Unavailable)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DnsValidationRecord {
@@ -25,11 +40,18 @@ pub struct CustomHostnameObservation {
     pub error_class: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CustomHostnameDeletionObservation {
+    Present(CustomHostnameObservation),
+    Absent,
+}
+
 #[derive(Clone)]
 pub struct CloudflareCustomHostnameClient {
     http: reqwest::Client,
     token: String,
     zone_id: String,
+    timeout: Duration,
 }
 
 impl CloudflareCustomHostnameClient {
@@ -47,15 +69,22 @@ impl CloudflareCustomHostnameClient {
         if !valid(&token, 512) || !valid(&zone_id, 64) {
             return Err(IntegrationError::ContractDrift);
         }
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|_| IntegrationError::Unavailable)?;
         Ok(Self {
-            http,
+            http: shared_http()?,
             token,
             zone_id,
+            timeout,
         })
+    }
+
+    fn request<U>(&self, method: reqwest::Method, url: U) -> reqwest::RequestBuilder
+    where
+        U: reqwest::IntoUrl,
+    {
+        self.http
+            .request(method, url)
+            .bearer_auth(&self.token)
+            .timeout(self.timeout)
     }
 
     fn endpoint(&self, provider_ref: Option<&str>) -> String {
@@ -73,9 +102,7 @@ impl CloudflareCustomHostnameClient {
         domain_id: uuid::Uuid,
     ) -> Result<CustomHostnameObservation, IntegrationError> {
         let response = self
-            .http
-            .post(self.endpoint(None))
-            .bearer_auth(&self.token)
+            .request(reqwest::Method::POST, self.endpoint(None))
             .json(&json!({
                 "hostname":hostname,
                 "custom_metadata":{"workshop_id":workshop,"domain_id":domain_id},
@@ -84,9 +111,12 @@ impl CloudflareCustomHostnameClient {
                     "settings":{"min_tls_version":"1.2","http2":"on","tls_1_3":"on"}
                 }
             }))
+            .with_current_trace_context()
             .send()
             .await
-            .map_err(|_| IntegrationError::Unavailable)?;
+            // A POST may have reached Cloudflare before the transport failed.
+            // Reconciliation must find by hostname before it ever creates again.
+            .map_err(|_| IntegrationError::UnknownOutcome)?;
         parse_response(response).await
     }
 
@@ -98,9 +128,8 @@ impl CloudflareCustomHostnameClient {
             url::Url::parse(&self.endpoint(None)).map_err(|_| IntegrationError::ContractDrift)?;
         endpoint.query_pairs_mut().append_pair("hostname", hostname);
         let response = self
-            .http
-            .get(endpoint)
-            .bearer_auth(&self.token)
+            .request(reqwest::Method::GET, endpoint)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -139,13 +168,42 @@ impl CloudflareCustomHostnameClient {
             return Err(IntegrationError::ContractDrift);
         }
         let response = self
-            .http
-            .get(self.endpoint(Some(provider_ref)))
-            .bearer_auth(&self.token)
+            .request(reqwest::Method::GET, self.endpoint(Some(provider_ref)))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
         parse_response(response).await
+    }
+
+    /// Observe deletion by the immutable provider identifier. A 404 is
+    /// authoritative absence; transport failures remain retryable uncertainty.
+    pub async fn observe_deletion(
+        &self,
+        provider_ref: &str,
+    ) -> Result<CustomHostnameDeletionObservation, IntegrationError> {
+        if provider_ref.len() > 128
+            || !provider_ref
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(IntegrationError::ContractDrift);
+        }
+        let response = self
+            .request(reqwest::Method::GET, self.endpoint(Some(provider_ref)))
+            .with_current_trace_context()
+            .send()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // Consume the bounded body before returning so the pooled
+            // connection remains reusable. Its contents are not trusted.
+            let _ = bounded_body(response, MAXIMUM_RESPONSE).await?;
+            return Ok(CustomHostnameDeletionObservation::Absent);
+        }
+        parse_response(response)
+            .await
+            .map(CustomHostnameDeletionObservation::Present)
     }
 
     pub async fn delete(&self, provider_ref: &str) -> Result<(), IntegrationError> {
@@ -157,12 +215,14 @@ impl CloudflareCustomHostnameClient {
             return Err(IntegrationError::ContractDrift);
         }
         let response = self
-            .http
-            .delete(self.endpoint(Some(provider_ref)))
-            .bearer_auth(&self.token)
+            .request(reqwest::Method::DELETE, self.endpoint(Some(provider_ref)))
+            .with_current_trace_context()
             .send()
             .await
-            .map_err(|_| IntegrationError::Unavailable)?;
+            // DELETE may have reached Cloudflare before the transport failed.
+            // Keep the durable operation reconcilable instead of terminalizing
+            // a potentially successful deletion.
+            .map_err(|_| IntegrationError::UnknownOutcome)?;
         match response.status() {
             StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(()),
             status => Err(classify_status(status)),
@@ -310,5 +370,26 @@ mod tests {
             observation.error_class.as_deref(),
             Some("edge_validation_failed")
         );
+    }
+
+    #[test]
+    fn pooled_transport_keeps_bearer_token_and_timeout_request_local() {
+        let client = CloudflareCustomHostnameClient::new(
+            "cloudflare-token-one".into(),
+            "023e105f4ecef8ad9ca31a8372d0c353".into(),
+            Duration::from_secs(19),
+        )
+        .unwrap();
+        let request = client
+            .request(reqwest::Method::GET, client.endpoint(None))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer cloudflare-token-one"
+        );
+        assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(19)));
     }
 }

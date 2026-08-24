@@ -79,6 +79,7 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_superuser_password
       CONTROL_POSTGRES_PASSWORD: "@/run/secrets/control_postgres_password"
       CONTROL_API_POSTGRES_PASSWORD: "@/run/secrets/control_api_postgres_password"
+      CONTROL_TENANT_API_POSTGRES_PASSWORD: "@/run/secrets/control_tenant_api_postgres_password"
       CONTROL_MEMBERSHIP_POSTGRES_PASSWORD: "@/run/secrets/control_membership_postgres_password"
       CONTROL_PROVISIONING_POSTGRES_PASSWORD: "@/run/secrets/control_provisioning_postgres_password"
       CONTROL_INVOICE_POSTGRES_PASSWORD: "@/run/secrets/control_invoice_postgres_password"
@@ -96,6 +97,7 @@ services:
       - postgres_superuser_password
       - control_postgres_password
       - control_api_postgres_password
+      - control_tenant_api_postgres_password
       - control_membership_postgres_password
       - control_provisioning_postgres_password
       - control_invoice_postgres_password
@@ -195,6 +197,7 @@ services:
       PGHOST: postgres
       POSTGRES_SUPERUSER_PASSWORD: "@/run/secrets/postgres_superuser_password"
       CONTROL_API_POSTGRES_PASSWORD: "@/run/secrets/control_api_postgres_password"
+      CONTROL_TENANT_API_POSTGRES_PASSWORD: "@/run/secrets/control_tenant_api_postgres_password"
       CONTROL_MEMBERSHIP_POSTGRES_PASSWORD: "@/run/secrets/control_membership_postgres_password"
       CONTROL_PROVISIONING_POSTGRES_PASSWORD: "@/run/secrets/control_provisioning_postgres_password"
       CONTROL_INVOICE_POSTGRES_PASSWORD: "@/run/secrets/control_invoice_postgres_password"
@@ -211,6 +214,7 @@ services:
     secrets:
       - postgres_superuser_password
       - control_api_postgres_password
+      - control_tenant_api_postgres_password
       - control_membership_postgres_password
       - control_provisioning_postgres_password
       - control_invoice_postgres_password
@@ -238,6 +242,7 @@ services:
     build: {context: ..}
     environment:
       CONTROL_DATABASE_URL: "@/run/secrets/control_api_database_url"
+      CONTROL_TENANT_DATABASE_URL: "@/run/secrets/control_tenant_api_database_url"
       CONTROL_DATA_MODE: ${CONTROL_DATA_MODE:?CONTROL_DATA_MODE is required}
       CONTROL_PRIVACY_CONTROLLER_REF: ${CONTROL_PRIVACY_CONTROLLER_REF:-}
       CONTROL_PRIVACY_PROCESSING_RECORD_REF: ${CONTROL_PRIVACY_PROCESSING_RECORD_REF:-}
@@ -279,6 +284,7 @@ services:
       - tenant-secrets:/run/mb-secrets:ro
     secrets:
       - control_api_database_url
+      - control_tenant_api_database_url
       - control_internal_token
       - control_metrics_token
       - control_mail_event_token
@@ -396,6 +402,7 @@ services:
       DRIVER_RAUTHY_ADMIN_URL: http://rauthy:8092/auth/v1
       DRIVER_RAUTHY_ADMIN_KEY: "@/run/secrets/control_rauthy_deployment_key"
       DRIVER_OIDC_ISSUER: http://rauthy.localhost:${RAUTHY_HTTP_PORT:-8092}/auth/v1
+      DRIVER_TENANT_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
       DRIVER_PUBLIC_SCHEME: http
       DRIVER_ENVIRONMENT: development
       DRIVER_PUBLIC_PORT: ${ODOO_HTTP_PORT:-8169}
@@ -457,6 +464,7 @@ services:
       CONTROL_PAPERLESS_SECRET_ROOT: /run/mb-paperless-client-secrets
       CONTROL_EXTRACTION_BROKER_URL: http://document-extraction:8080
       CONTROL_EXTRACTION_BROKER_TOKEN: "@/run/secrets/document_extraction_token"
+      CONTROL_PAPERLESS_CAPTURED_TAG_IDS: ${CONTROL_PAPERLESS_CAPTURED_TAG_IDS:-}
       CONTROL_AZURE_MONTHLY_PAGE_LIMIT: "1000"
       CONTROL_AZURE_ANALYZE_MIN_INTERVAL_MS: "1100"
     volumes:
@@ -652,6 +660,7 @@ secrets:
   postgres_superuser_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/postgres_superuser_password"}
   control_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_postgres_password"}
   control_api_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_api_postgres_password"}
+  control_tenant_api_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_tenant_api_postgres_password"}
   control_membership_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_membership_postgres_password"}
   control_provisioning_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_provisioning_postgres_password"}
   control_invoice_postgres_password: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_invoice_postgres_password"}
@@ -696,6 +705,7 @@ secrets:
   backup_age_recipient: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/backup_age_recipient"}
   control_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_database_url"}
   control_api_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_api_database_url"}
+  control_tenant_api_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_tenant_api_database_url"}
   control_membership_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_membership_database_url"}
   control_provisioning_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_provisioning_database_url"}
   control_invoice_database_url: {file: "${WORKSPACE_SECRET_ROOT:-./secrets/runtime}/control_invoice_database_url"}

@@ -6,17 +6,16 @@
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
 	import { formatInstant, roleLabel, sentence } from '$lib/format';
 	import { request } from '$lib/session.svelte';
-	import type { PlatformWorkshopDetailResponse } from '$lib/generated/control-api';
-	type WebshopDashboard = { state:string; checks:{key:string;label:string;ready:boolean}[]; issues:{key:string;category:string;state:string;count:number;safe_error_class?:string;next_action:string;href?:string;operation_id?:string}[] };
+	import type { OperationCommandResponse, PlatformWorkshopDetailResponse, WebshopDashboardResponse, WorkshopDeletionCommandResponse } from '$lib/generated/control-api';
 	const id = $derived(page.params.id ?? '');
 	let workshop = $state<PlatformWorkshopDetailResponse>(); let error = $state(''); let loading = $state(true);
-	let webshop = $state<WebshopDashboard>();
+	let webshop = $state<WebshopDashboardResponse>();
 	let reconciling = $state(false); let operationId = $state(''); let notice = $state('');
 	let deletionConfirmation = $state(''); let deleting = $state(false);
 	$effect(() => { id; void load(); const timer = window.setInterval(() => void load(false), 8000); return () => window.clearInterval(timer); });
-	async function load(showError = true) { try { [workshop, webshop] = await Promise.all([request<PlatformWorkshopDetailResponse>(`/v1/platform/workshops/${id}`),request<WebshopDashboard>(`/v1/platform/workshops/${id}/webshop`)]); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
-	async function reconcile() { reconciling = true; error = ''; notice = ''; try { const result = await request<{operation_id:string}>(`/v1/platform/workshops/${id}/reconcile`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID()} }); operationId = result.operation_id; notice = 'A complete tenant observation and repair pass was queued.'; await load(); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { reconciling = false; } }
-	async function removeWorkshop() { if (!workshop) return; deleting = true; error = ''; notice = ''; try { const result = await request<{operation_id:string}>(`/v1/platform/workshops/${id}/deletion`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID(),'if-match':`"workshop-${id}-v${workshop.version}"`}, body:JSON.stringify({confirmation:deletionConfirmation}) }); operationId = result.operation_id; notice = 'Workshop removal started. Access is restricted while the final encrypted backup is verified.'; deletionConfirmation = ''; await load(); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { deleting = false; } }
+	async function load(showError = true) { try { [workshop, webshop] = await Promise.all([request<PlatformWorkshopDetailResponse>(`/v1/platform/workshops/${id}`),request<WebshopDashboardResponse>(`/v1/platform/workshops/${id}/webshop`)]); if (showError) error = ''; } catch (cause) { if (showError) error = cause instanceof Error ? cause.message : String(cause); } finally { loading = false; } }
+	async function reconcile() { reconciling = true; error = ''; notice = ''; try { const result = await request<OperationCommandResponse>(`/v1/platform/workshops/${id}/reconcile`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID()} }); operationId = result.operation_id; notice = 'A complete tenant observation and repair pass was queued.'; await load(); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { reconciling = false; } }
+	async function removeWorkshop() { if (!workshop) return; deleting = true; error = ''; notice = ''; try { const result = await request<WorkshopDeletionCommandResponse>(`/v1/platform/workshops/${id}/deletion`, { method:'POST', headers:{'idempotency-key':crypto.randomUUID(),'if-match':`"workshop-${id}-v${workshop.version}"`}, body:JSON.stringify({confirmation:deletionConfirmation}) }); operationId = result.operation_id; notice = 'Workshop removal started. Access is restricted while the final encrypted backup is verified.'; deletionConfirmation = ''; await load(); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); } finally { deleting = false; } }
 </script>
 
 <svelte:head><title>{workshop?.display_name ?? 'Workshop'} · Platform · MakersBrain</title></svelte:head>

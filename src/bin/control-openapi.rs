@@ -1,4 +1,22 @@
-fn main() -> anyhow::Result<()> {
+use std::process::ExitCode;
+
+fn command_failure(error: &anyhow::Error) -> ExitCode {
+    let (classes, truncated) = mb_control_plane::error_reporting::safe_anyhow_chain(error);
+    let error_class = classes.first().copied().unwrap_or("internal");
+    eprintln!(
+        "{{\"level\":\"ERROR\",\"service\":\"mb-control-openapi\",\"error_class\":\"{error_class}\",\"error_chain_truncated\":{truncated},\"message\":\"command failed\"}}"
+    );
+    ExitCode::FAILURE
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => command_failure(&error),
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
         None => println!(

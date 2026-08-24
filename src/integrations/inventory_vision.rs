@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 use super::{bounded_body, classify_status};
 
@@ -98,12 +99,9 @@ impl InventoryVisionClient {
             }
         }
         Ok(Self {
-            http: reqwest::Client::builder()
+            http: crate::outbound_http::external_api_builder("mb-ai-broker")
                 .default_headers(headers)
                 .timeout(Duration::from_secs(90))
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent("mb-ai-broker")
                 .build()?,
             endpoint,
             model: model.to_owned(),
@@ -122,6 +120,7 @@ impl InventoryVisionClient {
             .http
             .post(self.endpoint.clone())
             .json(&self.request(assets, ocr_tokens))
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|error| {

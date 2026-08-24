@@ -10,11 +10,11 @@ use aws_lc_rs::signature::{
 };
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use reqwest::header::{HeaderValue, USER_AGENT};
+use reqwest::header::HeaderValue;
 use rustls_pki_types::{CertificateDer, UnixTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +28,8 @@ use tower_http::trace::TraceLayer;
 use url::Url;
 use uuid::Uuid;
 use webpki::{ALL_VERIFICATION_ALGS, EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 const SCALEWAY_ENDPOINT: &str =
     "https://api.scaleway.com/transactional-email/v1alpha1/regions/fr-par/emails";
@@ -236,16 +238,12 @@ impl MailGatewayState {
         provider_token.set_sensitive(true);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("X-Auth-Token", provider_token);
-        headers.insert(USER_AGENT, HeaderValue::from_static("mb-mail-gateway/1"));
-        let provider_client = reqwest::Client::builder()
+        let provider_client = crate::outbound_http::external_api_builder("mb-mail-gateway/1")
             .default_headers(headers)
             .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let public_client = reqwest::Client::builder()
+        let public_client = crate::outbound_http::external_api_builder("mb-mail-gateway/1")
             .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-mail-gateway/1")
             .build()?;
         let control_event_url = Url::parse(&configured("MAIL_GATEWAY_CONTROL_EVENT_URL")?)?;
         if !matches!(control_event_url.scheme(), "http" | "https")
@@ -310,12 +308,29 @@ pub fn app(state: MailGatewayState) -> Router {
             |request: &axum::http::Request<axum::body::Body>| {
                 tracing::info_span!(
                     "mail_gateway_http_request",
-                    http_request_method = %request.method(),
-                    http_route = %request.uri().path()
+                    http_request_method = http_method_label(request.method()),
+                    http_route = mail_gateway_route_label(request.uri().path())
                 )
             },
         ))
         .with_state(Arc::new(state))
+}
+
+fn http_method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        _ => "other",
+    }
+}
+
+fn mail_gateway_route_label(path: &str) -> &'static str {
+    match path {
+        "/health/live" => "/health/live",
+        "/v1/mail" => "/v1/mail",
+        "/v1/mail/events" => "/v1/mail/events",
+        _ => "unmatched",
+    }
 }
 
 async fn send(
@@ -419,9 +434,17 @@ async fn send(
         .provider_client
         .post(state.endpoint.clone())
         .json(&payload)
+        .with_current_trace_context()
         .send()
         .await
         .map_err(|error| {
+            tracing::warn!(
+                provider = "scaleway-tem",
+                operation = "send-mail",
+                outcome = "transport-failure",
+                error_class = crate::error_reporting::safe_error_class(&error),
+                "mail provider call failed"
+            );
             if error.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -429,6 +452,13 @@ async fn send(
             }
         })?;
     if !response.status().is_success() {
+        tracing::warn!(
+            provider = "scaleway-tem",
+            operation = "send-mail",
+            outcome = "provider-rejected",
+            http_response_status = response.status().as_u16(),
+            "mail provider rejected request"
+        );
         return Err(StatusCode::BAD_GATEWAY);
     }
     if response
@@ -494,14 +524,32 @@ async fn receive_sns_event(
             let response = state
                 .public_client
                 .get(confirmation)
+                // This URL originates in a signed provider callback. Do not
+                // disclose the gateway's internal trace context back to it.
                 .send()
                 .await
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        provider = "scaleway-sns",
+                        operation = "confirm-subscription",
+                        outcome = "transport-failure",
+                        error_class = crate::error_reporting::safe_error_class(&error),
+                        "SNS confirmation call failed"
+                    );
+                    StatusCode::BAD_GATEWAY
+                })?;
             if !response.status().is_success()
                 || response
                     .content_length()
                     .is_some_and(|length| length > MAX_CERTIFICATE_BODY as u64)
             {
+                tracing::warn!(
+                    provider = "scaleway-sns",
+                    operation = "confirm-subscription",
+                    outcome = "invalid-response",
+                    http_response_status = response.status().as_u16(),
+                    "SNS confirmation response was invalid"
+                );
                 return Err(StatusCode::BAD_GATEWAY);
             }
             let body = response
@@ -521,7 +569,18 @@ async fn receive_sns_event(
                 .await
                 .append(record.clone())
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|error| {
+                    let (error_classes, error_chain_truncated) =
+                        crate::error_reporting::safe_anyhow_chain(&error);
+                    tracing::error!(
+                        ?error_classes,
+                        error_chain_truncated,
+                        operation = "append-delivery-event",
+                        outcome = "failure",
+                        "mail event journal append failed"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
             publish_delivery_event(&state, &record).await?;
             Ok(StatusCode::NO_CONTENT)
         }
@@ -538,13 +597,30 @@ async fn publish_delivery_event(
         .post(state.control_event_url.clone())
         .bearer_auth(&state.control_event_token)
         .json(record)
+        .with_current_trace_context()
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|error| {
+            tracing::warn!(
+                provider = "control-plane",
+                operation = "publish-delivery-event",
+                outcome = "transport-failure",
+                error_class = crate::error_reporting::safe_error_class(&error),
+                "delivery event publication failed"
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
     if !matches!(
         response.status(),
         StatusCode::CREATED | StatusCode::NO_CONTENT
     ) {
+        tracing::warn!(
+            provider = "control-plane",
+            operation = "publish-delivery-event",
+            outcome = "provider-rejected",
+            http_response_status = response.status().as_u16(),
+            "delivery event publication was rejected"
+        );
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(())
@@ -734,20 +810,44 @@ async fn signer_certificate(state: &MailGatewayState, url: Url) -> Result<Vec<u8
     let response = state
         .public_client
         .get(url.clone())
+        // Signing-certificate URLs originate in provider callbacks. Their
+        // allowlist and signature checks do not make trace disclosure useful.
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|error| {
+            tracing::warn!(
+                provider = "scaleway-sns",
+                operation = "fetch-signing-certificate",
+                outcome = "transport-failure",
+                error_class = crate::error_reporting::safe_error_class(&error),
+                "SNS signing certificate fetch failed"
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
     if !response.status().is_success()
         || response
             .content_length()
             .is_some_and(|length| length > MAX_CERTIFICATE_BODY as u64)
     {
+        tracing::warn!(
+            provider = "scaleway-sns",
+            operation = "fetch-signing-certificate",
+            outcome = "invalid-response",
+            http_response_status = response.status().as_u16(),
+            "SNS signing certificate response was invalid"
+        );
         return Err(StatusCode::BAD_GATEWAY);
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let body = response.bytes().await.map_err(|error| {
+        tracing::warn!(
+            provider = "scaleway-sns",
+            operation = "read-signing-certificate",
+            outcome = "transport-failure",
+            error_class = crate::error_reporting::safe_error_class(&error),
+            "SNS signing certificate response read failed"
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
     if body.len() > MAX_CERTIFICATE_BODY {
         return Err(StatusCode::BAD_GATEWAY);
     }
@@ -1118,8 +1218,43 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::ServiceExt;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone, Default)]
+    struct RecordedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct LogVisitor<'a>(&'a mut String);
+
+    impl Visit for LogVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?};", field.name());
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for RecordedLogs {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut rendered = format!("span={};", attributes.metadata().name());
+            attributes.record(&mut LogVisitor(&mut rendered));
+            self.0.lock().unwrap().push(rendered);
+        }
+
+        fn on_event(&self, event: &Event<'_>, _context: tracing_subscriber::layer::Context<'_, S>) {
+            let mut rendered = String::new();
+            event.record(&mut LogVisitor(&mut rendered));
+            self.0.lock().unwrap().push(rendered);
+        }
+    }
 
     fn test_state(endpoint: Url, provider_client: reqwest::Client) -> MailGatewayState {
         let journal_directory =
@@ -1165,6 +1300,85 @@ mod tests {
             subject: Some("delivery".into()),
             token: None,
             subscribe_url: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_tracing_never_records_mail_secrets_or_personal_content() {
+        const TOKEN: &str = "mail-bearer-canary-never-log";
+        const EMAIL: &str = "private-mail-canary@example.test";
+        const PAYLOAD: &str = "mail-payload-and-model-result-canary";
+        const SECRET_PATH: &str = "/run/secrets/mail-signing-key-canary";
+
+        let recorded = RecordedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(recorded.clone());
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/emails"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "token": TOKEN,
+                "recipient": EMAIL,
+                "provider_detail": PAYLOAD,
+                "certificate_path": SECRET_PATH
+            })))
+            .expect(1)
+            .mount(&provider)
+            .await;
+        let mut state = test_state(
+            Url::parse(&format!("{}/emails", provider.uri())).unwrap(),
+            reqwest::Client::new(),
+        );
+        state.internal_token = TOKEN.into();
+        let router = app(state);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/mail")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "delivery_id": Uuid::new_v4(),
+                            "to": "synthetic@example.test",
+                            "template": "odoo-rendered-v1",
+                            "reply_to": EMAIL,
+                            "data": {
+                                "subject": "Safe bounded subject",
+                                "text": PAYLOAD,
+                                "html": format!("<p>{SECRET_PATH}</p>")
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let unmatched = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(SECRET_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let rendered = recorded.0.lock().unwrap().join("\n");
+        assert!(rendered.contains("mail_gateway_http_request"));
+        assert!(rendered.contains("/v1/mail"));
+        assert!(rendered.contains("unmatched"));
+        for canary in [TOKEN, EMAIL, PAYLOAD, SECRET_PATH] {
+            assert!(
+                !rendered.contains(canary),
+                "logged private canary: {canary}"
+            );
         }
     }
 

@@ -3,6 +3,7 @@ set -eu
 
 for name in \
   POSTGRES_SUPERUSER_PASSWORD CONTROL_API_POSTGRES_PASSWORD \
+  CONTROL_TENANT_API_POSTGRES_PASSWORD \
   CONTROL_MEMBERSHIP_POSTGRES_PASSWORD CONTROL_PROVISIONING_POSTGRES_PASSWORD \
   CONTROL_INVOICE_POSTGRES_PASSWORD CONTROL_INVENTORY_POSTGRES_PASSWORD \
   CONTROL_EMAIL_POSTGRES_PASSWORD CONTROL_RECONCILIATION_POSTGRES_PASSWORD \
@@ -25,6 +26,7 @@ done
 export PGPASSWORD=$POSTGRES_SUPERUSER_PASSWORD
 psql --set=ON_ERROR_STOP=1 --host="${PGHOST:-postgres}" --username=postgres --dbname=postgres \
   --set=control_api_password="$CONTROL_API_POSTGRES_PASSWORD" \
+  --set=control_tenant_api_password="$CONTROL_TENANT_API_POSTGRES_PASSWORD" \
   --set=control_membership_password="$CONTROL_MEMBERSHIP_POSTGRES_PASSWORD" \
   --set=control_provisioning_password="$CONTROL_PROVISIONING_POSTGRES_PASSWORD" \
   --set=control_invoice_password="$CONTROL_INVOICE_POSTGRES_PASSWORD" \
@@ -40,7 +42,7 @@ select 'create role control_runtime_read nologin'
 where not exists (select from pg_roles where rolname='control_runtime_read') \gexec
 select format('create role %I nologin', role_name)
 from unnest(array[
-  'control_api','control_membership_worker','control_provisioning_worker',
+  'control_api','control_tenant_api','control_membership_worker','control_provisioning_worker',
   'control_invoice_worker','control_inventory_worker','control_email_worker',
   'control_reconciliation_worker','control_lifecycle_worker',
   'control_backup_scheduler','control_driver_ledger','control_release_worker',
@@ -50,6 +52,7 @@ where not exists (select from pg_roles where rolname=role_name) \gexec
 
 alter role control_runtime_read nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
 alter role control_api login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_api_password';
+alter role control_tenant_api login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_tenant_api_password';
 alter role control_membership_worker login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_membership_password';
 alter role control_provisioning_worker login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_provisioning_password';
 alter role control_invoice_worker login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_invoice_password';
@@ -62,11 +65,16 @@ alter role control_driver_ledger login nosuperuser nocreatedb nocreaterole norep
 alter role control_release_worker login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_release_password';
 alter role control_privacy_worker login nosuperuser nocreatedb nocreaterole noreplication nobypassrls password :'control_privacy_password';
 
-grant control_runtime_read to control_api,control_membership_worker,
+grant control_runtime_read to control_api,control_tenant_api,control_membership_worker,
   control_provisioning_worker,control_invoice_worker,control_inventory_worker,
   control_email_worker,control_reconciliation_worker,control_lifecycle_worker,
   control_backup_scheduler,control_driver_ledger,control_release_worker,
   control_privacy_worker;
+revoke control_api,control_membership_worker,control_provisioning_worker,
+  control_invoice_worker,control_inventory_worker,control_email_worker,
+  control_reconciliation_worker,control_lifecycle_worker,
+  control_backup_scheduler,control_driver_ledger,control_release_worker,
+  control_privacy_worker from control_tenant_api;
 revoke all on database mb_control from public;
 grant connect on database mb_control to control_runtime_read;
 SQL

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::unix::fs::symlink;
 use std::process::Stdio;
@@ -303,6 +304,15 @@ impl QuadletBackend {
         Ok(())
     }
 
+    pub(super) async fn container_boot_selected(
+        &self,
+        container: &str,
+    ) -> Result<bool, DriverError> {
+        let unit = self.unit_for_container(container)?;
+        self.command_success("systemctl", ["--user", "is-enabled", &unit])
+            .await
+    }
+
     fn unit_for_container(&self, name: &str) -> Result<String, DriverError> {
         self.unit_path_for_container(name).map(|(unit, _)| unit)
     }
@@ -435,9 +445,8 @@ impl QuadletBackend {
             .ok_or_else(|| DriverError::internal("runtime job image is required"))?;
         validate_digest_image(image)?;
         self.assert_image_admitted(image)?;
-        let kind = object
-            .get("Labels")
-            .and_then(Value::as_object)
+        let labels = object.get("Labels").and_then(Value::as_object);
+        let kind = labels
             .and_then(|labels| labels.get("mb.kind"))
             .and_then(Value::as_str)
             .unwrap_or("odoo-extension-verifier");
@@ -482,6 +491,18 @@ impl QuadletBackend {
             "--label".to_owned(),
             format!("mb.kind={kind}"),
         ];
+        if let Some(labels) = labels {
+            for (key, value) in labels {
+                if key == "mb.kind" {
+                    continue;
+                }
+                validate_runtime_label(key, value)?;
+                podman.extend([
+                    "--label".into(),
+                    format!("{key}={}", value.as_str().expect("validated label")),
+                ]);
+            }
+        }
         if object.get("NetworkDisabled").and_then(Value::as_bool) == Some(true) {
             podman.push("--network=none".into());
         }
@@ -635,27 +656,124 @@ impl QuadletBackend {
         result.map(|_| ())
     }
 
-    pub(super) fn workspace_resources(&self) -> Result<Vec<String>, DriverError> {
-        let mut resources = Vec::new();
+    pub(super) fn workspace_resource_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, DriverError> {
+        if !(1..=docker_client::WORKSPACE_RUNTIME_PAGE_LIMIT).contains(&limit) {
+            return Err(DriverError::internal(
+                "workspace runtime page request is invalid",
+            ));
+        }
+        if let Some(after) = after {
+            validate_name(after)?;
+        }
+        let mut resources = BTreeSet::new();
         for category in ["paperless", "odoo-slots"] {
             let directory = self.root.join(category);
             if !directory.exists() {
                 continue;
             }
-            for entry in std::fs::read_dir(directory).map_err(DriverError::internal)? {
+            if std::fs::symlink_metadata(&directory)
+                .map_err(DriverError::internal)?
+                .file_type()
+                .is_symlink()
+                || !directory.is_dir()
+            {
+                return Err(DriverError::internal(
+                    "workspace runtime category is not a safe directory",
+                ));
+            }
+            for entry in std::fs::read_dir(&directory).map_err(DriverError::internal)? {
                 let entry = entry.map_err(DriverError::internal)?;
                 if let Some(unit) = entry
                     .file_name()
                     .to_str()
                     .and_then(|name| name.strip_suffix(".container"))
                 {
-                    resources.push(unit.to_owned());
+                    validate_name(unit)?;
+                    let other_category = if category == "paperless" {
+                        "odoo-slots"
+                    } else {
+                        "paperless"
+                    };
+                    if std::fs::symlink_metadata(
+                        self.root.join(other_category).join(entry.file_name()),
+                    )
+                    .is_ok()
+                    {
+                        return Err(DriverError::internal(
+                            "workspace runtime identity is ambiguous",
+                        ));
+                    }
+                    if after.is_none_or(|cursor| unit > cursor) {
+                        resources.insert(unit.to_owned());
+                        if resources.len() > limit {
+                            resources.pop_last();
+                        }
+                    }
                 }
             }
         }
-        resources.sort();
-        resources.dedup();
-        Ok(resources)
+        Ok(resources.into_iter().collect())
+    }
+
+    pub(super) fn workspace_resource_exists(&self, unit: &str) -> Result<bool, DriverError> {
+        validate_name(unit)?;
+        let category = if unit.starts_with("mb-paperless-") {
+            "paperless"
+        } else if unit.starts_with("mb-odoo-") {
+            "odoo-slots"
+        } else {
+            return Err(DriverError::internal(
+                "workspace runtime identity has an invalid category",
+            ));
+        };
+        let directory = self.root.join(category);
+        if !directory.exists() {
+            return Ok(false);
+        }
+        if std::fs::symlink_metadata(&directory)
+            .map_err(DriverError::internal)?
+            .file_type()
+            .is_symlink()
+            || !directory.is_dir()
+        {
+            return Err(DriverError::internal(
+                "workspace runtime category is not a safe directory",
+            ));
+        }
+        match std::fs::symlink_metadata(directory.join(format!("{unit}.container"))) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Ok(true),
+            Ok(_) => Err(DriverError::internal(
+                "selected workspace runtime is not a symlink",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(DriverError::internal(error)),
+        }
+    }
+
+    pub(super) fn workspace_resources(&self) -> Result<Vec<String>, DriverError> {
+        let mut resources = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self.workspace_resource_page(
+                after.as_deref(),
+                docker_client::WORKSPACE_RUNTIME_PAGE_LIMIT,
+            )?;
+            let full = page.len() == docker_client::WORKSPACE_RUNTIME_PAGE_LIMIT;
+            if full && page.last() == after.as_ref() {
+                return Err(DriverError::internal(
+                    "workspace runtime cursor did not advance",
+                ));
+            }
+            after = page.last().cloned();
+            resources.extend(page);
+            if !full {
+                return Ok(resources);
+            }
+        }
     }
 
     pub(super) async fn reconcile_persistent_unit(
@@ -745,6 +863,27 @@ impl QuadletBackend {
             health: RuntimeHealth::Healthy,
             runtime_object_id: Some(container.into()),
         })
+    }
+
+    pub(super) async fn observe_gateway_generation(
+        &self,
+        container: &str,
+        endpoint: &str,
+    ) -> Result<Vec<u8>, DriverError> {
+        validate_name(container)?;
+        let output = self
+            .command(
+                "podman",
+                ["exec", container, "wget", "-qO-", endpoint],
+                None,
+            )
+            .await?;
+        if output.len() > 1024 {
+            return Err(DriverError::internal(
+                "gateway generation observation exceeded its bound",
+            ));
+        }
+        Ok(output.into_bytes())
     }
 
     pub(super) async fn set_odoo_boot_selected(
@@ -1207,24 +1346,22 @@ impl QuadletBackend {
                 None,
             )
             .await?;
-        let load = output
-            .lines()
-            .find_map(|line| line.strip_prefix("LoadState="));
-        let active = output
-            .lines()
-            .find_map(|line| line.strip_prefix("ActiveState="));
-        if load == Some("not-found") || matches!(active, Some("inactive" | "failed")) {
-            Ok(false)
-        } else if matches!(
-            active,
-            Some("active" | "activating" | "reloading" | "deactivating")
-        ) {
-            Ok(true)
-        } else {
-            Err(DriverError::internal(
-                "runtime job systemd state is ambiguous",
-            ))
+        parse_job_active(&output)
+    }
+
+    pub(super) async fn inspect_job(&self, container: &str) -> Result<Option<Value>, DriverError> {
+        validate_name(container)?;
+        if self.container_exists(container).await? {
+            // If the object disappears between these calls, inspection fails
+            // closed instead of converting a race into absence evidence.
+            return self.inspect_container(container).await.map(Some);
         }
+        if self.job_active(container).await? {
+            return Err(DriverError::internal(
+                "active runtime job has no inspectable identity",
+            ));
+        }
+        Ok(None)
     }
 
     async fn command_bytes<I, S>(
@@ -1280,6 +1417,27 @@ impl QuadletBackend {
     }
 }
 
+fn parse_job_active(output: &str) -> Result<bool, DriverError> {
+    let load = output
+        .lines()
+        .find_map(|line| line.strip_prefix("LoadState="));
+    let active = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ActiveState="));
+    if load == Some("not-found") || matches!(active, Some("inactive" | "failed")) {
+        Ok(false)
+    } else if matches!(
+        active,
+        Some("active" | "activating" | "reloading" | "deactivating")
+    ) {
+        Ok(true)
+    } else {
+        Err(DriverError::internal(
+            "runtime job systemd state is ambiguous",
+        ))
+    }
+}
+
 fn append_environment(source: &mut String, environment: &[(String, String)]) {
     for (key, value) in environment {
         source.push_str(&format!(
@@ -1318,7 +1476,7 @@ fn validate_digest(value: &str) -> Result<(), DriverError> {
     }
 }
 
-fn validate_name(value: &str) -> Result<(), DriverError> {
+pub(super) fn validate_name(value: &str) -> Result<(), DriverError> {
     if (1..=128).contains(&value.len())
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
@@ -1416,6 +1574,7 @@ fn validate_job_environment(key: &str, value: &str) -> Result<(), DriverError> {
         "PAPERLESS_TEMPORARY",
         "PAPERLESS_UID",
         "PGHOST",
+        "PGAPPNAME",
         "PGPASSFILE",
         "PGPORT",
         "PGSSLROOTCERT",
@@ -1440,6 +1599,33 @@ fn validate_job_environment(key: &str, value: &str) -> Result<(), DriverError> {
             "job environment is outside the closed schema",
         ))
     }
+}
+
+fn validate_runtime_label(key: &str, value: &Value) -> Result<(), DriverError> {
+    const ALLOWED: &[&str] = &[
+        "mb.database",
+        "mb.driver-fence",
+        "mb.driver-operation",
+        "mb.fleet-run",
+        "mb.payload",
+        "mb.release-adoption",
+        "mb.workshop",
+    ];
+    let value = value
+        .as_str()
+        .ok_or_else(|| DriverError::internal("runtime label must be a string"))?;
+    if !ALLOWED.contains(&key)
+        || value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(DriverError::internal(
+            "runtime label is outside the closed schema",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_cli_value(value: &str) -> Result<(), DriverError> {
@@ -1509,6 +1695,25 @@ mod tests {
         assert!(validate_environment(&[("HOST".into(), "postgres.internal".into())]).is_ok());
         assert!(validate_environment(&[("LD_PRELOAD".into(), "/tmp/inject".into())]).is_err());
         assert!(validate_environment(&[("HOST".into(), "ok\nExecStart=bad".into())]).is_err());
+        assert!(validate_job_environment("PGAPPNAME", "mb-release-v1-deadbeef").is_ok());
+        assert!(validate_job_environment("PGAPPNAME", "bad\nname").is_err());
+    }
+
+    #[test]
+    fn transient_runtime_labels_have_a_closed_schema() {
+        assert!(validate_runtime_label("mb.fleet-run", &json!(Uuid::new_v4())).is_ok());
+        assert!(validate_runtime_label("mb.driver-fence", &json!("42")).is_ok());
+        assert!(validate_runtime_label("mb.untrusted", &json!("value")).is_err());
+        assert!(validate_runtime_label("mb.fleet-run", &json!("bad\nvalue")).is_err());
+    }
+
+    #[test]
+    fn transient_systemd_job_state_is_fail_closed() {
+        assert!(parse_job_active("LoadState=loaded\nActiveState=active\n").unwrap());
+        assert!(!parse_job_active("LoadState=loaded\nActiveState=failed\n").unwrap());
+        assert!(!parse_job_active("LoadState=not-found\nActiveState=inactive\n").unwrap());
+        assert!(parse_job_active("LoadState=loaded\nActiveState=unknown\n").is_err());
+        assert!(parse_job_active("garbled").is_err());
     }
 
     #[test]
@@ -1534,6 +1739,101 @@ mod tests {
                 .assert_image_admitted(&format!("registry.test/other@sha256:{}", "b".repeat(64)))
                 .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quadlet_workspace_inventory_is_keyset_paged() {
+        let root = std::env::temp_dir().join(format!("mb-runtime-page-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("quadlets/paperless")).unwrap();
+        std::fs::create_dir_all(root.join("quadlets/odoo-slots")).unwrap();
+        for (category, unit) in [
+            ("paperless", "mb-c"),
+            ("odoo-slots", "mb-a"),
+            ("paperless", "mb-b"),
+        ] {
+            std::fs::write(
+                root.join("quadlets")
+                    .join(category)
+                    .join(format!("{unit}.container")),
+                "[Container]\n",
+            )
+            .unwrap();
+        }
+        let backend = QuadletBackend {
+            root: root.join("quadlets"),
+            runtime_dir: root.join("run"),
+            grant_root: root.join("grants"),
+            allow_raw_migration: false,
+        };
+
+        assert_eq!(
+            backend.workspace_resource_page(None, 2).unwrap(),
+            vec!["mb-a", "mb-b"]
+        );
+        assert_eq!(
+            backend.workspace_resource_page(Some("mb-b"), 2).unwrap(),
+            vec!["mb-c"]
+        );
+        assert_eq!(
+            backend.workspace_resources().unwrap(),
+            vec!["mb-a", "mb-b", "mb-c"]
+        );
+        assert!(backend.workspace_resource_page(None, 0).is_err());
+        assert!(
+            backend
+                .workspace_resource_page(Some("../escape"), 1)
+                .is_err()
+        );
+        std::fs::write(
+            root.join("quadlets/odoo-slots/mb-c.container"),
+            "[Container]\n",
+        )
+        .unwrap();
+        assert!(backend.workspace_resource_page(None, 2).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quadlet_workspace_inventory_rejects_a_symlinked_category() {
+        let root = std::env::temp_dir().join(format!("mb-runtime-page-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::create_dir_all(root.join("quadlets")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("quadlets/paperless")).unwrap();
+        let backend = QuadletBackend {
+            root: root.join("quadlets"),
+            runtime_dir: root.join("run"),
+            grant_root: root.join("grants"),
+            allow_raw_migration: false,
+        };
+        assert!(backend.workspace_resource_page(None, 1).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quadlet_workspace_identity_lookup_is_direct_and_typed() {
+        let root = std::env::temp_dir().join(format!("mb-runtime-lookup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("quadlets/paperless")).unwrap();
+        std::fs::create_dir_all(root.join("generation")).unwrap();
+        std::fs::write(
+            root.join("generation/mb-paperless-a.container"),
+            "[Container]\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("generation/mb-paperless-a.container"),
+            root.join("quadlets/paperless/mb-paperless-a.container"),
+        )
+        .unwrap();
+        let backend = QuadletBackend {
+            root: root.join("quadlets"),
+            runtime_dir: root.join("run"),
+            grant_root: root.join("grants"),
+            allow_raw_migration: false,
+        };
+        assert!(backend.workspace_resource_exists("mb-paperless-a").unwrap());
+        assert!(!backend.workspace_resource_exists("mb-odoo-blue").unwrap());
+        assert!(backend.workspace_resource_exists("unowned-a").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

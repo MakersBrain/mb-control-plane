@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::domain::IntegrationError;
+use crate::outbound_http::TraceRequestBuilderExt as _;
 
 use super::{bounded_body, classify_status};
 
@@ -18,6 +19,9 @@ const MAX_PRIVACY_EXPORT_BYTES: usize = 96 * 1024 * 1024;
 pub struct OdooClient {
     http: reqwest::Client,
     base_url: Url,
+    authorization: reqwest::header::HeaderValue,
+    database_filter: Option<reqwest::header::HeaderValue>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,6 +231,22 @@ impl OdooClient {
         database_ref: Option<&str>,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
+        Self::with_http(
+            crate::outbound_http::tenant_service_client()?,
+            base_url,
+            token,
+            database_ref,
+            timeout,
+        )
+    }
+
+    fn with_http(
+        http: reqwest::Client,
+        base_url: &str,
+        token: &str,
+        database_ref: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
         if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
             anyhow::bail!("Odoo URL must be absolute HTTP(S)");
@@ -236,9 +256,7 @@ impl OdooClient {
         }
         let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
         authorization.set_sensitive(true);
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, authorization);
-        if let Some(database_ref) = database_ref {
+        let database_filter = if let Some(database_ref) = database_ref {
             if database_ref.len() != 35
                 || !database_ref.starts_with("mb_")
                 || !database_ref[3..]
@@ -247,19 +265,32 @@ impl OdooClient {
             {
                 anyhow::bail!("Odoo database reference is not opaque");
             }
-            headers.insert(
-                "x-odoo-dbfilter",
-                reqwest::header::HeaderValue::from_str(&format!(r"^{database_ref}\Z"))?,
-            );
+            Some(reqwest::header::HeaderValue::from_str(&format!(
+                r"^{database_ref}\Z"
+            ))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            http,
+            base_url,
+            authorization,
+            database_filter,
+            timeout,
+        })
+    }
+
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
+        let request = self
+            .http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .timeout(self.timeout);
+        if let Some(database_filter) = &self.database_filter {
+            request.header("x-odoo-dbfilter", database_filter.clone())
+        } else {
+            request
         }
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("mb-control-worker")
-            .build()?;
-        Ok(Self { http, base_url })
     }
 
     async fn post<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -275,13 +306,18 @@ impl OdooClient {
             .base_url
             .join(path)
             .map_err(|_| IntegrationError::ContractDrift)?;
-        let response = self.http.get(url).send().await.map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .with_current_trace_context()
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    IntegrationError::UnknownOutcome
+                } else {
+                    IntegrationError::Unavailable
+                }
+            })?;
         let status = response.status();
         let bytes = bounded_body(response, MAX_RESPONSE_BYTES).await?;
         if !status.is_success() {
@@ -301,9 +337,9 @@ impl OdooClient {
             .join(path)
             .map_err(|_| IntegrationError::ContractDrift)?;
         let response = self
-            .http
-            .post(url)
+            .request(reqwest::Method::POST, url)
             .json(body)
+            .with_current_trace_context()
             .send()
             .await
             .map_err(|error| {
@@ -390,13 +426,18 @@ impl OdooClient {
                 "/mb_control/v1/inventory-captures/{capture_id}/assets/{asset_id}"
             ))
             .map_err(|_| IntegrationError::ContractDrift)?;
-        let response = self.http.get(url).send().await.map_err(|error| {
-            if error.is_timeout() {
-                IntegrationError::UnknownOutcome
-            } else {
-                IntegrationError::Unavailable
-            }
-        })?;
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .with_current_trace_context()
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    IntegrationError::UnknownOutcome
+                } else {
+                    IntegrationError::Unavailable
+                }
+            })?;
         let status = response.status();
         if !status.is_success() {
             return Err(classify_status(status));
@@ -569,6 +610,80 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn shared_transport_keeps_tenant_credentials_and_timeouts_request_scoped() {
+        let shared = crate::outbound_http::internal_service_builder("mb-control-worker")
+            .build()
+            .unwrap();
+        let first = OdooClient::with_http(
+            shared.clone(),
+            "https://odoo.example.test",
+            "tenant-one-token",
+            Some("mb_00000000000000000000000000000001"),
+            Duration::from_secs(11),
+        )
+        .unwrap();
+        let second = OdooClient::with_http(
+            shared.clone(),
+            "https://odoo.example.test",
+            "tenant-two-token",
+            Some("mb_00000000000000000000000000000002"),
+            Duration::from_secs(29),
+        )
+        .unwrap();
+
+        let first_request = first
+            .request(
+                reqwest::Method::GET,
+                Url::parse("https://odoo.example.test/health").unwrap(),
+            )
+            .build()
+            .unwrap();
+        let second_request = second
+            .request(
+                reqwest::Method::GET,
+                Url::parse("https://odoo.example.test/health").unwrap(),
+            )
+            .build()
+            .unwrap();
+        let bare_transport_request = shared
+            .get("https://odoo.example.test/health")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            first_request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer tenant-one-token"
+        );
+        assert_eq!(
+            first_request.headers()["x-odoo-dbfilter"],
+            r"^mb_00000000000000000000000000000001\Z"
+        );
+        assert_eq!(first_request.timeout(), Some(&Duration::from_secs(11)));
+        assert_eq!(
+            second_request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer tenant-two-token"
+        );
+        assert_eq!(
+            second_request.headers()["x-odoo-dbfilter"],
+            r"^mb_00000000000000000000000000000002\Z"
+        );
+        assert_eq!(second_request.timeout(), Some(&Duration::from_secs(29)));
+        assert!(
+            bare_transport_request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
+        assert!(
+            bare_transport_request
+                .headers()
+                .get("x-odoo-dbfilter")
+                .is_none()
+        );
+        assert_eq!(bare_transport_request.timeout(), None);
+    }
+
+    #[test]
     fn carrier_rotation_material_is_sent_only_when_explicitly_present() {
         let command = CarrierSecretBindingCommand {
             workshop_id: Uuid::nil(),
@@ -612,6 +727,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/mb_control/v1/tenant/bootstrap"))
             .and(header("authorization", "Bearer fixture-token"))
+            .and(header("user-agent", "mb-control-worker"))
             .and(header(
                 "x-odoo-dbfilter",
                 r"^mb_00000000000000000000000000000001\Z",

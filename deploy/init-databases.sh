@@ -3,6 +3,7 @@ set -eu
 
 for name in \
   CONTROL_POSTGRES_PASSWORD CONTROL_API_POSTGRES_PASSWORD \
+  CONTROL_TENANT_API_POSTGRES_PASSWORD \
   CONTROL_MEMBERSHIP_POSTGRES_PASSWORD CONTROL_PROVISIONING_POSTGRES_PASSWORD \
   CONTROL_INVOICE_POSTGRES_PASSWORD CONTROL_INVENTORY_POSTGRES_PASSWORD \
   CONTROL_EMAIL_POSTGRES_PASSWORD CONTROL_RECONCILIATION_POSTGRES_PASSWORD \
@@ -25,6 +26,7 @@ done
 psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set=control_password="$CONTROL_POSTGRES_PASSWORD" \
   --set=control_api_password="$CONTROL_API_POSTGRES_PASSWORD" \
+  --set=control_tenant_api_password="$CONTROL_TENANT_API_POSTGRES_PASSWORD" \
   --set=control_membership_password="$CONTROL_MEMBERSHIP_POSTGRES_PASSWORD" \
   --set=control_provisioning_password="$CONTROL_PROVISIONING_POSTGRES_PASSWORD" \
   --set=control_invoice_password="$CONTROL_INVOICE_POSTGRES_PASSWORD" \
@@ -41,6 +43,7 @@ psql --set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
 create role control login password :'control_password';
 create role control_runtime_read nologin;
 create role control_api login password :'control_api_password' in role control_runtime_read;
+create role control_tenant_api login password :'control_tenant_api_password' in role control_runtime_read;
 create role control_membership_worker login password :'control_membership_password' in role control_runtime_read;
 create role control_provisioning_worker login password :'control_provisioning_password' in role control_runtime_read;
 create role control_invoice_worker login password :'control_invoice_password' in role control_runtime_read;
