@@ -56,7 +56,7 @@
     "indexes": {"count": 223, "digest": "872163942579b561f5fba934ff8ffc43"},
     "functions": {"count": 251, "digest": "fe7a87cc77cee4b053fb820241d2d536"},
     "triggers": {"count": 68, "digest": "b2c82d8965dd520d34cb859b5a10f3e6"},
-    "privileges": {"count": 1720, "digest": "22dbaeff03d56c8d2942acf62844cf79"},
+    "privileges": {"count": 1716, "digest": "a28c222b1b1d248a09553a0be011e5bc"},
     "default_privileges": {"count": 3, "digest": "0c6219b31f278a51ab29c7f4446032a4"}
   }
 }

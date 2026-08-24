@@ -957,6 +957,16 @@ transaction-local workshop context and matching recovery parent. Missing,
 malformed, and cross-workshop contexts fail closed in the production-role
 PostgreSQL matrix. No runtime delete policy exists.
 
+Implemented recovery-point ACL preparation (2026-08-24): the release worker no
+longer has stale direct SELECT/INSERT/UPDATE access to the recovery-point
+ledger, and the privacy worker no longer has stale direct SELECT access. Their
+production modules contain no direct recovery-point SQL. Release review keeps
+only its bounded fixed-search-path `SECURITY DEFINER` function, and live role
+tests prove the removed table operations fail with PostgreSQL privilege errors.
+This narrows the next Phase 2 review to the platform API's mixed fleet release
+and status behavior plus the driver ledger's bounded fleet release read; it
+does not yet enable RLS on the recovery-point parent.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
