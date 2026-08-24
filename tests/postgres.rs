@@ -66,6 +66,8 @@ type ReleaseDriverAdmissionRow = (
     Option<Vec<Uuid>>,
 );
 
+type ReleaseDriverTenantRow = (Uuid, Uuid, Uuid, String, String, Uuid, Vec<String>);
+
 async fn insert_leased_release_operation(
     pool: &sqlx::PgPool,
     owner: &str,
@@ -5293,6 +5295,353 @@ async fn fleet_release_reserves_its_snapshot_and_excludes_route_applications() {
         .rows_affected(),
         1
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL with control_driver_ledger"]
+async fn driver_recovery_read_capabilities_require_exact_live_authority() {
+    let store = store().await;
+    sqlx::query(
+        "update control.deployment_driver_resource_leases
+            set state='idle',authority_kind=null,driver_operation_id=null,effect_run_id=null,
+                route_set_publication_id=null,lease_owner=null,
+                lease_token=null,lease_expires_at=null,heartbeat_at=null,quarantined_at=null,
+                safe_error=null,updated_at=now()
+          where resource_key='runtime/shared-odoo'",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let requested_by = Uuid::new_v4();
+    sqlx::query("insert into control.users(id,email) values($1,$2)")
+        .bind(requested_by)
+        .bind(format!("{requested_by}@example.test"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let workshops = [Uuid::new_v4(), Uuid::new_v4()];
+    for workshop in workshops {
+        sqlx::query(
+            "insert into control.workshops(id,slug,display_name,time_zone)
+             values($1,$2,'Driver recovery read fixture','Europe/Paris')",
+        )
+        .bind(workshop)
+        .bind(format!("driver-read-{}", workshop.simple()))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    let mut release = insert_leased_release_operation(store.pool(), "driver-read-worker").await;
+    attach_release_fleet_run(store.pool(), &mut release, &workshops).await;
+    let fleet_run = release.fleet_run_id.unwrap();
+    let release_id: String =
+        sqlx::query_scalar("select release_id from control.release_fleet_runs where id=$1")
+            .bind(fleet_run)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+
+    let adoptions: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "select id,workshop_id,database_id
+           from control.tenant_release_adoptions where operation_id=$1",
+    )
+    .bind(release.control_operation_id)
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let mut setup = store.pool().begin().await.unwrap();
+    for (adoption, workshop, database) in &adoptions {
+        let recovery = Uuid::new_v4();
+        sqlx::query(
+            "insert into control.workshop_recovery_points(
+               id,workshop_id,database_id,operation_id,kind,label,requested_by)
+             values($1,$2,$3,$4,'backup','Driver fleet read',$5)",
+        )
+        .bind(recovery)
+        .bind(workshop)
+        .bind(database)
+        .bind(release.control_operation_id)
+        .bind(requested_by)
+        .execute(&mut *setup)
+        .await
+        .unwrap();
+        sqlx::query("set local session_replication_role=replica")
+            .execute(&mut *setup)
+            .await
+            .unwrap();
+        sqlx::query(
+            "update control.tenant_release_adoptions set backup_recovery_id=$2 where id=$1",
+        )
+        .bind(adoption)
+        .bind(recovery)
+        .execute(&mut *setup)
+        .await
+        .unwrap();
+        sqlx::query("set local session_replication_role=origin")
+            .execute(&mut *setup)
+            .await
+            .unwrap();
+    }
+    setup.commit().await.unwrap();
+
+    let admission = admit_release_driver_lease(store.pool(), &release).await;
+    assert_eq!(admission.0, "acquired");
+    let driver_operation = admission.1.unwrap();
+    let fence = admission.2.unwrap();
+    assert_eq!(
+        sqlx::query(
+            "update control.release_fleet_runs set driver_fence_token=$2,updated_at=now()
+             where id=$1 and state='preparing' and driver_fence_token is null",
+        )
+        .bind(fleet_run)
+        .bind(fence)
+        .execute(store.pool())
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+
+    let mut role_tx = store.pool().begin().await.unwrap();
+    sqlx::query("set local role control_driver_ledger")
+        .execute(&mut *role_tx)
+        .await
+        .unwrap();
+    let rows: Vec<ReleaseDriverTenantRow> = sqlx::query_as(
+        "select * from control.read_release_driver_tenants(
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(fleet_run)
+    .bind(&release_id)
+    .bind(driver_operation)
+    .bind(release.control_operation_id)
+    .bind(release.control_operation_attempt)
+    .bind(&release.control_operation_owner)
+    .bind(release.instance_owner)
+    .bind(release.execution_token)
+    .bind(release.resource_lease_token)
+    .bind(fence)
+    .fetch_all(&mut *role_tx)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), workshops.len());
+    role_tx.rollback().await.unwrap();
+
+    let mut rejected_tx = store.pool().begin().await.unwrap();
+    sqlx::query("set local role control_driver_ledger")
+        .execute(&mut *rejected_tx)
+        .await
+        .unwrap();
+    let rejected = sqlx::query(
+        "select * from control.read_release_driver_tenants(
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(fleet_run)
+    .bind(&release_id)
+    .bind(driver_operation)
+    .bind(release.control_operation_id)
+    .bind(release.control_operation_attempt)
+    .bind(&release.control_operation_owner)
+    .bind(release.instance_owner)
+    .bind(release.execution_token)
+    .bind(Uuid::new_v4())
+    .bind(fence)
+    .execute(&mut *rejected_tx)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        rejected.as_database_error().unwrap().code().as_deref(),
+        Some("42501")
+    );
+    rejected_tx.rollback().await.unwrap();
+
+    let activation_intent = Uuid::new_v4();
+    let original_driver_action = Uuid::new_v4();
+    let gateway_digest = format!("sha256:{}", "b".repeat(64));
+    let reconciliation = Uuid::new_v4();
+    let reconciliation_owner = Uuid::new_v4();
+    let reconciliation_token = Uuid::new_v4();
+    let mut reconciliation_setup = store.pool().begin().await.unwrap();
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *reconciliation_setup)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update control.tenant_release_adoptions adoption
+            set state='prepared',verified_at=now(),updated_at=now()
+          where adoption.operation_id=$1",
+    )
+    .bind(release.control_operation_id)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update control.workshop_recovery_points recovery
+            set state='ready',ready_at=now(),verification_state='verified',
+                verified_at=now()
+          where recovery.operation_id=$1",
+    )
+    .bind(release.control_operation_id)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    sqlx::query("set local session_replication_role=origin")
+        .execute(&mut *reconciliation_setup)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update control.deployment_driver_operations
+            set safe_error='runtime_outcome_unknown',execution_token=null,
+                lease_expires_at=null,release_executor_protocol_version=1,updated_at=now()
+          where id=$1",
+    )
+    .bind(driver_operation)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update control.deployment_driver_resource_leases
+            set state='quarantined',lease_token=null,lease_expires_at=null,
+                quarantined_at=now(),safe_error='runtime_outcome_unknown',updated_at=now()
+          where resource_key='runtime/shared-odoo' and driver_operation_id=$1",
+    )
+    .bind(driver_operation)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into control.fleet_activation_intents(
+           id,fleet_run_id,release_id,runtime_key,target_slot,odoo_subject_digest,
+           extension_subject_digest,pair_qualification_digest,prepared_tenants,
+           gateway_configuration_digest,driver_action_id,driver_fence_token,
+           gateway_identity_version)
+         select $1,$2,$3,'shared-odoo','blue',release.odoo_subject_digest,
+                release.extension_subject_digest,release.odoo_subject_digest,'[]',$4,$5,$6,1
+           from control.application_releases release where release.id=$3",
+    )
+    .bind(activation_intent)
+    .bind(fleet_run)
+    .bind(&release_id)
+    .bind(&gateway_digest)
+    .bind(original_driver_action)
+    .bind(fence)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into control.fleet_release_reconciliations(
+           id,driver_operation_id,fleet_run_id,activation_intent_id,target_key,
+           original_fence_token,original_instance_owner,original_driver_action_id,
+           release_executor_protocol_version,gateway_identity_version,
+           gateway_configuration_digest,target_slot,state,control_operation_attempt,
+           control_operation_lease_owner,instance_owner,execution_token,lease_expires_at)
+         values($1,$2,$3,$4,$5,$6,$7,$8,1,1,$9,'blue','observing',$10,$11,$12,$13,
+                now()+interval '5 minutes')",
+    )
+    .bind(reconciliation)
+    .bind(driver_operation)
+    .bind(fleet_run)
+    .bind(activation_intent)
+    .bind(&release.target_key)
+    .bind(fence)
+    .bind(release.instance_owner)
+    .bind(original_driver_action)
+    .bind(&gateway_digest)
+    .bind(release.control_operation_attempt)
+    .bind(&release.control_operation_owner)
+    .bind(reconciliation_owner)
+    .bind(reconciliation_token)
+    .execute(&mut *reconciliation_setup)
+    .await
+    .unwrap();
+    reconciliation_setup.commit().await.unwrap();
+
+    let mut reconciliation_role = store.pool().begin().await.unwrap();
+    sqlx::query("set local role control_driver_ledger")
+        .execute(&mut *reconciliation_role)
+        .await
+        .unwrap();
+    let observed: Vec<(Uuid, Uuid, Uuid, String, String, Vec<String>)> = sqlx::query_as(
+        "select * from control.read_release_reconciliation_tenants(
+          $1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(reconciliation)
+    .bind(reconciliation_owner)
+    .bind(reconciliation_token)
+    .bind(fleet_run)
+    .bind(&release_id)
+    .bind(release.control_operation_id)
+    .bind(driver_operation)
+    .bind(release.instance_owner)
+    .bind(fence)
+    .fetch_all(&mut *reconciliation_role)
+    .await
+    .unwrap();
+    assert_eq!(observed.len(), workshops.len());
+    reconciliation_role.rollback().await.unwrap();
+
+    let mut stale_reconciliation_role = store.pool().begin().await.unwrap();
+    sqlx::query("set local role control_driver_ledger")
+        .execute(&mut *stale_reconciliation_role)
+        .await
+        .unwrap();
+    let stale_reconciliation = sqlx::query(
+        "select * from control.read_release_reconciliation_tenants(
+          $1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(reconciliation)
+    .bind(reconciliation_owner)
+    .bind(Uuid::new_v4())
+    .bind(fleet_run)
+    .bind(&release_id)
+    .bind(release.control_operation_id)
+    .bind(driver_operation)
+    .bind(release.instance_owner)
+    .bind(fence)
+    .execute(&mut *stale_reconciliation_role)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        stale_reconciliation
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("42501")
+    );
+    stale_reconciliation_role.rollback().await.unwrap();
+
+    let public_acl: (bool, bool) = sqlx::query_as(
+        "select
+          has_function_privilege('public','control.read_release_driver_tenants(uuid,text,uuid,uuid,integer,text,uuid,uuid,uuid,bigint)','execute'),
+          has_function_privilege('public','control.read_release_reconciliation_tenants(uuid,uuid,uuid,uuid,text,uuid,uuid,uuid,bigint)','execute')",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(public_acl, (false, false));
+
+    sqlx::query(
+        "update control.deployment_driver_resource_leases
+            set state='idle',authority_kind=null,driver_operation_id=null,effect_run_id=null,
+                route_set_publication_id=null,lease_owner=null,
+                lease_token=null,lease_expires_at=null,heartbeat_at=null,quarantined_at=null,
+                safe_error=null,updated_at=now()
+          where resource_key='runtime/shared-odoo'",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "update control.release_fleet_runs
+            set state='failed',failure_class='test_fixture_complete',updated_at=now()
+          where id=$1 and state in ('preparing','activating')",
+    )
+    .bind(fleet_run)
+    .execute(store.pool())
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

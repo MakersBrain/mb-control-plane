@@ -15,6 +15,7 @@ use super::*;
 
 #[derive(Clone, Copy)]
 pub(super) struct ReleaseRuntimeObservationRequest<'a> {
+    pub reconciliation_authority: Option<ReleaseRuntimeReconciliationAuthority>,
     pub fleet_run_id: Uuid,
     pub release_id: &'a str,
     pub control_operation_id: Uuid,
@@ -25,6 +26,13 @@ pub(super) struct ReleaseRuntimeObservationRequest<'a> {
     pub manifest: &'a crate::release::ApplicationReleaseManifest,
     pub expected_tenant_snapshot: &'a Value,
     pub gateway_identity: &'a ReleaseGatewayGenerationIdentity,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReleaseRuntimeReconciliationAuthority {
+    pub reconciliation_id: Uuid,
+    pub instance_owner: Uuid,
+    pub execution_token: Uuid,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -360,7 +368,9 @@ pub(super) async fn observe_release_runtime(
 /// expectation. This is intentionally dormant: the future coordinator owns
 /// claim renewal, timeout, receipt persistence, and the later protocol-v2
 /// loaded-overlay proof. Failure to observe the rolling gateway identity is
-/// inconclusive and must retain quarantine.
+/// inconclusive and must retain quarantine. Until that coordinator supplies a
+/// dedicated tenant-read authority, validation rejects this path before any
+/// database or runtime observation.
 #[allow(dead_code)]
 pub(super) async fn observe_recovery_release_runtime(
     state: &DriverState,
@@ -378,6 +388,7 @@ pub(super) async fn observe_recovery_release_runtime(
     observe_release_runtime(
         state,
         ReleaseRuntimeObservationRequest {
+            reconciliation_authority: None,
             fleet_run_id: expectation.fleet_run_id,
             release_id: &expectation.release_id,
             control_operation_id: expectation.control_operation_id,
@@ -573,6 +584,7 @@ async fn observe_release_runtime_with_fs<F: ReleaseRuntimeObservationFsPort>(
 fn validate_request(request: &ReleaseRuntimeObservationRequest<'_>) -> Result<(), DriverError> {
     request.manifest.validate().map_err(DriverError::internal)?;
     if request.fleet_run_id.is_nil()
+        || request.reconciliation_authority.is_none()
         || request.release_id.is_empty()
         || request.release_id != request.manifest.release_id
         || request.control_operation_id.is_nil()
@@ -596,22 +608,22 @@ async fn load_verified_tenants(
     state: &DriverState,
     request: &ReleaseRuntimeObservationRequest<'_>,
 ) -> Result<Vec<ObservedTenant>, DriverError> {
+    let authority = request.reconciliation_authority.ok_or_else(|| {
+        DriverError::internal("release runtime reconciliation authority is absent")
+    })?;
     let tenants = sqlx::query_as::<_, ObservedTenant>(
-        "select adoption.id adoption_id,adoption.workshop_id,adoption.database_id,
-                database.database_ref,database.public_hostname,recovery.component_scope
-           from control.tenant_release_adoptions adoption
-           join control.odoo_databases database on database.id=adoption.database_id
-             and database.workshop_id=adoption.workshop_id
-           join control.workshop_recovery_points recovery on recovery.id=adoption.backup_recovery_id
-             and recovery.workshop_id=adoption.workshop_id
-          where adoption.operation_id=$1 and adoption.release_id=$2 and adoption.state='prepared'
-            and adoption.verified_at is not null and recovery.state='ready'
-            and recovery.verification_state='verified' and recovery.verified_at is not null
-            and (recovery.expires_at is null or recovery.expires_at>now())
-          order by adoption.created_at,adoption.id limit 501",
+        "select * from control.read_release_reconciliation_tenants(
+            $1,$2,$3,$4,$5,$6,$7,$8,$9)",
     )
-    .bind(request.control_operation_id)
+    .bind(authority.reconciliation_id)
+    .bind(authority.instance_owner)
+    .bind(authority.execution_token)
+    .bind(request.fleet_run_id)
     .bind(request.release_id)
+    .bind(request.control_operation_id)
+    .bind(request.driver_operation_id)
+    .bind(request.original_instance_owner)
+    .bind(request.original_global_fence_token)
     .fetch_all(&state.ledger)
     .await
     .map_err(DriverError::internal)?;

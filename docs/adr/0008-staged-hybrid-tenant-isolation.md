@@ -258,9 +258,19 @@ requester, component scope, label, format, and release provenance from trusted
 ledger state. Both calls remain inside their original transactions, preserving
 command, deletion, and fleet-adoption atomicity. Production-role tests verify
 the narrowed ACL, capability metadata, PUBLIC denial, and direct mutation
-failure. This still does not enable recovery-point RLS: the driver ledger's two
-bounded fleet-release reads must first be replaced or classified without
-weakening its tenant-scoped recovery workflow.
+failure. This did not yet enable recovery-point RLS because the driver ledger's
+two bounded fleet-release reads still required a capability split.
+
+Implemented driver recovery-read capability slice (2026-08-25): migration
+`0045_driver_recovery_read_capabilities` moves the normal fleet release and
+forward-reconciliation recovery joins behind distinct fixed-search-path
+`SECURITY DEFINER` functions. The first validates the complete live release
+lease and global resource fence; the second validates the current observation
+claim and quarantined original release identity. Both are fail-closed and
+bounded to 501 rows, and neither is executable by PUBLIC. Tenant-scoped driver
+recovery reads and updates intentionally retain direct access pending the final
+forced-RLS policy matrix review; this migration does not claim that parent-table
+RLS is complete.
 
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime

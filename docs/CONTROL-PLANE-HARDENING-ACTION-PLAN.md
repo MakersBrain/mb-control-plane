@@ -976,9 +976,20 @@ capabilities. Each validates its exact durable operation and derives the row's
 tenant ownership and security-sensitive fields from authoritative ledger state;
 the Rust calls stay within the existing deletion or fleet-adoption transaction.
 Static and production-role tests prevent direct platform writes, PUBLIC
-execution, or a return to inline table inserts. The remaining recovery-parent
-blocker is the driver ledger's bounded fleet-release read; completing that split
-will allow the final forced-RLS policy matrix to be reviewed.
+execution, or a return to inline table inserts. At this point the remaining
+recovery-parent blocker was the driver ledger's bounded fleet-release read.
+
+Implemented driver recovery-read capability slice (2026-08-25): migration
+`0045_driver_recovery_read_capabilities` replaces both fleet-wide driver reads
+of recovery points with separate, bounded, fixed-search-path
+`SECURITY DEFINER` capabilities. Normal release preparation must present the
+exact live control-operation, driver, global-resource, and fleet fence tuple;
+forward reconciliation must present its exact live observation claim plus the
+quarantined original release identity. Stale or mismatched authority fails with
+a privilege error, and both result sets remain capped at 501 rows. The direct
+driver SELECT/UPDATE grant remains temporarily because tenant-scoped backup,
+restore, and progress operations still use it. The next Phase 2 step is the
+final forced-RLS policy and privilege matrix for that tenant workflow.
 
 ## 6. Phase 3 — complete typed startup configuration
 
