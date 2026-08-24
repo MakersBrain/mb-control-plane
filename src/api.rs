@@ -150,6 +150,21 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
+    async fn for_route_test(database_url: &str) -> anyhow::Result<Self> {
+        let store = Store::connect(database_url).await?;
+        store.migrate().await?;
+        let tenant_store = TenantStore::connect(database_url).await?;
+        let config = Config::for_api_route_test(database_url.to_owned());
+        let auth = Arc::new(Authenticator::new(
+            config.oidc_issuer.clone(),
+            config.oidc_audience.clone(),
+            config.oidc_discovery_url.clone(),
+        )?);
+        let invitation_verifier = Arc::new(InvitationVerifier::for_api_route_test());
+        Self::new(store, tenant_store, config, auth, invitation_verifier)
+    }
+
     pub fn new(
         store: Store,
         tenant_store: TenantStore,

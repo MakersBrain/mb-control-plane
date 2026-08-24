@@ -108,6 +108,8 @@ jobs:
         run: cargo test --locked --manifest-path Cargo.toml --test schema_epoch -- --ignored --test-threads=1
       - name: PostgreSQL integration tests
         run: cargo test --locked --manifest-path Cargo.toml --test postgres -- --ignored --test-threads=1
+      - name: Handler-level workshop authorization matrix
+        run: 'cargo test --locked --manifest-path Cargo.toml --lib api::routes::tests::actual_workshop_routes_reject_before_handler_database_or_external_effects -- --ignored --test-threads=1'
       - name: PostgreSQL driver boundary tests
         run: 'cargo test --locked --manifest-path Cargo.toml --lib docker_driver:: -- --ignored --test-threads=1'
       - name: PostgreSQL scheduler boundary tests

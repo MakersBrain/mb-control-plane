@@ -71,6 +71,40 @@ impl MigrationConfig {
 }
 
 impl Config {
+    #[cfg(test)]
+    pub(crate) fn for_api_route_test(database_url: String) -> Self {
+        Self {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            database_url: database_url.clone(),
+            tenant_database_url: database_url,
+            public_origin: Url::parse("https://app.example.test").unwrap(),
+            cors_origin: Url::parse("https://app.example.test").unwrap(),
+            oidc_issuer: Url::parse("https://identity.example.test").unwrap(),
+            oidc_audience: "control-test".into(),
+            oidc_discovery_url: Url::parse(
+                "https://identity.example.test/.well-known/openid-configuration",
+            )
+            .unwrap(),
+            tenant_domain: "example.test".into(),
+            tenant_public_port: None,
+            internal_token: "internal-test-token".into(),
+            metrics_token: "metrics-test-token".into(),
+            mail_event_token: "mail-test-token".into(),
+            release_publish_token: "release-test-token".into(),
+            invitation_verification_keys_file: PathBuf::from("unused-in-route-test"),
+            invitation_signing_key_id: "test-1".into(),
+            deployment_driver_url: Url::parse("http://127.0.0.1:9").unwrap(),
+            deployment_driver_socket: None,
+            deployment_driver_token: "driver-test-token".into(),
+            extraction_broker_url: Url::parse("http://127.0.0.1:9").unwrap(),
+            extraction_broker_token: "extraction-test-token".into(),
+            allow_self_signup: false,
+            operator_emails: HashSet::new(),
+            request_timeout: Duration::from_secs(2),
+            synthetic_data_only: true,
+        }
+    }
+
     pub fn database_url() -> Result<String, ConfigError> {
         let value = required_secret("CONTROL_DATABASE_URL")?;
         validate_database_url("CONTROL_DATABASE_URL", &value)?;

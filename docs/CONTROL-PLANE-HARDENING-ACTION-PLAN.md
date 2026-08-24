@@ -6,6 +6,12 @@ Scope: `mb-control-plane`
 
 Current implementation progress:
 
+- the reconstructed pre-change baseline, tenant-isolation threat model, and
+  drift-checked public/internal route inventory are recorded in
+  `docs/CONTROL-PLANE-HARDENING-BASELINE.md` and
+  `docs/control-plane-route-security-inventory.tsv`; the inventory comes from
+  the same registries that construct the Axum routers and includes every
+  method, path, access policy, and handler symbol;
 - every public HTTP method now declares `Public`, `VerifiedBearer`,
   `Authenticated`, `Workshop(WorkshopPermission)`, or
   `Platform(PlatformPermission)` access explicitly;
@@ -17,6 +23,12 @@ Current implementation progress:
 - unit tests cover the permission matrices, rejection before handler side
   effects, validated scope insertion, invalid workshop IDs, path-family policy,
   and OpenAPI security consistency;
+- a disposable-PostgreSQL handler-level gate now sends denied requests through
+  every real workshop route registration, proves that no durable operation is
+  admitted, and exercises an actual workshop-A/member-B read and mutation with
+  database and command-state assertions; the policy-only fast matrix remains
+  separate so its minimum-role assertions are not presented as handler/SQL
+  coverage;
 - all handlers declared with `Workshop(...)` access now consume the validated
   `WorkshopScope`; raw workshop path values are no longer used as their tenant
   authority, while resource-derived invitation and transfer routes retain
