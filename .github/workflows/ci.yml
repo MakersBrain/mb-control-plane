@@ -103,7 +103,7 @@ jobs:
       - run: python3 tools/test_topology_odoo_isolation.py --self-test
       - run: python3 tools/test_workspace_configuration.py
       - run: cargo clippy --locked --all-targets --manifest-path Cargo.toml -- -D warnings
-      - run: cargo test --locked --manifest-path Cargo.toml
+      - run: cargo test --locked --manifest-path Cargo.toml -- --test-threads=1
       - name: PostgreSQL integration tests
         run: cargo test --locked --manifest-path Cargo.toml --test postgres -- --ignored --test-threads=1
       - name: PostgreSQL driver boundary tests
