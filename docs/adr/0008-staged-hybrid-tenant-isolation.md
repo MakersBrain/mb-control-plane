@@ -222,6 +222,20 @@ database transaction, and rehearsal outcome plus audit event commit atomically.
 This still does not authorize rehearsal RLS: production behavior and every
 remaining API/driver path must pass the workflow matrix first.
 
+Implemented rehearsal-policy slice (2026-08-24): migration
+`0042_rehearsal_tenant_rls` enables and forces RLS on
+`workshop_recovery_rehearsals` with command-specific policies. The platform API
+retains fleet-wide read-only visibility for status and metrics, and the backup
+scheduler retains read-only visibility for its bounded discovery queries. The
+API's inherited mutation grants are removed. Scheduler inserts and updates are
+visible only when their row and recovery parent match the fail-closed,
+transaction-local workshop context already installed by `TenantStore`; no
+runtime role receives a delete policy. Production-role tests prove fleet reads,
+same-workshop writes, missing and malformed context, cross-workshop denial,
+catalog flags, policy metadata, and the narrowed ACLs. This policy protects the
+rehearsal ledger's runtime mutations; its recovery-point parent remains pending
+until release and privacy access are split.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

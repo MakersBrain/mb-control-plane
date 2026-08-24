@@ -182,6 +182,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0030_route_set_publication_recovery.sql"),
         include_str!("../migrations/0031_route_set_publication_terminal_recovery.sql"),
         include_str!("../migrations/0032_route_set_flat_writer_guardrails.sql"),
+        include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -266,6 +267,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0030_route_set_publication_recovery.sql"),
         include_str!("../migrations/0031_route_set_publication_terminal_recovery.sql"),
         include_str!("../migrations/0032_route_set_flat_writer_guardrails.sql"),
+        include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -292,7 +294,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         let table_name = table["name"].as_str().unwrap();
         let is_enforced_candidate = matches!(
             table_name,
-            "ownership_transfers" | "workshop_recovery_components"
+            "ownership_transfers" | "workshop_recovery_components" | "workshop_recovery_rehearsals"
         );
         assert_eq!(
             table["migration_readiness"]["ready"], is_enforced_candidate,
@@ -508,6 +510,44 @@ fn recovery_component_policy_has_no_machine_or_platform_bypass() {
     let driver = include_str!("../src/docker_driver/recovery.rs");
     assert!(driver.contains(".store\n        .begin(ledger.workshop)"));
     assert!(driver.contains("where recovery_point_id=$1 and workshop_id=$2 order by component"));
+}
+
+#[test]
+fn recovery_rehearsal_policy_separates_fleet_reads_from_tenant_writes() {
+    let migration = include_str!("../migrations/0042_rehearsal_tenant_rls.sql");
+    assert!(
+        migration
+            .contains("alter table control.workshop_recovery_rehearsals enable row level security")
+    );
+    assert!(
+        migration
+            .contains("alter table control.workshop_recovery_rehearsals force row level security")
+    );
+    assert!(migration.contains("revoke insert, update, delete"));
+    assert!(migration.contains("from control_api"));
+    assert!(migration.contains("workshop_recovery_rehearsals_platform_read"));
+    assert!(migration.contains("workshop_recovery_rehearsals_scheduler_discovery"));
+    assert!(migration.contains("workshop_recovery_rehearsals_scheduler_insert"));
+    assert!(migration.contains("workshop_recovery_rehearsals_scheduler_update"));
+    assert!(migration.contains("for select\n        to control_api"));
+    assert!(migration.contains("for select\n        to control_backup_scheduler"));
+    assert!(migration.contains("for insert\n        to control_backup_scheduler"));
+    assert!(migration.contains("for update\n        to control_backup_scheduler"));
+    assert!(!migration.contains("for delete"));
+    assert!(!migration.contains("control.platform"));
+    assert!(!migration.contains("to public"));
+    assert!(
+        migration
+            .matches("workshop_id = control.current_workshop_id()")
+            .count()
+            >= 6,
+        "scheduler insert and update policies must bind both row and parent"
+    );
+
+    let scheduler = include_str!("../src/backup_scheduler.rs");
+    assert!(scheduler.contains("fetch_all(&self.fleet_discovery)"));
+    assert!(scheduler.contains("self.tenant_store.begin(claim.workshop)"));
+    assert!(scheduler.contains("self.tenant_store.begin(workshop)"));
 }
 
 #[test]
@@ -1325,21 +1365,93 @@ async fn assert_production_backup_scheduler_grants(
     admin_url: &str,
     database: &str,
     owner_store: &Store,
-    workshop: Uuid,
+    first_workshop: Uuid,
+    second_workshop: Uuid,
     requested_by: Uuid,
 ) {
-    let database_id = Uuid::new_v4();
-    let recovery = Uuid::new_v4();
-    let rehearsal = Uuid::new_v4();
-    sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,state,routable) values($1,$2,'primary',$3,$4,'Scheduler grant fixture','ready',true)")
-        .bind(database_id).bind(workshop).bind(format!("mb_{}",database_id.simple()))
-        .bind(format!("{}.example.test",database_id.simple())).execute(owner_store.pool()).await.unwrap();
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,state,ready_at,storage_location,verification_state,verified_at) values($1,$2,$3,'backup','Scheduler grant fixture',$4,'ready',now(),'s3','verified',now())")
-        .bind(recovery).bind(workshop).bind(database_id).bind(requested_by)
-        .execute(owner_store.pool()).await.unwrap();
-    sqlx::query("insert into control.workshop_recovery_rehearsals(id,recovery_point_id,workshop_id,state,lease_owner,lease_token,lease_expires_at) values($1,$2,$3,'running',$4,$5,now()+interval '20 minutes')")
-        .bind(rehearsal).bind(recovery).bind(workshop).bind(Uuid::new_v4()).bind(Uuid::new_v4())
-        .execute(owner_store.pool()).await.unwrap();
+    let mut fixtures = Vec::new();
+    for workshop in [first_workshop, second_workshop] {
+        let database_id = Uuid::new_v4();
+        let recovery = Uuid::new_v4();
+        let rehearsal = Uuid::new_v4();
+        sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,state,routable) values($1,$2,'primary',$3,$4,'Scheduler grant fixture','ready',true)")
+            .bind(database_id).bind(workshop).bind(format!("mb_{}",database_id.simple()))
+            .bind(format!("{}.example.test",database_id.simple())).execute(owner_store.pool()).await.unwrap();
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by,state,ready_at,storage_location,verification_state,verified_at) values($1,$2,$3,'backup','Scheduler grant fixture',$4,'ready',now(),'s3','verified',now())")
+            .bind(recovery).bind(workshop).bind(database_id).bind(requested_by)
+            .execute(owner_store.pool()).await.unwrap();
+        sqlx::query("insert into control.workshop_recovery_rehearsals(id,recovery_point_id,workshop_id,state,finished_at) values($1,$2,$3,'succeeded',now())")
+            .bind(rehearsal).bind(recovery).bind(workshop)
+            .execute(owner_store.pool()).await.unwrap();
+        fixtures.push((recovery, rehearsal));
+    }
+    let (first_recovery, first_rehearsal) = fixtures[0];
+    let (second_recovery, second_rehearsal) = fixtures[1];
+
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control'
+            and relation.relname='workshop_recovery_rehearsals'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+    let privileges = sqlx::query_as::<_, (bool, bool, bool, bool, bool, bool, bool, bool, bool)>(
+        "select
+           has_table_privilege('control_api','control.workshop_recovery_rehearsals','select'),
+           has_table_privilege('control_api','control.workshop_recovery_rehearsals','insert'),
+           has_table_privilege('control_api','control.workshop_recovery_rehearsals','update'),
+           has_table_privilege('control_api','control.workshop_recovery_rehearsals','delete'),
+           has_table_privilege('control_backup_scheduler','control.workshop_recovery_rehearsals','select'),
+           has_table_privilege('control_backup_scheduler','control.workshop_recovery_rehearsals','insert'),
+           has_any_column_privilege('control_backup_scheduler','control.workshop_recovery_rehearsals','update'),
+           has_table_privilege('control_backup_scheduler','control.workshop_recovery_rehearsals','delete'),
+           has_function_privilege('control_backup_scheduler','control.current_workshop_id()','execute')",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        (true, false, false, false, true, true, true, false, true)
+    );
+    let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "select policyname,cmd,roles::text[]
+           from pg_policies
+          where schemaname='control' and tablename='workshop_recovery_rehearsals'
+          order by policyname",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        policies,
+        vec![
+            (
+                "workshop_recovery_rehearsals_platform_read".into(),
+                "SELECT".into(),
+                vec!["control_api".into()],
+            ),
+            (
+                "workshop_recovery_rehearsals_scheduler_discovery".into(),
+                "SELECT".into(),
+                vec!["control_backup_scheduler".into()],
+            ),
+            (
+                "workshop_recovery_rehearsals_scheduler_insert".into(),
+                "INSERT".into(),
+                vec!["control_backup_scheduler".into()],
+            ),
+            (
+                "workshop_recovery_rehearsals_scheduler_update".into(),
+                "UPDATE".into(),
+                vec!["control_backup_scheduler".into()],
+            ),
+        ]
+    );
 
     let scheduler_url = login_database_url(
         admin_url,
@@ -1347,39 +1459,99 @@ async fn assert_production_backup_scheduler_grants(
         "control_backup_scheduler",
         "backup-scheduler-isolation-password",
     );
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&scheduler_url)
+    let scheduler_store = Store::connect(&scheduler_url).await.unwrap();
+    let tenant_store = scheduler_store.worker_tenant_scope();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from control.workshop_recovery_rehearsals where id=any($1)"
+        )
+        .bind(vec![first_rehearsal, second_rehearsal])
+        .fetch_one(scheduler_store.pool())
+        .await
+        .unwrap(),
+        2,
+        "bounded scheduler discovery deliberately remains fleet-readable"
+    );
+    assert_eq!(
+        sqlx::query(
+            "update control.workshop_recovery_rehearsals set started_at=started_at where id=$1"
+        )
+        .bind(first_rehearsal)
+        .execute(scheduler_store.pool())
+        .await
+        .unwrap()
+        .rows_affected(),
+        0,
+        "a scheduler write without transaction-local workshop context must fail closed"
+    );
+
+    let mut first_tx = tenant_store.begin(first_workshop).await.unwrap();
+    assert_eq!(
+        sqlx::query(
+            "update control.workshop_recovery_rehearsals set started_at=started_at where id=$1"
+        )
+        .bind(first_rehearsal)
+        .execute(&mut *first_tx)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query(
+            "update control.workshop_recovery_rehearsals set started_at=started_at where id=$1"
+        )
+        .bind(second_rehearsal)
+        .execute(&mut *first_tx)
+        .await
+        .unwrap()
+        .rows_affected(),
+        0,
+        "one workshop capability must not update another workshop's rehearsal"
+    );
+    assert!(
+        sqlx::query("insert into control.workshop_recovery_rehearsals(id,recovery_point_id,workshop_id,state) values($1,$2,$3,'running')")
+            .bind(Uuid::new_v4()).bind(second_recovery).bind(first_workshop)
+            .execute(&mut *first_tx).await.is_err(),
+        "a rehearsal insert must match both workshop context and recovery parent"
+    );
+    first_tx.rollback().await.unwrap();
+
+    let mut malformed_tx = scheduler_store.begin().await.unwrap();
+    sqlx::query("select set_config('control.workshop_id','not-a-uuid',true)")
+        .execute(&mut *malformed_tx)
         .await
         .unwrap();
     assert_eq!(
         sqlx::query(
             "update control.workshop_recovery_rehearsals set started_at=started_at where id=$1"
         )
-        .bind(rehearsal)
-        .execute(&pool)
+        .bind(first_rehearsal)
+        .execute(&mut *malformed_tx)
         .await
         .unwrap()
         .rows_affected(),
-        1
+        0
     );
+    malformed_tx.rollback().await.unwrap();
+
     assert!(
         sqlx::query("update control.workshop_recovery_rehearsals set recovery_point_id=recovery_point_id where id=$1")
-            .bind(rehearsal).execute(&pool).await.is_err(),
+            .bind(first_rehearsal).execute(scheduler_store.pool()).await.is_err(),
         "the scheduler must not rewrite rehearsal ownership"
     );
     assert!(
         sqlx::query("delete from control.workshop_recovery_rehearsals where id=$1")
-            .bind(rehearsal)
-            .execute(&pool)
+            .bind(first_rehearsal)
+            .execute(scheduler_store.pool())
             .await
             .is_err(),
         "the scheduler must not delete its durable claim ledger"
     );
     sqlx::query("insert into control.audit_events(id,actor_audit_subject_id,workshop_id,action,target_type,target_id,correlation_id,outcome,detail) values($1,null,$2,'database.recovery.rehearse','workshop_recovery_point',$3,$4,'failed','{}')")
-        .bind(Uuid::new_v4()).bind(workshop).bind(recovery.to_string()).bind(rehearsal)
-        .execute(&pool).await.unwrap();
-    pool.close().await;
+        .bind(Uuid::new_v4()).bind(first_workshop).bind(first_recovery.to_string()).bind(first_rehearsal)
+        .execute(scheduler_store.pool()).await.unwrap();
+    scheduler_store.pool().close().await;
 }
 
 async fn assert_privacy_retention_batch_capability(owner_store: &Store) {
@@ -2397,6 +2569,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         vec![
             ("ownership_transfers".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
+            ("workshop_recovery_rehearsals".to_owned(), true, true),
         ],
         "the characterization must name every protected table"
     );
@@ -2489,8 +2662,10 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     assert_production_tenant_pool(&admin_url, &database, first, second).await;
     assert_production_worker_execution_scopes(&admin_url, &database, &store, first).await;
     assert_production_lifecycle_execution_scope(&admin_url, &database, &store, first).await;
-    assert_production_backup_scheduler_grants(&admin_url, &database, &store, first, from_user)
-        .await;
+    assert_production_backup_scheduler_grants(
+        &admin_url, &database, &store, first, second, from_user,
+    )
+    .await;
     assert_privacy_retention_batch_capability(&store).await;
     let (_, first_recovery) = seed_recovery_component(&store, first, from_user, 'a').await;
     let (_, second_recovery) = seed_recovery_component(&store, second, from_user, 'b').await;
