@@ -107,11 +107,11 @@ jobs:
       - name: PostgreSQL integration tests
         run: cargo test --locked --manifest-path Cargo.toml --test postgres -- --ignored --test-threads=1
       - name: PostgreSQL driver boundary tests
-        run: cargo test --locked --manifest-path Cargo.toml --lib docker_driver:: -- --ignored --test-threads=1
+        run: 'cargo test --locked --manifest-path Cargo.toml --lib docker_driver:: -- --ignored --test-threads=1'
       - name: PostgreSQL scheduler boundary tests
-        run: cargo test --locked --manifest-path Cargo.toml --lib backup_scheduler:: -- --ignored --test-threads=1
+        run: 'cargo test --locked --manifest-path Cargo.toml --lib backup_scheduler:: -- --ignored --test-threads=1'
       - name: PostgreSQL privacy cleanup boundary tests
-        run: cargo test --locked --manifest-path Cargo.toml --lib workers::privacy:: -- --ignored --test-threads=1
+        run: 'cargo test --locked --manifest-path Cargo.toml --lib workers::privacy:: -- --ignored --test-threads=1'
       - name: PostgreSQL schema epoch tests
         run: cargo test --locked --manifest-path Cargo.toml --test schema_epoch -- --ignored --test-threads=1
       - name: PostgreSQL tenant isolation tests
