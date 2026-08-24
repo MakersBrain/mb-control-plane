@@ -236,6 +236,18 @@ catalog flags, policy metadata, and the narrowed ACLs. This policy protects the
 rehearsal ledger's runtime mutations; its recovery-point parent remains pending
 until release and privacy access are split.
 
+Implemented recovery-point ACL preparation (2026-08-24): migration
+`0043_recovery_point_runtime_acl_pruning` removes the release worker's stale
+direct SELECT/INSERT/UPDATE grant and the privacy worker's stale direct SELECT
+grant on `workshop_recovery_points`. Neither worker contains direct SQL for the
+table. Interrupted release review retains its fixed-search-path
+`SECURITY DEFINER` capability, which performs the bounded recovery-evidence
+read without restoring general table access. Production-role tests prove the
+removed operations fail with PostgreSQL privilege errors. This is least-
+privilege preparation, not RLS: platform fleet release preparation and status,
+plus the driver ledger's bounded fleet release read, still need explicit policy
+classification before the recovery parent can be protected.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

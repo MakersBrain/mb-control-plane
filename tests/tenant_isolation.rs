@@ -182,7 +182,9 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0030_route_set_publication_recovery.sql"),
         include_str!("../migrations/0031_route_set_publication_terminal_recovery.sql"),
         include_str!("../migrations/0032_route_set_flat_writer_guardrails.sql"),
+        include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql"),
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
+        include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -267,7 +269,9 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0030_route_set_publication_recovery.sql"),
         include_str!("../migrations/0031_route_set_publication_terminal_recovery.sql"),
         include_str!("../migrations/0032_route_set_flat_writer_guardrails.sql"),
+        include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql"),
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
+        include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -376,10 +380,35 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
                     .expect("grant statement must name one role")
             })
             .collect::<BTreeSet<_>>();
+        let normalized_migrations = lowercase_migrations
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         for role in RUNTIME_ROLES {
-            if lowercase_migrations.contains(&format!(
-                "revoke all on table control.{table_name} from {role}"
-            )) {
+            let historical_privileges = ["select", "insert", "update", "delete"]
+                .into_iter()
+                .filter(|privilege| {
+                    migration_grant_lines.iter().any(|line| {
+                        line.contains(&format!(" to {role}")) && line.contains(privilege)
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            let revoke_marker = format!(" on table control.{table_name} from {role}");
+            let revoked_privileges = normalized_migrations
+                .split("revoke ")
+                .skip(1)
+                .filter_map(|suffix| {
+                    suffix
+                        .split_once(&revoke_marker)
+                        .map(|(privileges, _)| privileges)
+                })
+                .flat_map(|privileges| privileges.split(','))
+                .map(str::trim)
+                .collect::<BTreeSet<_>>();
+            if revoked_privileges.contains("all")
+                || (!historical_privileges.is_empty()
+                    && historical_privileges.is_subset(&revoked_privileges))
+            {
                 granted_roles_in_migrations.remove(role);
             }
         }
@@ -548,6 +577,37 @@ fn recovery_rehearsal_policy_separates_fleet_reads_from_tenant_writes() {
     assert!(scheduler.contains("fetch_all(&self.fleet_discovery)"));
     assert!(scheduler.contains("self.tenant_store.begin(claim.workshop)"));
     assert!(scheduler.contains("self.tenant_store.begin(workshop)"));
+}
+
+#[test]
+fn recovery_point_acl_pruning_removes_unused_worker_table_access() {
+    let migration = include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains(
+        "revoke select, insert, update on table control.workshop_recovery_points from control_release_worker"
+    ));
+    assert!(normalized.contains(
+        "revoke select on table control.workshop_recovery_points from control_privacy_worker"
+    ));
+    assert!(!migration.contains("enable row level security"));
+    assert!(!migration.contains("grant "));
+
+    for source in [
+        include_str!("../src/workers/release.rs"),
+        include_str!("../src/workers/privacy.rs"),
+    ] {
+        assert!(
+            !source.contains("workshop_recovery_points"),
+            "a worker with no direct recovery-point ACL must not add direct table SQL"
+        );
+    }
+
+    let bounded_release_review =
+        include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql");
+    assert!(bounded_release_review.contains(
+        "grant execute on function control.review_interrupted_immutable_release_runtime_observation"
+    ));
+    assert!(bounded_release_review.contains("language plpgsql security definer"));
 }
 
 #[test]
@@ -1573,6 +1633,70 @@ async fn assert_production_backup_scheduler_grants(
         .bind(Uuid::new_v4()).bind(first_workshop).bind(first_recovery.to_string()).bind(first_rehearsal)
         .execute(scheduler_store.pool()).await.unwrap();
     scheduler_store.pool().close().await;
+}
+
+async fn assert_recovery_point_stale_worker_grants_removed(owner_store: &Store, workshop: Uuid) {
+    let privileges = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "select
+           has_table_privilege('control_release_worker','control.workshop_recovery_points','select'),
+           has_table_privilege('control_release_worker','control.workshop_recovery_points','insert'),
+           has_table_privilege('control_release_worker','control.workshop_recovery_points','update'),
+           has_table_privilege('control_privacy_worker','control.workshop_recovery_points','select')",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(privileges, (false, false, false, false));
+
+    let bounded_release_review = sqlx::query_as::<_, (bool, bool)>(
+        "select procedure.prosecdef,
+                has_function_privilege('control_release_worker',procedure.oid,'execute')
+           from pg_proc procedure
+           join pg_namespace namespace on namespace.oid=procedure.pronamespace
+          where namespace.nspname='control'
+            and procedure.oid='control.review_interrupted_immutable_release_runtime_observation(uuid,bigint,uuid,integer,text,text,text)'::regprocedure",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded_release_review,
+        (true, true),
+        "release review must retain only its bounded SECURITY DEFINER capability"
+    );
+
+    for (role, operation) in [
+        ("control_release_worker", "select"),
+        ("control_release_worker", "insert"),
+        ("control_release_worker", "update"),
+        ("control_privacy_worker", "select"),
+    ] {
+        let mut tx = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut tx, role, workshop).await;
+        let denied =
+            match operation {
+                "select" => {
+                    sqlx::query("select id from control.workshop_recovery_points limit 1")
+                        .execute(&mut *tx)
+                        .await
+                }
+                "insert" => {
+                    sqlx::query("insert into control.workshop_recovery_points default values")
+                        .execute(&mut *tx)
+                        .await
+                }
+                "update" => sqlx::query(
+                    "update control.workshop_recovery_points set state=state where workshop_id=$1",
+                )
+                .bind(workshop)
+                .execute(&mut *tx)
+                .await,
+                _ => unreachable!(),
+            }
+            .expect_err("the stale direct recovery-point privilege must be removed");
+        assert_insufficient_privilege(denied, &format!("{role} direct recovery-point {operation}"));
+        tx.rollback().await.unwrap();
+    }
 }
 
 async fn assert_privacy_retention_batch_capability(owner_store: &Store) {
@@ -2687,6 +2811,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         &admin_url, &database, &store, first, second, from_user,
     )
     .await;
+    assert_recovery_point_stale_worker_grants_removed(&store, first).await;
     assert_privacy_retention_batch_capability(&store).await;
     let (_, first_recovery) = seed_recovery_component(&store, first, from_user, 'a').await;
     let (_, second_recovery) = seed_recovery_component(&store, second, from_user, 'b').await;
