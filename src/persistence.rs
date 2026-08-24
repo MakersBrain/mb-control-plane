@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0043_recovery_point_runtime_acl_pruning";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0044_platform_recovery_capabilities";
 
 #[derive(Clone)]
 pub struct Store {

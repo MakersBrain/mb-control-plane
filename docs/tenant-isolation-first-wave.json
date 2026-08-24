@@ -336,17 +336,19 @@
           {"constraint": "workshop_deletions_final_recovery_workshop_fkey", "direction": "inbound", "related_table": "workshop_deletions"}
         ],
         "security_definer_functions": [
-          {"name": "control.review_interrupted_immutable_release_runtime_observation", "reason": "bounded release review validates verified recovery evidence without direct release-worker table access"}
+          {"name": "control.review_interrupted_immutable_release_runtime_observation", "reason": "bounded release review validates verified recovery evidence without direct release-worker table access"},
+          {"name": "control.insert_platform_deletion_recovery_point", "reason": "validates the exact tenant-lifecycle deletion operation and derives the final safety-backup row without general platform write access"},
+          {"name": "control.insert_platform_release_recovery_point", "reason": "validates the exact fleet run, operation, release, and canonical tenant snapshot before deriving one pre-release backup row"}
         ]
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_api": ["SELECT"],
         "control_tenant_api": ["SELECT", "INSERT"],
         "control_lifecycle_worker": ["SELECT", "INSERT", "UPDATE", "DELETE"],
         "control_backup_scheduler": ["SELECT", "INSERT"],
         "control_driver_ledger": ["SELECT", "UPDATE"]
       },
-      "migration_readiness": {"ready": false, "next_review": "split the platform API's fleet release inserts from fleet status reads and classify the driver ledger's bounded fleet release read; lifecycle, scheduler, and tenant API mutations already use scoped capabilities"}
+      "migration_readiness": {"ready": false, "next_review": "classify the driver ledger's two bounded fleet release reads; platform status is read-only and platform deletion/release writes now use bounded capabilities, while lifecycle, scheduler, and tenant API mutations already use scoped transactions"}
     },
     {
       "name": "workshop_recovery_components",

@@ -8,8 +8,8 @@
     "sha256": "a6d49252dd8a990409c270c5b492c3922dbc95ae112fdddc77e60bf481f13273"
   },
   "release": "0.1.0",
-  "schema_release": "0043_recovery_point_runtime_acl_pruning",
-  "schema_compatibility": "=0043_recovery_point_runtime_acl_pruning",
+  "schema_release": "0044_platform_recovery_capabilities",
+  "schema_compatibility": "=0044_platform_recovery_capabilities",
   "staging_qualification": {
     "builder": "podman/qualification.py",
     "environment": "synthetic-only staging",
@@ -787,7 +787,7 @@
     ]
   },
   "rollback": {
-    "application": "requires an application release for control-plane schema epoch 0043_recovery_point_runtime_acl_pruning",
+    "application": "requires an application release for control-plane schema epoch 0044_platform_recovery_capabilities",
     "database": "no cross-epoch rollback; destroy the disposable topology and recreate a blank database with one matching code epoch"
   },
   "postgresql_recovery": {

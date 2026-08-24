@@ -276,14 +276,6 @@ pub(super) async fn platform_delete_workshop(
     }
     let database_id = primary_database(&mut tx, id).await?;
     ensure_lifecycle_idle(&mut tx, id).await?;
-    let documents_enabled = sqlx::query_scalar::<_, bool>(
-        "select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')",
-    ).bind(id).fetch_one(&mut *tx).await?;
-    let component_scope = if documents_enabled {
-        vec!["odoo", "paperless"]
-    } else {
-        vec!["odoo"]
-    };
     let payload =
         json!({"action":"delete","database_id":database_id,"recovery_point_id":recovery_id});
     let operation_id = Store::enqueue(
@@ -300,8 +292,20 @@ pub(super) async fn platform_delete_workshop(
         },
     )
     .await?;
-    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version) values($1,$2,$3,$4,'backup','Final pre-deletion backup',$5,$6,'mb-workshop-recovery-v2')")
-        .bind(recovery_id).bind(id).bind(database_id).bind(operation_id).bind(who.user_id).bind(&component_scope).execute(&mut *tx).await?;
+    let inserted_recovery = sqlx::query_scalar::<_, Uuid>(
+        "select control.insert_platform_deletion_recovery_point($1,$2,$3,$4)",
+    )
+    .bind(recovery_id)
+    .bind(id)
+    .bind(database_id)
+    .bind(operation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if inserted_recovery != recovery_id {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "platform deletion recovery capability returned an invalid identity"
+        )));
+    }
     sqlx::query("insert into control.workshop_deletions(workshop_id,previous_status,requested_by,operation_id,final_recovery_point_id,purge_after) values($1,$2,$3,$4,$5,now()+interval '30 days')")
         .bind(id).bind(&previous_status).bind(who.user_id).bind(operation_id).bind(recovery_id).execute(&mut *tx).await?;
     let changed=sqlx::query("update control.workshops set status='restricted',version=version+1 where id=$1 and version=$2")
@@ -1174,17 +1178,25 @@ pub(super) async fn platform_release_adopt(
     for tenant in &tenants {
         let adoption_id = Uuid::new_v4();
         let recovery_id = Uuid::new_v4();
-        let source=sqlx::query_scalar::<_,String>("select release_id from control.tenant_release_adoptions where workshop_id=$1 and database_id=$2 and state='active'")
-            .bind(tenant.0).bind(tenant.1).fetch_optional(&mut *tx).await?;
-        let component_scope = if tenant.3 {
-            vec!["odoo", "paperless"]
-        } else {
-            vec!["odoo"]
-        };
-        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,operation_id,kind,label,requested_by,component_scope,format_version,source_release) values($1,$2,$3,$4,'backup',$5,$6,$7,'mb-workshop-recovery-v2',$8)")
-            .bind(recovery_id).bind(tenant.0).bind(tenant.1).bind(operation_id).bind(format!("Pre-release recovery for {id}")).bind(who.user_id).bind(&component_scope).bind(&source).execute(&mut *tx).await?;
+        let inserted_recovery = sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "select recovery_id,source_release_id
+               from control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(recovery_id)
+        .bind(fleet_run_id)
+        .bind(tenant.0)
+        .bind(tenant.1)
+        .bind(operation_id)
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if inserted_recovery.0 != recovery_id {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "platform release recovery capability returned an invalid identity"
+            )));
+        }
         sqlx::query("insert into control.tenant_release_adoptions(id,workshop_id,database_id,release_id,source_release_id,registry_version,state,operation_id,backup_recovery_id,target_schema_epoch) values($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9)")
-            .bind(adoption_id).bind(tenant.0).bind(tenant.1).bind(&id).bind(source).bind(release.3).bind(operation_id).bind(recovery_id).bind(release.2).execute(&mut *tx).await?;
+            .bind(adoption_id).bind(tenant.0).bind(tenant.1).bind(&id).bind(inserted_recovery.1).bind(release.3).bind(operation_id).bind(recovery_id).bind(release.2).execute(&mut *tx).await?;
     }
     audit_command(
         &mut tx,

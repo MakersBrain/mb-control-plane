@@ -967,6 +967,19 @@ This narrows the next Phase 2 review to the platform API's mixed fleet release
 and status behavior plus the driver ledger's bounded fleet release read; it
 does not yet enable RLS on the recovery-point parent.
 
+Implemented platform recovery-point capability slice (2026-08-24): platform
+status and metrics retain read-only fleet visibility, while migration
+`0044_platform_recovery_capabilities` removes direct recovery-point
+INSERT/UPDATE/DELETE from `control_api`. Final deletion backups and pre-release
+fleet backups now use separate fixed-search-path `SECURITY DEFINER`
+capabilities. Each validates its exact durable operation and derives the row's
+tenant ownership and security-sensitive fields from authoritative ledger state;
+the Rust calls stay within the existing deletion or fleet-adoption transaction.
+Static and production-role tests prevent direct platform writes, PUBLIC
+execution, or a return to inline table inserts. The remaining recovery-parent
+blocker is the driver ledger's bounded fleet-release read; completing that split
+will allow the final forced-RLS policy matrix to be reviewed.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
