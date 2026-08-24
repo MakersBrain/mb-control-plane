@@ -555,19 +555,12 @@ fn login_database_url(admin_url: &str, database: &str, role: &str, password: &st
 }
 
 async fn create_runtime_roles(admin: &sqlx::PgPool) {
-    let roles = RUNTIME_ROLES
-        .iter()
-        .map(|role| {
-            format!(
-                "create role {role} nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
     sqlx::query(AssertSqlSafe(format!(
         "do $roles$ begin
-           create role control_runtime_read nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
-           {roles};
+           if not exists(select 1 from pg_roles where rolname='control_runtime_read') then
+             create role control_runtime_read nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+           end if;
+           {};
            grant control_runtime_read to {};
            alter role control_tenant_api login password 'tenant-isolation-password';
            alter role control_membership_worker login password 'membership-isolation-password';
@@ -576,6 +569,13 @@ async fn create_runtime_roles(admin: &sqlx::PgPool) {
            alter role control_backup_scheduler login password 'backup-scheduler-isolation-password';
            alter role control_driver_ledger login password 'driver-ledger-isolation-password';
          end $roles$",
+        RUNTIME_ROLES
+            .iter()
+            .map(|role| format!(
+                "if not exists(select 1 from pg_roles where rolname='{role}') then create role {role} nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if"
+            ))
+            .collect::<Vec<_>>()
+            .join("; "),
         RUNTIME_ROLES.join(",")
     )))
     .execute(admin)
@@ -2552,15 +2552,4 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     .execute(&admin)
     .await
     .unwrap();
-    sqlx::query(AssertSqlSafe(format!(
-        "drop role {}",
-        RUNTIME_ROLES.join(",")
-    )))
-    .execute(&admin)
-    .await
-    .unwrap();
-    sqlx::query("drop role control_runtime_read")
-        .execute(&admin)
-        .await
-        .unwrap();
 }
