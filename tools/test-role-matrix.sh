@@ -3,33 +3,34 @@ set -eu
 
 : "${CONTROL_TEST_ADMIN_URL:?CONTROL_TEST_ADMIN_URL is required}"
 database=control_role_matrix_test
-runtime_roles="control_api control_tenant_api control_membership_worker control_provisioning_worker control_invoice_worker control_inventory_worker control_email_worker control_reconciliation_worker control_lifecycle_worker control_backup_scheduler control_driver_ledger control_release_worker control_privacy_worker"
 
 cleanup() {
   dropdb --if-exists --force --maintenance-db="$CONTROL_TEST_ADMIN_URL" "$database" >/dev/null 2>&1 || true
-  for role in $runtime_roles; do
-    psql "$CONTROL_TEST_ADMIN_URL" -v ON_ERROR_STOP=1 -c "drop role if exists $role" >/dev/null 2>&1 || true
-  done
-  psql "$CONTROL_TEST_ADMIN_URL" -v ON_ERROR_STOP=1 -c "drop role if exists control_runtime_read" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT HUP INT TERM
 cleanup
 
 psql "$CONTROL_TEST_ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
-create role control_runtime_read nologin;
-create role control_api nologin in role control_runtime_read;
-create role control_tenant_api nologin in role control_runtime_read;
-create role control_membership_worker nologin in role control_runtime_read;
-create role control_provisioning_worker nologin in role control_runtime_read;
-create role control_invoice_worker nologin in role control_runtime_read;
-create role control_inventory_worker nologin in role control_runtime_read;
-create role control_email_worker nologin in role control_runtime_read;
-create role control_reconciliation_worker nologin in role control_runtime_read;
-create role control_lifecycle_worker nologin in role control_runtime_read;
-create role control_backup_scheduler nologin in role control_runtime_read;
-create role control_driver_ledger nologin in role control_runtime_read;
-create role control_release_worker nologin in role control_runtime_read;
-create role control_privacy_worker nologin in role control_runtime_read;
+do $roles$
+declare
+  runtime_role text;
+begin
+  if not exists(select 1 from pg_roles where rolname = 'control_runtime_read') then
+    create role control_runtime_read nologin;
+  end if;
+  foreach runtime_role in array array[
+    'control_api','control_tenant_api','control_membership_worker','control_provisioning_worker',
+    'control_invoice_worker','control_inventory_worker','control_email_worker',
+    'control_reconciliation_worker','control_lifecycle_worker','control_backup_scheduler',
+    'control_driver_ledger','control_release_worker','control_privacy_worker'
+  ] loop
+    if not exists(select 1 from pg_roles where rolname = runtime_role) then
+      execute format('create role %I nologin', runtime_role);
+    end if;
+    execute format('grant control_runtime_read to %I', runtime_role);
+  end loop;
+end
+$roles$;
 SQL
 
 createdb --maintenance-db="$CONTROL_TEST_ADMIN_URL" "$database"
