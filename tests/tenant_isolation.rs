@@ -187,6 +187,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
+        include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -276,6 +277,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
+        include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -302,7 +304,10 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         let table_name = table["name"].as_str().unwrap();
         let is_enforced_candidate = matches!(
             table_name,
-            "ownership_transfers" | "workshop_recovery_components" | "workshop_recovery_rehearsals"
+            "ownership_transfers"
+                | "workshop_recovery_points"
+                | "workshop_recovery_components"
+                | "workshop_recovery_rehearsals"
         );
         assert_eq!(
             table["migration_readiness"]["ready"], is_enforced_candidate,
@@ -695,6 +700,60 @@ fn fleet_recovery_reads_use_live_driver_capabilities() {
             "fleet release modules must not regain direct recovery-point reads"
         );
     }
+}
+
+#[test]
+fn recovery_point_policy_separates_fleet_reads_from_tenant_workflows() {
+    let migration = include_str!("../migrations/0046_recovery_point_tenant_rls.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized
+            .contains("alter table control.workshop_recovery_points enable row level security")
+    );
+    assert!(
+        normalized
+            .contains("alter table control.workshop_recovery_points force row level security")
+    );
+    assert!(normalized.contains(
+        "revoke insert, delete on table control.workshop_recovery_points from control_lifecycle_worker"
+    ));
+    for policy in [
+        "workshop_recovery_points_platform_read",
+        "workshop_recovery_points_tenant_api_read",
+        "workshop_recovery_points_tenant_api_insert",
+        "workshop_recovery_points_lifecycle_read",
+        "workshop_recovery_points_lifecycle_update",
+        "workshop_recovery_points_scheduler_discovery",
+        "workshop_recovery_points_scheduler_insert",
+        "workshop_recovery_points_driver_read",
+        "workshop_recovery_points_driver_update",
+    ] {
+        assert!(migration.contains(policy));
+    }
+    assert_eq!(migration.matches("using (true)").count(), 3);
+    assert!(migration.matches("control.current_workshop_id()").count() >= 12);
+    assert!(!migration.contains("for delete"));
+    assert!(!migration.contains("to public"));
+
+    for source in [
+        include_str!("../src/api/recovery.rs"),
+        include_str!("../src/workers/lifecycle.rs"),
+        include_str!("../src/backup_scheduler.rs"),
+        include_str!("../src/docker_driver/recovery.rs"),
+    ] {
+        assert!(source.contains("workshop_recovery_points"));
+    }
+    assert!(
+        include_str!("../src/api/recovery.rs").contains("tenant_store.begin(scope.workshop_id)")
+    );
+    assert!(include_str!("../src/workers/lifecycle.rs").contains("tenant_store.begin(workshop)"));
+    assert!(
+        include_str!("../src/backup_scheduler.rs").contains("self.tenant_store.begin(workshop)")
+    );
+    assert!(
+        include_str!("../src/docker_driver/recovery.rs")
+            .contains(".tenant_ledger\n        .begin(workshop)")
+    );
 }
 
 #[test]
@@ -1786,6 +1845,293 @@ async fn assert_recovery_point_stale_worker_grants_removed(owner_store: &Store, 
     }
 }
 
+async fn assert_recovery_point_rls(
+    admin_url: &str,
+    database: &str,
+    owner_store: &Store,
+    workshops: (Uuid, Uuid),
+    recoveries: (Uuid, Uuid),
+    requested_by: Uuid,
+) {
+    let (first_workshop, second_workshop) = workshops;
+    let (first_recovery, second_recovery) = recoveries;
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control'
+            and relation.relname='workshop_recovery_points'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+
+    let privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_lifecycle_worker',
+                  'control_backup_scheduler','control_driver_ledger',
+                  'control_release_worker','control_privacy_worker'
+                ]::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(
+                  role_name,'control.workshop_recovery_points',privilege
+                )
+          order by role_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            ("control_api".into(), "SELECT".into()),
+            ("control_backup_scheduler".into(), "INSERT".into()),
+            ("control_backup_scheduler".into(), "SELECT".into()),
+            ("control_driver_ledger".into(), "SELECT".into()),
+            ("control_driver_ledger".into(), "UPDATE".into()),
+            ("control_lifecycle_worker".into(), "SELECT".into()),
+            ("control_lifecycle_worker".into(), "UPDATE".into()),
+            ("control_tenant_api".into(), "INSERT".into()),
+            ("control_tenant_api".into(), "SELECT".into()),
+        ]
+    );
+
+    let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "select policyname,cmd,roles::text[]
+           from pg_policies
+          where schemaname='control'
+            and tablename='workshop_recovery_points'
+            and policyname <> 'workshop_recovery_points_migration_owner'
+          order by policyname",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        policies,
+        vec![
+            (
+                "workshop_recovery_points_driver_read".into(),
+                "SELECT".into(),
+                vec!["control_driver_ledger".into()],
+            ),
+            (
+                "workshop_recovery_points_driver_update".into(),
+                "UPDATE".into(),
+                vec!["control_driver_ledger".into()],
+            ),
+            (
+                "workshop_recovery_points_lifecycle_read".into(),
+                "SELECT".into(),
+                vec!["control_lifecycle_worker".into()],
+            ),
+            (
+                "workshop_recovery_points_lifecycle_update".into(),
+                "UPDATE".into(),
+                vec!["control_lifecycle_worker".into()],
+            ),
+            (
+                "workshop_recovery_points_platform_read".into(),
+                "SELECT".into(),
+                vec!["control_api".into()],
+            ),
+            (
+                "workshop_recovery_points_scheduler_discovery".into(),
+                "SELECT".into(),
+                vec!["control_backup_scheduler".into()],
+            ),
+            (
+                "workshop_recovery_points_scheduler_insert".into(),
+                "INSERT".into(),
+                vec!["control_backup_scheduler".into()],
+            ),
+            (
+                "workshop_recovery_points_tenant_api_insert".into(),
+                "INSERT".into(),
+                vec!["control_tenant_api".into()],
+            ),
+            (
+                "workshop_recovery_points_tenant_api_read".into(),
+                "SELECT".into(),
+                vec!["control_tenant_api".into()],
+            ),
+        ]
+    );
+
+    let mut platform_tx = owner_store.begin().await.unwrap();
+    set_local_role(&mut platform_tx, "control_api").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from control.workshop_recovery_points where id=any($1)",
+        )
+        .bind(vec![first_recovery, second_recovery])
+        .fetch_one(&mut *platform_tx)
+        .await
+        .unwrap(),
+        2,
+        "platform status deliberately remains fleet-readable"
+    );
+    platform_tx.rollback().await.unwrap();
+
+    let first_database = sqlx::query_scalar::<_, Uuid>(
+        "select database_id from control.workshop_recovery_points where id=$1",
+    )
+    .bind(first_recovery)
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    let second_database = sqlx::query_scalar::<_, Uuid>(
+        "select database_id from control.workshop_recovery_points where id=$1",
+    )
+    .bind(second_recovery)
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+
+    let tenant_url = login_database_url(
+        admin_url,
+        database,
+        "control_tenant_api",
+        "tenant-isolation-password",
+    );
+    let tenant_store = TenantStore::connect(&tenant_url).await.unwrap();
+    let mut tenant_tx = tenant_store.begin(first_workshop).await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.workshop_recovery_points where id=$1)",
+        )
+        .bind(first_recovery)
+        .fetch_one(&mut *tenant_tx)
+        .await
+        .unwrap()
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.workshop_recovery_points where id=$1)",
+        )
+        .bind(second_recovery)
+        .fetch_one(&mut *tenant_tx)
+        .await
+        .unwrap()
+    );
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'snapshot','Scoped API fixture',$4)")
+        .bind(Uuid::new_v4()).bind(first_workshop).bind(first_database).bind(requested_by)
+        .execute(&mut *tenant_tx).await.unwrap();
+    assert!(
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'snapshot','Cross API fixture',$4)")
+            .bind(Uuid::new_v4()).bind(second_workshop).bind(second_database).bind(requested_by)
+            .execute(&mut *tenant_tx).await.is_err()
+    );
+    tenant_tx.rollback().await.unwrap();
+    drop(tenant_store);
+
+    for (role, password) in [
+        ("control_lifecycle_worker", "lifecycle-isolation-password"),
+        ("control_driver_ledger", "driver-ledger-isolation-password"),
+    ] {
+        let role_url = login_database_url(admin_url, database, role, password);
+        let role_store = Store::connect(&role_url).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.workshop_recovery_points")
+                .fetch_one(role_store.pool())
+                .await
+                .unwrap(),
+            0,
+            "{role} must fail closed without workshop context"
+        );
+        let scoped = role_store.worker_tenant_scope();
+        let mut tx = scoped.begin(first_workshop).await.unwrap();
+        assert_eq!(
+            sqlx::query("update control.workshop_recovery_points set state=state where id=$1")
+                .bind(first_recovery)
+                .execute(&mut *tx)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            sqlx::query("update control.workshop_recovery_points set state=state where id=$1")
+                .bind(second_recovery)
+                .execute(&mut *tx)
+                .await
+                .unwrap()
+                .rows_affected(),
+            0,
+            "{role} must not update another workshop's recovery point"
+        );
+        let denied = sqlx::query("delete from control.workshop_recovery_points where id=$1")
+            .bind(first_recovery)
+            .execute(&mut *tx)
+            .await
+            .expect_err("no runtime role may delete recovery points");
+        assert_insufficient_privilege(denied, &format!("{role} recovery-point delete"));
+        tx.rollback().await.unwrap();
+        role_store.pool().close().await;
+    }
+
+    let scheduler_url = login_database_url(
+        admin_url,
+        database,
+        "control_backup_scheduler",
+        "backup-scheduler-isolation-password",
+    );
+    let scheduler_store = Store::connect(&scheduler_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from control.workshop_recovery_points where id=any($1)",
+        )
+        .bind(vec![first_recovery, second_recovery])
+        .fetch_one(scheduler_store.pool())
+        .await
+        .unwrap(),
+        2,
+        "scheduler discovery deliberately remains fleet-readable"
+    );
+    assert!(
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'backup','Missing scheduler context',$4)")
+            .bind(Uuid::new_v4()).bind(first_workshop).bind(first_database).bind(requested_by)
+            .execute(scheduler_store.pool()).await.is_err()
+    );
+    let scheduler_tenant = scheduler_store.worker_tenant_scope();
+    let mut scheduler_tx = scheduler_tenant.begin(first_workshop).await.unwrap();
+    sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'backup','Scoped scheduler fixture',$4)")
+        .bind(Uuid::new_v4()).bind(first_workshop).bind(first_database).bind(requested_by)
+        .execute(&mut *scheduler_tx).await.unwrap();
+    assert!(
+        sqlx::query("insert into control.workshop_recovery_points(id,workshop_id,database_id,kind,label,requested_by) values($1,$2,$3,'backup','Cross scheduler fixture',$4)")
+            .bind(Uuid::new_v4()).bind(second_workshop).bind(second_database).bind(requested_by)
+            .execute(&mut *scheduler_tx).await.is_err()
+    );
+    scheduler_tx.rollback().await.unwrap();
+    scheduler_store.pool().close().await;
+
+    let driver_url = login_database_url(
+        admin_url,
+        database,
+        "control_driver_ledger",
+        "driver-ledger-isolation-password",
+    );
+    let driver_store = Store::connect(&driver_url).await.unwrap();
+    let mut malformed = driver_store.begin().await.unwrap();
+    sqlx::query("select set_config('control.workshop_id','not-a-uuid',true)")
+        .execute(&mut *malformed)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from control.workshop_recovery_points")
+            .fetch_one(&mut *malformed)
+            .await
+            .unwrap(),
+        0,
+        "malformed workshop context must fail closed"
+    );
+    malformed.rollback().await.unwrap();
+    driver_store.pool().close().await;
+}
+
 async fn seed_platform_capability_release(
     owner_store: &Store,
     status: &str,
@@ -1872,10 +2218,7 @@ async fn assert_platform_recovery_point_capabilities(
 
     for operation in ["insert", "update", "delete"] {
         let mut tx = owner_store.begin().await.unwrap();
-        sqlx::query("set local role control_api")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+        set_local_role(&mut tx, "control_api").await;
         let denied = match operation {
             "insert" => {
                 sqlx::query("insert into control.workshop_recovery_points default values")
@@ -1901,10 +2244,7 @@ async fn assert_platform_recovery_point_capabilities(
 
     let visible = {
         let mut tx = owner_store.begin().await.unwrap();
-        sqlx::query("set local role control_api")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+        set_local_role(&mut tx, "control_api").await;
         let visible =
             sqlx::query_scalar::<_, i64>("select count(*) from control.workshop_recovery_points")
                 .fetch_one(&mut *tx)
@@ -1947,10 +2287,7 @@ async fn assert_platform_recovery_point_capabilities(
     .await
     .unwrap();
     let mut deletion_tx = owner_store.begin().await.unwrap();
-    sqlx::query("set local role control_api")
-        .execute(&mut *deletion_tx)
-        .await
-        .unwrap();
+    set_local_role(&mut deletion_tx, "control_api").await;
     let inserted = sqlx::query_scalar::<_, Uuid>(
         "select control.insert_platform_deletion_recovery_point($1,$2,$3,$4)",
     )
@@ -2058,10 +2395,7 @@ async fn assert_platform_recovery_point_capabilities(
     .unwrap();
     let release_recovery = Uuid::new_v4();
     let mut release_tx = owner_store.begin().await.unwrap();
-    sqlx::query("set local role control_api")
-        .execute(&mut *release_tx)
-        .await
-        .unwrap();
+    set_local_role(&mut release_tx, "control_api").await;
     let returned = sqlx::query_as::<_, (Uuid, Option<String>)>(
         "select recovery_id,source_release_id
            from control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)",
@@ -2109,10 +2443,7 @@ async fn assert_platform_recovery_point_capabilities(
         "select * from control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)",
     ] {
         let mut tx = owner_store.begin().await.unwrap();
-        sqlx::query("set local role control_api")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+        set_local_role(&mut tx, "control_api").await;
         let random = Uuid::new_v4();
         let mut query = sqlx::query(call)
             .bind(random)
@@ -2436,11 +2767,7 @@ async fn assert_production_driver_ledger_grants(
     pool.close().await;
 }
 
-async fn set_local_role_and_workshop(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    role: &str,
-    workshop: Uuid,
-) {
+async fn set_local_role(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, role: &str) {
     assert!(
         RUNTIME_ROLES.contains(&role),
         "role identifier must be curated"
@@ -2456,6 +2783,14 @@ async fn set_local_role_and_workshop(
         .execute(&mut **tx)
         .await
         .unwrap();
+}
+
+async fn set_local_role_and_workshop(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    role: &str,
+    workshop: Uuid,
+) {
+    set_local_role(tx, role).await;
     sqlx::query("select set_config('control.workshop_id',$1,true)")
         .bind(workshop.to_string())
         .execute(&mut **tx)
@@ -3153,6 +3488,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         vec![
             ("ownership_transfers".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
+            ("workshop_recovery_points".to_owned(), true, true),
             ("workshop_recovery_rehearsals".to_owned(), true, true),
         ],
         "the characterization must name every protected table"
@@ -3255,6 +3591,15 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     assert_privacy_retention_batch_capability(&store).await;
     let (_, first_recovery) = seed_recovery_component(&store, first, from_user, 'a').await;
     let (_, second_recovery) = seed_recovery_component(&store, second, from_user, 'b').await;
+    assert_recovery_point_rls(
+        &admin_url,
+        &database,
+        &store,
+        (first, second),
+        (first_recovery, second_recovery),
+        from_user,
+    )
+    .await;
     assert_recovery_component_rls(
         &admin_url,
         &database,

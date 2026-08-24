@@ -991,6 +991,18 @@ driver SELECT/UPDATE grant remains temporarily because tenant-scoped backup,
 restore, and progress operations still use it. The next Phase 2 step is the
 final forced-RLS policy and privilege matrix for that tenant workflow.
 
+Implemented recovery-point forced-RLS slice (2026-08-25): migration
+`0046_recovery_point_tenant_rls` enables and forces RLS on
+`workshop_recovery_points`. Platform status and scheduler discovery retain
+explicit fleet-wide read policies; tenant API reads/inserts, lifecycle
+reads/updates, scheduler inserts, and driver reads/updates require the exact
+transaction-local workshop context. No runtime delete policy exists, and the
+lifecycle worker's unused INSERT/DELETE privileges are removed. The platform
+write and driver fleet-read capabilities remain usable through the migration
+owner policy without restoring table-wide runtime authority. The production-
+role PostgreSQL matrix now proves missing, malformed, and cross-workshop
+contexts fail closed for the recovery parent.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify

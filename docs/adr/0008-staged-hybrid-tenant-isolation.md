@@ -272,6 +272,18 @@ recovery reads and updates intentionally retain direct access pending the final
 forced-RLS policy matrix review; this migration does not claim that parent-table
 RLS is complete.
 
+Implemented recovery-point policy slice (2026-08-25): migration
+`0046_recovery_point_tenant_rls` enables and forces RLS on the recovery parent
+with a command-specific role matrix. Platform API status and backup-scheduler
+discovery remain explicitly fleet-readable. Tenant API SELECT/INSERT,
+lifecycle SELECT/UPDATE, scheduler INSERT, and driver SELECT/UPDATE require the
+fail-closed transaction-local workshop identity; release-driver fleet reads
+continue through the exact capabilities introduced in migration 0045. The
+lifecycle worker loses unused direct INSERT/DELETE privileges and no runtime
+role receives a DELETE policy. Live production-role tests cover catalog flags,
+policy metadata, ACLs, same-workshop success, and missing, malformed, and cross-
+workshop denial.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate
