@@ -2624,10 +2624,16 @@ async fn startup_route_heartbeat_is_atomic_and_driver_authority_is_function_only
     assert_eq!(distinct_expiries, 1);
 
     let workshop: Uuid = sqlx::query_scalar(
-        "select workshop_id from control.workshop_route_effect_reservations
-          where effect_run_id=$1 and action='remove-uninitialized' order by workshop_id limit 1",
+        "select reservation.workshop_id
+           from control.workshop_route_effect_reservations reservation
+           join control.workshops workshop on workshop.id=reservation.workshop_id
+          where reservation.effect_run_id=$1
+            and reservation.action='remove-uninitialized'
+            and workshop.slug like $2||'-%'
+          order by reservation.workshop_id limit 1",
     )
     .bind(effect_run_id)
+    .bind(format!("heartbeat-{fixture_prefix}"))
     .fetch_one(store.pool())
     .await
     .unwrap();
