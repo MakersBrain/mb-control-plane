@@ -103,7 +103,7 @@ pub(super) async fn release_fleet(
             "release identity does not match its manifest",
         ));
     }
-    let tenants = release_tenants(state, fleet_run, release_id).await?;
+    let tenants = release_tenants(state, lease, fleet_run, release_id).await?;
     if tenants.is_empty() {
         return Err(DriverError::bad("fleet run contains no tenants"));
     }
@@ -764,23 +764,24 @@ struct ReleaseTenant {
 
 async fn release_tenants(
     state: &DriverState,
+    lease: &ReleaseDriverLease,
     fleet_run: Uuid,
     release_id: &str,
 ) -> Result<Vec<ReleaseTenant>, DriverError> {
     sqlx::query_as::<_, ReleaseTenant>(
-        "select a.id,a.workshop_id,a.database_id,d.database_ref,d.public_hostname,
-                a.backup_recovery_id,r.component_scope
-         from control.tenant_release_adoptions a
-         join control.release_fleet_runs f on f.operation_id=a.operation_id
-         join control.odoo_databases d on d.id=a.database_id and d.workshop_id=a.workshop_id
-         join control.workshop_recovery_points r
-           on r.id=a.backup_recovery_id and r.workshop_id=a.workshop_id
-         where f.id=$1 and a.release_id=$2
-         order by a.created_at,a.id limit $3",
+        "select * from control.read_release_driver_tenants(
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(fleet_run)
     .bind(release_id)
-    .bind(i64::try_from(crate::release::MAX_FLEET_TENANTS + 1).map_err(DriverError::internal)?)
+    .bind(lease.driver_operation_id)
+    .bind(lease.control_operation.id)
+    .bind(lease.control_operation.attempt)
+    .bind(&lease.control_operation.owner)
+    .bind(lease.instance_owner)
+    .bind(lease.execution_token)
+    .bind(lease.resource_lease_token)
+    .bind(lease.fence_token)
     .fetch_all(&state.ledger)
     .await
     .map_err(DriverError::internal)
@@ -2167,9 +2168,8 @@ mod tests {
     fn release_adoption_reads_and_mutations_use_composite_tenant_identity() {
         let source = include_str!("release.rs");
 
-        assert!(source.contains(
-            "join control.workshop_recovery_points r\n           on r.id=a.backup_recovery_id and r.workshop_id=a.workshop_id"
-        ));
+        assert!(source.contains("control.read_release_driver_tenants("));
+        assert!(!source.contains(&["join control.", "workshop_recovery_points"].concat()));
         assert!(source.contains(
             "select state from control.tenant_release_adoptions where id=$1 and workshop_id=$2"
         ));

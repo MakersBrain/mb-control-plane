@@ -286,7 +286,7 @@
         "api": ["src/api.rs", "src/api/domains.rs", "src/api/internal.rs", "src/api/platform.rs", "src/api/recovery.rs", "src/api/webshop.rs", "src/api/workshops.rs"],
         "workers": ["src/persistence.rs", "src/worker.rs", "src/workers/extraction.rs", "src/workers/lifecycle.rs", "src/workers/release.rs", "src/workers/routes.rs"],
         "schedulers": ["src/backup_scheduler.rs"],
-        "drivers": ["src/docker_driver.rs", "src/docker_driver/privacy.rs", "src/docker_driver/recovery.rs", "src/docker_driver/release.rs", "src/docker_driver/startup.rs"]
+        "drivers": ["src/docker_driver.rs", "src/docker_driver/privacy.rs", "src/docker_driver/recovery.rs", "src/docker_driver/startup.rs"]
       },
       "database_touch_paths": {
         "triggers": [],
@@ -298,7 +298,9 @@
           {"constraint": "tenant_release_adoptions_database_workshop_fkey", "direction": "inbound", "related_table": "tenant_release_adoptions"}
         ],
         "security_definer_functions": [
-          {"name": "control.initial_release_preparable", "reason": "fleet-empty bootstrap check reads the database registry"}
+          {"name": "control.initial_release_preparable", "reason": "fleet-empty bootstrap check reads the database registry"},
+          {"name": "control.read_release_driver_tenants", "reason": "projects database identity for an exact live release driver lease"},
+          {"name": "control.read_release_reconciliation_tenants", "reason": "projects database identity for an exact live fleet reconciliation claim"}
         ]
       },
       "current_grants": {
@@ -320,7 +322,7 @@
         "api": ["src/api.rs", "src/api/platform.rs", "src/api/recovery.rs"],
         "workers": ["src/workers/lifecycle.rs"],
         "schedulers": ["src/backup_scheduler.rs"],
-        "drivers": ["src/docker_driver/recovery.rs", "src/docker_driver/release.rs"]
+        "drivers": ["src/docker_driver/recovery.rs"]
       },
       "database_touch_paths": {
         "triggers": [],
@@ -338,7 +340,9 @@
         "security_definer_functions": [
           {"name": "control.review_interrupted_immutable_release_runtime_observation", "reason": "bounded release review validates verified recovery evidence without direct release-worker table access"},
           {"name": "control.insert_platform_deletion_recovery_point", "reason": "validates the exact tenant-lifecycle deletion operation and derives the final safety-backup row without general platform write access"},
-          {"name": "control.insert_platform_release_recovery_point", "reason": "validates the exact fleet run, operation, release, and canonical tenant snapshot before deriving one pre-release backup row"}
+          {"name": "control.insert_platform_release_recovery_point", "reason": "validates the exact fleet run, operation, release, and canonical tenant snapshot before deriving one pre-release backup row"},
+          {"name": "control.read_release_driver_tenants", "reason": "returns one bounded fleet recovery projection only for an exact live release driver and resource lease tuple"},
+          {"name": "control.read_release_reconciliation_tenants", "reason": "returns one bounded verified fleet recovery projection only for an exact live forward-reconciliation claim"}
         ]
       },
       "current_grants": {
@@ -348,7 +352,7 @@
         "control_backup_scheduler": ["SELECT", "INSERT"],
         "control_driver_ledger": ["SELECT", "UPDATE"]
       },
-      "migration_readiness": {"ready": false, "next_review": "classify the driver ledger's two bounded fleet release reads; platform status is read-only and platform deletion/release writes now use bounded capabilities, while lifecycle, scheduler, and tenant API mutations already use scoped transactions"}
+      "migration_readiness": {"ready": false, "next_review": "complete the final forced-RLS policy and privilege matrix review now that platform writes and both driver fleet reads use bounded capabilities; retain the driver ledger's tenant-scoped recovery workflow access until that matrix is proven"}
     },
     {
       "name": "workshop_recovery_components",

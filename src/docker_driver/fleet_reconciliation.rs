@@ -88,6 +88,13 @@ async fn observe(
     let observation = super::release_runtime_observation::observe_release_runtime(
         state,
         super::release_runtime_observation::ReleaseRuntimeObservationRequest {
+            reconciliation_authority: Some(
+                super::release_runtime_observation::ReleaseRuntimeReconciliationAuthority {
+                    reconciliation_id: reconciliation.id,
+                    instance_owner: reconciliation.instance_owner,
+                    execution_token: reconciliation.execution_token,
+                },
+            ),
             fleet_run_id: fleet_run,
             release_id,
             control_operation_id: run.2,

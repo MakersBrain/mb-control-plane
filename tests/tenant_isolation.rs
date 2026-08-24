@@ -186,6 +186,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
+        include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -274,6 +275,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
+        include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -658,6 +660,41 @@ fn platform_recovery_writes_use_bounded_database_capabilities() {
     assert!(api.contains(
         "select extract(epoch from now()-max(ready_at))::float8 from control.workshop_recovery_points"
     ));
+}
+
+#[test]
+fn fleet_recovery_reads_use_live_driver_capabilities() {
+    let migration = include_str!("../migrations/0045_driver_recovery_read_capabilities.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    for function in [
+        "control.read_release_driver_tenants",
+        "control.read_release_reconciliation_tenants",
+    ] {
+        assert!(normalized.contains(&format!("create function {function}")));
+        assert!(normalized.contains(&format!("revoke all on function {function}")));
+        assert!(normalized.contains(&format!("grant execute on function {function}")));
+    }
+    assert_eq!(migration.matches("security definer").count(), 2);
+    assert_eq!(
+        migration
+            .matches("set search_path = pg_catalog, control")
+            .count(),
+        2
+    );
+    assert_eq!(migration.matches("limit 501").count(), 2);
+    assert_eq!(migration.matches("errcode = '42501'").count(), 2);
+    assert!(!migration.contains("to public"));
+
+    for source in [
+        include_str!("../src/docker_driver/release.rs"),
+        include_str!("../src/docker_driver/release_runtime_observation.rs"),
+    ] {
+        assert!(source.contains("control.read_release_"));
+        assert!(
+            !source.contains(&["join control.", "workshop_recovery_points"].concat()),
+            "fleet release modules must not regain direct recovery-point reads"
+        );
+    }
 }
 
 #[test]
