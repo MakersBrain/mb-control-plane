@@ -16,6 +16,30 @@ use uuid::Uuid;
 async fn store() -> Store {
     let url = std::env::var("CONTROL_TEST_DATABASE_URL").expect("CONTROL_TEST_DATABASE_URL");
     let store = Store::connect(&url).await.expect("connect test PostgreSQL");
+    sqlx::query(
+        "do $roles$
+         declare role_name text;
+         begin
+           if not exists(select 1 from pg_roles where rolname='control_runtime_read') then
+             create role control_runtime_read nologin;
+           end if;
+           foreach role_name in array array[
+             'control_api','control_tenant_api','control_membership_worker',
+             'control_provisioning_worker','control_invoice_worker','control_inventory_worker',
+             'control_email_worker','control_reconciliation_worker','control_lifecycle_worker',
+             'control_backup_scheduler','control_driver_ledger','control_release_worker',
+             'control_privacy_worker'
+           ] loop
+             if not exists(select 1 from pg_roles where rolname=role_name) then
+               execute format('create role %I nologin',role_name);
+             end if;
+             execute format('grant control_runtime_read to %I',role_name);
+           end loop;
+         end $roles$",
+    )
+    .execute(store.pool())
+    .await
+    .expect("prepare production runtime roles before migrations");
     store.migrate().await.expect("migrate test PostgreSQL");
     store
 }
@@ -3034,6 +3058,15 @@ async fn release_route_snapshot_v2_freezes_exact_applied_projections_and_pages_t
         snapshot_count, 1,
         "exact replay must not duplicate snapshots"
     );
+    sqlx::query(
+        "update control.release_fleet_runs
+            set state='failed',failure_class='test_fixture_complete',updated_at=now()
+          where id=$1 and state not in ('active','failed')",
+    )
+    .bind(fleet_run)
+    .execute(store.pool())
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -5015,6 +5048,15 @@ async fn immutable_release_route_publication_is_exact_and_retains_authority() {
         vector.1,
         "sha256:59c2a7266d764878e81696d3fb4ebfe3c030344280b81795e91e0b293b403a7a"
     );
+    sqlx::query(
+        "update control.release_fleet_runs
+            set state='failed',failure_class='test_fixture_complete',updated_at=now()
+          where id=$1 and state not in ('active','failed')",
+    )
+    .bind(fleet_run)
+    .execute(store.pool())
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
