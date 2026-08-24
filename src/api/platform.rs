@@ -1154,8 +1154,9 @@ pub(super) async fn platform_release_adopt(
             ));
         }
     }
-    sqlx::query("insert into control.operations(id,kind,queue,payload,requested_by,correlation_id,idempotency_key) values($1,'odoo.release.adopt','release-adoption',$2,$3,$4,$5)")
-        .bind(operation_id).bind(&semantic).bind(who.user_id).bind(correlation).bind(format!("command:{command_id}")).execute(&mut *tx).await?;
+    let trace_context = crate::telemetry::current_trace_context();
+    sqlx::query("insert into control.operations(id,kind,queue,payload,requested_by,correlation_id,idempotency_key,trace_parent,trace_state) values($1,'odoo.release.adopt','release-adoption',$2,$3,$4,$5,$6,$7)")
+        .bind(operation_id).bind(&semantic).bind(who.user_id).bind(correlation).bind(format!("command:{command_id}")).bind(trace_context.trace_parent).bind(trace_context.trace_state).execute(&mut *tx).await?;
     let generation = sqlx::query_scalar::<_, i64>(
         "select coalesce(max(fleet_generation),0)+1 from control.release_fleet_runs",
     )

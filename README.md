@@ -8,7 +8,9 @@ or runtime files from sibling repositories.
 
 See the [current architecture](docs/CONTROL-PLANE-ARCHITECTURE.md), the
 [gated roadmap](docs/CONTROL-PLANE-ROADMAP.md), and the
-[database identity runbook](docs/database-identities.md).
+[database identity runbook](docs/database-identities.md). The reconstructed
+[hardening baseline and tenant-isolation threat model](docs/CONTROL-PLANE-HARDENING-BASELINE.md)
+links the drift-checked public/internal route inventory.
 
 ## Verify
 
