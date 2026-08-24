@@ -198,6 +198,14 @@ impl AppState {
 }
 
 pub fn app(state: AppState) -> Router {
+    let state = Arc::new(state);
+    app_with_route_lookup(state.clone(), state)
+}
+
+fn app_with_route_lookup(
+    state: Arc<AppState>,
+    route_lookup: Arc<dyn routes::RouteAuthorizationLookup>,
+) -> Router {
     let origin: HeaderValue = state
         .config
         .cors_origin
@@ -205,8 +213,7 @@ pub fn app(state: AppState) -> Router {
         .trim_end_matches('/')
         .parse()
         .expect("validated CORS origin is a header value");
-    let state = Arc::new(state);
-    routes::build(state.clone())
+    routes::build(route_lookup)
         .merge(routes::build_internal(state.clone()))
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -582,7 +589,9 @@ async fn metrics(
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, String)> {
     metrics_reader(&state, &headers)?;
-    let queues=sqlx::query_as::<_,(String,i64,i64,f64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='dead_letter'),coalesce(extract(epoch from now()-min(o.next_attempt_at) filter(where o.state in ('pending','awaiting_reconciliation') and o.next_attempt_at<=now())),0)::float8 from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue")
+    let queues=sqlx::query_as::<_,(String,i64,i64,i64,f64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(o.id) filter(where o.state in ('pending','awaiting_reconciliation')),count(o.id) filter(where o.state='in_flight'),count(o.id) filter(where o.state='dead_letter'),coalesce(extract(epoch from now()-min(o.next_attempt_at) filter(where o.state in ('pending','awaiting_reconciliation') and o.next_attempt_at<=now())),0)::float8 from known left join control.operations o on o.queue=known.queue group by known.queue order by known.queue")
+        .fetch_all(state.store.pool()).await?;
+    let operation_lifecycle=sqlx::query_as::<_,(String,i64,i64,i64,i64,i64)>("select kind,count(*),count(*) filter(where state='succeeded'),coalesce(sum(greatest(attempt-1,0)),0),count(*) filter(where state='dead_letter'),count(*) filter(where state='in_flight' and lease_expires_at<now()) from control.operations group by kind order by kind")
         .fetch_all(state.store.pool()).await?;
     let workers=sqlx::query_as::<_,(String,i64)>("with known(queue) as (values ('tenant-provisioning'),('membership-provisioning'),('invoice-capture'),('inventory-capture'),('email-delivery'),('tenant-reconciliation'),('tenant-lifecycle'),('release-adoption'),('privacy-operations')) select known.queue,count(h.worker_id) filter(where h.shutdown_at is null and h.last_heartbeat_at>now()-interval '30 seconds') from known left join control.worker_heartbeats h on h.queue=known.queue group by known.queue order by known.queue")
         .fetch_all(state.store.pool()).await?;
@@ -604,10 +613,23 @@ async fn metrics(
     let abandoned=sqlx::query_scalar::<_,i64>("select count(*) from control.operations where state='in_flight' and lease_expires_at<now()")
         .fetch_one(state.store.pool()).await?;
     let mut body = String::from(
-        "# HELP mb_queue_depth Due or queued durable operations.\n# TYPE mb_queue_depth gauge\n",
+        "# HELP mb_queue_depth Due or queued durable operations.\n\
+# TYPE mb_queue_depth gauge\n\
+# HELP mb_queue_in_flight Durable operations with an active or expired lease.\n\
+# TYPE mb_queue_in_flight gauge\n\
+# HELP mb_queue_dead_letters Durable operations in the dead-letter state.\n\
+# TYPE mb_queue_dead_letters gauge\n\
+# HELP mb_queue_oldest_due_age_seconds Age of the oldest due durable operation.\n\
+# TYPE mb_queue_oldest_due_age_seconds gauge\n",
     );
-    for (queue, depth, dead, age) in queues {
-        body.push_str(&format!("mb_queue_depth{{queue=\"{queue}\"}} {depth}\nmb_queue_dead_letters{{queue=\"{queue}\"}} {dead}\nmb_queue_oldest_due_age_seconds{{queue=\"{queue}\"}} {age}\n"));
+    for (queue, depth, in_flight, dead, age) in queues {
+        body.push_str(&format!("mb_queue_depth{{queue=\"{queue}\"}} {depth}\nmb_queue_in_flight{{queue=\"{queue}\"}} {in_flight}\nmb_queue_dead_letters{{queue=\"{queue}\"}} {dead}\nmb_queue_oldest_due_age_seconds{{queue=\"{queue}\"}} {age}\n"));
+    }
+    body.push_str("# HELP mb_operation_admissions_total Durable operations admitted by closed operation kind.\n# TYPE mb_operation_admissions_total counter\n# HELP mb_operation_completions_total Durable operations completed successfully by closed operation kind.\n# TYPE mb_operation_completions_total counter\n# HELP mb_operation_retries_total Durable operation retries derived from persisted attempts by closed operation kind.\n# TYPE mb_operation_retries_total counter\n# HELP mb_operation_dead_letters Durable operations in the dead-letter state by closed operation kind.\n# TYPE mb_operation_dead_letters gauge\n# HELP mb_operation_expired_leases In-flight durable operations with expired leases by closed operation kind.\n# TYPE mb_operation_expired_leases gauge\n");
+    for (kind, admissions, completions, retries, dead_letters, expired_leases) in
+        operation_lifecycle
+    {
+        body.push_str(&format!("mb_operation_admissions_total{{kind=\"{kind}\"}} {admissions}\nmb_operation_completions_total{{kind=\"{kind}\"}} {completions}\nmb_operation_retries_total{{kind=\"{kind}\"}} {retries}\nmb_operation_dead_letters{{kind=\"{kind}\"}} {dead_letters}\nmb_operation_expired_leases{{kind=\"{kind}\"}} {expired_leases}\n"));
     }
     body.push_str(
         "# HELP mb_worker_fresh Fresh worker heartbeats by queue.\n# TYPE mb_worker_fresh gauge\n",

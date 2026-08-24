@@ -56,6 +56,12 @@ Current implementation progress:
   otherwise), return the ID on every response, and record it with response
   status and latency on the matched-route tracing span; valid inbound W3C trace
   context is attached to that span and malformed parents are rejected safely;
+- durable operation metrics now expose admitted, completed, retried,
+  dead-lettered, and expired-lease counts by closed operation kind alongside
+  queue in-flight counts. An actual authenticated HTTP workshop admission
+  persists its W3C context and a worker span consumes it in the PostgreSQL CI
+  gate; direct workshop-provisioning and fleet-release admissions no longer
+  bypass trace-context persistence;
 - the document-extraction broker loads typed network/provider timing config at
   startup, and its extraction adapters share an outbound HTTP builder with a
   bounded connect timeout, redirects disabled, and explicit caller identity;

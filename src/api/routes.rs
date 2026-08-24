@@ -1274,6 +1274,262 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn actual_http_admission_continues_into_the_durable_worker_trace() {
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("http-worker-trace-test")),
+        );
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let inbound_trace_parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let expected_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+        let database_url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for HTTP-to-worker trace test");
+        let state = Arc::new(
+            AppState::for_route_test(&database_url)
+                .await
+                .expect("trace test application state"),
+        );
+        let principal = Principal {
+            user_id: Uuid::new_v4(),
+            issuer: "https://identity.example.test".into(),
+            subject: format!("trace-user-{}", Uuid::new_v4()),
+            email: format!("trace-{}@example.test", Uuid::new_v4().simple()),
+            recent_strong_authentication: true,
+        };
+        sqlx::query("insert into control.users(id,email) values($1,$2)")
+            .bind(principal.user_id)
+            .bind(&principal.email)
+            .execute(state.store.pool())
+            .await
+            .expect("trace test principal");
+        let lookup: Arc<dyn RouteAuthorizationLookup> = Arc::new(FakeLookup {
+            principal: principal.clone(),
+            authority: None,
+            platform_roles: Vec::new(),
+            platform_role_lookups: Arc::new(AtomicUsize::new(0)),
+        });
+        let slug = format!("trace-{}", Uuid::new_v4().simple());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/workshops")
+            .header(header::AUTHORIZATION, "Bearer trace-test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", Uuid::new_v4().to_string())
+            .header("traceparent", inbound_trace_parent)
+            .header("tracestate", "vendor=value")
+            .body(Body::from(
+                json!({
+                    "slug": slug,
+                    "display_name": "Trace integration workshop",
+                    "country_code": "FR",
+                    "time_zone": "Europe/Paris"
+                })
+                .to_string(),
+            ))
+            .expect("trace integration request");
+        let response = crate::api::app_with_route_lookup(state.clone(), lookup)
+            .oneshot(request)
+            .await
+            .expect("trace integration response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let persisted = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "select trace_parent,trace_state from control.operations
+             where requested_by=$1 and kind='tenant.provision' order by created_at desc limit 1",
+        )
+        .bind(principal.user_id)
+        .fetch_one(state.store.pool())
+        .await
+        .expect("persisted HTTP trace context");
+        let worker_span = tracing::info_span!("durable_operation_integration");
+        assert_eq!(
+            crate::telemetry::attach_durable_trace_parent(
+                &worker_span,
+                persisted.0.as_deref(),
+                persisted.1.as_deref(),
+            ),
+            Ok(true)
+        );
+        let worker_context = worker_span.context();
+        assert_eq!(
+            worker_context.span().span_context().trace_id().to_string(),
+            expected_trace_id
+        );
+
+        drop(_subscriber);
+        provider.shutdown().unwrap();
+    }
+
+    async fn scrape_metrics(state: Arc<AppState>) -> (HeaderMap, String) {
+        let response = build_internal(state.clone())
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/metrics")
+                    .header(header::AUTHORIZATION, "Bearer metrics-test-token")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024)
+            .await
+            .expect("bounded metrics body");
+        (
+            parts.headers,
+            String::from_utf8(bytes.to_vec()).expect("UTF-8 metrics body"),
+        )
+    }
+
+    fn metric_value(body: &str, name: &str, labels: &str) -> i64 {
+        let prefix = format!("{name}{labels} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse::<i64>().expect("integer metric value"))
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn actual_metrics_expose_bounded_operation_lifecycle_values() {
+        use crate::domain::OperationKind;
+
+        let database_url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for metrics contract test");
+        let state = Arc::new(
+            AppState::for_route_test(&database_url)
+                .await
+                .expect("metrics test application state"),
+        );
+        let (_, before) = scrape_metrics(state.clone()).await;
+        let kind = OperationKind::PrivacyDataSubjectRequest;
+        let kind_labels = format!("{{kind=\"{}\"}}", kind.as_str());
+        let queue_labels = format!("{{queue=\"{}\"}}", kind.queue());
+        let before_values = [
+            metric_value(&before, "mb_operation_admissions_total", &kind_labels),
+            metric_value(&before, "mb_operation_completions_total", &kind_labels),
+            metric_value(&before, "mb_operation_retries_total", &kind_labels),
+            metric_value(&before, "mb_operation_dead_letters", &kind_labels),
+            metric_value(&before, "mb_operation_expired_leases", &kind_labels),
+            metric_value(&before, "mb_queue_depth", &queue_labels),
+            metric_value(&before, "mb_queue_in_flight", &queue_labels),
+            metric_value(&before, "mb_queue_dead_letters", &queue_labels),
+        ];
+
+        let fixtures = [
+            ("pending", 0_i32, None, None),
+            ("succeeded", 3, None, None),
+            ("dead_letter", 2, None, None),
+            ("in_flight", 1, Some("metrics-active"), Some(600_i64)),
+            ("in_flight", 4, Some("metrics-expired"), Some(-600_i64)),
+        ];
+        let mut operation_ids = Vec::with_capacity(fixtures.len());
+        for (operation_state, attempt, leased_by, lease_offset_seconds) in fixtures {
+            let operation_id = Uuid::new_v4();
+            operation_ids.push(operation_id);
+            sqlx::query(
+                "insert into control.operations(
+                   id,kind,queue,payload,correlation_id,idempotency_key,state,attempt,
+                   leased_by,lease_expires_at,finished_at
+                 ) values(
+                   $1,$2,$3,'{}',$4,$5,$6,$7,$8,
+                   case when $9::bigint is null then null else now()+($9*interval '1 second') end,
+                   case when $6 in ('succeeded','dead_letter') then now() else null end
+                 )",
+            )
+            .bind(operation_id)
+            .bind(kind.as_str())
+            .bind(kind.queue())
+            .bind(Uuid::new_v4())
+            .bind(format!("metrics-test:{operation_id}"))
+            .bind(operation_state)
+            .bind(attempt)
+            .bind(leased_by)
+            .bind(lease_offset_seconds)
+            .execute(state.store.pool())
+            .await
+            .expect("operation metrics fixture");
+        }
+
+        let (headers, after) = scrape_metrics(state.clone()).await;
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let after_values = [
+            metric_value(&after, "mb_operation_admissions_total", &kind_labels),
+            metric_value(&after, "mb_operation_completions_total", &kind_labels),
+            metric_value(&after, "mb_operation_retries_total", &kind_labels),
+            metric_value(&after, "mb_operation_dead_letters", &kind_labels),
+            metric_value(&after, "mb_operation_expired_leases", &kind_labels),
+            metric_value(&after, "mb_queue_depth", &queue_labels),
+            metric_value(&after, "mb_queue_in_flight", &queue_labels),
+            metric_value(&after, "mb_queue_dead_letters", &queue_labels),
+        ];
+        let deltas = after_values
+            .iter()
+            .zip(before_values)
+            .map(|(after, before)| after - before)
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec![5, 1, 6, 1, 1, 1, 2, 1]);
+
+        for metadata in [
+            "# TYPE mb_operation_admissions_total counter",
+            "# TYPE mb_operation_completions_total counter",
+            "# TYPE mb_operation_retries_total counter",
+            "# TYPE mb_operation_dead_letters gauge",
+            "# TYPE mb_operation_expired_leases gauge",
+            "# TYPE mb_queue_in_flight gauge",
+        ] {
+            assert_eq!(after.lines().filter(|line| *line == metadata).count(), 1);
+        }
+        for line in after
+            .lines()
+            .filter(|line| line.starts_with("mb_operation_"))
+        {
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once("} "))
+                .map(|(labels, _)| labels)
+                .expect("operation metric has one label set");
+            let value = labels
+                .strip_prefix("kind=\"")
+                .and_then(|labels| labels.strip_suffix('"'))
+                .expect("operation metric has only a kind label");
+            assert!(!labels.contains(','));
+            value
+                .parse::<OperationKind>()
+                .expect("closed operation kind label");
+        }
+
+        sqlx::query("delete from control.operations where id = any($1)")
+            .bind(&operation_ids)
+            .execute(state.store.pool())
+            .await
+            .expect("metrics fixture cleanup");
+    }
+
     #[tokio::test]
     async fn workshop_guard_rejects_before_the_handler_and_inserts_validated_scope() {
         let workshop = Uuid::new_v4();
