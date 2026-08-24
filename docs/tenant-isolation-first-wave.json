@@ -398,10 +398,24 @@
         "security_definer_functions": []
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_api": ["SELECT"],
         "control_backup_scheduler": ["SELECT", "INSERT", "UPDATE"]
       },
-      "migration_readiness": {"ready": false, "next_review": "validate bounded scheduler discovery and scoped claim paths under production load, then design the rehearsal row policy"}
+      "migration_readiness": {"ready": true, "next_review": "retain bounded fleet discovery while extending forced tenant RLS to the recovery parent after release and privacy claims are split"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0042_rehearsal_tenant_rls.sql",
+        "policies": [
+          {"name": "workshop_recovery_rehearsals_migration_owner", "scope": "migration_owner"},
+          {"name": "workshop_recovery_rehearsals_platform_read", "scope": "platform_fleet_read"},
+          {"name": "workshop_recovery_rehearsals_scheduler_discovery", "scope": "scheduler_bounded_fleet_read"},
+          {"name": "workshop_recovery_rehearsals_scheduler_insert", "scope": "scheduler_tenant_insert"},
+          {"name": "workshop_recovery_rehearsals_scheduler_update", "scope": "scheduler_tenant_update"}
+        ]
+      }
     }
   ]
 }

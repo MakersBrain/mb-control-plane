@@ -8,8 +8,8 @@
     "sha256": "a6d49252dd8a990409c270c5b492c3922dbc95ae112fdddc77e60bf481f13273"
   },
   "release": "0.1.0",
-  "schema_release": "0041_interrupted_release_runtime_receipt_review",
-  "schema_compatibility": "=0041_interrupted_release_runtime_receipt_review",
+  "schema_release": "0042_rehearsal_tenant_rls",
+  "schema_compatibility": "=0042_rehearsal_tenant_rls",
   "staging_qualification": {
     "builder": "podman/qualification.py",
     "environment": "synthetic-only staging",
@@ -787,7 +787,7 @@
     ]
   },
   "rollback": {
-    "application": "requires an application release for control-plane schema epoch 0041_interrupted_release_runtime_receipt_review",
+    "application": "requires an application release for control-plane schema epoch 0042_rehearsal_tenant_rls",
     "database": "no cross-epoch rollback; destroy the disposable topology and recreate a blank database with one matching code epoch"
   },
   "postgresql_recovery": {

@@ -949,6 +949,14 @@ Acceptance criteria are defined by the ADR and must include a direct database
 cross-tenant test. Do not claim database-enforced isolation until that test is
 running in CI.
 
+Implemented rehearsal tenant-isolation slice (2026-08-24): the rehearsal
+ledger now uses forced, command-specific RLS. Platform status/metrics and the
+scheduler's bounded discovery retain explicit fleet-wide read policies; API
+mutation grants are removed, while scheduler insert/update require the exact
+transaction-local workshop context and matching recovery parent. Missing,
+malformed, and cross-workshop contexts fail closed in the production-role
+PostgreSQL matrix. No runtime delete policy exists.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
