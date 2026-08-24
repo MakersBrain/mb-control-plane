@@ -248,6 +248,20 @@ privilege preparation, not RLS: platform fleet release preparation and status,
 plus the driver ledger's bounded fleet release read, still need explicit policy
 classification before the recovery parent can be protected.
 
+Implemented platform recovery-point capability slice (2026-08-24): migration
+`0044_platform_recovery_capabilities` separates the platform API's intentional
+fleet status reads from its two recovery-point writes. Direct platform
+INSERT/UPDATE/DELETE privileges are removed. Workshop deletion and fleet
+release preparation instead call distinct, fixed-search-path `SECURITY DEFINER`
+functions that validate the exact durable operation and derive ownership,
+requester, component scope, label, format, and release provenance from trusted
+ledger state. Both calls remain inside their original transactions, preserving
+command, deletion, and fleet-adoption atomicity. Production-role tests verify
+the narrowed ACL, capability metadata, PUBLIC denial, and direct mutation
+failure. This still does not enable recovery-point RLS: the driver ledger's two
+bounded fleet-release reads must first be replaced or classified without
+weakening its tenant-scoped recovery workflow.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

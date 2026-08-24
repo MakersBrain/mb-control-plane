@@ -185,6 +185,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql"),
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
+        include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -272,6 +273,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0041_interrupted_release_runtime_receipt_review.sql"),
         include_str!("../migrations/0042_rehearsal_tenant_rls.sql"),
         include_str!("../migrations/0043_recovery_point_runtime_acl_pruning.sql"),
+        include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -608,6 +610,54 @@ fn recovery_point_acl_pruning_removes_unused_worker_table_access() {
         "grant execute on function control.review_interrupted_immutable_release_runtime_observation"
     ));
     assert!(bounded_release_review.contains("language plpgsql security definer"));
+}
+
+#[test]
+fn platform_recovery_writes_use_bounded_database_capabilities() {
+    let migration = include_str!("../migrations/0044_platform_recovery_capabilities.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains(
+        "revoke insert, update, delete on table control.workshop_recovery_points from control_api"
+    ));
+    assert!(
+        normalized
+            .contains("grant select on table control.workshop_recovery_points to control_api")
+    );
+    for function in [
+        "control.insert_platform_deletion_recovery_point",
+        "control.insert_platform_release_recovery_point",
+    ] {
+        assert!(normalized.contains(&format!("revoke all on function {function}")));
+        assert!(normalized.contains(&format!("grant execute on function {function}")));
+    }
+    assert!(normalized.matches("from public").count() >= 2);
+    assert!(normalized.matches("to control_api").count() >= 3);
+    assert!(migration.matches("security definer").count() >= 2);
+    assert!(
+        migration
+            .matches("set search_path = pg_catalog, control")
+            .count()
+            >= 2
+    );
+    assert!(!migration.contains("to control_tenant_api"));
+
+    let platform = include_str!("../src/api/platform.rs");
+    assert!(platform.contains("control.insert_platform_deletion_recovery_point($1,$2,$3,$4)"));
+    assert!(platform.contains("control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)"));
+    assert_eq!(
+        platform
+            .matches("insert into control.workshop_recovery_points")
+            .count(),
+        0,
+        "platform handlers must not regain direct recovery-point write authority"
+    );
+    assert!(platform.contains(
+        "select r.id,r.workshop_id,w.display_name,r.ready_at,r.source_release from control.workshop_recovery_points"
+    ));
+    let api = include_str!("../src/api.rs");
+    assert!(api.contains(
+        "select extract(epoch from now()-max(ready_at))::float8 from control.workshop_recovery_points"
+    ));
 }
 
 #[test]
@@ -1695,6 +1745,358 @@ async fn assert_recovery_point_stale_worker_grants_removed(owner_store: &Store, 
             }
             .expect_err("the stale direct recovery-point privilege must be removed");
         assert_insufficient_privilege(denied, &format!("{role} direct recovery-point {operation}"));
+        tx.rollback().await.unwrap();
+    }
+}
+
+async fn seed_platform_capability_release(
+    owner_store: &Store,
+    status: &str,
+    marker: char,
+) -> String {
+    let release_id = format!("odoo-2026.08.24-{}", Uuid::new_v4().simple());
+    let digest = |value: char| format!("sha256:{}", value.to_string().repeat(64));
+    sqlx::query(
+        "insert into control.application_releases(
+           id,source_commit,odoo_version,odoo_subject_digest,extension_subject_digest,
+           odoo_runtime,extension_bundle,pair_qualifications,manifest_digest,addon_versions,
+           compatibility,bridge_contract,schema_epoch,change_class,required_postconditions,
+           manifest,signature_bundle_ref,extension_signature_ref,sbom_ref,published_at,status,
+           publication_idempotency_key,publication_request_digest
+         ) values($1,$2,'19.0',$3,$4,'{}','{}','[{}]',$5,'{}','{}','>=3.2.0,<4.0.0',1,'A','[]',
+           jsonb_build_object('capability_registry_version',1),
+           'oci://signature','oci://extension-signature','oci://sbom',now(),$6,$7,$8)",
+    )
+    .bind(&release_id)
+    .bind(marker.to_string().repeat(40))
+    .bind(digest(marker))
+    .bind(digest(char::from_u32(marker as u32 + 1).unwrap()))
+    .bind(digest(char::from_u32(marker as u32 + 2).unwrap()))
+    .bind(status)
+    .bind(format!("platform-capability:{release_id}"))
+    .bind(vec![marker as u8; 32])
+    .execute(owner_store.pool())
+    .await
+    .unwrap();
+    release_id
+}
+
+async fn assert_platform_recovery_point_capabilities(
+    owner_store: &Store,
+    deletion_workshop: Uuid,
+    release_workshop: Uuid,
+    requested_by: Uuid,
+) {
+    let privileges = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "select
+           has_table_privilege('control_api','control.workshop_recovery_points','select'),
+           has_table_privilege('control_api','control.workshop_recovery_points','insert'),
+           has_table_privilege('control_api','control.workshop_recovery_points','update'),
+           has_table_privilege('control_api','control.workshop_recovery_points','delete')",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(privileges, (true, false, false, false));
+
+    for identity in [
+        "control.insert_platform_deletion_recovery_point(uuid,uuid,uuid,uuid)",
+        "control.insert_platform_release_recovery_point(uuid,uuid,uuid,uuid,uuid,text)",
+    ] {
+        let metadata = sqlx::query_as::<_, (bool, bool, bool, bool, bool)>(
+            "select procedure.prosecdef,
+                    coalesce(procedure.proconfig,'{}'::text[])
+                        @> array['search_path=pg_catalog, control'],
+                    has_function_privilege('control_api',procedure.oid,'execute'),
+                    has_function_privilege('control_tenant_api',procedure.oid,'execute'),
+                    not exists(
+                        select 1
+                          from aclexplode(coalesce(
+                              procedure.proacl,
+                              acldefault('f',procedure.proowner)
+                          )) privilege
+                         where privilege.grantee=0
+                           and privilege.privilege_type='EXECUTE'
+                    )
+               from pg_proc procedure
+               join pg_namespace namespace on namespace.oid=procedure.pronamespace
+              where namespace.nspname='control' and procedure.oid=$1::regprocedure",
+        )
+        .bind(identity)
+        .fetch_one(owner_store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            metadata,
+            (true, true, true, false, true),
+            "{identity} must be a fixed-path API-only capability"
+        );
+    }
+
+    for operation in ["insert", "update", "delete"] {
+        let mut tx = owner_store.begin().await.unwrap();
+        sqlx::query("set local role control_api")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let denied = match operation {
+            "insert" => {
+                sqlx::query("insert into control.workshop_recovery_points default values")
+                    .execute(&mut *tx)
+                    .await
+            }
+            "update" => {
+                sqlx::query("update control.workshop_recovery_points set state=state where false")
+                    .execute(&mut *tx)
+                    .await
+            }
+            "delete" => {
+                sqlx::query("delete from control.workshop_recovery_points where false")
+                    .execute(&mut *tx)
+                    .await
+            }
+            _ => unreachable!(),
+        }
+        .expect_err("control_api must not retain direct recovery-point mutation authority");
+        assert_insufficient_privilege(denied, &format!("control_api recovery-point {operation}"));
+        tx.rollback().await.unwrap();
+    }
+
+    let visible = {
+        let mut tx = owner_store.begin().await.unwrap();
+        sqlx::query("set local role control_api")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let visible =
+            sqlx::query_scalar::<_, i64>("select count(*) from control.workshop_recovery_points")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        tx.rollback().await.unwrap();
+        visible
+    };
+    assert!(
+        visible >= 0,
+        "platform fleet status must retain read access"
+    );
+
+    let deletion_database = sqlx::query_scalar::<_, Uuid>(
+        "select id from control.odoo_databases
+          where workshop_id=$1 and kind='primary' and deleted_at is null",
+    )
+    .bind(deletion_workshop)
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    let deletion_recovery = Uuid::new_v4();
+    let deletion_operation = Uuid::new_v4();
+    sqlx::query(
+        "insert into control.operations(
+           id,kind,queue,workshop_id,payload,requested_by,correlation_id,idempotency_key
+         ) values($1,'tenant.lifecycle','tenant-lifecycle',$2,$3,$4,$5,$6)",
+    )
+    .bind(deletion_operation)
+    .bind(deletion_workshop)
+    .bind(serde_json::json!({
+        "action": "delete",
+        "database_id": deletion_database,
+        "recovery_point_id": deletion_recovery,
+    }))
+    .bind(requested_by)
+    .bind(Uuid::new_v4())
+    .bind(format!("platform-capability-delete:{deletion_operation}"))
+    .execute(owner_store.pool())
+    .await
+    .unwrap();
+    let mut deletion_tx = owner_store.begin().await.unwrap();
+    sqlx::query("set local role control_api")
+        .execute(&mut *deletion_tx)
+        .await
+        .unwrap();
+    let inserted = sqlx::query_scalar::<_, Uuid>(
+        "select control.insert_platform_deletion_recovery_point($1,$2,$3,$4)",
+    )
+    .bind(deletion_recovery)
+    .bind(deletion_workshop)
+    .bind(deletion_database)
+    .bind(deletion_operation)
+    .fetch_one(&mut *deletion_tx)
+    .await
+    .unwrap();
+    assert_eq!(inserted, deletion_recovery);
+    let derived = sqlx::query_as::<_, (Uuid, Vec<String>, String, String)>(
+        "select requested_by,component_scope,label,format_version
+           from control.workshop_recovery_points where id=$1",
+    )
+    .bind(deletion_recovery)
+    .fetch_one(&mut *deletion_tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        derived,
+        (
+            requested_by,
+            vec!["odoo".to_owned()],
+            "Final pre-deletion backup".to_owned(),
+            "mb-workshop-recovery-v2".to_owned(),
+        )
+    );
+    deletion_tx.rollback().await.unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.workshop_recovery_points where id=$1)",
+        )
+        .bind(deletion_recovery)
+        .fetch_one(owner_store.pool())
+        .await
+        .unwrap()
+    );
+
+    let (release_database, database_ref) = sqlx::query_as::<_, (Uuid, String)>(
+        "select id,database_ref from control.odoo_databases
+          where workshop_id=$1 and kind='primary' and deleted_at is null",
+    )
+    .bind(release_workshop)
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    let source_release = seed_platform_capability_release(owner_store, "active", 'a').await;
+    let target_release = seed_platform_capability_release(owner_store, "prepared", 'd').await;
+    sqlx::query(
+        "insert into control.tenant_release_adoptions(
+           id,workshop_id,database_id,release_id,registry_version,state,target_schema_epoch
+         ) values($1,$2,$3,$4,1,'active',1)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(release_workshop)
+    .bind(release_database)
+    .bind(&source_release)
+    .execute(owner_store.pool())
+    .await
+    .unwrap();
+    let release_operation = Uuid::new_v4();
+    sqlx::query(
+        "insert into control.operations(
+           id,kind,queue,payload,requested_by,correlation_id,idempotency_key
+         ) values($1,'odoo.release.adopt','release-adoption',$2,$3,$4,$5)",
+    )
+    .bind(release_operation)
+    .bind(serde_json::json!({
+        "release_id": target_release,
+        "phase": "adopt",
+        "confirmation": target_release,
+    }))
+    .bind(requested_by)
+    .bind(Uuid::new_v4())
+    .bind(format!("platform-capability-release:{release_operation}"))
+    .execute(owner_store.pool())
+    .await
+    .unwrap();
+    let fleet_run = Uuid::new_v4();
+    let generation = sqlx::query_scalar::<_, i64>(
+        "select coalesce(max(fleet_generation),0)+1 from control.release_fleet_runs",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into control.release_fleet_runs(
+           id,release_id,operation_id,fleet_generation,state,tenant_snapshot,canary_workshop_id
+         ) values($1,$2,$3,$4,'preparing',$5,$6)",
+    )
+    .bind(fleet_run)
+    .bind(&target_release)
+    .bind(release_operation)
+    .bind(generation)
+    .bind(serde_json::json!([{
+        "workshop_id": release_workshop,
+        "database_id": release_database,
+        "database_ref": database_ref,
+        "paperless_enabled": false,
+    }]))
+    .bind(release_workshop)
+    .execute(owner_store.pool())
+    .await
+    .unwrap();
+    let release_recovery = Uuid::new_v4();
+    let mut release_tx = owner_store.begin().await.unwrap();
+    sqlx::query("set local role control_api")
+        .execute(&mut *release_tx)
+        .await
+        .unwrap();
+    let returned = sqlx::query_as::<_, (Uuid, Option<String>)>(
+        "select recovery_id,source_release_id
+           from control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(release_recovery)
+    .bind(fleet_run)
+    .bind(release_workshop)
+    .bind(release_database)
+    .bind(release_operation)
+    .bind(&target_release)
+    .fetch_one(&mut *release_tx)
+    .await
+    .unwrap();
+    assert_eq!(returned, (release_recovery, Some(source_release.clone())));
+    let derived = sqlx::query_as::<_, (Uuid, Vec<String>, Option<String>, String)>(
+        "select requested_by,component_scope,source_release,label
+           from control.workshop_recovery_points where id=$1",
+    )
+    .bind(release_recovery)
+    .fetch_one(&mut *release_tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        derived,
+        (
+            requested_by,
+            vec!["odoo".to_owned()],
+            Some(source_release),
+            format!("Pre-release recovery for {target_release}"),
+        )
+    );
+    release_tx.rollback().await.unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from control.workshop_recovery_points where id=$1)",
+        )
+        .bind(release_recovery)
+        .fetch_one(owner_store.pool())
+        .await
+        .unwrap()
+    );
+
+    for call in [
+        "select control.insert_platform_deletion_recovery_point($1,$2,$3,$4)",
+        "select * from control.insert_platform_release_recovery_point($1,$2,$3,$4,$5,$6)",
+    ] {
+        let mut tx = owner_store.begin().await.unwrap();
+        sqlx::query("set local role control_api")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let random = Uuid::new_v4();
+        let mut query = sqlx::query(call)
+            .bind(random)
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4());
+        if call.contains("release_recovery") {
+            query = query.bind(Uuid::new_v4()).bind("missing-release");
+        }
+        let error = query
+            .execute(&mut *tx)
+            .await
+            .expect_err("a capability must reject unmatched durable state");
+        let code = error
+            .as_database_error()
+            .and_then(|database_error| database_error.code());
+        assert_ne!(
+            code.as_deref(),
+            Some("42501"),
+            "control_api must reach the bounded capability before its validation fails"
+        );
         tx.rollback().await.unwrap();
     }
 }
@@ -2812,6 +3214,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     )
     .await;
     assert_recovery_point_stale_worker_grants_removed(&store, first).await;
+    assert_platform_recovery_point_capabilities(&store, first, second, from_user).await;
     assert_privacy_retention_batch_capability(&store).await;
     let (_, first_recovery) = seed_recovery_component(&store, first, from_user, 'a').await;
     let (_, second_recovery) = seed_recovery_component(&store, second, from_user, 'b').await;
