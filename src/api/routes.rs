@@ -1371,6 +1371,165 @@ mod tests {
         provider.shutdown().unwrap();
     }
 
+    async fn scrape_metrics(state: Arc<AppState>) -> (HeaderMap, String) {
+        let response = build_internal(state.clone())
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/metrics")
+                    .header(header::AUTHORIZATION, "Bearer metrics-test-token")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024)
+            .await
+            .expect("bounded metrics body");
+        (
+            parts.headers,
+            String::from_utf8(bytes.to_vec()).expect("UTF-8 metrics body"),
+        )
+    }
+
+    fn metric_value(body: &str, name: &str, labels: &str) -> i64 {
+        let prefix = format!("{name}{labels} ");
+        body.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse::<i64>().expect("integer metric value"))
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires a disposable CONTROL_TEST_DATABASE_URL"]
+    async fn actual_metrics_expose_bounded_operation_lifecycle_values() {
+        use crate::domain::OperationKind;
+
+        let database_url = std::env::var("CONTROL_TEST_DATABASE_URL")
+            .expect("CONTROL_TEST_DATABASE_URL for metrics contract test");
+        let state = Arc::new(
+            AppState::for_route_test(&database_url)
+                .await
+                .expect("metrics test application state"),
+        );
+        let (_, before) = scrape_metrics(state.clone()).await;
+        let kind = OperationKind::PrivacyDataSubjectRequest;
+        let kind_labels = format!("{{kind=\"{}\"}}", kind.as_str());
+        let queue_labels = format!("{{queue=\"{}\"}}", kind.queue());
+        let before_values = [
+            metric_value(&before, "mb_operation_admissions_total", &kind_labels),
+            metric_value(&before, "mb_operation_completions_total", &kind_labels),
+            metric_value(&before, "mb_operation_retries_total", &kind_labels),
+            metric_value(&before, "mb_operation_dead_letters", &kind_labels),
+            metric_value(&before, "mb_operation_expired_leases", &kind_labels),
+            metric_value(&before, "mb_queue_depth", &queue_labels),
+            metric_value(&before, "mb_queue_in_flight", &queue_labels),
+            metric_value(&before, "mb_queue_dead_letters", &queue_labels),
+        ];
+
+        let fixtures = [
+            ("pending", 0_i32, None, None),
+            ("succeeded", 3, None, None),
+            ("dead_letter", 2, None, None),
+            ("in_flight", 1, Some("metrics-active"), Some(600_i64)),
+            ("in_flight", 4, Some("metrics-expired"), Some(-600_i64)),
+        ];
+        let mut operation_ids = Vec::with_capacity(fixtures.len());
+        for (operation_state, attempt, leased_by, lease_offset_seconds) in fixtures {
+            let operation_id = Uuid::new_v4();
+            operation_ids.push(operation_id);
+            sqlx::query(
+                "insert into control.operations(
+                   id,kind,queue,payload,correlation_id,idempotency_key,state,attempt,
+                   leased_by,lease_expires_at,finished_at
+                 ) values(
+                   $1,$2,$3,'{}',$4,$5,$6,$7,$8,
+                   case when $9::bigint is null then null else now()+($9*interval '1 second') end,
+                   case when $6 in ('succeeded','dead_letter') then now() else null end
+                 )",
+            )
+            .bind(operation_id)
+            .bind(kind.as_str())
+            .bind(kind.queue())
+            .bind(Uuid::new_v4())
+            .bind(format!("metrics-test:{operation_id}"))
+            .bind(operation_state)
+            .bind(attempt)
+            .bind(leased_by)
+            .bind(lease_offset_seconds)
+            .execute(state.store.pool())
+            .await
+            .expect("operation metrics fixture");
+        }
+
+        let (headers, after) = scrape_metrics(state.clone()).await;
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let after_values = [
+            metric_value(&after, "mb_operation_admissions_total", &kind_labels),
+            metric_value(&after, "mb_operation_completions_total", &kind_labels),
+            metric_value(&after, "mb_operation_retries_total", &kind_labels),
+            metric_value(&after, "mb_operation_dead_letters", &kind_labels),
+            metric_value(&after, "mb_operation_expired_leases", &kind_labels),
+            metric_value(&after, "mb_queue_depth", &queue_labels),
+            metric_value(&after, "mb_queue_in_flight", &queue_labels),
+            metric_value(&after, "mb_queue_dead_letters", &queue_labels),
+        ];
+        let deltas = after_values
+            .iter()
+            .zip(before_values)
+            .map(|(after, before)| after - before)
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec![5, 1, 6, 1, 1, 1, 2, 1]);
+
+        for metadata in [
+            "# TYPE mb_operation_admissions_total counter",
+            "# TYPE mb_operation_completions_total counter",
+            "# TYPE mb_operation_retries_total counter",
+            "# TYPE mb_operation_dead_letters gauge",
+            "# TYPE mb_operation_expired_leases gauge",
+            "# TYPE mb_queue_in_flight gauge",
+        ] {
+            assert_eq!(after.lines().filter(|line| *line == metadata).count(), 1);
+        }
+        for line in after
+            .lines()
+            .filter(|line| line.starts_with("mb_operation_"))
+        {
+            let labels = line
+                .split_once('{')
+                .and_then(|(_, rest)| rest.split_once("} "))
+                .map(|(labels, _)| labels)
+                .expect("operation metric has one label set");
+            let value = labels
+                .strip_prefix("kind=\"")
+                .and_then(|labels| labels.strip_suffix('"'))
+                .expect("operation metric has only a kind label");
+            assert!(!labels.contains(','));
+            value
+                .parse::<OperationKind>()
+                .expect("closed operation kind label");
+        }
+
+        sqlx::query("delete from control.operations where id = any($1)")
+            .bind(&operation_ids)
+            .execute(state.store.pool())
+            .await
+            .expect("metrics fixture cleanup");
+    }
+
     #[tokio::test]
     async fn workshop_guard_rejects_before_the_handler_and_inserts_validated_scope() {
         let workshop = Uuid::new_v4();
