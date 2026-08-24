@@ -1418,10 +1418,31 @@ async fn assert_production_backup_scheduler_grants(
         privileges,
         (true, false, false, false, true, true, true, false, true)
     );
+    let migration_owner_policy_matches_role = sqlx::query_scalar::<_, bool>(
+        "select
+           exists(select 1 from pg_roles where rolname='control') =
+           exists(
+             select 1 from pg_policies
+              where schemaname='control'
+                and tablename='workshop_recovery_rehearsals'
+                and policyname='workshop_recovery_rehearsals_migration_owner'
+                and cmd='ALL'
+                and roles::text[]=array['control']::text[]
+           )",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert!(
+        migration_owner_policy_matches_role,
+        "the migration-owner policy must exist exactly when its optional role exists"
+    );
     let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
         "select policyname,cmd,roles::text[]
            from pg_policies
-          where schemaname='control' and tablename='workshop_recovery_rehearsals'
+          where schemaname='control'
+            and tablename='workshop_recovery_rehearsals'
+            and policyname <> 'workshop_recovery_rehearsals_migration_owner'
           order by policyname",
     )
     .fetch_all(owner_store.pool())
