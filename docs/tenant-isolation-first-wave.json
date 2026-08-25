@@ -348,11 +348,30 @@
       "current_grants": {
         "control_api": ["SELECT"],
         "control_tenant_api": ["SELECT", "INSERT"],
-        "control_lifecycle_worker": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_lifecycle_worker": ["SELECT", "UPDATE"],
         "control_backup_scheduler": ["SELECT", "INSERT"],
         "control_driver_ledger": ["SELECT", "UPDATE"]
       },
-      "migration_readiness": {"ready": false, "next_review": "complete the final forced-RLS policy and privilege matrix review now that platform writes and both driver fleet reads use bounded capabilities; retain the driver ledger's tenant-scoped recovery workflow access until that matrix is proven"}
+      "migration_readiness": {"ready": true, "next_review": "use this completed parent policy as the prerequisite for reviewing the remaining directly keyed first-wave API and worker tables"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0046_recovery_point_tenant_rls.sql",
+        "policies": [
+          {"name": "workshop_recovery_points_migration_owner", "scope": "migration_owner"},
+          {"name": "workshop_recovery_points_platform_read", "scope": "platform_read"},
+          {"name": "workshop_recovery_points_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "workshop_recovery_points_tenant_api_insert", "scope": "tenant_api_insert"},
+          {"name": "workshop_recovery_points_lifecycle_read", "scope": "lifecycle_tenant_read"},
+          {"name": "workshop_recovery_points_lifecycle_update", "scope": "lifecycle_tenant_update"},
+          {"name": "workshop_recovery_points_scheduler_discovery", "scope": "scheduler_discovery"},
+          {"name": "workshop_recovery_points_scheduler_insert", "scope": "scheduler_tenant_insert"},
+          {"name": "workshop_recovery_points_driver_read", "scope": "driver_tenant_read"},
+          {"name": "workshop_recovery_points_driver_update", "scope": "driver_tenant_update"}
+        ]
+      }
     },
     {
       "name": "workshop_recovery_components",

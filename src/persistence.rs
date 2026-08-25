@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0045_driver_recovery_read_capabilities";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0046_recovery_point_tenant_rls";
 
 #[derive(Clone)]
 pub struct Store {
