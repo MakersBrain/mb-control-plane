@@ -347,6 +347,16 @@ Provider absence and bounded dispatch history remain durable, parent-bound
 evidence with no runtime deletion capability. The live role matrix verifies
 the owner-only policy and exhaustive direct-access denial.
 
+Implemented route-projection parent policy slice (2026-08-25): migration
+`0053_route_projection_parent_tenant_rls` forces RLS on
+`workshop_route_projections` and `workshop_route_projection_state`. The
+deployment driver's last direct projection read is replaced by an exact
+fixed-path disposition lookup, and its stale applied-state read grant is
+removed. Immutable materialization, startup/release snapshots, fenced
+admission, and applied-head transitions remain function-only. No runtime role
+has a direct table policy or privilege; live tests verify the lookup ACL,
+owner-only policies, and direct-access denial.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

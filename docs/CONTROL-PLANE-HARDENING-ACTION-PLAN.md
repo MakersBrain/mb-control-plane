@@ -1074,6 +1074,16 @@ parent-bound to retained disconnected-domain history. Live tests cover the
 owner-only policy, exhaustive runtime ACL denial, direct-access refusal, and
 the existing bounded advancement workflow.
 
+Implemented route-projection parent forced-RLS slice (2026-08-25): migration
+`0053_route_projection_parent_tenant_rls` removes the deployment driver's last
+direct read of immutable workshop projections and replaces it with an exact
+fixed-path disposition lookup. The stale direct read of desired/applied state
+is removed at the same boundary. Forced RLS now protects both
+`workshop_route_projections` and `workshop_route_projection_state`; every
+runtime materialization, fleet snapshot, admission, and applied-head transition
+remains behind an existing fenced owner capability. Live role tests cover the
+function ACL, exhaustive table denial, and owner-only policies.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify

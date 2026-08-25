@@ -2257,8 +2257,8 @@ async fn admit_route_application(
     projection: &RouteProjectionContract,
 ) -> Result<RouteApplicationAdmission, DriverError> {
     let stored_disposition = sqlx::query_scalar::<_, String>(
-        "select disposition from control.workshop_route_projections
-          where workshop_id=$1 and generation=$2 and projection_digest=$3",
+        "select disposition
+           from control.read_workshop_route_projection_disposition($1,$2,$3)",
     )
     .bind(workshop)
     .bind(projection.generation)
