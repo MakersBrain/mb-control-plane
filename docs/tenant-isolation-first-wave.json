@@ -325,20 +325,35 @@
         ]
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE"],
-        "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
+        "control_tenant_api": ["SELECT", "UPDATE"],
         "control_reconciliation_worker": ["SELECT", "UPDATE"],
         "control_lifecycle_worker": ["SELECT", "UPDATE"]
       },
       "compatibility_preparation": {
-        "state": "implemented",
+        "state": "deployed",
         "evidence": [
           "all application route-projection reads use WorkshopTransaction",
           "hostname claims use a stable fixed-path capability and preserve unique-conflict responses",
-          "the compatibility capability preserves disconnected-hostname reuse until the staged partial-index migration redefines it to insert a fresh row"
+          "live hostname uniqueness releases disconnected history without transferring an existing row between workshops"
         ]
       },
-      "migration_readiness": {"ready": false, "next_review": "deploy the compatibility preparation, then replace global hostname uniqueness, remove stale direct role grants, and enforce the reviewed tenant policy"}
+      "migration_readiness": {"ready": true, "next_review": "review provider-deletion retention and remaining route-projection parent tables"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0051_webshop_domain_tenant_rls.sql",
+        "policies": [
+          {"name": "webshop_domains_migration_owner", "scope": "migration_owner"},
+          {"name": "webshop_domains_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "webshop_domains_tenant_api_update", "scope": "tenant_api_update"},
+          {"name": "webshop_domains_reconciliation_read", "scope": "reconciliation_worker_tenant"},
+          {"name": "webshop_domains_reconciliation_update", "scope": "reconciliation_worker_tenant_update"},
+          {"name": "webshop_domains_lifecycle_read", "scope": "lifecycle_worker_tenant"},
+          {"name": "webshop_domains_lifecycle_update", "scope": "lifecycle_worker_tenant_update"}
+        ]
+      }
     },
     {
       "name": "webshop_email_domains",
