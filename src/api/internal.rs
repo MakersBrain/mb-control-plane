@@ -102,118 +102,30 @@ pub(super) async fn mail_delivery_event(
             "mail delivery event timestamp is invalid",
         ));
     }
-    let delivery_state = match body.event_type.as_str() {
-        "email_queued" => "submitted",
-        "email_deferred" => "deferred",
-        "email_delivered" => "delivered",
-        "email_dropped" | "email_mailbox_not_found" => "bounced",
-        "email_spam" => "complained",
-        "email_blocklisted" => "suppressed",
-        _ => unreachable!(),
-    };
-    let mut tx = state.store.begin().await?;
-    let outbox = sqlx::query_as::<_, (Uuid, String)>(
-        "select workshop_id,recipient from control.outbox
-          where id=$1 and kind='odoo_transactional'
-            and (provider_message_id is null or provider_message_id=$2)
-            and (provider_domain_id is null or provider_domain_id=$3)
-          for update",
-    )
-    .bind(body.delivery_id)
-    .bind(body.email_id)
-    .bind(body.domain_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(outbox) = outbox else {
-        // The provider topic also carries mail that is intentionally outside the
-        // webshop outbox (for example platform invitations). It is authenticated
-        // provider evidence, but there is no tenant delivery row to mutate.
-        tx.rollback().await?;
-        return Ok(StatusCode::NO_CONTENT);
-    };
-    let inserted = sqlx::query_scalar::<_, Uuid>(
-        "insert into control.email_delivery_events(
-             event_id,outbox_id,provider_message_id,sns_message_id,event_type,occurred_at
-         ) values($1,$2,$3,$4,$5,$6)
-         on conflict(event_id) do nothing returning event_id",
+    let outcome = sqlx::query_scalar::<_, String>(
+        "select control.record_transactional_outbox_delivery_event(
+             $1,$2,$3,$4,$5,$6,$7
+         )",
     )
     .bind(body.event_id)
     .bind(body.delivery_id)
     .bind(body.email_id)
     .bind(body.sns_message_id)
+    .bind(body.domain_id)
     .bind(&body.event_type)
     .bind(occurred_at)
-    .fetch_optional(&mut *tx)
+    .fetch_one(state.store.pool())
     .await?;
-    if inserted.is_none() {
-        let existing = sqlx::query_as::<_, (Uuid, Uuid, String, OffsetDateTime)>(
-            "select outbox_id,provider_message_id,event_type,occurred_at
-               from control.email_delivery_events where event_id=$1",
-        )
-        .bind(body.event_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if existing
-            != (
-                body.delivery_id,
-                body.email_id,
-                body.event_type.clone(),
-                occurred_at,
-            )
-        {
-            return Err(ApiError::Conflict(
-                "delivery event identity was already used for different content",
-            ));
-        }
+    match outcome.as_str() {
+        "created" => Ok(StatusCode::CREATED),
+        "replayed" | "ignored" => Ok(StatusCode::NO_CONTENT),
+        "conflict" => Err(ApiError::Conflict(
+            "delivery event identity was already used for different content",
+        )),
+        _ => Err(ApiError::Internal(anyhow::anyhow!(
+            "mail delivery capability returned an invalid outcome"
+        ))),
     }
-    sqlx::query(
-        "update control.outbox
-            set delivery_state=$2,last_event_at=$3,
-                provider_message_id=coalesce(provider_message_id,$4),
-                provider_domain_id=coalesce(provider_domain_id,$5),
-                state=case when state='sending' then 'sent' else state end,
-                sent_at=case when state='sending' then coalesce(sent_at,now()) else sent_at end
-          where id=$1 and (last_event_at is null or last_event_at <= $3)",
-    )
-    .bind(body.delivery_id)
-    .bind(delivery_state)
-    .bind(occurred_at)
-    .bind(body.email_id)
-    .bind(body.domain_id)
-    .execute(&mut *tx)
-    .await?;
-    if body.event_type == "email_delivered" {
-        sqlx::query("update control.webshop_email_domains set test_delivered_at=coalesce(test_delivered_at,$2),updated_at=now(),version=version+1 where test_outbox_id=$1 and desired_state='active'")
-            .bind(body.delivery_id).bind(occurred_at).execute(&mut *tx).await?;
-    }
-    let suppression_reason = match body.event_type.as_str() {
-        "email_dropped" => Some("dropped"),
-        "email_spam" => Some("spam"),
-        "email_mailbox_not_found" => Some("mailbox_not_found"),
-        "email_blocklisted" => Some("blocklisted"),
-        _ => None,
-    };
-    if let Some(reason) = suppression_reason {
-        sqlx::query(
-            "insert into control.email_suppressions(
-                 workshop_id,recipient,reason,source_event_id
-             ) values($1,$2,$3,$4)
-             on conflict(workshop_id,recipient) do update set
-                 reason=excluded.reason,source_event_id=excluded.source_event_id,updated_at=now()",
-        )
-        .bind(outbox.0)
-        .bind(outbox.1)
-        .bind(reason)
-        .bind(body.event_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(if inserted.is_some() {
-        StatusCode::CREATED
-    } else {
-        StatusCode::NO_CONTENT
-    })
 }
 
 #[derive(Deserialize)]
@@ -334,7 +246,7 @@ pub(super) async fn webshop_transactional_mail(
         "sender_name":body.sender_name,"reply_to":reply_to,"model":body.model,
         "attachments":body.attachments
     });
-    let mut tx = state.store.begin().await?;
+    let mut tx = state.tenant_store.begin(workshop_id).await?;
     let proposed = Uuid::new_v4();
     let inserted = sqlx::query_scalar::<_, Uuid>(
         "insert into control.outbox(

@@ -1028,6 +1028,19 @@ lease-authenticated batch capability. Static and live production-role tests
 cover ACLs, policy metadata, same-tenant access, cross-tenant denial, token
 generation fencing, and management-authority checks.
 
+Implemented outbox forced-RLS slice (2026-08-25): migration
+`0049_outbox_tenant_rls` enables and forces RLS on the now non-null,
+workshop-owned `outbox`. Platform delivery reporting remains fleet-readable but
+read-only. Tenant API producers, the reconciliation producer, and email-worker
+reads or delivery-state updates require transaction-local workshop context.
+Authenticated provider callbacks use one fixed-path, replay-safe capability
+that binds the event to the exact transactional outbox row and provider
+identities, then atomically updates delivery evidence, branded-domain test
+state, and suppression state. Privacy direct privileges are removed; bounded
+lease-authenticated retention remains function-only. Live production-role tests
+cover policies, ACLs, producer isolation, worker updates, replay/conflict
+semantics, and cross-workshop denial.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify

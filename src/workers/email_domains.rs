@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 use crate::integrations::scaleway_tem::{EmailDomainObservation, ScalewayTemDomainClient};
-use crate::persistence::{LeasedOperation, NewOperation, Store, lock_current_operation_lease};
+use crate::persistence::{
+    LeasedOperation, NewOperation, Store, TenantStore, lock_current_operation_lease,
+};
 
 fn client() -> Result<ScalewayTemDomainClient, IntegrationError> {
     let token = crate::runtime_secret::required("CONTROL_MAIL_SCW_SECRET_KEY")
@@ -55,6 +57,7 @@ async fn store_observation(
 
 pub(crate) async fn run(
     store: &Store,
+    tenant_store: &TenantStore,
     operation: &LeasedOperation,
 ) -> Result<(), IntegrationError> {
     let workshop = operation
@@ -127,8 +130,8 @@ pub(crate) async fn run(
             return Ok(());
         }
         let outbox = Uuid::new_v4();
-        let mut tx = store
-            .begin()
+        let mut tx = tenant_store
+            .begin(workshop)
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
         sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1',$3,$4,$5)")

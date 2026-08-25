@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "staged_policies_enforced",
   "decision": "docs/adr/0008-staged-hybrid-tenant-isolation.md",
-  "scope": "first-wave candidate tables only; ownership_transfers and workshop_recovery_components are enforced candidates and this inventory is not evidence of complete database-enforced tenant isolation",
+  "scope": "reviewed first-wave and directly owned follow-on tenant tables only; this inventory is not evidence of complete database-enforced tenant isolation",
   "deployed_runtime_roles": [
     "control_api",
     "control_tenant_api",
@@ -82,7 +82,7 @@
       "name": "invitations",
       "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
       "application_touch_paths": {
-        "api": ["src/api/workshops.rs", "src/api/internal.rs"],
+        "api": ["src/api/workshops.rs"],
         "workers": ["src/workers/email.rs", "src/workers/privacy.rs"],
         "schedulers": [],
         "drivers": []
@@ -119,6 +119,53 @@
           {"name": "invitations_tenant_api_insert", "scope": "tenant_api_insert"},
           {"name": "invitations_tenant_api_update", "scope": "tenant_api_update"},
           {"name": "invitations_email_worker_read", "scope": "email_worker_tenant"}
+        ]
+      }
+    },
+    {
+      "name": "outbox",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/internal.rs", "src/api/platform.rs", "src/api/webshop.rs", "src/api/workshops.rs"],
+        "workers": ["src/workers/email.rs", "src/workers/email_domains.rs", "src/workers/privacy.rs"],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [{"name": "outbox_retention_sequence_insert", "function": "control.maintain_retention_sequence", "security_definer": false}],
+        "foreign_keys": [
+          {"constraint": "outbox_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "outbox_invitation_id_fkey", "direction": "outbound", "related_table": "invitations"},
+          {"constraint": "outbox_invitation_tenant_recipient_fkey", "direction": "outbound", "related_table": "invitations"},
+          {"constraint": "email_delivery_events_outbox_id_fkey", "direction": "inbound", "related_table": "email_delivery_events"},
+          {"constraint": "webshop_email_domains_test_outbox_tenant_fkey", "direction": "inbound", "related_table": "webshop_email_domains"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.record_transactional_outbox_delivery_event", "reason": "atomically records one authenticated provider event, updates its exact transactional delivery, and preserves replay identity"},
+          {"name": "control.run_privacy_retention_batch", "reason": "deletes eligible mail-delivery history only under the exact privacy operation lease and bounded batch"}
+        ]
+      },
+      "current_grants": {
+        "control_api": ["SELECT"],
+        "control_tenant_api": ["SELECT", "INSERT"],
+        "control_email_worker": ["SELECT", "UPDATE"],
+        "control_reconciliation_worker": ["INSERT"]
+      },
+      "migration_readiness": {"ready": true, "next_review": "use the protected outbox as the parent boundary for email delivery events and branded-domain delivery evidence"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0049_outbox_tenant_rls.sql",
+        "policies": [
+          {"name": "outbox_migration_owner", "scope": "migration_owner"},
+          {"name": "outbox_platform_read", "scope": "platform_read"},
+          {"name": "outbox_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "outbox_tenant_api_insert", "scope": "tenant_api_insert"},
+          {"name": "outbox_email_worker_read", "scope": "email_worker_tenant"},
+          {"name": "outbox_email_worker_update", "scope": "email_worker_tenant_update"},
+          {"name": "outbox_reconciliation_worker_insert", "scope": "reconciliation_worker_tenant_insert"}
         ]
       }
     },
@@ -228,7 +275,7 @@
       "name": "webshop_email_domains",
       "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
       "application_touch_paths": {
-        "api": ["src/api/email_domains.rs", "src/api/internal.rs", "src/api/webshop.rs"],
+        "api": ["src/api/email_domains.rs", "src/api/webshop.rs"],
         "workers": ["src/worker.rs", "src/workers/email.rs", "src/workers/email_domains.rs"],
         "schedulers": [],
         "drivers": []
