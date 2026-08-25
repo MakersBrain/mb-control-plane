@@ -318,6 +318,16 @@ worker loses direct table authority and continues bounded deletion only through
 the existing leased retention capability. The live role matrix verifies scoped
 producer and worker behavior plus provider-event replay and conflict fencing.
 
+Implemented delivery-evidence policy slice (2026-08-25): migration
+`0050_email_delivery_evidence_tenant_rls` materializes the outbox-derived
+workshop owner on `email_delivery_events` with a same-workshop composite foreign
+key, removes every runtime direct event grant, and enables forced RLS on events,
+`email_suppressions`, and `webshop_email_domains`. Suppression checks and
+branded-domain reconciliation now use transaction-local workshop identity.
+Fleet periodic admission remains function-only, and the provider-event
+capability is the sole runtime writer for delivery and suppression evidence.
+The live role matrix verifies fail-closed access and cross-workshop denial.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

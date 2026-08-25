@@ -257,7 +257,6 @@ async fn dashboard(
         "select count(*),(array_agg(operation_id) filter (where operation_id is not null))[1],max(last_error_class)
            from control.webshop_domains where workshop_id=$1 and state='action_required'",
     ).bind(workshop).fetch_one(&mut *domain_tx).await?;
-    domain_tx.commit().await?;
     if domains.0 > 0 {
         issues.push(WebshopIssueResponse {
             key: "domains".into(),
@@ -274,7 +273,7 @@ async fn dashboard(
     let email_domains = sqlx::query_as::<_, (i64, Option<Uuid>, Option<String>)>(
         "select count(*),(array_agg(operation_id) filter (where operation_id is not null))[1],max(last_error_class)
            from control.webshop_email_domains where workshop_id=$1 and state='action_required'",
-    ).bind(workshop).fetch_one(state.store.pool()).await?;
+    ).bind(workshop).fetch_one(&mut *domain_tx).await?;
     if email_domains.0 > 0 {
         issues.push(WebshopIssueResponse {
             key: "email-domains".into(),
@@ -293,7 +292,8 @@ async fn dashboard(
     let delivery_failures = sqlx::query_scalar::<_, i64>(
         "select count(*) from control.outbox where workshop_id=$1
           and (state='dead_letter' or delivery_state in ('deferred','bounced','complained','suppressed'))",
-    ).bind(workshop).fetch_one(state.store.pool()).await?;
+    ).bind(workshop).fetch_one(&mut *domain_tx).await?;
+    domain_tx.commit().await?;
     if delivery_failures > 0 {
         issues.push(WebshopIssueResponse {
             key: "email-delivery".into(),

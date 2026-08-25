@@ -137,7 +137,7 @@
           {"constraint": "outbox_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
           {"constraint": "outbox_invitation_id_fkey", "direction": "outbound", "related_table": "invitations"},
           {"constraint": "outbox_invitation_tenant_recipient_fkey", "direction": "outbound", "related_table": "invitations"},
-          {"constraint": "email_delivery_events_outbox_id_fkey", "direction": "inbound", "related_table": "email_delivery_events"},
+          {"constraint": "email_delivery_events_outbox_tenant_fkey", "direction": "inbound", "related_table": "email_delivery_events"},
           {"constraint": "webshop_email_domains_test_outbox_tenant_fkey", "direction": "inbound", "related_table": "webshop_email_domains"}
         ],
         "security_definer_functions": [
@@ -151,7 +151,7 @@
         "control_email_worker": ["SELECT", "UPDATE"],
         "control_reconciliation_worker": ["INSERT"]
       },
-      "migration_readiness": {"ready": true, "next_review": "use the protected outbox as the parent boundary for email delivery events and branded-domain delivery evidence"},
+      "migration_readiness": {"ready": true, "next_review": "review remaining workshop-owned mail metadata and retention dependencies"},
       "rls": {
         "state": "enforced",
         "enabled": true,
@@ -166,6 +166,75 @@
           {"name": "outbox_email_worker_read", "scope": "email_worker_tenant"},
           {"name": "outbox_email_worker_update", "scope": "email_worker_tenant_update"},
           {"name": "outbox_reconciliation_worker_insert", "scope": "reconciliation_worker_tenant_insert"}
+        ]
+      }
+    },
+    {
+      "name": "email_delivery_events",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"], "derived_from": "outbox.workshop_id" },
+      "application_touch_paths": {
+        "api": [],
+        "workers": [],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "email_delivery_events_outbox_tenant_fkey", "direction": "outbound", "related_table": "outbox"},
+          {"constraint": "email_suppressions_source_event_tenant_fkey", "direction": "inbound", "related_table": "email_suppressions"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.record_transactional_outbox_delivery_event", "reason": "derives workshop ownership from the locked outbox parent and records exact replay-safe provider evidence"}
+        ]
+      },
+      "current_grants": {},
+      "migration_readiness": {"ready": true, "next_review": "keep all runtime event access behind the provider evidence capability"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0050_email_delivery_evidence_tenant_rls.sql",
+        "policies": [
+          {"name": "email_delivery_events_migration_owner", "scope": "migration_owner"}
+        ]
+      }
+    },
+    {
+      "name": "email_suppressions",
+      "tenant_key": { "kind": "direct", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": ["src/api/internal.rs"],
+        "workers": ["src/workers/email_domains.rs"],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [
+          {"constraint": "email_suppressions_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
+          {"constraint": "email_suppressions_source_event_tenant_fkey", "direction": "outbound", "related_table": "email_delivery_events"}
+        ],
+        "security_definer_functions": [
+          {"name": "control.record_transactional_outbox_delivery_event", "reason": "upserts suppression evidence only from an exact authenticated provider event"}
+        ]
+      },
+      "current_grants": {
+        "control_tenant_api": ["SELECT"],
+        "control_reconciliation_worker": ["SELECT"]
+      },
+      "migration_readiness": {"ready": true, "next_review": "review suppression retention alongside mail-delivery deletion"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0050_email_delivery_evidence_tenant_rls.sql",
+        "policies": [
+          {"name": "email_suppressions_migration_owner", "scope": "migration_owner"},
+          {"name": "email_suppressions_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "email_suppressions_reconciliation_read", "scope": "reconciliation_worker_tenant"}
         ]
       }
     },
@@ -285,19 +354,37 @@
         "foreign_keys": [
           {"constraint": "webshop_email_domains_workshop_id_fkey", "direction": "outbound", "related_table": "workshops"},
           {"constraint": "webshop_email_domains_created_by_fkey", "direction": "outbound", "related_table": "users"},
-          {"constraint": "webshop_email_domains_operation_id_fkey", "direction": "outbound", "related_table": "operations"},
+          {"constraint": "webshop_email_domains_operation_workshop_fkey", "direction": "outbound", "related_table": "operations"},
           {"constraint": "webshop_email_domains_test_outbox_id_fkey", "direction": "outbound", "related_table": "outbox"},
           {"constraint": "webshop_email_domains_test_outbox_tenant_fkey", "direction": "outbound", "related_table": "outbox"}
         ],
-        "security_definer_functions": []
+        "security_definer_functions": [
+          {"name": "control.admit_due_webshop_email_domain_reconciliations", "reason": "bounded fleet admission atomically selects and binds workshop-owned reconciliation work"},
+          {"name": "control.record_transactional_outbox_delivery_event", "reason": "records branded-domain test delivery only for the exact same-workshop outbox parent"}
+        ]
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE"],
         "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
         "control_reconciliation_worker": ["SELECT", "UPDATE"],
         "control_email_worker": ["SELECT"]
       },
-      "migration_readiness": {"ready": false, "next_review": "classify internal delivery events and replace fleet reconciliation scans"}
+      "migration_readiness": {"ready": true, "next_review": "review sender-domain global uniqueness and provider-deletion evidence"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0050_email_delivery_evidence_tenant_rls.sql",
+        "policies": [
+          {"name": "webshop_email_domains_migration_owner", "scope": "migration_owner"},
+          {"name": "webshop_email_domains_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "webshop_email_domains_tenant_api_insert", "scope": "tenant_api_insert"},
+          {"name": "webshop_email_domains_tenant_api_update", "scope": "tenant_api_update"},
+          {"name": "webshop_email_domains_reconciliation_read", "scope": "reconciliation_worker_tenant"},
+          {"name": "webshop_email_domains_reconciliation_update", "scope": "reconciliation_worker_tenant_update"},
+          {"name": "webshop_email_domains_email_worker_read", "scope": "email_worker_tenant"}
+        ]
+      }
     },
     {
       "name": "workshop_modules",

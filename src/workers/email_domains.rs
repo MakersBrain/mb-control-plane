@@ -34,7 +34,8 @@ fn dns_ready(observation: &EmailDomainObservation) -> bool {
 }
 
 async fn store_observation(
-    store: &Store,
+    tenant_store: &TenantStore,
+    workshop: Uuid,
     id: Uuid,
     operation: Uuid,
     observation: &EmailDomainObservation,
@@ -49,9 +50,16 @@ async fn store_observation(
     } else {
         "dns_pending"
     };
-    sqlx::query("update control.webshop_email_domains set provider_ref=$3,provider_status=$4,dns_records=$5,verification=$6,state=$7,last_health_checked_at=now(),last_error_class=case when $7='action_required' then 'provider_domain_invalid' else null end,updated_at=now(),version=version+1 where id=$1 and operation_id=$2 and desired_state='active'")
+    let mut tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
+    sqlx::query("update control.webshop_email_domains set provider_ref=$3,provider_status=$4,dns_records=$5,verification=$6,state=$7,last_health_checked_at=now(),last_error_class=case when $7='action_required' then 'provider_domain_invalid' else null end,updated_at=now(),version=version+1 where id=$1 and workshop_id=$8 and operation_id=$2 and desired_state='active'")
         .bind(id).bind(operation).bind(observation.id).bind(&observation.status).bind(&observation.records).bind(&observation.verification).bind(next)
-        .execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        .bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+    tx.commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     Ok(())
 }
 
@@ -69,9 +77,17 @@ pub(crate) async fn run(
         .and_then(Value::as_str)
         .and_then(|v| Uuid::parse_str(v).ok())
         .ok_or(IntegrationError::ContractDrift)?;
+    let mut read_tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     let row=sqlx::query_as::<_,(String,String,Option<Uuid>,Option<Uuid>,Option<Uuid>,Option<time::OffsetDateTime>,Uuid)>(
         "select domain_name,desired_state,provider_ref,webhook_ref,test_outbox_id,test_delivered_at,created_by from control.webshop_email_domains where id=$1 and workshop_id=$2 and operation_id=$3")
-        .bind(id).bind(workshop).bind(operation.id).fetch_optional(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
+        .bind(id).bind(workshop).bind(operation.id).fetch_optional(&mut *read_tx).await.map_err(|_|IntegrationError::Unavailable)?.ok_or(IntegrationError::NotFound)?;
+    read_tx
+        .commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     let provider = client()?;
     if row.1 == "disconnected" {
         if let Some(webhook_ref) = row.3 {
@@ -80,8 +96,15 @@ pub(crate) async fn run(
         if let Some(provider_ref) = row.2 {
             provider.revoke(provider_ref).await?;
         }
-        sqlx::query("update control.webshop_email_domains set state='disconnected',provider_status='revoked',disconnected_at=now(),last_error_class=null,updated_at=now(),version=version+1 where id=$1 and operation_id=$2")
-            .bind(id).bind(operation.id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        let mut tx = tenant_store
+            .begin(workshop)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        sqlx::query("update control.webshop_email_domains set state='disconnected',provider_status='revoked',disconnected_at=now(),last_error_class=null,updated_at=now(),version=version+1 where id=$1 and workshop_id=$3 and operation_id=$2")
+            .bind(id).bind(operation.id).bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         return Ok(());
     }
     let observation = match row.2 {
@@ -94,7 +117,7 @@ pub(crate) async fn run(
     if observation.name != row.0 {
         return Err(IntegrationError::ContractDrift);
     }
-    store_observation(store, id, operation.id, &observation).await?;
+    store_observation(tenant_store, workshop, id, operation.id, &observation).await?;
     if observation.status != "checked" || !dns_ready(&observation) {
         return Ok(());
     }
@@ -103,18 +126,34 @@ pub(crate) async fn run(
     let webhook_ref = provider
         .ensure_webhook(observation.id, &sns_arn, &format!("mb-{id}"))
         .await?;
+    let mut webhook_tx = tenant_store
+        .begin(workshop)
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     sqlx::query(
-        "update control.webshop_email_domains set webhook_ref=$2 where id=$1 and operation_id=$3",
+        "update control.webshop_email_domains set webhook_ref=$2 where id=$1 and workshop_id=$4 and operation_id=$3",
     )
     .bind(id)
     .bind(webhook_ref)
     .bind(operation.id)
-    .execute(store.pool())
+    .bind(workshop)
+    .execute(&mut *webhook_tx)
     .await
     .map_err(|_| IntegrationError::Unavailable)?;
+    webhook_tx
+        .commit()
+        .await
+        .map_err(|_| IntegrationError::Unavailable)?;
     if row.5.is_some() {
-        sqlx::query("update control.webshop_email_domains set state='active',last_error_class=null,updated_at=now(),version=version+1 where id=$1 and operation_id=$2 and test_delivered_at is not null")
-            .bind(id).bind(operation.id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        let mut tx = tenant_store
+            .begin(workshop)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        sqlx::query("update control.webshop_email_domains set state='active',last_error_class=null,updated_at=now(),version=version+1 where id=$1 and workshop_id=$3 and operation_id=$2 and test_delivered_at is not null")
+            .bind(id).bind(operation.id).bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         return Ok(());
     }
     if row.4.is_none() {
@@ -124,11 +163,23 @@ pub(crate) async fn run(
                 .fetch_one(store.pool())
                 .await
                 .map_err(|_| IntegrationError::Unavailable)?;
-        let suppressed=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.email_suppressions where workshop_id=$1 and recipient=$2)").bind(workshop).bind(&recipient).fetch_one(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+        let mut suppression_tx = tenant_store
+            .begin(workshop)
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
+        let suppressed=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.email_suppressions where workshop_id=$1 and recipient=$2)").bind(workshop).bind(&recipient).fetch_one(&mut *suppression_tx).await.map_err(|_|IntegrationError::Unavailable)?;
         if suppressed {
-            sqlx::query("update control.webshop_email_domains set state='action_required',last_error_class='test_recipient_suppressed',updated_at=now(),version=version+1 where id=$1 and operation_id=$2").bind(id).bind(operation.id).execute(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+            sqlx::query("update control.webshop_email_domains set state='action_required',last_error_class='test_recipient_suppressed',updated_at=now(),version=version+1 where id=$1 and workshop_id=$3 and operation_id=$2").bind(id).bind(operation.id).bind(workshop).execute(&mut *suppression_tx).await.map_err(|_|IntegrationError::Unavailable)?;
+            suppression_tx
+                .commit()
+                .await
+                .map_err(|_| IntegrationError::Unavailable)?;
             return Ok(());
         }
+        suppression_tx
+            .commit()
+            .await
+            .map_err(|_| IntegrationError::Unavailable)?;
         let outbox = Uuid::new_v4();
         let mut tx = tenant_store
             .begin(workshop)
@@ -153,8 +204,8 @@ pub(crate) async fn run(
         )
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
-        sqlx::query("update control.webshop_email_domains set test_outbox_id=$2,updated_at=now(),version=version+1 where id=$1 and operation_id=$3")
-            .bind(id).bind(outbox).bind(operation.id).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
+        sqlx::query("update control.webshop_email_domains set test_outbox_id=$2,updated_at=now(),version=version+1 where id=$1 and operation_id=$3 and workshop_id=$4")
+            .bind(id).bind(outbox).bind(operation.id).bind(workshop).execute(&mut *tx).await.map_err(|_|IntegrationError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| IntegrationError::Unavailable)?;
@@ -164,7 +215,7 @@ pub(crate) async fn run(
 }
 
 pub(crate) async fn failed(
-    store: &Store,
+    tenant_store: &TenantStore,
     operation: &LeasedOperation,
 ) -> Result<(), IntegrationError> {
     let Some(workshop) = operation.workshop_id else {
@@ -178,8 +229,8 @@ pub(crate) async fn failed(
     else {
         return Err(IntegrationError::ContractDrift);
     };
-    let mut tx = store
-        .begin()
+    let mut tx = tenant_store
+        .begin(workshop)
         .await
         .map_err(|_| IntegrationError::Unavailable)?;
     if !lock_current_operation_lease(&mut tx, operation)

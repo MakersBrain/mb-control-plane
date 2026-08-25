@@ -25,6 +25,8 @@ const FIRST_WAVE_TABLES: &[&str] = &[
     "memberships",
     "invitations",
     "outbox",
+    "email_delivery_events",
+    "email_suppressions",
     "ownership_transfers",
     "carrier_secrets",
     "webshop_domains",
@@ -192,6 +194,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
+        include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -285,6 +288,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
+        include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -314,7 +318,10 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
             "memberships"
                 | "invitations"
                 | "outbox"
+                | "email_delivery_events"
+                | "email_suppressions"
                 | "ownership_transfers"
+                | "webshop_email_domains"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
                 | "workshop_recovery_rehearsals"
@@ -382,7 +389,14 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         let grants = table["current_grants"]
             .as_object()
             .expect("current grants must be an object");
-        assert!(!grants.is_empty(), "{table_name} must inventory its grants");
+        assert!(
+            !grants.is_empty()
+                || !database_paths["security_definer_functions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+            "{table_name} must inventory direct grants or its function-only boundary"
+        );
         let lowercase_migrations = migrations.to_ascii_lowercase();
         let table_grant_marker = format!("table control.{table_name} to ");
         let migration_grant_lines = lowercase_migrations
@@ -910,6 +924,55 @@ fn outbox_policy_uses_scoped_producers_and_exact_provider_event_capability() {
     assert!(platform.contains("from control.outbox order by created_at desc,id desc limit 200"));
     let privacy = include_str!("../src/workers/privacy.rs");
     assert!(privacy.contains("control.run_privacy_retention_batch($1,$2,$3,$4,$5)"));
+}
+
+#[test]
+fn email_delivery_evidence_policy_is_parent_bound_and_tenant_scoped() {
+    let migration = include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    for table in [
+        "email_delivery_events",
+        "email_suppressions",
+        "webshop_email_domains",
+    ] {
+        assert!(normalized.contains(&format!(
+            "alter table control.{table} enable row level security"
+        )));
+        assert!(normalized.contains(&format!(
+            "alter table control.{table} force row level security"
+        )));
+    }
+    assert!(normalized.contains(
+        "foreign key (outbox_id, workshop_id) references control.outbox(id, workshop_id)"
+    ));
+    assert!(normalized.contains(
+        "foreign key (source_event_id, workshop_id) references control.email_delivery_events(event_id, workshop_id)"
+    ));
+    assert!(
+        normalized.contains(
+            "revoke select, insert on table control.email_delivery_events from control_api"
+        )
+    );
+    assert!(normalized.contains(
+        "revoke select, insert, update on table control.email_suppressions from control_api"
+    ));
+    assert!(normalized.contains(
+        "revoke select, insert, update on table control.webshop_email_domains from control_api"
+    ));
+    assert!(normalized.contains("v_existing.workshop_id is distinct from v_outbox.workshop_id"));
+    assert!(normalized.contains("domain.workshop_id = v_outbox.workshop_id"));
+
+    let internal = include_str!("../src/api/internal.rs");
+    assert!(internal.contains("state.tenant_store.begin(workshop_id)"));
+    let webshop = include_str!("../src/api/webshop.rs");
+    assert!(webshop.contains("fetch_one(&mut *domain_tx)"));
+    let worker = include_str!("../src/workers/email_domains.rs");
+    assert!(worker.matches(".begin(workshop)").count() >= 7);
+    assert!(
+        worker.contains("control.webshop_email_domains set provider_ref=$3,provider_status=$4")
+    );
+    assert!(!worker.contains("execute(store.pool())"));
+    assert!(worker.contains("fetch_one(&mut *suppression_tx)"));
 }
 
 #[test]
@@ -2538,6 +2601,327 @@ async fn assert_outbox_rls(owner_store: &Store, workshops: (Uuid, Uuid)) {
         "ignored"
     );
     capability.rollback().await.unwrap();
+}
+
+async fn assert_email_delivery_evidence_rls(
+    owner_store: &Store,
+    workshops: (Uuid, Uuid),
+    owner_user: Uuid,
+) {
+    let (first_workshop, second_workshop) = workshops;
+    let first_outbox = Uuid::new_v4();
+    let second_outbox = Uuid::new_v4();
+    for (outbox, workshop, label) in [
+        (first_outbox, first_workshop, "first"),
+        (second_outbox, second_workshop, "second"),
+    ] {
+        sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1','{}',$3,$4)")
+            .bind(outbox)
+            .bind(format!("evidence-{label}-{outbox}@example.test"))
+            .bind(workshop)
+            .bind(format!("evidence:{outbox}"))
+            .execute(owner_store.pool())
+            .await
+            .unwrap();
+    }
+
+    let first_domain = Uuid::new_v4();
+    let second_domain = Uuid::new_v4();
+    for (domain, workshop, label) in [
+        (first_domain, first_workshop, "first"),
+        (second_domain, second_workshop, "second"),
+    ] {
+        sqlx::query("insert into control.webshop_email_domains(id,workshop_id,domain_name,created_by) values($1,$2,$3,$4)")
+            .bind(domain)
+            .bind(workshop)
+            .bind(format!("{label}-{domain}.example.test"))
+            .bind(owner_user)
+            .execute(owner_store.pool())
+            .await
+            .unwrap();
+    }
+
+    let first_event = Uuid::new_v4();
+    let second_event = Uuid::new_v4();
+    let mut provider = owner_store.begin().await.unwrap();
+    set_local_role(&mut provider, "control_api").await;
+    for (event, outbox) in [(first_event, first_outbox), (second_event, second_outbox)] {
+        let outcome = sqlx::query_scalar::<_, String>(
+            "select control.record_transactional_outbox_delivery_event($1,$2,$3,$4,$5,'email_spam',now())",
+        )
+        .bind(event)
+        .bind(outbox)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .fetch_one(&mut *provider)
+        .await
+        .unwrap();
+        assert_eq!(outcome, "created");
+    }
+    provider.commit().await.unwrap();
+
+    let event_owners = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "select event_id,workshop_id from control.email_delivery_events
+          where event_id=any($1) order by event_id",
+    )
+    .bind(vec![first_event, second_event])
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    let mut expected_owners = vec![
+        (first_event, first_workshop),
+        (second_event, second_workshop),
+    ];
+    expected_owners.sort_unstable();
+    assert_eq!(event_owners, expected_owners);
+
+    let mismatched_suppression = sqlx::query(
+        "insert into control.email_suppressions(
+             workshop_id,recipient,reason,source_event_id
+         ) values($1,$2,'spam',$3)",
+    )
+    .bind(second_workshop)
+    .bind(format!("mismatched-{}@example.test", Uuid::new_v4()))
+    .bind(first_event)
+    .execute(owner_store.pool())
+    .await
+    .expect_err("suppression ownership must match its source delivery event");
+    assert_eq!(
+        mismatched_suppression
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("email_suppressions_source_event_tenant_fkey")
+    );
+
+    let flags = sqlx::query_as::<_, (String, bool, bool)>(
+        "select relation.relname,relation.relrowsecurity,relation.relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control'
+            and relation.relname=any($1)
+          order by relation.relname",
+    )
+    .bind(vec![
+        "email_delivery_events",
+        "email_suppressions",
+        "webshop_email_domains",
+    ])
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        flags,
+        vec![
+            ("email_delivery_events".into(), true, true),
+            ("email_suppressions".into(), true, true),
+            ("webshop_email_domains".into(), true, true),
+        ]
+    );
+
+    let privileges = sqlx::query_as::<_, (String, String, String)>(
+        "select role_name,table_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_email_worker',
+                  'control_reconciliation_worker','control_privacy_worker'
+                ]::text[]) role_name
+          cross join unnest(array[
+                  'email_delivery_events','email_suppressions','webshop_email_domains'
+                ]::text[]) table_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.'||table_name,privilege)
+          order by role_name,table_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            (
+                "control_email_worker".into(),
+                "webshop_email_domains".into(),
+                "SELECT".into(),
+            ),
+            (
+                "control_reconciliation_worker".into(),
+                "email_suppressions".into(),
+                "SELECT".into(),
+            ),
+            (
+                "control_reconciliation_worker".into(),
+                "webshop_email_domains".into(),
+                "SELECT".into(),
+            ),
+            (
+                "control_reconciliation_worker".into(),
+                "webshop_email_domains".into(),
+                "UPDATE".into(),
+            ),
+            (
+                "control_tenant_api".into(),
+                "email_suppressions".into(),
+                "SELECT".into(),
+            ),
+            (
+                "control_tenant_api".into(),
+                "webshop_email_domains".into(),
+                "INSERT".into(),
+            ),
+            (
+                "control_tenant_api".into(),
+                "webshop_email_domains".into(),
+                "SELECT".into(),
+            ),
+            (
+                "control_tenant_api".into(),
+                "webshop_email_domains".into(),
+                "UPDATE".into(),
+            ),
+        ]
+    );
+
+    let policies = sqlx::query_as::<_, (String, i64)>(
+        "select tablename,count(*)
+           from pg_policies
+          where schemaname='control'
+            and tablename=any($1)
+            and policyname not like '%migration_owner'
+          group by tablename order by tablename",
+    )
+    .bind(vec![
+        "email_delivery_events",
+        "email_suppressions",
+        "webshop_email_domains",
+    ])
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        policies,
+        vec![
+            ("email_suppressions".into(), 2),
+            ("webshop_email_domains".into(), 6),
+        ]
+    );
+
+    for role in RUNTIME_ROLES {
+        let mut direct = owner_store.begin().await.unwrap();
+        set_local_role(&mut direct, role).await;
+        let denied = sqlx::query("select event_id from control.email_delivery_events limit 1")
+            .execute(&mut *direct)
+            .await
+            .expect_err("delivery events must be function-only for runtime roles");
+        assert_insufficient_privilege(denied, "direct delivery-event access");
+        direct.rollback().await.unwrap();
+    }
+
+    for role in ["control_tenant_api", "control_reconciliation_worker"] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.email_suppressions")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.email_suppressions")
+                .fetch_one(&mut *scoped)
+                .await
+                .unwrap(),
+            1
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    for role in [
+        "control_tenant_api",
+        "control_reconciliation_worker",
+        "control_email_worker",
+    ] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.webshop_email_domains")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<Uuid>>(
+                "select coalesce(array_agg(id order by id),'{}') from control.webshop_email_domains",
+            )
+            .fetch_one(&mut *scoped)
+            .await
+            .unwrap(),
+            vec![first_domain]
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    for role in ["control_tenant_api", "control_reconciliation_worker"] {
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query(
+                "update control.webshop_email_domains set updated_at=updated_at where id=$1"
+            )
+            .bind(first_domain)
+            .execute(&mut *scoped)
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        assert_eq!(
+            sqlx::query(
+                "update control.webshop_email_domains set updated_at=updated_at where id=$1"
+            )
+            .bind(second_domain)
+            .execute(&mut *scoped)
+            .await
+            .unwrap()
+            .rows_affected(),
+            0
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    let mut email_mutation = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut email_mutation, "control_email_worker", first_workshop).await;
+    let denied =
+        sqlx::query("update control.webshop_email_domains set updated_at=updated_at where id=$1")
+            .bind(first_domain)
+            .execute(&mut *email_mutation)
+            .await
+            .expect_err("email worker must remain read-only for branded domains");
+    assert_insufficient_privilege(denied, "email worker branded-domain update");
+    email_mutation.rollback().await.unwrap();
+
+    for statement in [
+        "select * from control.email_suppressions limit 1",
+        "select * from control.webshop_email_domains limit 1",
+    ] {
+        let mut platform = owner_store.begin().await.unwrap();
+        set_local_role(&mut platform, "control_api").await;
+        let denied = sqlx::query(statement)
+            .execute(&mut *platform)
+            .await
+            .expect_err("platform API direct delivery evidence access must be removed");
+        assert_insufficient_privilege(denied, "platform delivery evidence access");
+        platform.rollback().await.unwrap();
+    }
 }
 
 async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), owner_user: Uuid) {
@@ -4454,10 +4838,13 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     assert_eq!(
         protected_tables,
         vec![
+            ("email_delivery_events".to_owned(), true, true),
+            ("email_suppressions".to_owned(), true, true),
             ("invitations".to_owned(), true, true),
             ("memberships".to_owned(), true, true),
             ("outbox".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
+            ("webshop_email_domains".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
             ("workshop_recovery_points".to_owned(), true, true),
             ("workshop_recovery_rehearsals".to_owned(), true, true),
@@ -4508,6 +4895,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     }
     assert_invitation_rls(&store, (first, second), from_user).await;
     assert_outbox_rls(&store, (first, second)).await;
+    assert_email_delivery_evidence_rls(&store, (first, second), from_user).await;
     assert_membership_rls(&store, (first, second), from_user).await;
     assert_webshop_domain_claim_compatibility(
         &admin_url, &database, &store, first, second, from_user,

@@ -1041,6 +1041,17 @@ lease-authenticated retention remains function-only. Live production-role tests
 cover policies, ACLs, producer isolation, worker updates, replay/conflict
 semantics, and cross-workshop denial.
 
+Implemented email-delivery evidence forced-RLS slice (2026-08-25): migration
+`0050_email_delivery_evidence_tenant_rls` derives and persists the workshop on
+every provider delivery event from its protected outbox parent, removes all
+runtime direct event-table authority, and forces RLS on delivery events,
+recipient suppressions, and branded sender domains. Tenant API, reconciliation,
+and email-worker reads or mutations now require transaction-local workshop
+context. Fleet domain admission remains behind its existing bounded fixed-path
+capability, while provider callbacks remain behind the exact replay-safe outbox
+event capability. Live role tests cover parent ownership, ACL removal,
+fail-closed context, same-workshop access, and cross-workshop denial.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify

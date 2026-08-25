@@ -228,13 +228,14 @@ pub(super) async fn webshop_transactional_mail(
     if !enabled {
         return Err(ApiError::Forbidden);
     }
+    let mut tx = state.tenant_store.begin(workshop_id).await?;
     let suppressed = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from control.email_suppressions
           where workshop_id=$1 and recipient=$2)",
     )
     .bind(workshop_id)
     .bind(&recipient)
-    .fetch_one(state.store.pool())
+    .fetch_one(&mut *tx)
     .await?;
     if suppressed {
         return Err(ApiError::Conflict(
@@ -246,7 +247,6 @@ pub(super) async fn webshop_transactional_mail(
         "sender_name":body.sender_name,"reply_to":reply_to,"model":body.model,
         "attachments":body.attachments
     });
-    let mut tx = state.tenant_store.begin(workshop_id).await?;
     let proposed = Uuid::new_v4();
     let inserted = sqlx::query_scalar::<_, Uuid>(
         "insert into control.outbox(
