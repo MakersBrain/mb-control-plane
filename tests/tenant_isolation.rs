@@ -195,6 +195,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
+        include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -289,6 +290,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
+        include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -321,6 +323,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
                 | "email_delivery_events"
                 | "email_suppressions"
                 | "ownership_transfers"
+                | "webshop_domains"
                 | "webshop_email_domains"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
@@ -976,15 +979,28 @@ fn email_delivery_evidence_policy_is_parent_bound_and_tenant_scoped() {
 }
 
 #[test]
-fn webshop_domain_claim_preparation_has_a_stable_scoped_boundary() {
-    let migration = include_str!("../migrations/0021_webshop_domain_claim_compatibility.sql");
-    assert!(migration.contains("create function control.claim_webshop_domain("));
+fn webshop_domain_policy_has_live_uniqueness_and_a_stable_scoped_claim() {
+    let preparation = include_str!("../migrations/0021_webshop_domain_claim_compatibility.sql");
+    let migration = include_str!("../migrations/0051_webshop_domain_tenant_rls.sql");
+    assert!(preparation.contains("create function control.claim_webshop_domain("));
+    assert!(migration.contains("create or replace function control.claim_webshop_domain("));
     assert!(migration.contains("language plpgsql security definer"));
     assert!(migration.contains("set search_path = pg_catalog, control"));
     assert!(migration.contains("control.current_workshop_id() is distinct from p_workshop_id"));
     assert!(migration.contains("membership.role in ('owner', 'studio_manager')"));
-    assert!(migration.contains("v_existing.state <> 'disconnected'"));
-    assert!(migration.contains("control.webshop_domain_provider_deletion_attempts"));
+    assert!(migration.contains("drop constraint webshop_domains_hostname_key"));
+    assert!(migration.contains("create unique index webshop_domains_live_hostname_unique"));
+    assert!(migration.contains("where state <> 'disconnected'"));
+    assert!(!migration.contains("set workshop_id = p_workshop_id"));
+    assert!(migration.contains("alter table control.webshop_domains enable row level security"));
+    assert!(migration.contains("alter table control.webshop_domains force row level security"));
+    assert!(migration.contains(
+        "revoke select, insert, update on table control.webshop_domains from control_api"
+    ));
+    assert!(
+        migration
+            .contains("revoke insert on table control.webshop_domains from control_tenant_api")
+    );
     assert!(migration.contains(
         "revoke all on function control.claim_webshop_domain(uuid,uuid,text,text,text,text,uuid)"
     ));
@@ -1119,6 +1135,50 @@ async fn assert_webshop_domain_claim_compatibility(
     );
     assert!(metadata.6, "PUBLIC hostname-claim execute must be revoked");
 
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control' and relation.relname='webshop_domains'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+    let privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_reconciliation_worker',
+                  'control_lifecycle_worker'
+                ]::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.webshop_domains',privilege)
+          order by role_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            ("control_lifecycle_worker".into(), "SELECT".into()),
+            ("control_lifecycle_worker".into(), "UPDATE".into()),
+            ("control_reconciliation_worker".into(), "SELECT".into()),
+            ("control_reconciliation_worker".into(), "UPDATE".into()),
+            ("control_tenant_api".into(), "SELECT".into()),
+            ("control_tenant_api".into(), "UPDATE".into()),
+        ]
+    );
+    let policy_count = sqlx::query_scalar::<_, i64>(
+        "select count(*) from pg_policies
+          where schemaname='control' and tablename='webshop_domains'
+            and policyname<>'webshop_domains_migration_owner'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(policy_count, 6);
+
     let tenant_url = login_database_url(
         admin_url,
         database,
@@ -1169,10 +1229,11 @@ async fn assert_webshop_domain_claim_compatibility(
     .execute(owner_store.pool())
     .await
     .unwrap();
+    let replacement = Uuid::new_v4();
     let mut second = tenant_store.begin(second_workshop).await.unwrap();
     let reclaimed = claim_webshop_domain(
         &mut second,
-        Uuid::new_v4(),
+        replacement,
         second_workshop,
         &hostname,
         &verification_name,
@@ -1180,16 +1241,88 @@ async fn assert_webshop_domain_claim_compatibility(
     )
     .await
     .unwrap();
-    assert_eq!(reclaimed.0, "reclaimed");
-    assert_eq!(reclaimed.1, Some(domain));
+    assert_eq!(reclaimed.0, "created");
+    assert_eq!(reclaimed.1, Some(replacement));
     second.commit().await.unwrap();
-    let owner: Uuid =
-        sqlx::query_scalar("select workshop_id from control.webshop_domains where id=$1")
-            .bind(domain)
-            .fetch_one(owner_store.pool())
+    let history = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        "select id,workshop_id,state from control.webshop_domains
+          where hostname=$1 order by id",
+    )
+    .bind(&hostname)
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    let mut expected_history = vec![
+        (domain, first_workshop, "disconnected".into()),
+        (replacement, second_workshop, "ownership_pending".into()),
+    ];
+    expected_history.sort_unstable();
+    assert_eq!(history, expected_history);
+
+    for role in [
+        "control_tenant_api",
+        "control_reconciliation_worker",
+        "control_lifecycle_worker",
+    ] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.webshop_domains")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0,
+            "{role} must fail closed without workshop context"
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<Uuid>>(
+                "select coalesce(array_agg(id order by id),'{}') from control.webshop_domains",
+            )
+            .fetch_one(&mut *scoped)
             .await
-            .unwrap();
-    assert_eq!(owner, second_workshop);
+            .unwrap(),
+            vec![domain]
+        );
+        assert_eq!(
+            sqlx::query("update control.webshop_domains set updated_at=updated_at where id=$1")
+                .bind(replacement)
+                .execute(&mut *scoped)
+                .await
+                .unwrap()
+                .rows_affected(),
+            0,
+            "{role} must not update another workshop's hostname"
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    let mut platform = owner_store.begin().await.unwrap();
+    set_local_role(&mut platform, "control_api").await;
+    let denied = sqlx::query("select id from control.webshop_domains limit 1")
+        .execute(&mut *platform)
+        .await
+        .expect_err("platform API direct hostname access must be removed");
+    assert_insufficient_privilege(denied, "platform API direct hostname access");
+    platform.rollback().await.unwrap();
+
+    let mut direct_insert = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut direct_insert, "control_tenant_api", first_workshop).await;
+    let denied = sqlx::query("insert into control.webshop_domains(id,workshop_id,hostname,verification_name,verification_value,routing_target,created_by) values($1,$2,$3,$4,$5,'shops.example.test',$6)")
+        .bind(Uuid::new_v4())
+        .bind(first_workshop)
+        .bind(format!("direct-{}.example.test", Uuid::new_v4().simple()))
+        .bind(format!("_mb-challenge.direct-{}.example.test", Uuid::new_v4().simple()))
+        .bind(format!("mb-verification={}", Uuid::new_v4().simple()))
+        .bind(manager)
+        .execute(&mut *direct_insert)
+        .await
+        .expect_err("tenant hostname inserts must use the claim capability");
+    assert_insufficient_privilege(denied, "direct tenant hostname insert");
+    direct_insert.rollback().await.unwrap();
 
     let raw = PgPoolOptions::new()
         .max_connections(1)
@@ -4844,6 +4977,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
             ("memberships".to_owned(), true, true),
             ("outbox".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
+            ("webshop_domains".to_owned(), true, true),
             ("webshop_email_domains".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
             ("workshop_recovery_points".to_owned(), true, true),

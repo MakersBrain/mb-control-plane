@@ -52,11 +52,11 @@
   ],
   "catalog": {
     "columns": {"count": 1326, "digest": "32eb7beef7e77657d9dd5b47625c290a"},
-    "constraints": {"count": 897, "digest": "1ff23655fd7b7dc6f83403202593d91b"},
-    "indexes": {"count": 224, "digest": "a3fcc816f725c03fb2900e8c5e84e0a3"},
+    "constraints": {"count": 896, "digest": "db559d55d946525030d07a1f371a530f"},
+    "indexes": {"count": 224, "digest": "7047de4d9a1922e878d40023fb3ccaac"},
     "functions": {"count": 262, "digest": "1aeaacb2db45a844f680057c0f98d5f9"},
     "triggers": {"count": 68, "digest": "b2c82d8965dd520d34cb859b5a10f3e6"},
-    "privileges": {"count": 1712, "digest": "05c7301ada76578de4f5cbfeb3f26bc1"},
+    "privileges": {"count": 1708, "digest": "2f00dfe105d422e4f974d07d357f1ed4"},
     "default_privileges": {"count": 3, "digest": "0c6219b31f278a51ab29c7f4446032a4"}
   }
 }

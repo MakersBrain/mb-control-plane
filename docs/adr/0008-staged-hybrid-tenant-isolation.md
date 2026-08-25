@@ -328,6 +328,16 @@ Fleet periodic admission remains function-only, and the provider-event
 capability is the sole runtime writer for delivery and suppression evidence.
 The live role matrix verifies fail-closed access and cross-workshop denial.
 
+Implemented custom-hostname policy slice (2026-08-25): migration
+`0051_webshop_domain_tenant_rls` drops global `hostname` uniqueness in favor of
+uniqueness among non-disconnected rows. A released hostname is claimed by
+inserting a fresh row rather than transferring disconnected history between
+workshops. Forced RLS now protects `webshop_domains`; tenant API,
+reconciliation, and lifecycle direct access requires transaction-local
+workshop identity, while human claims and fleet workflows remain bounded
+function capabilities. Platform direct grants and tenant direct inserts are
+removed, with live role tests covering fail-closed and cross-workshop behavior.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

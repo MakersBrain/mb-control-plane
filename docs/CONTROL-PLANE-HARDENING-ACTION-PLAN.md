@@ -1052,6 +1052,17 @@ capability, while provider callbacks remain behind the exact replay-safe outbox
 event capability. Live role tests cover parent ownership, ACL removal,
 fail-closed context, same-workshop access, and cross-workshop denial.
 
+Implemented custom-hostname forced-RLS slice (2026-08-25): migration
+`0051_webshop_domain_tenant_rls` replaces global hostname uniqueness with a
+live-row partial unique index, so disconnected history remains immutable and a
+later claim receives a fresh workshop-owned row. Platform direct table access
+and tenant direct inserts are removed. Tenant API, reconciliation, and
+lifecycle reads or updates require transaction-local workshop context; human
+claims, periodic fleet admission, provider-deletion evidence, and startup route
+projection remain behind their reviewed fixed-path capabilities. Live tests
+cover claim conflicts, disconnected-hostname reuse, ACLs, policies, and
+cross-workshop denial.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
