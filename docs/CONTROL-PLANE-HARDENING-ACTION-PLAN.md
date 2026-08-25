@@ -1003,6 +1003,19 @@ owner policy without restoring table-wide runtime authority. The production-
 role PostgreSQL matrix now proves missing, malformed, and cross-workshop
 contexts fail closed for the recovery parent.
 
+Implemented membership forced-RLS slice (2026-08-25): migration
+`0047_membership_tenant_rls` enables and forces RLS on `memberships`. Platform
+reporting retains explicit fleet-wide read-only visibility, while tenant API,
+membership, provisioning, reconciliation, backup, privacy, and driver reads
+require transaction-local workshop context; only tenant API updates are
+permitted directly. Initial-owner creation and invitation acceptance use
+separate exact command-bound capabilities, nightly-backup discovery is capped
+at 100 candidates, and privacy subject expansion requires the exact live
+privacy operation lease and is capped at 501 rows. Stale invoice and inventory
+worker grants are removed. Static and production-role PostgreSQL tests prove
+the ACL, policy, capability, missing-context, malformed-authority, and cross-
+workshop matrix.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify

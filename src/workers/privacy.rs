@@ -19,6 +19,7 @@ type ExportMembership = (
 );
 
 const MAX_EXPORT_WORKSHOPS: usize = 50;
+const MAX_ERASURE_WORKSHOPS: usize = 500;
 const MAX_EXPORT_CLEANUP_BATCH: i64 = 100;
 const RETENTION_BATCH_SIZE: i32 = 200;
 
@@ -45,6 +46,14 @@ struct PrivacyExportSnapshot {
     request_history: Vec<ExportRequestHistory>,
     processor_tasks: Vec<ExportProcessorTask>,
     workshop_ids: Vec<Uuid>,
+}
+
+struct DataSubjectExportRequest<'a> {
+    operation: &'a LeasedOperation,
+    id: Uuid,
+    subject_user_id: Uuid,
+    request_type: &'a str,
+    scope: &'a Value,
 }
 
 fn export_timestamp(value: OffsetDateTime) -> Result<String, IntegrationError> {
@@ -230,8 +239,29 @@ fn requested_workshops(scope: &Value) -> Result<Vec<Uuid>, IntegrationError> {
     Ok(workshops)
 }
 
+async fn read_privacy_subject_workshops(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &LeasedOperation,
+    request_id: Uuid,
+    limit: usize,
+) -> Result<Vec<Uuid>, IntegrationError> {
+    sqlx::query_scalar::<_, Uuid>(
+        "select workshop_id
+           from control.read_privacy_subject_workshops($1,$2,$3,$4,$5)",
+    )
+    .bind(request_id)
+    .bind(operation.id)
+    .bind(operation.attempt)
+    .bind(&operation.leased_by)
+    .bind(i32::try_from(limit).map_err(|_| IntegrationError::TooLarge)?)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| IntegrationError::Unavailable)
+}
+
 async fn privacy_export_snapshot(
     store: &Store,
+    operation: &LeasedOperation,
     request_id: Uuid,
     subject_user_id: Uuid,
     scope: &Value,
@@ -274,15 +304,13 @@ async fn privacy_export_snapshot(
     .map_err(|_| IntegrationError::Unavailable)?;
     let mut workshop_ids = requested_workshops(scope)?;
     if workshop_ids.is_empty() {
-        workshop_ids = sqlx::query_scalar::<_, Uuid>(
-            "select workshop_id from control.memberships where user_id=$1
-             order by workshop_id limit $2",
+        workshop_ids = read_privacy_subject_workshops(
+            &mut tx,
+            operation,
+            request_id,
+            MAX_EXPORT_WORKSHOPS + 1,
         )
-        .bind(subject_user_id)
-        .bind(i64::try_from(MAX_EXPORT_WORKSHOPS + 1).expect("bounded export limit"))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| IntegrationError::Unavailable)?;
+        .await?;
         if workshop_ids.len() > MAX_EXPORT_WORKSHOPS {
             return Err(IntegrationError::TooLarge);
         }
@@ -332,16 +360,13 @@ async fn tenant_export_memberships(
 async fn prepare_data_subject_export(
     store: &Store,
     tenant_store: &TenantStore,
-    request_id: Uuid,
-    subject_user_id: Uuid,
-    request_type: &str,
-    scope: &Value,
+    request: DataSubjectExportRequest<'_>,
     driver: &PrivacyDriverConfig,
 ) -> Result<(), IntegrationError> {
     if let Some(state) = sqlx::query_scalar::<_, String>(
         "select state from control.data_subject_exports where data_subject_request_id=$1",
     )
-    .bind(request_id)
+    .bind(request.id)
     .fetch_optional(store.pool())
     .await
     .map_err(|_| IntegrationError::Unavailable)?
@@ -353,17 +378,28 @@ async fn prepare_data_subject_export(
         };
     }
 
-    let snapshot = privacy_export_snapshot(store, request_id, subject_user_id, scope).await?;
-    let memberships =
-        tenant_export_memberships(tenant_store, subject_user_id, &snapshot.workshop_ids).await?;
-    let processor_exports = processor_exports(request_id, &snapshot.workshop_ids, driver).await?;
+    let snapshot = privacy_export_snapshot(
+        store,
+        request.operation,
+        request.id,
+        request.subject_user_id,
+        request.scope,
+    )
+    .await?;
+    let memberships = tenant_export_memberships(
+        tenant_store,
+        request.subject_user_id,
+        &snapshot.workshop_ids,
+    )
+    .await?;
+    let processor_exports = processor_exports(request.id, &snapshot.workshop_ids, driver).await?;
 
     let payload = json!({
         "format":"mb-gdpr-export-v1",
         "generated_at":export_timestamp(OffsetDateTime::now_utc())?,
-        "request":{"id":request_id,"type":request_type,"scope":scope},
+        "request":{"id":request.id,"type":request.request_type,"scope":request.scope},
         "subject":{
-            "id":subject_user_id,"email":snapshot.user.0,"display_name":snapshot.user.1,"locale":snapshot.user.2,
+            "id":request.subject_user_id,"email":snapshot.user.0,"display_name":snapshot.user.1,"locale":snapshot.user.2,
             "created_at":export_timestamp(snapshot.user.3)?,
             "disabled_at":snapshot.user.4.map(export_timestamp).transpose()?
         },
@@ -396,7 +432,7 @@ async fn prepare_data_subject_export(
          ) values($1,$2,$3,$4,$5,'ready',now(),now()+interval '7 days',$6,null,$7,$8)",
     )
     .bind(export_id)
-    .bind(request_id)
+    .bind(request.id)
     .bind(&storage_ref)
     .bind(privacy_crypto::export_key_id()?)
     .bind(digest)
@@ -618,8 +654,24 @@ pub(crate) async fn data_subject_request(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if workshops.is_empty() {
-                workshops=sqlx::query_scalar::<_,Uuid>("select workshop_id from control.memberships where user_id=$1 order by workshop_id")
-                    .bind(request.2).fetch_all(store.pool()).await.map_err(|_|IntegrationError::Unavailable)?;
+                let mut membership_tx = store
+                    .begin()
+                    .await
+                    .map_err(|_| IntegrationError::Unavailable)?;
+                workshops = read_privacy_subject_workshops(
+                    &mut membership_tx,
+                    operation,
+                    request_id,
+                    MAX_ERASURE_WORKSHOPS + 1,
+                )
+                .await?;
+                membership_tx
+                    .commit()
+                    .await
+                    .map_err(|_| IntegrationError::Unavailable)?;
+                if workshops.len() > MAX_ERASURE_WORKSHOPS {
+                    return Err(IntegrationError::TooLarge);
+                }
             }
             for workshop in workshops {
                 let documents=sqlx::query_scalar::<_,bool>("select exists(select 1 from control.workshop_modules where workshop_id=$1 and module_key='documents' and state='enabled')")
@@ -652,10 +704,13 @@ pub(crate) async fn data_subject_request(
         prepare_data_subject_export(
             store,
             tenant_store,
-            request_id,
-            request.2,
-            &request.0,
-            &request.4,
+            DataSubjectExportRequest {
+                operation,
+                id: request_id,
+                subject_user_id: request.2,
+                request_type: &request.0,
+                scope: &request.4,
+            },
             driver,
         )
         .await?;

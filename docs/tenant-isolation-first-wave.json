@@ -40,21 +40,43 @@
           {"constraint": "memberships_user_id_fkey", "direction": "outbound", "related_table": "users"},
           {"constraint": "membership_targets_workshop_id_user_id_fkey", "direction": "inbound", "related_table": "membership_targets"}
         ],
-        "security_definer_functions": []
+        "security_definer_functions": [
+          {"name": "control.insert_initial_workshop_owner", "reason": "inserts the first owner only for an exact admitted workshop-creation command and empty workshop membership set"},
+          {"name": "control.accept_invitation_membership", "reason": "accepts one live invitation only for the matching user and admitted acceptance command"},
+          {"name": "control.discover_due_backup_memberships", "reason": "returns at most 100 due backup candidates with one active owner identity"},
+          {"name": "control.read_privacy_subject_workshops", "reason": "returns a bounded subject workshop list only for the exact live privacy operation lease"}
+        ]
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+        "control_api": ["SELECT"],
         "control_tenant_api": ["SELECT", "UPDATE"],
         "control_membership_worker": ["SELECT"],
         "control_provisioning_worker": ["SELECT"],
-        "control_invoice_worker": ["SELECT"],
-        "control_inventory_worker": ["SELECT"],
         "control_reconciliation_worker": ["SELECT"],
         "control_privacy_worker": ["SELECT"],
         "control_driver_ledger": ["SELECT"],
         "control_backup_scheduler": ["SELECT"]
       },
-      "migration_readiness": {"ready": false, "next_review": "split API scopes and classify fleet reads used by backup, privacy, and driver workflows"}
+      "migration_readiness": {"ready": true, "next_review": "use the completed membership policy as the parent prerequisite for membership_targets and invitation workflow isolation"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0047_membership_tenant_rls.sql",
+        "policies": [
+          {"name": "memberships_migration_owner", "scope": "migration_owner"},
+          {"name": "memberships_platform_read", "scope": "platform_read"},
+          {"name": "memberships_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "memberships_tenant_api_update", "scope": "tenant_api_update"},
+          {"name": "memberships_membership_worker_read", "scope": "membership_worker_tenant"},
+          {"name": "memberships_provisioning_worker_read", "scope": "provisioning_worker_tenant"},
+          {"name": "memberships_reconciliation_worker_read", "scope": "reconciliation_worker_tenant"},
+          {"name": "memberships_backup_scheduler_read", "scope": "backup_scheduler_tenant"},
+          {"name": "memberships_privacy_worker_read", "scope": "privacy_worker_tenant"},
+          {"name": "memberships_driver_read", "scope": "driver_tenant"}
+        ]
+      }
     },
     {
       "name": "invitations",

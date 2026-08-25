@@ -68,21 +68,8 @@ impl BackupScheduler {
     #[tracing::instrument(name = "backup_scheduler.schedule", skip_all)]
     pub async fn schedule_due_backups(&self) -> anyhow::Result<usize> {
         let due = sqlx::query_as::<_, (Uuid, Uuid, Uuid)>(
-            "select d.workshop_id,d.id,m.user_id
-             from control.odoo_databases d
-             join lateral (
-                 select user_id from control.memberships
-                 where workshop_id=d.workshop_id and role='owner' and status='active'
-                 order by user_id limit 1
-             ) m on true
-             where d.kind='primary' and d.state='ready' and d.deleted_at is null
-               and not exists (
-                 select 1 from control.workshop_recovery_points r
-                 where r.workshop_id=d.workshop_id and r.kind='backup'
-                   and r.created_at > now()-interval '24 hours'
-                   and r.state in ('queued','creating','ready')
-               )
-             limit 100",
+            "select workshop_id,database_id,owner_user_id
+               from control.discover_due_backup_memberships(100)",
         )
         .fetch_all(&self.fleet_discovery)
         .await?;
