@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0052_provider_deletion_evidence_tenant_rls";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0053_route_projection_parent_tenant_rls";
 
 #[derive(Clone)]
 pub struct Store {

@@ -54,9 +54,9 @@
     "columns": {"count": 1326, "digest": "32eb7beef7e77657d9dd5b47625c290a"},
     "constraints": {"count": 896, "digest": "db559d55d946525030d07a1f371a530f"},
     "indexes": {"count": 224, "digest": "7047de4d9a1922e878d40023fb3ccaac"},
-    "functions": {"count": 262, "digest": "1aeaacb2db45a844f680057c0f98d5f9"},
+    "functions": {"count": 263, "digest": "5b7d579ee96c24b02cda252674fdd865"},
     "triggers": {"count": 68, "digest": "b2c82d8965dd520d34cb859b5a10f3e6"},
-    "privileges": {"count": 1708, "digest": "2f00dfe105d422e4f974d07d357f1ed4"},
+    "privileges": {"count": 1708, "digest": "be63c2546ac88758c30e8c5afcb434e1"},
     "default_privileges": {"count": 3, "digest": "0c6219b31f278a51ab29c7f4446032a4"}
   }
 }

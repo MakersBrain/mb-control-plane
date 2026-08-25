@@ -32,6 +32,8 @@ const FIRST_WAVE_TABLES: &[&str] = &[
     "webshop_domains",
     "webshop_domain_provider_deletion_attempts",
     "webshop_email_domains",
+    "workshop_route_projections",
+    "workshop_route_projection_state",
     "workshop_modules",
     "service_instances",
     "odoo_databases",
@@ -167,6 +169,8 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0009_driver_idempotency_scope.sql"),
         include_str!("../migrations/0010_release_driver_lease.sql"),
         include_str!("../migrations/0011_webshop_domain_reconciliation.sql"),
+        include_str!("../migrations/0012_workshop_route_projections.sql"),
+        include_str!("../migrations/0013_route_effect_authority.sql"),
         include_str!("../migrations/0014_webshop_domain_provider_deletion.sql"),
         include_str!("../migrations/0015_webshop_email_domain_reconciliation.sql"),
         include_str!("../migrations/0016_recovery_component_tenant_rls.sql"),
@@ -198,6 +202,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
         include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
         include_str!("../migrations/0052_provider_deletion_evidence_tenant_rls.sql"),
+        include_str!("../migrations/0053_route_projection_parent_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -263,6 +268,8 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0009_driver_idempotency_scope.sql"),
         include_str!("../migrations/0010_release_driver_lease.sql"),
         include_str!("../migrations/0011_webshop_domain_reconciliation.sql"),
+        include_str!("../migrations/0012_workshop_route_projections.sql"),
+        include_str!("../migrations/0013_route_effect_authority.sql"),
         include_str!("../migrations/0014_webshop_domain_provider_deletion.sql"),
         include_str!("../migrations/0015_webshop_email_domain_reconciliation.sql"),
         include_str!("../migrations/0016_recovery_component_tenant_rls.sql"),
@@ -294,6 +301,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
         include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
         include_str!("../migrations/0052_provider_deletion_evidence_tenant_rls.sql"),
+        include_str!("../migrations/0053_route_projection_parent_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -329,6 +337,8 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
                 | "webshop_domains"
                 | "webshop_domain_provider_deletion_attempts"
                 | "webshop_email_domains"
+                | "workshop_route_projections"
+                | "workshop_route_projection_state"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
                 | "workshop_recovery_rehearsals"
@@ -1058,6 +1068,120 @@ fn provider_deletion_evidence_policy_remains_function_only() {
         )));
     }
     assert!(!migration.contains("using (workshop_id = control.current_workshop_id())"));
+}
+
+#[test]
+fn route_projection_parent_policy_is_function_only() {
+    let migration = include_str!("../migrations/0053_route_projection_parent_tenant_rls.sql");
+    for table in [
+        "workshop_route_projections",
+        "workshop_route_projection_state",
+    ] {
+        assert!(migration.contains(&format!(
+            "alter table control.{table} enable row level security"
+        )));
+        assert!(migration.contains(&format!(
+            "alter table control.{table} force row level security"
+        )));
+    }
+    assert!(migration.contains("read_workshop_route_projection_disposition"));
+    assert!(migration.contains("to control_driver_ledger"));
+    assert!(migration.contains("revoke all on table control.workshop_route_projections, control.workshop_route_projection_state"));
+    let driver = include_str!("../src/docker_driver.rs");
+    assert!(driver.contains("control.read_workshop_route_projection_disposition"));
+    assert!(!driver.contains("control.workshop_route_projections"));
+    assert!(!driver.contains("control.workshop_route_projection_state"));
+}
+
+async fn assert_route_projection_parent_rls(owner_store: &Store) {
+    let identity = "control.read_workshop_route_projection_disposition(uuid,bigint,text)";
+    let metadata = sqlx::query_as::<_, (bool, bool, Vec<String>, bool)>(
+        "select procedure.prosecdef,
+                coalesce(procedure.proconfig,'{}'::text[])
+                    @> array['search_path=pg_catalog, control'],
+                coalesce(array_agg(role_name order by role_name)
+                    filter (where has_function_privilege(role_name,procedure.oid,'EXECUTE')),
+                    '{}'),
+                not exists(
+                    select 1 from aclexplode(coalesce(
+                        procedure.proacl,acldefault('f',procedure.proowner)
+                    )) privilege
+                    where privilege.grantee=0 and privilege.privilege_type='EXECUTE'
+                )
+           from pg_proc procedure
+           join pg_namespace namespace on namespace.oid=procedure.pronamespace
+          cross join unnest($2::text[]) role_name
+          where namespace.nspname='control' and procedure.oid=$1::regprocedure
+          group by procedure.oid",
+    )
+    .bind(identity)
+    .bind(RUNTIME_ROLES)
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert!(metadata.0 && metadata.1 && metadata.3);
+    assert_eq!(metadata.2, vec!["control_driver_ledger"]);
+
+    let relations = sqlx::query_as::<_, (String, bool, bool, Vec<String>)>(
+        "select relation.relname::text,relation.relrowsecurity,relation.relforcerowsecurity,
+                coalesce(array_agg(policy.policyname order by policy.policyname)
+                    filter (where policy.policyname is not null),'{}')
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+           left join pg_policies policy
+             on policy.schemaname=namespace.nspname and policy.tablename=relation.relname
+          where namespace.nspname='control'
+            and relation.relname=any($1::text[])
+          group by relation.relname,relation.relrowsecurity,relation.relforcerowsecurity
+          order by relation.relname",
+    )
+    .bind([
+        "workshop_route_projection_state",
+        "workshop_route_projections",
+    ])
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(relations.len(), 2);
+    for (table, enabled, forced, policies) in relations {
+        assert!(enabled && forced, "{table} must force RLS");
+        let owner_policy = match table.as_str() {
+            "workshop_route_projections" => "workshop_route_projections_migration_owner",
+            "workshop_route_projection_state" => "workshop_route_projection_state_migration_owner",
+            _ => unreachable!(),
+        };
+        assert!(
+            policies.is_empty() || policies == vec![owner_policy],
+            "{table} must expose no runtime policy"
+        );
+    }
+
+    let privileges = sqlx::query_as::<_, (String, String, String)>(
+        "select role_name,table_name,privilege
+           from unnest($1::text[]) role_name
+          cross join unnest($2::text[]) table_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.'||table_name,privilege)
+          order by role_name,table_name,privilege",
+    )
+    .bind(RUNTIME_ROLES)
+    .bind([
+        "workshop_route_projection_state",
+        "workshop_route_projections",
+    ])
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert!(privileges.is_empty());
+
+    let mut direct = owner_store.begin().await.unwrap();
+    set_local_role(&mut direct, "control_driver_ledger").await;
+    let denied = sqlx::query("select workshop_id from control.workshop_route_projections limit 1")
+        .execute(&mut *direct)
+        .await
+        .expect_err("the driver must use the exact projection lookup capability");
+    assert_insufficient_privilege(denied, "direct route projection read");
+    direct.rollback().await.unwrap();
 }
 
 fn database_url(admin_url: &str, database: &str) -> String {
@@ -5045,6 +5169,8 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
             ("workshop_recovery_components".to_owned(), true, true),
             ("workshop_recovery_points".to_owned(), true, true),
             ("workshop_recovery_rehearsals".to_owned(), true, true),
+            ("workshop_route_projection_state".to_owned(), true, true,),
+            ("workshop_route_projections".to_owned(), true, true),
         ],
         "the characterization must name every protected table"
     );
@@ -5102,6 +5228,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         &admin_url, &database, &store, first, second, from_user,
     )
     .await;
+    assert_route_projection_parent_rls(&store).await;
     let first_transfer = Uuid::new_v4();
     let second_transfer = Uuid::new_v4();
     for (id, workshop) in [(first_transfer, first), (second_transfer, second)] {
