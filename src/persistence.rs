@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::{IntegrationError, OperationKind};
 
-pub const EMBEDDED_SCHEMA_RELEASE: &str = "0049_outbox_tenant_rls";
+pub const EMBEDDED_SCHEMA_RELEASE: &str = "0050_email_delivery_evidence_tenant_rls";
 
 #[derive(Clone)]
 pub struct Store {

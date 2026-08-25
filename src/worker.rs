@@ -274,7 +274,7 @@ pub async fn run(store: Store, queue: &str, config: WorkerConfig) -> anyhow::Res
                                 && result.as_ref().is_err_and(|error| !error.retryable() || operation.attempt >= operation.max_attempts)
                         {
                             terminal_cleanup_error = crate::workers::email_domains::failed(
-                                &store,
+                                &tenant_store,
                                 &operation,
                             )
                             .await
