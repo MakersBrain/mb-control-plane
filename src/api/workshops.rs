@@ -409,8 +409,8 @@ pub(super) async fn resend_invitation(
     Path(id): Path<Uuid>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let key = idempotency(&headers)?.to_owned();
-    let row=sqlx::query_as::<_,(Uuid,String,String,String)>("select workshop_id,email,role,locale from control.invitations where id=$1 and accepted_at is null and revoked_at is null and expires_at>now()")
-        .bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+    let row=sqlx::query_as::<_,(Uuid,String,String,String)>("select workshop_id,email,role,locale from control.read_managed_invitation($1,$2) where expires_at>now()")
+        .bind(id).bind(who.user_id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
     let (role, authority_epoch) = authority(&state, who.user_id, row.0).await?;
     if !role.can_manage_members() {
         return Err(ApiError::Forbidden);
@@ -526,7 +526,14 @@ pub(super) async fn revoke_invitation(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     let key = idempotency(&headers)?.to_owned();
-    let workshop=sqlx::query_scalar::<_,Uuid>("select workshop_id from control.invitations where id=$1 and accepted_at is null and revoked_at is null").bind(id).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+    let workshop = sqlx::query_scalar::<_, Uuid>(
+        "select workshop_id from control.read_managed_invitation($1,$2)",
+    )
+    .bind(id)
+    .bind(who.user_id)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::NotFound)?;
     let (role, authority_epoch) = authority(&state, who.user_id, workshop).await?;
     if !role.can_manage_members() {
         return Err(ApiError::Forbidden);
@@ -623,8 +630,14 @@ pub(super) async fn validate_invitation(
         .invitation_verifier
         .verify(&body.token)
         .map_err(|_| ApiError::NotFound)?;
-    let row=sqlx::query_as::<_,(String,String,String,String)>("select i.email,i.role,i.locale,w.display_name from control.invitations i join control.workshops w on w.id=i.workshop_id where i.id=$1 and i.token_generation=$2 and i.accepted_at is null and i.revoked_at is null and i.expires_at>now()")
-        .bind(claims.jti).bind(claims.r#gen).fetch_optional(state.store.pool()).await?.ok_or(ApiError::NotFound)?;
+    let row = sqlx::query_as::<_, (String, String, String, String)>(
+        "select email,role,locale,workshop_display_name from control.lock_live_invitation($1,$2)",
+    )
+    .bind(claims.jti)
+    .bind(claims.r#gen)
+    .fetch_optional(state.store.pool())
+    .await?
+    .ok_or(ApiError::NotFound)?;
     Ok((
         invitation_response_headers(),
         Json(json!({"email":row.0,"role":row.1,"locale":row.2,"workshop_name":row.3})),
@@ -644,8 +657,14 @@ pub(super) async fn accept_invitation(
         .map_err(|_| ApiError::NotFound)?;
     let correlation_id = Uuid::new_v4();
     let mut tx = state.store.begin().await?;
-    let invitation=sqlx::query_as::<_,(Uuid,Uuid,String,String,Option<OffsetDateTime>,Option<OffsetDateTime>,OffsetDateTime)>("select id,workshop_id,email,role,accepted_at,revoked_at,expires_at from control.invitations where id=$1 and token_generation=$2 for update")
-        .bind(claims.jti).bind(claims.r#gen).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
+    let invitation = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        "select invitation_id,workshop_id,email from control.lock_live_invitation($1,$2)",
+    )
+    .bind(claims.jti)
+    .bind(claims.r#gen)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
     if invitation.2 != verified.email {
         return Err(ApiError::Forbidden);
     }
@@ -705,10 +724,6 @@ pub(super) async fn accept_invitation(
             ));
         }
     };
-    if invitation.4.is_some() || invitation.5.is_some() || invitation.6 <= OffsetDateTime::now_utc()
-    {
-        return Err(ApiError::NotFound);
-    }
     let accepted = sqlx::query_as::<_, (Uuid, i32)>(
         "select workshop_id,authority_epoch
            from control.accept_invitation_membership($1,$2,$3,$4)",

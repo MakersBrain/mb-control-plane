@@ -96,15 +96,31 @@
           {"constraint": "outbox_invitation_id_fkey", "direction": "inbound", "related_table": "outbox"},
           {"constraint": "outbox_invitation_tenant_recipient_fkey", "direction": "inbound", "related_table": "outbox"}
         ],
-        "security_definer_functions": []
+        "security_definer_functions": [
+          {"name": "control.lock_live_invitation", "reason": "locks and returns one live invitation only for an exact verified token identifier and generation"},
+          {"name": "control.read_managed_invitation", "reason": "returns one pending invitation only when the supplied user has active membership-management authority"},
+          {"name": "control.accept_invitation_membership", "reason": "accepts the authoritative invitation and membership together for the exact admitted acceptance command"}
+        ]
       },
       "current_grants": {
-        "control_api": ["SELECT", "INSERT", "UPDATE", "DELETE"],
         "control_tenant_api": ["SELECT", "INSERT", "UPDATE"],
-        "control_email_worker": ["SELECT"],
-        "control_privacy_worker": ["SELECT", "UPDATE", "DELETE"]
+        "control_email_worker": ["SELECT"]
       },
-      "migration_readiness": {"ready": false, "next_review": "separate bearer-bootstrap and internal-machine paths from human tenant transactions"}
+      "migration_readiness": {"ready": true, "next_review": "use the completed invitation policy when hardening the tenant-owned outbox relationship"},
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "control.current_workshop_id",
+        "migration": "migrations/0048_invitation_tenant_rls.sql",
+        "policies": [
+          {"name": "invitations_migration_owner", "scope": "migration_owner"},
+          {"name": "invitations_tenant_api_read", "scope": "tenant_api_read"},
+          {"name": "invitations_tenant_api_insert", "scope": "tenant_api_insert"},
+          {"name": "invitations_tenant_api_update", "scope": "tenant_api_update"},
+          {"name": "invitations_email_worker_read", "scope": "email_worker_tenant"}
+        ]
+      }
     },
     {
       "name": "ownership_transfers",

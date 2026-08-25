@@ -296,6 +296,17 @@ bound to the exact in-flight privacy lease. Invoice and inventory workers lose
 unused SELECT, no runtime role has direct INSERT/DELETE, and the live role
 matrix verifies both capabilities and cross-tenant denial.
 
+Implemented invitation policy slice (2026-08-25): migration
+`0048_invitation_tenant_rls` enables and forces RLS on invitation capability
+state. Tenant API reads and mutations and email-worker reads require the
+fail-closed transaction-local workshop identity. The platform API has no direct
+table privileges: verified-token bootstrap uses an exact live invitation lock,
+and authenticated resend or revocation discovery requires active owner or
+studio-manager authority. Privacy retention remains function-only under its
+existing operation-lease fence. Live role tests verify scoped access, token
+generation and expiry fencing, management authorization, and stale direct-grant
+removal.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

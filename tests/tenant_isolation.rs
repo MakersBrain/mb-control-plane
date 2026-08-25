@@ -189,6 +189,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
+        include_str!("../migrations/0048_invitation_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -280,6 +281,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
+        include_str!("../migrations/0048_invitation_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -307,6 +309,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         let is_enforced_candidate = matches!(
             table_name,
             "memberships"
+                | "invitations"
                 | "ownership_transfers"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
@@ -811,6 +814,48 @@ fn membership_policy_uses_scoped_reads_and_bounded_fleet_capabilities() {
     assert!(!privacy.contains("select workshop_id from control.memberships where user_id=$1"));
     let driver = include_str!("../src/docker_driver/privacy.rs");
     assert!(driver.contains("tenant_ledger\n        .begin(workshop)"));
+}
+
+#[test]
+fn invitation_policy_uses_scoped_access_and_exact_bootstrap_capabilities() {
+    let migration = include_str!("../migrations/0048_invitation_tenant_rls.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("alter table control.invitations enable row level security"));
+    assert!(normalized.contains("alter table control.invitations force row level security"));
+    assert!(normalized.contains(
+        "revoke select, insert, update, delete on table control.invitations from control_api"
+    ));
+    assert!(normalized.contains(
+        "revoke select, update, delete on table control.invitations from control_privacy_worker"
+    ));
+    for function in [
+        "control.lock_live_invitation",
+        "control.read_managed_invitation",
+    ] {
+        assert!(normalized.contains(&format!("create function {function}")));
+        assert!(normalized.contains(&format!("revoke all on function {function}")));
+    }
+    assert_eq!(migration.matches("security definer").count(), 2);
+    assert_eq!(
+        migration
+            .matches("set search_path = pg_catalog, control")
+            .count(),
+        2
+    );
+    assert!(!migration.contains("to public"));
+    assert!(!migration.contains("for delete"));
+    assert_eq!(migration.matches("using (true)").count(), 1);
+
+    let api = include_str!("../src/api/workshops.rs");
+    assert!(api.contains("control.lock_live_invitation($1,$2)"));
+    assert!(api.contains("control.read_managed_invitation($1,$2)"));
+    assert!(!api.contains("select workshop_id from control.invitations where id=$1"));
+    assert!(!api.contains("from control.invitations i join control.workshops w"));
+    assert!(!api.contains("from control.invitations where id=$1 and token_generation=$2"));
+    let email = include_str!("../src/workers/email.rs");
+    assert!(email.contains(".begin(workshop)"));
+    let privacy = include_str!("../src/workers/privacy.rs");
+    assert!(privacy.contains("control.run_privacy_retention_batch($1,$2,$3,$4,$5)"));
 }
 
 #[test]
@@ -1900,6 +1945,256 @@ async fn assert_recovery_point_stale_worker_grants_removed(owner_store: &Store, 
         assert_insufficient_privilege(denied, &format!("{role} direct recovery-point {operation}"));
         tx.rollback().await.unwrap();
     }
+}
+
+async fn assert_invitation_rls(owner_store: &Store, workshops: (Uuid, Uuid), manager: Uuid) {
+    let (first_workshop, second_workshop) = workshops;
+    let first_invitation = Uuid::new_v4();
+    let second_invitation = Uuid::new_v4();
+    for (invitation, workshop, label) in [
+        (first_invitation, first_workshop, "first"),
+        (second_invitation, second_workshop, "second"),
+    ] {
+        sqlx::query("insert into control.invitations(id,workshop_id,email,role,invited_by,idempotency_key,expires_at) values($1,$2,$3,'artisan',$4,$5,now()+interval '1 day')")
+            .bind(invitation)
+            .bind(workshop)
+            .bind(format!("invitation-{label}-{invitation}@example.test"))
+            .bind(manager)
+            .bind(format!("invitation-rls:{invitation}"))
+            .execute(owner_store.pool())
+            .await
+            .unwrap();
+    }
+
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control' and relation.relname='invitations'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+
+    let privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_email_worker','control_privacy_worker'
+                ]::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.invitations',privilege)
+          order by role_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            ("control_email_worker".into(), "SELECT".into()),
+            ("control_tenant_api".into(), "INSERT".into()),
+            ("control_tenant_api".into(), "SELECT".into()),
+            ("control_tenant_api".into(), "UPDATE".into()),
+        ]
+    );
+
+    let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "select policyname,cmd,roles::text[] from pg_policies
+          where schemaname='control' and tablename='invitations'
+            and policyname <> 'invitations_migration_owner'
+          order by policyname",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(policies.len(), 4);
+    assert!(policies.iter().all(|(_, command, roles)| {
+        roles == &["control_tenant_api"]
+            || (command == "SELECT" && roles == &["control_email_worker"])
+    }));
+
+    for identity in [
+        "control.lock_live_invitation(uuid,integer)",
+        "control.read_managed_invitation(uuid,uuid)",
+    ] {
+        let metadata = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+            "select procedure.prosecdef,
+                    coalesce(procedure.proconfig,'{}'::text[])
+                        @> array['search_path=pg_catalog, control'],
+                    has_function_privilege('control_api',procedure.oid,'EXECUTE'),
+                    not exists(
+                        select 1 from aclexplode(coalesce(
+                            procedure.proacl,acldefault('f',procedure.proowner)
+                        )) privilege
+                        where privilege.grantee=0 and privilege.privilege_type='EXECUTE'
+                    )
+               from pg_proc procedure
+               join pg_namespace namespace on namespace.oid=procedure.pronamespace
+              where namespace.nspname='control' and procedure.oid=$1::regprocedure",
+        )
+        .bind(identity)
+        .fetch_one(owner_store.pool())
+        .await
+        .unwrap();
+        assert_eq!(metadata, (true, true, true, true));
+    }
+
+    for role in ["control_tenant_api", "control_email_worker"] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.invitations")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0,
+            "{role} must fail closed without workshop context"
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<Uuid>>(
+                "select coalesce(array_agg(id order by id),'{}') from control.invitations",
+            )
+            .fetch_one(&mut *scoped)
+            .await
+            .unwrap(),
+            vec![first_invitation]
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    let tenant_invitation = Uuid::new_v4();
+    let mut tenant_insert = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut tenant_insert, "control_tenant_api", first_workshop).await;
+    assert_eq!(
+        sqlx::query("insert into control.invitations(id,workshop_id,email,role,invited_by,idempotency_key,expires_at) values($1,$2,$3,'viewer',$4,$5,now()+interval '1 day')")
+            .bind(tenant_invitation)
+            .bind(first_workshop)
+            .bind(format!("tenant-invite-{tenant_invitation}@example.test"))
+            .bind(manager)
+            .bind(format!("tenant-invite:{tenant_invitation}"))
+            .execute(&mut *tenant_insert)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    tenant_insert.rollback().await.unwrap();
+
+    let mut cross_insert = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut cross_insert, "control_tenant_api", first_workshop).await;
+    let denied = sqlx::query("insert into control.invitations(id,workshop_id,email,role,invited_by,idempotency_key,expires_at) values($1,$2,$3,'viewer',$4,$5,now()+interval '1 day')")
+        .bind(Uuid::new_v4())
+        .bind(second_workshop)
+        .bind(format!("cross-invite-{}@example.test", Uuid::new_v4()))
+        .bind(manager)
+        .bind(format!("cross-invite:{}", Uuid::new_v4()))
+        .execute(&mut *cross_insert)
+        .await
+        .expect_err("tenant API must not insert a cross-workshop invitation");
+    assert_insufficient_privilege(denied, "cross-workshop invitation insert");
+    cross_insert.rollback().await.unwrap();
+
+    let mut tenant_update = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut tenant_update, "control_tenant_api", first_workshop).await;
+    assert_eq!(
+        sqlx::query("update control.invitations set last_sent_at=last_sent_at where id=$1")
+            .bind(first_invitation)
+            .execute(&mut *tenant_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query("update control.invitations set last_sent_at=last_sent_at where id=$1")
+            .bind(second_invitation)
+            .execute(&mut *tenant_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    tenant_update.rollback().await.unwrap();
+
+    for role in ["control_api", "control_privacy_worker"] {
+        for statement in [
+            "select id from control.invitations limit 1",
+            "update control.invitations set last_sent_at=last_sent_at where false",
+            "delete from control.invitations where false",
+        ] {
+            let mut direct = owner_store.begin().await.unwrap();
+            set_local_role(&mut direct, role).await;
+            let denied = sqlx::query(statement)
+                .execute(&mut *direct)
+                .await
+                .expect_err("fleet identities must not directly access invitations");
+            assert_insufficient_privilege(denied, &format!("{role} direct invitation access"));
+            direct.rollback().await.unwrap();
+        }
+    }
+
+    let mut email_mutation = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut email_mutation, "control_email_worker", first_workshop).await;
+    let denied =
+        sqlx::query("update control.invitations set last_sent_at=last_sent_at where false")
+            .execute(&mut *email_mutation)
+            .await
+            .expect_err("email worker invitation access must be read-only");
+    assert_insufficient_privilege(denied, "email-worker invitation update");
+    email_mutation.rollback().await.unwrap();
+
+    let mut capability = owner_store.begin().await.unwrap();
+    set_local_role(&mut capability, "control_api").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Uuid>(
+            "select invitation_id from control.lock_live_invitation($1,1)",
+        )
+        .bind(first_invitation)
+        .fetch_one(&mut *capability)
+        .await
+        .unwrap(),
+        first_invitation
+    );
+    assert!(
+        sqlx::query_scalar::<_, Uuid>(
+            "select invitation_id from control.lock_live_invitation($1,2)",
+        )
+        .bind(first_invitation)
+        .fetch_optional(&mut *capability)
+        .await
+        .unwrap()
+        .is_none(),
+        "the token bootstrap capability must bind the generation"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Uuid>(
+            "select invitation_id from control.read_managed_invitation($1,$2)",
+        )
+        .bind(second_invitation)
+        .bind(manager)
+        .fetch_one(&mut *capability)
+        .await
+        .unwrap(),
+        second_invitation
+    );
+    assert!(
+        sqlx::query_scalar::<_, Uuid>(
+            "select invitation_id from control.read_managed_invitation($1,$2)",
+        )
+        .bind(first_invitation)
+        .bind(Uuid::new_v4())
+        .fetch_optional(&mut *capability)
+        .await
+        .unwrap()
+        .is_none(),
+        "manager discovery must require active membership authority"
+    );
+    capability.rollback().await.unwrap();
 }
 
 async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), owner_user: Uuid) {
@@ -3813,6 +4108,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     assert_eq!(
         protected_tables,
         vec![
+            ("invitations".to_owned(), true, true),
             ("memberships".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
@@ -3863,6 +4159,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         .await
         .unwrap();
     }
+    assert_invitation_rls(&store, (first, second), from_user).await;
     assert_membership_rls(&store, (first, second), from_user).await;
     assert_webshop_domain_claim_compatibility(
         &admin_url, &database, &store, first, second, from_user,
