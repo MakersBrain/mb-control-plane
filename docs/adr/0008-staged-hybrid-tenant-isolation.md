@@ -307,6 +307,17 @@ existing operation-lease fence. Live role tests verify scoped access, token
 generation and expiry fencing, management authorization, and stale direct-grant
 removal.
 
+Implemented outbox policy slice (2026-08-25): migration
+`0049_outbox_tenant_rls` enables and forces RLS on the non-null workshop-owned
+mail `outbox`. Platform reporting keeps fleet SELECT only; tenant and
+reconciliation producers and the email worker use the fail-closed
+transaction-local workshop identity. Authenticated provider evidence is applied
+by one exact, replay-safe `SECURITY DEFINER` capability that owns the event,
+delivery-state, branded-domain test, and suppression transaction. The privacy
+worker loses direct table authority and continues bounded deletion only through
+the existing leased retention capability. The live role matrix verifies scoped
+producer and worker behavior plus provider-event replay and conflict fencing.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate
@@ -436,7 +447,7 @@ table is migrated, every API, worker, scheduler, driver, trigger, foreign-key
 path, and security-definer function touching it must appear in the role/workflow
 matrix. Indirect children such as recovery components need a policy joined
 through their owning recovery point. Mixed-scope tables such as `operations`,
-`outbox`, privacy records, users, audit events, and release coordination remain
+privacy records, users, audit events, and release coordination remain
 outside the first wave until their global/null-workshop semantics are modeled.
 
 ## Verification gates

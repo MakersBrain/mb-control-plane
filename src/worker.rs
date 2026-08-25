@@ -577,7 +577,7 @@ async fn handle(
                 .await
             }
             OperationKind::WebshopEmailDomainReconcile => {
-                crate::workers::email_domains::run(store, operation).await
+                crate::workers::email_domains::run(store, tenant_store, operation).await
             }
             OperationKind::WebshopOnboardingReconcile => {
                 crate::workers::onboarding::run(store, operation).await

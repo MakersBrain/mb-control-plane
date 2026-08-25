@@ -24,6 +24,7 @@ const RUNTIME_ROLES: &[&str] = &[
 const FIRST_WAVE_TABLES: &[&str] = &[
     "memberships",
     "invitations",
+    "outbox",
     "ownership_transfers",
     "carrier_secrets",
     "webshop_domains",
@@ -190,6 +191,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
+        include_str!("../migrations/0049_outbox_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -282,6 +284,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
         include_str!("../migrations/0047_membership_tenant_rls.sql"),
         include_str!("../migrations/0048_invitation_tenant_rls.sql"),
+        include_str!("../migrations/0049_outbox_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -310,6 +313,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
             table_name,
             "memberships"
                 | "invitations"
+                | "outbox"
                 | "ownership_transfers"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
@@ -854,6 +858,56 @@ fn invitation_policy_uses_scoped_access_and_exact_bootstrap_capabilities() {
     assert!(!api.contains("from control.invitations where id=$1 and token_generation=$2"));
     let email = include_str!("../src/workers/email.rs");
     assert!(email.contains(".begin(workshop)"));
+    let privacy = include_str!("../src/workers/privacy.rs");
+    assert!(privacy.contains("control.run_privacy_retention_batch($1,$2,$3,$4,$5)"));
+}
+
+#[test]
+fn outbox_policy_uses_scoped_producers_and_exact_provider_event_capability() {
+    let migration = include_str!("../migrations/0049_outbox_tenant_rls.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("alter table control.outbox enable row level security"));
+    assert!(normalized.contains("alter table control.outbox force row level security"));
+    assert!(
+        normalized
+            .contains("revoke insert, update, delete on table control.outbox from control_api")
+    );
+    assert!(normalized.contains(
+        "revoke select, update, delete on table control.outbox from control_privacy_worker"
+    ));
+    assert!(
+        normalized
+            .contains("revoke select on table control.outbox from control_reconciliation_worker")
+    );
+    assert!(
+        normalized.contains("create function control.record_transactional_outbox_delivery_event")
+    );
+    assert!(
+        normalized
+            .contains("revoke all on function control.record_transactional_outbox_delivery_event")
+    );
+    assert_eq!(migration.matches("security definer").count(), 1);
+    assert_eq!(
+        migration
+            .matches("set search_path = pg_catalog, control")
+            .count(),
+        1
+    );
+    assert!(!migration.contains("to public"));
+    assert!(!migration.contains("for delete"));
+    assert_eq!(migration.matches("using (true)").count(), 2);
+
+    let internal = include_str!("../src/api/internal.rs");
+    assert!(internal.contains("control.record_transactional_outbox_delivery_event("));
+    assert!(internal.contains("state.tenant_store.begin(workshop_id)"));
+    assert!(!internal.contains("update control.outbox"));
+    assert!(!internal.contains("select workshop_id,recipient from control.outbox"));
+    let email_domains = include_str!("../src/workers/email_domains.rs");
+    assert!(email_domains.contains("tenant_store\n            .begin(workshop)"));
+    let email = include_str!("../src/workers/email.rs");
+    assert!(email.contains(".begin(workshop)"));
+    let platform = include_str!("../src/api/platform.rs");
+    assert!(platform.contains("from control.outbox order by created_at desc,id desc limit 200"));
     let privacy = include_str!("../src/workers/privacy.rs");
     assert!(privacy.contains("control.run_privacy_retention_batch($1,$2,$3,$4,$5)"));
 }
@@ -2197,6 +2251,295 @@ async fn assert_invitation_rls(owner_store: &Store, workshops: (Uuid, Uuid), man
     capability.rollback().await.unwrap();
 }
 
+async fn assert_outbox_rls(owner_store: &Store, workshops: (Uuid, Uuid)) {
+    let (first_workshop, second_workshop) = workshops;
+    let first_outbox = Uuid::new_v4();
+    let second_outbox = Uuid::new_v4();
+    for (outbox, workshop, label) in [
+        (first_outbox, first_workshop, "first"),
+        (second_outbox, second_workshop, "second"),
+    ] {
+        sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1','{}',$3,$4)")
+            .bind(outbox)
+            .bind(format!("outbox-{label}-{outbox}@example.test"))
+            .bind(workshop)
+            .bind(format!("outbox-rls:{outbox}"))
+            .execute(owner_store.pool())
+            .await
+            .unwrap();
+    }
+
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control' and relation.relname='outbox'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+
+    let privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_email_worker',
+                  'control_reconciliation_worker','control_privacy_worker'
+                ]::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.outbox',privilege)
+          order by role_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            ("control_api".into(), "SELECT".into()),
+            ("control_email_worker".into(), "SELECT".into()),
+            ("control_email_worker".into(), "UPDATE".into()),
+            ("control_reconciliation_worker".into(), "INSERT".into()),
+            ("control_tenant_api".into(), "INSERT".into()),
+            ("control_tenant_api".into(), "SELECT".into()),
+        ]
+    );
+
+    let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "select policyname,cmd,roles::text[] from pg_policies
+          where schemaname='control' and tablename='outbox'
+            and policyname <> 'outbox_migration_owner'
+          order by policyname",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(policies.len(), 6);
+
+    let metadata = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "select procedure.prosecdef,
+                coalesce(procedure.proconfig,'{}'::text[])
+                    @> array['search_path=pg_catalog, control'],
+                has_function_privilege('control_api',procedure.oid,'EXECUTE'),
+                not exists(
+                    select 1 from aclexplode(coalesce(
+                        procedure.proacl,acldefault('f',procedure.proowner)
+                    )) privilege
+                    where privilege.grantee=0 and privilege.privilege_type='EXECUTE'
+                )
+           from pg_proc procedure
+           join pg_namespace namespace on namespace.oid=procedure.pronamespace
+          where namespace.nspname='control'
+            and procedure.oid='control.record_transactional_outbox_delivery_event(uuid,uuid,uuid,uuid,uuid,text,timestamptz)'::regprocedure",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(metadata, (true, true, true, true));
+
+    let mut platform = owner_store.begin().await.unwrap();
+    set_local_role(&mut platform, "control_api").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from control.outbox")
+            .fetch_one(&mut *platform)
+            .await
+            .unwrap(),
+        2
+    );
+    platform.rollback().await.unwrap();
+    for statement in [
+        "insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values(gen_random_uuid(),'odoo_transactional','denied@example.test','odoo-rendered-v1','{}',gen_random_uuid(),'denied')",
+        "update control.outbox set state=state where false",
+        "delete from control.outbox where false",
+    ] {
+        let mut direct = owner_store.begin().await.unwrap();
+        set_local_role(&mut direct, "control_api").await;
+        let denied = sqlx::query(statement)
+            .execute(&mut *direct)
+            .await
+            .expect_err("platform outbox mutations must use scoped paths or capabilities");
+        assert_insufficient_privilege(denied, "platform direct outbox mutation");
+        direct.rollback().await.unwrap();
+    }
+
+    for role in ["control_tenant_api", "control_email_worker"] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.outbox")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0,
+            "{role} must fail closed without workshop context"
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<Uuid>>(
+                "select coalesce(array_agg(id order by id),'{}') from control.outbox",
+            )
+            .fetch_one(&mut *scoped)
+            .await
+            .unwrap(),
+            vec![first_outbox]
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    let tenant_outbox = Uuid::new_v4();
+    let mut tenant_insert = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut tenant_insert, "control_tenant_api", first_workshop).await;
+    assert_eq!(
+        sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1','{}',$3,$4)")
+            .bind(tenant_outbox)
+            .bind(format!("tenant-outbox-{tenant_outbox}@example.test"))
+            .bind(first_workshop)
+            .bind(format!("tenant-outbox:{tenant_outbox}"))
+            .execute(&mut *tenant_insert)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    tenant_insert.rollback().await.unwrap();
+
+    let mut tenant_cross = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut tenant_cross, "control_tenant_api", first_workshop).await;
+    let denied = sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1','{}',$3,$4)")
+        .bind(Uuid::new_v4())
+        .bind(format!("tenant-cross-{}@example.test", Uuid::new_v4()))
+        .bind(second_workshop)
+        .bind(format!("tenant-cross:{}", Uuid::new_v4()))
+        .execute(&mut *tenant_cross)
+        .await
+        .expect_err("tenant API must not insert a cross-workshop outbox row");
+    assert_insufficient_privilege(denied, "cross-workshop tenant outbox insert");
+    tenant_cross.rollback().await.unwrap();
+
+    let reconciliation_outbox = Uuid::new_v4();
+    let mut reconciliation = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(
+        &mut reconciliation,
+        "control_reconciliation_worker",
+        first_workshop,
+    )
+    .await;
+    assert_eq!(
+        sqlx::query("insert into control.outbox(id,kind,recipient,template,payload,workshop_id,source_key) values($1,'odoo_transactional',$2,'odoo-rendered-v1','{}',$3,$4)")
+            .bind(reconciliation_outbox)
+            .bind(format!("reconciliation-{reconciliation_outbox}@example.test"))
+            .bind(first_workshop)
+            .bind(format!("reconciliation:{reconciliation_outbox}"))
+            .execute(&mut *reconciliation)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    reconciliation.rollback().await.unwrap();
+    let mut reconciliation_read = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(
+        &mut reconciliation_read,
+        "control_reconciliation_worker",
+        first_workshop,
+    )
+    .await;
+    let denied = sqlx::query("select id from control.outbox limit 1")
+        .execute(&mut *reconciliation_read)
+        .await
+        .expect_err("reconciliation outbox authority is insert-only");
+    assert_insufficient_privilege(denied, "reconciliation direct outbox read");
+    reconciliation_read.rollback().await.unwrap();
+
+    let mut email_update = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut email_update, "control_email_worker", first_workshop).await;
+    assert_eq!(
+        sqlx::query("update control.outbox set next_attempt_at=next_attempt_at where id=$1")
+            .bind(first_outbox)
+            .execute(&mut *email_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query("update control.outbox set next_attempt_at=next_attempt_at where id=$1")
+            .bind(second_outbox)
+            .execute(&mut *email_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    email_update.rollback().await.unwrap();
+
+    for statement in [
+        "select id from control.outbox limit 1",
+        "update control.outbox set state=state where false",
+        "delete from control.outbox where false",
+    ] {
+        let mut privacy = owner_store.begin().await.unwrap();
+        set_local_role(&mut privacy, "control_privacy_worker").await;
+        let denied = sqlx::query(statement)
+            .execute(&mut *privacy)
+            .await
+            .expect_err("privacy retention must remain function-only");
+        assert_insufficient_privilege(denied, "privacy direct outbox access");
+        privacy.rollback().await.unwrap();
+    }
+
+    let provider_message = Uuid::new_v4();
+    let provider_domain = Uuid::new_v4();
+    let event = Uuid::new_v4();
+    let sns = Uuid::new_v4();
+    let occurred_at = time::OffsetDateTime::now_utc();
+    let mut capability = owner_store.begin().await.unwrap();
+    set_local_role(&mut capability, "control_api").await;
+    let invoke = |event_id: Uuid, sns_id: Uuid, message_id: Uuid| {
+        sqlx::query_scalar::<_, String>(
+            "select control.record_transactional_outbox_delivery_event($1,$2,$3,$4,$5,'email_deferred',$6)",
+        )
+        .bind(event_id)
+        .bind(first_outbox)
+        .bind(message_id)
+        .bind(sns_id)
+        .bind(provider_domain)
+        .bind(occurred_at)
+    };
+    assert_eq!(
+        invoke(event, sns, provider_message)
+            .fetch_one(&mut *capability)
+            .await
+            .unwrap(),
+        "created"
+    );
+    assert_eq!(
+        invoke(event, sns, provider_message)
+            .fetch_one(&mut *capability)
+            .await
+            .unwrap(),
+        "replayed"
+    );
+    assert_eq!(
+        invoke(event, Uuid::new_v4(), provider_message)
+            .fetch_one(&mut *capability)
+            .await
+            .unwrap(),
+        "conflict"
+    );
+    assert_eq!(
+        invoke(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
+            .fetch_one(&mut *capability)
+            .await
+            .unwrap(),
+        "ignored"
+    );
+    capability.rollback().await.unwrap();
+}
+
 async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), owner_user: Uuid) {
     let (first_workshop, second_workshop) = workshops;
     let flags = sqlx::query_as::<_, (bool, bool)>(
@@ -2429,7 +2772,7 @@ async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), own
         .bind(request).bind(owner_user).bind(operation).execute(owner_store.pool()).await.unwrap();
     let mut privacy_tx = owner_store.begin().await.unwrap();
     set_local_role(&mut privacy_tx, "control_privacy_worker").await;
-    let visible = sqlx::query_scalar::<_, Uuid>(
+    let mut visible = sqlx::query_scalar::<_, Uuid>(
         "select workshop_id from control.read_privacy_subject_workshops($1,$2,1,$3,51)",
     )
     .bind(request)
@@ -2438,7 +2781,10 @@ async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), own
     .fetch_all(&mut *privacy_tx)
     .await
     .unwrap();
-    assert_eq!(visible, vec![first_workshop, second_workshop]);
+    visible.sort_unstable();
+    let mut expected = vec![first_workshop, second_workshop];
+    expected.sort_unstable();
+    assert_eq!(visible, expected);
     let forged = sqlx::query("select * from control.read_privacy_subject_workshops($1,$2,2,$3,51)")
         .bind(request)
         .bind(operation)
@@ -4110,6 +4456,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         vec![
             ("invitations".to_owned(), true, true),
             ("memberships".to_owned(), true, true),
+            ("outbox".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
             ("workshop_recovery_points".to_owned(), true, true),
@@ -4160,6 +4507,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         .unwrap();
     }
     assert_invitation_rls(&store, (first, second), from_user).await;
+    assert_outbox_rls(&store, (first, second)).await;
     assert_membership_rls(&store, (first, second), from_user).await;
     assert_webshop_domain_claim_compatibility(
         &admin_url, &database, &store, first, second, from_user,
