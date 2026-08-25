@@ -337,7 +337,7 @@
           "live hostname uniqueness releases disconnected history without transferring an existing row between workshops"
         ]
       },
-      "migration_readiness": {"ready": true, "next_review": "review provider-deletion retention and remaining route-projection parent tables"},
+      "migration_readiness": {"ready": true, "next_review": "review remaining route-projection parent tables"},
       "rls": {
         "state": "enforced",
         "enabled": true,
@@ -352,6 +352,41 @@
           {"name": "webshop_domains_reconciliation_update", "scope": "reconciliation_worker_tenant_update"},
           {"name": "webshop_domains_lifecycle_read", "scope": "lifecycle_worker_tenant"},
           {"name": "webshop_domains_lifecycle_update", "scope": "lifecycle_worker_tenant_update"}
+        ]
+      }
+    },
+    {
+      "name": "webshop_domain_provider_deletion_attempts",
+      "tenant_key": { "kind": "direct_and_parent", "columns": ["workshop_id"] },
+      "application_touch_paths": {
+        "api": [],
+        "workers": [],
+        "schedulers": [],
+        "drivers": []
+      },
+      "database_touch_paths": {
+        "triggers": [],
+        "foreign_keys": [],
+        "security_definer_functions": [
+          {"name": "control.advance_webshop_domain_provider_deletion", "reason": "authenticates the exact live operation lease and advances bounded provider-deletion evidence"},
+          {"name": "control.admit_due_webshop_domain_reconciliations", "reason": "reads terminal deletion evidence while admitting bounded workshop-owned reconciliation work"}
+        ]
+      },
+      "current_grants": {},
+      "migration_readiness": {"ready": true, "next_review": "review workshop route-projection and applied-state parent tables without widening driver or release access"},
+      "retention": {
+        "state": "durable_evidence",
+        "delete_capability": "none",
+        "evidence": "provider absence and bounded dispatch history remain parent-bound; disconnected domain history is retained rather than reassigned"
+      },
+      "rls": {
+        "state": "enforced",
+        "enabled": true,
+        "forced": true,
+        "context_helper": "function_only_owner_capabilities",
+        "migration": "migrations/0052_provider_deletion_evidence_tenant_rls.sql",
+        "policies": [
+          {"name": "webshop_domain_provider_deletion_attempts_migration_owner", "scope": "migration_owner"}
         ]
       }
     },
