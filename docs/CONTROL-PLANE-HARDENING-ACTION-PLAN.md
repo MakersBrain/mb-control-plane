@@ -1016,6 +1016,18 @@ worker grants are removed. Static and production-role PostgreSQL tests prove
 the ACL, policy, capability, missing-context, malformed-authority, and cross-
 workshop matrix.
 
+Implemented invitation forced-RLS slice (2026-08-25): migration
+`0048_invitation_tenant_rls` enables and forces RLS on `invitations`. Tenant API
+reads, inserts, and updates and email-worker reads require transaction-local
+workshop context. Public token validation and bearer-bootstrap acceptance lock
+one live invitation by exact signed token identifier and generation; resend
+and revocation discovery return one pending invitation only for an active owner
+or studio manager. The platform API and privacy worker lose direct table
+privileges, with privacy retention continuing only through its existing
+lease-authenticated batch capability. Static and live production-role tests
+cover ACLs, policy metadata, same-tenant access, cross-tenant denial, token
+generation fencing, and management-authority checks.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
