@@ -30,6 +30,7 @@ const FIRST_WAVE_TABLES: &[&str] = &[
     "ownership_transfers",
     "carrier_secrets",
     "webshop_domains",
+    "webshop_domain_provider_deletion_attempts",
     "webshop_email_domains",
     "workshop_modules",
     "service_instances",
@@ -196,6 +197,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
         include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
+        include_str!("../migrations/0052_provider_deletion_evidence_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -291,6 +293,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0049_outbox_tenant_rls.sql"),
         include_str!("../migrations/0050_email_delivery_evidence_tenant_rls.sql"),
         include_str!("../migrations/0051_webshop_domain_tenant_rls.sql"),
+        include_str!("../migrations/0052_provider_deletion_evidence_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -324,6 +327,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
                 | "email_suppressions"
                 | "ownership_transfers"
                 | "webshop_domains"
+                | "webshop_domain_provider_deletion_attempts"
                 | "webshop_email_domains"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
@@ -490,7 +494,22 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
             assert_eq!(rls["state"], "enforced");
             assert_eq!(rls["enabled"], true);
             assert_eq!(rls["forced"], true);
-            assert_eq!(rls["context_helper"], "control.current_workshop_id");
+            let context_helper = rls["context_helper"]
+                .as_str()
+                .expect("enforced table needs a context helper");
+            assert!(
+                matches!(
+                    context_helper,
+                    "control.current_workshop_id" | "function_only_owner_capabilities"
+                ),
+                "{table_name} has an unknown RLS context strategy"
+            );
+            if context_helper == "function_only_owner_capabilities" {
+                assert!(
+                    grants.is_empty(),
+                    "function-only {table_name} must not inventory direct runtime grants"
+                );
+            }
             for policy in rls["policies"]
                 .as_array()
                 .expect("policies must be an array")
@@ -1020,6 +1039,27 @@ fn webshop_domain_policy_has_live_uniqueness_and_a_stable_scoped_claim() {
     assert!(api.contains("This hostname is already claimed"));
 }
 
+#[test]
+fn provider_deletion_evidence_policy_remains_function_only() {
+    let migration = include_str!("../migrations/0052_provider_deletion_evidence_tenant_rls.sql");
+    assert!(migration.contains(
+        "alter table control.webshop_domain_provider_deletion_attempts enable row level security"
+    ));
+    assert!(migration.contains(
+        "alter table control.webshop_domain_provider_deletion_attempts force row level security"
+    ));
+    assert!(
+        migration
+            .contains("create policy webshop_domain_provider_deletion_attempts_migration_owner")
+    );
+    for role in RUNTIME_ROLES {
+        assert!(migration.contains(&format!(
+            "revoke all on table control.webshop_domain_provider_deletion_attempts from {role}"
+        )));
+    }
+    assert!(!migration.contains("using (workshop_id = control.current_workshop_id())"));
+}
+
 fn database_url(admin_url: &str, database: &str) -> String {
     let mut url = url::Url::parse(admin_url).expect("CONTROL_TEST_ADMIN_URL must be a URL");
     url.set_path(database);
@@ -1489,40 +1529,58 @@ async fn assert_production_webshop_domain_admission(
         "the reconciliation role must use the claim functions, not mutate cursors"
     );
 
-    let deletion_acl = sqlx::query_as::<_, (bool, bool, bool)>(
+    let deletion_policy = sqlx::query_as::<_, (bool, bool, Vec<String>)>(
         "select
-            not exists(
-                select 1 from aclexplode(coalesce(
-                    table_class.relacl,acldefault('r',table_class.relowner)
-                )) privilege where privilege.grantee=0
-            ),
-            not has_table_privilege(
-                'control_api','control.webshop_domain_provider_deletion_attempts','SELECT'
-            ),
-            not has_table_privilege(
-                'control_reconciliation_worker',
-                'control.webshop_domain_provider_deletion_attempts','SELECT,INSERT,UPDATE,DELETE'
-            )
+            table_class.relrowsecurity,
+            table_class.relforcerowsecurity,
+            coalesce(array_agg(policy.policyname order by policy.policyname)
+                     filter (where policy.policyname is not null),'{}')
          from pg_class table_class
          join pg_namespace namespace on namespace.oid=table_class.relnamespace
+         left join pg_policies policy
+           on policy.schemaname=namespace.nspname and policy.tablename=table_class.relname
          where namespace.nspname='control'
-           and table_class.relname='webshop_domain_provider_deletion_attempts'",
+           and table_class.relname='webshop_domain_provider_deletion_attempts'
+         group by table_class.relrowsecurity,table_class.relforcerowsecurity",
     )
     .fetch_one(owner_store.pool())
     .await
     .unwrap();
+    assert!(deletion_policy.0 && deletion_policy.1);
     assert!(
-        deletion_acl.0,
-        "PUBLIC must have no deletion-ledger privileges"
+        deletion_policy.2.is_empty()
+            || deletion_policy.2
+                == vec!["webshop_domain_provider_deletion_attempts_migration_owner"],
+        "provider-deletion evidence must expose no policy except the conditional migration-owner policy"
     );
+    let deletion_privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest($1::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(
+              role_name,'control.webshop_domain_provider_deletion_attempts',privilege
+          )
+          order by role_name,privilege",
+    )
+    .bind(RUNTIME_ROLES)
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
     assert!(
-        deletion_acl.1,
-        "the platform API must not read deletion evidence"
+        deletion_privileges.is_empty(),
+        "provider-deletion evidence must remain function-only for every runtime role"
     );
-    assert!(
-        deletion_acl.2,
-        "the reconciliation role must use the fenced deletion function"
-    );
+
+    let mut reconciliation_direct = owner_store.begin().await.unwrap();
+    set_local_role(&mut reconciliation_direct, "control_reconciliation_worker").await;
+    let denied = sqlx::query(
+        "select domain_id from control.webshop_domain_provider_deletion_attempts limit 1",
+    )
+    .execute(&mut *reconciliation_direct)
+    .await
+    .expect_err("the reconciliation worker must not directly read deletion evidence");
+    assert_insufficient_privilege(denied, "direct provider-deletion evidence read");
+    reconciliation_direct.rollback().await.unwrap();
 
     let mut api_attempt = owner_store.begin().await.unwrap();
     sqlx::query("set local role control_api")
@@ -4977,6 +5035,11 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
             ("memberships".to_owned(), true, true),
             ("outbox".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
+            (
+                "webshop_domain_provider_deletion_attempts".to_owned(),
+                true,
+                true,
+            ),
             ("webshop_domains".to_owned(), true, true),
             ("webshop_email_domains".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),

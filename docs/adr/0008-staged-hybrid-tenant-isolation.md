@@ -338,6 +338,15 @@ workshop identity, while human claims and fleet workflows remain bounded
 function capabilities. Platform direct grants and tenant direct inserts are
 removed, with live role tests covering fail-closed and cross-workshop behavior.
 
+Implemented provider-deletion evidence policy slice (2026-08-25): migration
+`0052_provider_deletion_evidence_tenant_rls` forces RLS on
+`webshop_domain_provider_deletion_attempts` without granting any runtime role a
+direct policy or table privilege. The exact live-lease advancement capability
+and bounded periodic admission capability remain its only runtime access paths.
+Provider absence and bounded dispatch history remain durable, parent-bound
+evidence with no runtime deletion capability. The live role matrix verifies
+the owner-only policy and exhaustive direct-access denial.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate

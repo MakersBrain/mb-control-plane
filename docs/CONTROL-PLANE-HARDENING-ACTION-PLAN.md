@@ -1063,6 +1063,17 @@ projection remain behind their reviewed fixed-path capabilities. Live tests
 cover claim conflicts, disconnected-hostname reuse, ACLs, policies, and
 cross-workshop denial.
 
+Implemented provider-deletion evidence forced-RLS slice (2026-08-25):
+migration `0052_provider_deletion_evidence_tenant_rls` forces RLS on the
+workshop-owned provider-deletion ledger while preserving its function-only
+runtime boundary. Every deployed runtime role is explicitly denied direct
+table privileges. Exact operation-lease advancement and bounded periodic
+admission continue through their fixed-path owner capabilities. The durable
+absence and dispatch history has no runtime deletion capability and remains
+parent-bound to retained disconnected-domain history. Live tests cover the
+owner-only policy, exhaustive runtime ACL denial, direct-access refusal, and
+the existing bounded advancement workflow.
+
 ## 6. Phase 3 — complete typed startup configuration
 
 ### 6.1 Inventory and classify
