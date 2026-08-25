@@ -2772,7 +2772,7 @@ async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), own
         .bind(request).bind(owner_user).bind(operation).execute(owner_store.pool()).await.unwrap();
     let mut privacy_tx = owner_store.begin().await.unwrap();
     set_local_role(&mut privacy_tx, "control_privacy_worker").await;
-    let visible = sqlx::query_scalar::<_, Uuid>(
+    let mut visible = sqlx::query_scalar::<_, Uuid>(
         "select workshop_id from control.read_privacy_subject_workshops($1,$2,1,$3,51)",
     )
     .bind(request)
@@ -2781,7 +2781,10 @@ async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), own
     .fetch_all(&mut *privacy_tx)
     .await
     .unwrap();
-    assert_eq!(visible, vec![first_workshop, second_workshop]);
+    visible.sort_unstable();
+    let mut expected = vec![first_workshop, second_workshop];
+    expected.sort_unstable();
+    assert_eq!(visible, expected);
     let forged = sqlx::query("select * from control.read_privacy_subject_workshops($1,$2,2,$3,51)")
         .bind(request)
         .bind(operation)
