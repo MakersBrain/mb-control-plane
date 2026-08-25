@@ -126,11 +126,18 @@ pub(super) async fn create_workshop(
     if inserted.is_none() {
         return Err(ApiError::Conflict("workshop slug already exists"));
     }
-    sqlx::query("insert into control.memberships(workshop_id,user_id,role) values($1,$2,'owner')")
-        .bind(workshop_id)
-        .bind(who.user_id)
-        .execute(&mut *tx)
-        .await?;
+    let initial_owner_epoch =
+        sqlx::query_scalar::<_, i32>("select control.insert_initial_workshop_owner($1,$2,$3)")
+            .bind(command_id)
+            .bind(workshop_id)
+            .bind(who.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if initial_owner_epoch != 1 {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "initial workshop owner epoch is invalid"
+        )));
+    }
     sqlx::query("insert into control.odoo_databases(id,workshop_id,kind,database_ref,public_hostname,label,routable) values($1,$2,'primary',$3,$4,'Primary database',true)")
         .bind(database_id).bind(workshop_id).bind(&database_ref).bind(&public_hostname).execute(&mut *tx).await?;
     sqlx::query("insert into control.operations(id,kind,queue,workshop_id,target_user_id,desired_epoch,payload,requested_by,correlation_id,idempotency_key,trace_parent,trace_state)
@@ -702,21 +709,22 @@ pub(super) async fn accept_invitation(
     {
         return Err(ApiError::NotFound);
     }
-    sqlx::query("insert into control.memberships(workshop_id,user_id,role) values($1,$2,$3) on conflict(workshop_id,user_id) do update set role=excluded.role,status='active',revoked_at=null,authority_epoch=control.memberships.authority_epoch+1")
-        .bind(invitation.1).bind(user_id).bind(&invitation.3).execute(&mut *tx).await?;
-    let epoch = sqlx::query_scalar::<_, i32>(
-        "select authority_epoch from control.memberships where workshop_id=$1 and user_id=$2",
+    let accepted = sqlx::query_as::<_, (Uuid, i32)>(
+        "select workshop_id,authority_epoch
+           from control.accept_invitation_membership($1,$2,$3,$4)",
     )
-    .bind(invitation.1)
+    .bind(invitation.0)
+    .bind(claims.r#gen)
     .bind(user_id)
+    .bind(command_id)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("update control.invitations set accepted_at=now(),accepted_user_id=$2 where id=$1 and workshop_id=$3")
-        .bind(invitation.0)
-        .bind(user_id)
-        .bind(invitation.1)
-        .execute(&mut *tx)
-        .await?;
+    if accepted.0 != invitation.1 {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "invitation membership workshop drifted"
+        )));
+    }
+    let epoch = accepted.1;
     seed_targets(&mut tx, invitation.1, user_id, epoch).await?;
     let operation_id = Store::enqueue(
         &mut tx,

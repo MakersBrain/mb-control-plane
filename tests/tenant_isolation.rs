@@ -188,6 +188,7 @@ fn characterization_matrix_covers_the_deployed_runtime_roles() {
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
+        include_str!("../migrations/0047_membership_tenant_rls.sql"),
     ]
     .join("\n")
     .to_ascii_lowercase();
@@ -278,6 +279,7 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         include_str!("../migrations/0044_platform_recovery_capabilities.sql"),
         include_str!("../migrations/0045_driver_recovery_read_capabilities.sql"),
         include_str!("../migrations/0046_recovery_point_tenant_rls.sql"),
+        include_str!("../migrations/0047_membership_tenant_rls.sql"),
     ]
     .join("\n");
     let blockers = manifest["common_readiness_blockers"]
@@ -304,7 +306,8 @@ fn first_wave_manifest_tracks_touch_paths_grants_and_staged_rls_readiness() {
         let table_name = table["name"].as_str().unwrap();
         let is_enforced_candidate = matches!(
             table_name,
-            "ownership_transfers"
+            "memberships"
+                | "ownership_transfers"
                 | "workshop_recovery_points"
                 | "workshop_recovery_components"
                 | "workshop_recovery_rehearsals"
@@ -754,6 +757,60 @@ fn recovery_point_policy_separates_fleet_reads_from_tenant_workflows() {
         include_str!("../src/docker_driver/recovery.rs")
             .contains(".tenant_ledger\n        .begin(workshop)")
     );
+}
+
+#[test]
+fn membership_policy_uses_scoped_reads_and_bounded_fleet_capabilities() {
+    let migration = include_str!("../migrations/0047_membership_tenant_rls.sql");
+    let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized.contains("alter table control.memberships enable row level security"));
+    assert!(normalized.contains("alter table control.memberships force row level security"));
+    assert!(
+        normalized.contains(
+            "revoke insert, update, delete on table control.memberships from control_api"
+        )
+    );
+    assert!(
+        normalized
+            .contains("revoke select on table control.memberships from control_invoice_worker")
+    );
+    assert!(
+        normalized
+            .contains("revoke select on table control.memberships from control_inventory_worker")
+    );
+    for function in [
+        "control.insert_initial_workshop_owner",
+        "control.accept_invitation_membership",
+        "control.discover_due_backup_memberships",
+        "control.read_privacy_subject_workshops",
+    ] {
+        assert!(normalized.contains(&format!("create function {function}")));
+        assert!(normalized.contains(&format!("revoke all on function {function}")));
+    }
+    assert_eq!(migration.matches("security definer").count(), 4);
+    assert_eq!(
+        migration
+            .matches("set search_path = pg_catalog, control")
+            .count(),
+        4
+    );
+    assert!(!migration.contains("to public"));
+    assert!(!migration.contains("for delete"));
+    assert_eq!(migration.matches("using (true)").count(), 2);
+
+    let api = include_str!("../src/api/workshops.rs");
+    assert!(api.contains("control.insert_initial_workshop_owner($1,$2,$3)"));
+    assert!(api.contains("control.accept_invitation_membership($1,$2,$3,$4)"));
+    assert_eq!(api.matches("insert into control.memberships").count(), 0);
+
+    let scheduler = include_str!("../src/backup_scheduler.rs");
+    assert!(scheduler.contains("control.discover_due_backup_memberships(100)"));
+    assert!(!scheduler.contains("select user_id from control.memberships"));
+    let privacy = include_str!("../src/workers/privacy.rs");
+    assert!(privacy.contains("control.read_privacy_subject_workshops($1,$2,$3,$4,$5)"));
+    assert!(!privacy.contains("select workshop_id from control.memberships where user_id=$1"));
+    let driver = include_str!("../src/docker_driver/privacy.rs");
+    assert!(driver.contains("tenant_ledger\n        .begin(workshop)"));
 }
 
 #[test]
@@ -1843,6 +1900,276 @@ async fn assert_recovery_point_stale_worker_grants_removed(owner_store: &Store, 
         assert_insufficient_privilege(denied, &format!("{role} direct recovery-point {operation}"));
         tx.rollback().await.unwrap();
     }
+}
+
+async fn assert_membership_rls(owner_store: &Store, workshops: (Uuid, Uuid), owner_user: Uuid) {
+    let (first_workshop, second_workshop) = workshops;
+    let flags = sqlx::query_as::<_, (bool, bool)>(
+        "select relrowsecurity,relforcerowsecurity
+           from pg_class relation
+           join pg_namespace namespace on namespace.oid=relation.relnamespace
+          where namespace.nspname='control' and relation.relname='memberships'",
+    )
+    .fetch_one(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(flags, (true, true));
+
+    let privileges = sqlx::query_as::<_, (String, String)>(
+        "select role_name,privilege
+           from unnest(array[
+                  'control_api','control_tenant_api','control_membership_worker',
+                  'control_provisioning_worker','control_invoice_worker',
+                  'control_inventory_worker','control_reconciliation_worker',
+                  'control_backup_scheduler','control_privacy_worker','control_driver_ledger'
+                ]::text[]) role_name
+          cross join unnest(array['SELECT','INSERT','UPDATE','DELETE']::text[]) privilege
+          where has_table_privilege(role_name,'control.memberships',privilege)
+          order by role_name,privilege",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        privileges,
+        vec![
+            ("control_api".into(), "SELECT".into()),
+            ("control_backup_scheduler".into(), "SELECT".into()),
+            ("control_driver_ledger".into(), "SELECT".into()),
+            ("control_membership_worker".into(), "SELECT".into()),
+            ("control_privacy_worker".into(), "SELECT".into()),
+            ("control_provisioning_worker".into(), "SELECT".into()),
+            ("control_reconciliation_worker".into(), "SELECT".into()),
+            ("control_tenant_api".into(), "SELECT".into()),
+            ("control_tenant_api".into(), "UPDATE".into()),
+        ]
+    );
+
+    let policies = sqlx::query_as::<_, (String, String, Vec<String>)>(
+        "select policyname,cmd,roles::text[] from pg_policies
+          where schemaname='control' and tablename='memberships'
+            and policyname <> 'memberships_migration_owner'
+          order by policyname",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert_eq!(policies.len(), 9);
+    assert_eq!(
+        policies
+            .iter()
+            .filter(|(_, _, roles)| roles == &vec!["control_api".to_owned()])
+            .map(|(name, command, _)| (name.as_str(), command.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("memberships_platform_read", "SELECT")]
+    );
+    assert!(policies.iter().all(|(_, command, roles)| {
+        command == "SELECT" || (command == "UPDATE" && roles == &["control_tenant_api"])
+    }));
+
+    let mut platform = owner_store.begin().await.unwrap();
+    set_local_role(&mut platform, "control_api").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from control.memberships where user_id=$1",)
+            .bind(owner_user)
+            .fetch_one(&mut *platform)
+            .await
+            .unwrap(),
+        2,
+        "platform reporting deliberately remains fleet-readable"
+    );
+    platform.rollback().await.unwrap();
+    for statement in [
+        "insert into control.memberships(workshop_id,user_id,role) values(gen_random_uuid(),gen_random_uuid(),'owner')",
+        "update control.memberships set version=version where false",
+        "delete from control.memberships where false",
+    ] {
+        let mut platform_mutation = owner_store.begin().await.unwrap();
+        set_local_role(&mut platform_mutation, "control_api").await;
+        let error = sqlx::query(statement)
+            .execute(&mut *platform_mutation)
+            .await
+            .expect_err("platform API membership mutation must use a bounded capability");
+        assert_insufficient_privilege(error, "control_api membership mutation");
+        platform_mutation.rollback().await.unwrap();
+    }
+
+    for role in [
+        "control_tenant_api",
+        "control_membership_worker",
+        "control_provisioning_worker",
+        "control_reconciliation_worker",
+        "control_backup_scheduler",
+        "control_privacy_worker",
+        "control_driver_ledger",
+    ] {
+        let mut missing = owner_store.begin().await.unwrap();
+        set_local_role(&mut missing, role).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from control.memberships")
+                .fetch_one(&mut *missing)
+                .await
+                .unwrap(),
+            0,
+            "{role} must fail closed without workshop context"
+        );
+        missing.rollback().await.unwrap();
+
+        let mut scoped = owner_store.begin().await.unwrap();
+        set_local_role_and_workshop(&mut scoped, role, first_workshop).await;
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from control.memberships where workshop_id=$1 and user_id=$2)",
+            )
+            .bind(first_workshop)
+            .bind(owner_user)
+            .fetch_one(&mut *scoped)
+            .await
+            .unwrap()
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from control.memberships where workshop_id=$1 and user_id=$2)",
+            )
+            .bind(second_workshop)
+            .bind(owner_user)
+            .fetch_one(&mut *scoped)
+            .await
+            .unwrap()
+        );
+        scoped.rollback().await.unwrap();
+    }
+
+    let mut tenant_update = owner_store.begin().await.unwrap();
+    set_local_role_and_workshop(&mut tenant_update, "control_tenant_api", first_workshop).await;
+    assert_eq!(
+        sqlx::query("update control.memberships set version=version where workshop_id=$1")
+            .bind(first_workshop)
+            .execute(&mut *tenant_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query("update control.memberships set version=version where workshop_id=$1")
+            .bind(second_workshop)
+            .execute(&mut *tenant_update)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    tenant_update.rollback().await.unwrap();
+
+    let new_workshop = Uuid::new_v4();
+    sqlx::query("insert into control.workshops(id,slug,display_name,time_zone) values($1,$2,'Membership capability workshop','Europe/Paris')")
+        .bind(new_workshop).bind(format!("membership-capability-{}", new_workshop.simple()))
+        .execute(owner_store.pool()).await.unwrap();
+    let create_command = Uuid::new_v4();
+    sqlx::query("insert into control.commands(id,actor_user_id,scope,command_kind,idempotency_key,request_digest) values($1,$2,'platform:workshops','workshop.create',$3,$4)")
+        .bind(create_command).bind(owner_user).bind(format!("membership-create:{create_command}"))
+        .bind(vec![7_u8; 32]).execute(owner_store.pool()).await.unwrap();
+    let mut create_tx = owner_store.begin().await.unwrap();
+    set_local_role(&mut create_tx, "control_api").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("select control.insert_initial_workshop_owner($1,$2,$3)")
+            .bind(create_command)
+            .bind(new_workshop)
+            .bind(owner_user)
+            .fetch_one(&mut *create_tx)
+            .await
+            .unwrap(),
+        1
+    );
+    let forged = sqlx::query("select control.insert_initial_workshop_owner($1,$2,$3)")
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(owner_user)
+        .execute(&mut *create_tx)
+        .await
+        .expect_err("forged creation authority must fail");
+    assert_insufficient_privilege(forged, "forged initial-owner capability");
+    create_tx.rollback().await.unwrap();
+
+    let invited_user = Uuid::new_v4();
+    let invited_email = format!("invited-{}@example.test", invited_user.simple());
+    sqlx::query("insert into control.users(id,email) values($1,$2)")
+        .bind(invited_user)
+        .bind(&invited_email)
+        .execute(owner_store.pool())
+        .await
+        .unwrap();
+    let invitation = Uuid::new_v4();
+    sqlx::query("insert into control.invitations(id,workshop_id,email,role,invited_by,idempotency_key,expires_at) values($1,$2,$3,'artisan',$4,$5,now()+interval '1 day')")
+        .bind(invitation).bind(first_workshop).bind(&invited_email).bind(owner_user)
+        .bind(format!("membership-invite:{invitation}")).execute(owner_store.pool()).await.unwrap();
+    let accept_command = Uuid::new_v4();
+    sqlx::query("insert into control.commands(id,actor_user_id,scope,command_kind,idempotency_key,request_digest) values($1,$2,$3,'invitation.accept',$4,$5)")
+        .bind(accept_command).bind(invited_user).bind(format!("workshop:{first_workshop}"))
+        .bind(format!("membership-accept:{accept_command}")).bind(vec![8_u8; 32])
+        .execute(owner_store.pool()).await.unwrap();
+    let mut accept_tx = owner_store.begin().await.unwrap();
+    set_local_role(&mut accept_tx, "control_api").await;
+    let accepted = sqlx::query_as::<_, (Uuid, i32)>(
+        "select workshop_id,authority_epoch from control.accept_invitation_membership($1,1,$2,$3)",
+    )
+    .bind(invitation)
+    .bind(invited_user)
+    .bind(accept_command)
+    .fetch_one(&mut *accept_tx)
+    .await
+    .unwrap();
+    assert_eq!(accepted, (first_workshop, 1));
+    accept_tx.rollback().await.unwrap();
+
+    let operation = Uuid::new_v4();
+    let request = Uuid::new_v4();
+    let lease_owner = format!("membership-privacy-{operation}");
+    sqlx::query("insert into control.operations(id,kind,queue,target_user_id,payload,state,attempt,leased_by,lease_expires_at,correlation_id,idempotency_key) values($1,'privacy.data_subject_request','privacy-operations',$2,$3,'in_flight',1,$4,now()+interval '10 minutes',$5,$6)")
+        .bind(operation).bind(owner_user).bind(serde_json::json!({"request_id": request}))
+        .bind(&lease_owner).bind(Uuid::new_v4()).bind(format!("membership-privacy:{operation}"))
+        .execute(owner_store.pool()).await.unwrap();
+    sqlx::query("insert into control.data_subject_requests(id,subject_user_id,request_type,scope,status,operation_id) values($1,$2,'access','{}','executing',$3)")
+        .bind(request).bind(owner_user).bind(operation).execute(owner_store.pool()).await.unwrap();
+    let mut privacy_tx = owner_store.begin().await.unwrap();
+    set_local_role(&mut privacy_tx, "control_privacy_worker").await;
+    let visible = sqlx::query_scalar::<_, Uuid>(
+        "select workshop_id from control.read_privacy_subject_workshops($1,$2,1,$3,51)",
+    )
+    .bind(request)
+    .bind(operation)
+    .bind(&lease_owner)
+    .fetch_all(&mut *privacy_tx)
+    .await
+    .unwrap();
+    assert_eq!(visible, vec![first_workshop, second_workshop]);
+    let forged = sqlx::query("select * from control.read_privacy_subject_workshops($1,$2,2,$3,51)")
+        .bind(request)
+        .bind(operation)
+        .bind(&lease_owner)
+        .execute(&mut *privacy_tx)
+        .await
+        .expect_err("forged privacy lease must fail");
+    assert_insufficient_privilege(forged, "forged privacy membership capability");
+    privacy_tx.rollback().await.unwrap();
+
+    let mut scheduler_tx = owner_store.begin().await.unwrap();
+    set_local_role(&mut scheduler_tx, "control_backup_scheduler").await;
+    let discovered = sqlx::query_scalar::<_, i64>(
+        "select count(*) from control.discover_due_backup_memberships(100)",
+    )
+    .fetch_one(&mut *scheduler_tx)
+    .await
+    .unwrap();
+    assert!((0..=100).contains(&discovered));
+    assert!(
+        sqlx::query("select * from control.discover_due_backup_memberships(101)")
+            .execute(&mut *scheduler_tx)
+            .await
+            .is_err()
+    );
+    scheduler_tx.rollback().await.unwrap();
 }
 
 async fn assert_recovery_point_rls(
@@ -3486,6 +3813,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
     assert_eq!(
         protected_tables,
         vec![
+            ("memberships".to_owned(), true, true),
             ("ownership_transfers".to_owned(), true, true),
             ("workshop_recovery_components".to_owned(), true, true),
             ("workshop_recovery_points".to_owned(), true, true),
@@ -3535,6 +3863,7 @@ async fn runtime_role_cross_tenant_surface_is_characterized() {
         .await
         .unwrap();
     }
+    assert_membership_rls(&store, (first, second), from_user).await;
     assert_webshop_domain_claim_compatibility(
         &admin_url, &database, &store, first, second, from_user,
     )

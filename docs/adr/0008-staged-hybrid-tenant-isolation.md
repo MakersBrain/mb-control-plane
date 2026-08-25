@@ -284,6 +284,18 @@ role receives a DELETE policy. Live production-role tests cover catalog flags,
 policy metadata, ACLs, same-workshop success, and missing, malformed, and cross-
 workshop denial.
 
+Implemented membership policy slice (2026-08-25): migration
+`0047_membership_tenant_rls` enables and forces RLS on membership authority.
+The platform API keeps only fleet reporting SELECT; its initial-owner and
+invitation-acceptance writes are exact `SECURITY DEFINER` capabilities bound to
+admitted commands and authoritative workshop or invitation state. Tenant API
+SELECT/UPDATE and all reviewed worker, scheduler, privacy-driver reads require
+the fail-closed transaction-local workshop identity. Backup fleet discovery is
+a bounded scheduler-only projection, and privacy subject-workshop expansion is
+bound to the exact in-flight privacy lease. Invoice and inventory workers lose
+unused SELECT, no runtime role has direct INSERT/DELETE, and the live role
+matrix verifies both capabilities and cross-tenant denial.
+
 Implemented driver admission slice (2026-08-22): duplicate lifecycle payloads
 no longer carry a PostgreSQL target reference. Before maintenance or runtime
 effects, the driver derives the target from same-workshop primary/duplicate
