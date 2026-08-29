@@ -1,6 +1,6 @@
 /* The control plane's stylesheet is the shared design system plus whatever is
  * genuinely specific to this surface. If a rule below would be useful to the
- * landing page or the Odoo overrides too, it belongs in the brand package's
+ * public site or the Odoo overrides too, it belongs in the UI package's
  * ui.css instead.
  *
  * The design system is a dependency, not a copy. It used to be generated into
@@ -9,8 +9,9 @@
  * imported were different files kept equal by a check. Now they are the same
  * file, and the version in package-lock.json says which one. */
 
-@import '@makersbrain/brand/tokens.css';
-@import '@makersbrain/brand/ui.css';
+@import '@makersbrain/ui/tokens.css';
+@import '@makersbrain/ui/fonts.css';
+@import '@makersbrain/ui/ui.css';
 
 /* Operations run for minutes and people leave the tab open, so a running
  * operation gets a live edge rather than only a percentage that has to be
@@ -32,3 +33,83 @@
 .platform-table td {
   padding: var(--mb-space-2) var(--mb-space-3);
 }
+
+/* Product-domain layouts belong to the control plane, not the shared UI
+ * package. They still use only shared tokens and primitives. */
+.workshop-card {
+  display: grid;
+  gap: var(--mb-space-4);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color var(--mb-dur-fast) var(--mb-ease),
+              transform var(--mb-dur-fast) var(--mb-ease);
+}
+.workshop-card:hover { border-color: var(--mb-line-strong); transform: translateY(-1px); }
+.workshop-card .arrow { color: var(--mb-accent-text); font-size: 1.15rem; line-height: 1; }
+
+.services, .modules, .invite-grid, .database-actions {
+  display: grid;
+  gap: var(--mb-space-3);
+}
+.services, .modules { grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
+.database-actions { grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); margin: var(--mb-space-4) 0; }
+
+.target-grid { display: flex; flex-wrap: wrap; gap: var(--mb-space-2); margin-top: var(--mb-space-3); }
+.target {
+  font-size: var(--mb-text-small);
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--mb-radius-xs);
+  background: var(--mb-surface-sunken);
+  color: var(--mb-text-muted);
+}
+.target.degraded { background: var(--mb-danger-tint); color: var(--mb-danger); }
+
+.auth-state {
+  max-width: 32rem;
+  margin: 12vh auto;
+  padding: var(--mb-space-6);
+  text-align: center;
+  display: grid;
+  gap: var(--mb-space-4);
+  justify-items: center;
+}
+.create-form { display: grid; gap: var(--mb-space-4); }
+
+.member, .recovery-row, .restore, .transfer, .dependency {
+  display: grid;
+  gap: var(--mb-space-4);
+  align-items: center;
+}
+.member { grid-template-columns: minmax(13rem, 1fr) minmax(8rem, 10rem) auto; }
+.recovery-row, .transfer, .dependency { grid-template-columns: minmax(11rem, 1fr) auto; }
+.restore { grid-template-columns: minmax(13rem, 1fr) auto; align-items: end; }
+.module-description { font-size: var(--mb-text-small); color: var(--mb-text-muted); }
+.pending-invites { display: grid; gap: var(--mb-space-3); }
+.operation-card { display: grid; gap: var(--mb-space-3); }
+.operation-card.compact { padding: var(--mb-space-3); }
+.operation-message { font-size: var(--mb-text-small); color: var(--mb-text-muted); }
+.operation-failure { align-items: end; }
+.member-operation, .recovery-operation { margin-top: var(--mb-space-3); }
+.reconciliation { display: grid; gap: var(--mb-space-3); }
+.invitation-shell { max-width: 32rem; margin: 12vh auto; padding: var(--mb-space-5); }
+.invitation-card { display: grid; gap: var(--mb-space-4); }
+
+@media (max-width: 800px) {
+  .member, .recovery-row, .restore, .transfer, .dependency { grid-template-columns: 1fr; }
+}
+
+.app-footer {
+  width: 100%;
+  max-width: var(--mb-container);
+  margin: auto auto 0;
+  padding: var(--mb-space-4) var(--mb-space-5);
+  border-top: var(--mb-border);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--mb-space-3);
+  color: var(--mb-text-subtle);
+  font-size: var(--mb-text-small);
+}
+.app-footer nav { display: flex; gap: var(--mb-space-4); }
+.app-footer a { color: var(--mb-text-muted); }

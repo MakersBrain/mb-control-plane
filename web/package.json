@@ -21,6 +21,6 @@
     "vite": "^8.0.16"
   },
   "dependencies": {
-    "@makersbrain/brand": "^0.1.0"
+    "@makersbrain/ui": "0.1.0"
   }
 }

@@ -11,7 +11,7 @@
  * runs, and a link in `app.html` has to resolve to a real file under `static/`.
  *
  * So these are copies -- but generated ones. They are gitignored, they are
- * rewritten from `@makersbrain/brand` on every `dev` and `build`, and there is
+ * rewritten from `@makersbrain/ui` on every `dev` and `build`, and there is
  * no version of them that a person can edit and forget to push upstream. That
  * is the distinction that matters: the old `styles/` copies were committed
  * files kept equal to their source by a check, and these are build outputs.
@@ -31,9 +31,9 @@ const staticDir = join(here, '..', 'static');
 // Resolved through the package's own exports rather than by reaching into
 // node_modules, so a change to its layout is the package's business.
 const ICONS = {
-	'favicon.svg': '@makersbrain/brand/logo/favicon.svg',
-	'favicon-32.png': '@makersbrain/brand/logo/favicon-32.png',
-	'apple-touch-icon.png': '@makersbrain/brand/logo/favicon-180.png'
+	'favicon.svg': '@makersbrain/ui/logo/favicon.svg',
+	'favicon-32.png': '@makersbrain/ui/logo/favicon-32.png',
+	'apple-touch-icon.png': '@makersbrain/ui/logo/favicon-180.png'
 };
 
 mkdirSync(staticDir, { recursive: true });

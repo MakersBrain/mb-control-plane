@@ -4,7 +4,7 @@
 	import { ACCOUNT_URL } from '$lib/config';
 	import { currentIdToken, discard, establish, session } from '$lib/session.svelte';
 	import { logoutUrl, signIn } from '$lib/oidc';
-	import { BrandMark } from '@makersbrain/brand/svelte';
+	import { BrandMark } from '@makersbrain/ui/svelte';
 	let { children } = $props();
 	const publicRoute = $derived(page.url.pathname.startsWith('/oauth/') || page.url.pathname === '/signed-out' || page.url.pathname.startsWith('/invitations/'));
 	let started = false;
@@ -43,6 +43,10 @@
 			</div>
 		</header>
 		<main class="shell">{@render children()}</main>
+		<footer class="app-footer">
+			<span>MakersBrain</span>
+			<nav aria-label="Legal"><a href="https://makersbrain.app/privacy/">Privacy Policy</a><a href="https://makersbrain.app/terms/">Terms of Service</a></nav>
+		</footer>
 	</div>
 {:else if session.ready}
 	<main class="auth-state card">

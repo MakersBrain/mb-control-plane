@@ -2,7 +2,7 @@
 
 FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS builder
 WORKDIR /source
-# .npmrc carries the registry mapping for @makersbrain/brand and no credential.
+# .npmrc carries the registry mapping for @makersbrain/ui and no credential.
 # The credential arrives as a BuildKit secret mounted only for the length of this
 # RUN, so it is never written to a layer and never appears in the pushed image.
 COPY package.json package-lock.json .npmrc ./
