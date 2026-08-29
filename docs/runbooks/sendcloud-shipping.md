@@ -8,7 +8,7 @@ private API keys in the tenant-scoped external secret store; Odoo receives only
 an opaque reference. Never paste keys into Odoo fields, tickets, logs, fixtures,
 or source control.
 
-The implementation is original LGPL-3 MakersBrain code. No Odoo Enterprise,
+The implementation is original AGPL-3 MakersBrain code. No Odoo Enterprise,
 Onestein, or OCA connector source was copied. The official Odoo connector and
 the LGPL OCA 18.0 connector were used only as workflow and architecture prior
 art; the deployed addon uses Sendcloud API v3 and does not depend on parcel
